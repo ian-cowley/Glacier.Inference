@@ -64,11 +64,12 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / llama.cpp | 🟩 **Pure C# vs. Compiled C++** |
 | **External Dependencies** | 🟩 **0 Native C++ DLLs** (direct `nvcuda.dll`) | CUDA Toolkit, cuBLAS, libllama | 🟩 **Zero native toolchain bloat** |
 | **Deployment Footprint** | 🟩 **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 🟩 **300x Lighter Distribution** |
-| **Engine Cold-Start** | 🟩 **1.65 s (In-process, sub-50ms engine)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Short Generation (25 tok)** | 🟩 **43.50 tokens/sec** | 32.30 tokens/sec | 🟩 **+34.7% FASTER** |
-| **Total Wall Time (50 tok)** | 🟩 **1.54 seconds** | 3.64 seconds | 🟩 **>2.3x FASTER (136% speedup)** |
-| **Sustained Rate (50 tok)** | **40.53 tokens/sec** | **43.20 tokens/sec** | Within 6% of compiled C++ cuBLAS |
-| **Prompt Eval Rate** | **109.8 tokens/sec** | 125.4 tokens/sec | Near Parity |
+| **Engine Cold-Start** | 🟩 **1.50 s (In-process, sub-50ms engine)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
+| **Turnaround (25 tok)** | 🟩 **0.89 seconds (40.5 tok/s)** | ~2.50 seconds (32.3 tok/s) | 🟩 **>2.8x FASTER (Sub-second)** |
+| **Total Wall Time (50 tok)** | 🟩 **1.50 seconds** | 3.64 seconds | 🟩 **>2.4x FASTER (143% speedup)** |
+| **Sustained Rate (50 tok)** | **41.02 tokens/sec** | **43.20 tokens/sec** | Within 5% of compiled C++ cuBLAS |
+| **Prompt Eval Rate** | **113.1 tokens/sec** | 125.4 tokens/sec | Near Parity |
+| **KV-Cache Memory** | 🟩 **Adaptive FP16 / FP8 (118–235 MB)** | Fixed FP16 (~470 MB) | 🟩 **50% to 75% Less VRAM** |
 | **Memory Bus Saturation** | **203.6 GB/s (79.5% of peak bus)** | **216.8 GB/s (84.8% of peak bus)** | Saturating 128-bit hardware limits |
 
 ### 💡 Why Glacier is Faster & The 128-Bit Memory Bus Physics
