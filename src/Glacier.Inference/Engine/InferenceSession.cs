@@ -98,25 +98,25 @@ public sealed class InferenceSession : IDisposable
         Device = targetDevice;
         Engine = targetEngine;
 
-        if (targetEngine == InferenceEngineType.Cuda && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+        if (targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
         {
             try
             {
                 _gpu = new GpuContext(targetDevice.Index);
                 _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen);
-                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal CUDA]";
+                ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS]";
             }
             catch (Exception ex)
             {
                 var settings = GlacierSettings.Load();
                 if (!settings.FallbackToCpu)
-                    throw new InvalidOperationException($"Failed to initialize CUDA inference on {targetDevice.Name}: {ex.Message}", ex);
+                    throw new InvalidOperationException($"Failed to initialize Bare-Metal SASS inference on {targetDevice.Name}: {ex.Message}", ex);
 
                 _gpu?.Dispose();
                 _gpu = null;
                 _gpuModel = null;
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from CUDA]";
+                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
             }
         }
         else if (targetEngine == InferenceEngineType.DirectML)
@@ -140,7 +140,7 @@ public sealed class InferenceSession : IDisposable
             _ => "auto"
         }, device switch
         {
-            InferenceDevice.Gpu => InferenceEngineType.Cuda,
+            InferenceDevice.Gpu => InferenceEngineType.BareMetal,
             InferenceDevice.Cpu => InferenceEngineType.Cpu,
             _ => InferenceEngineType.Auto
         })

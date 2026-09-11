@@ -80,7 +80,7 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
-        Console.WriteLine("  --engine <cuda|directml|cpu|auto>    Execution engine (default: auto safe selection)");
+        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto safe selection)");
         Console.WriteLine();
         Console.WriteLine("Options for 'bench':");
         Console.WriteLine("  --tokens <n>                         Number of tokens to generate (default: 32)");
@@ -610,11 +610,11 @@ public static class Program
                 memStr = $"{dev.DedicatedVramGb:F1} GB VRAM";
             }
 
-            string safeEngines = string.Join(", ", dev.SupportedEngines);
+            string safeEngines = string.Join(", ", dev.SupportedEngines.Select(FormatEngineName));
             bool isCurrent = dev.Id == activeDevice.Id;
 
             if (isCurrent) Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"{dev.Id,-18} | {dev.Name,-34} | {memStr,-15} | {safeEngines,-25} {(isCurrent ? $"[ACTIVE: {activeEngine}]" : "")}");
+            Console.WriteLine($"{dev.Id,-18} | {dev.Name,-34} | {memStr,-15} | {safeEngines,-25} {(isCurrent ? $"[ACTIVE: {FormatEngineName(activeEngine)}]" : "")}");
             if (isCurrent) Console.ResetColor();
 
             Console.ForegroundColor = ConsoleColor.DarkGray;
@@ -625,9 +625,10 @@ public static class Program
         Console.WriteLine(new string('-', 108));
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("* To switch your active hardware & driver engine:");
-        Console.WriteLine("  glacier config --device <id|name> [--engine <cuda|directml|cpu>]");
-        Console.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine cuda");
+        Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|directml|cpu>]");
+        Console.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine baremetal");
         Console.WriteLine("  Example: glacier config --device amd-890m --engine directml");
+        Console.WriteLine("  Example: glacier config --device cpu");
         Console.ResetColor();
 
         return 0;
@@ -651,7 +652,7 @@ public static class Program
             Console.ResetColor();
             Console.WriteLine($"Config File:       {GlacierSettings.GetSettingsFilePath()}");
             Console.WriteLine($"Default Device:    {settings.DeviceId ?? "auto"} (Resolved: {activeDev.Name})");
-            Console.WriteLine($"Default Engine:    {settings.Engine} (Resolved: {activeEng})");
+            Console.WriteLine($"Default Engine:    {FormatEngineName(settings.Engine)} (Resolved: {FormatEngineName(activeEng)})");
             Console.WriteLine($"CPU Fallback:      {settings.FallbackToCpu}");
             Console.WriteLine($"Max Seq Length:    {settings.MaxSeqLen}");
             Console.WriteLine($"Default Temp:      {settings.DefaultTemperature}");
@@ -659,7 +660,7 @@ public static class Program
             Console.WriteLine($"Default Top-P:     {settings.DefaultTopP}");
             Console.WriteLine();
             Console.WriteLine("Commands to configure:");
-            Console.WriteLine("  glacier config --device <id|name> [--engine <cuda|directml|cpu>]");
+            Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|directml|cpu>]");
             Console.WriteLine("  glacier config --reset");
             return 0;
         }
@@ -701,12 +702,20 @@ public static class Program
             Console.WriteLine("Successfully updated settings!");
             Console.ResetColor();
             Console.WriteLine($"Active Device: {resolvedDev.Name} ({resolvedDev.Id})");
-            Console.WriteLine($"Active Engine: {resolvedEng}");
+            Console.WriteLine($"Active Engine: {FormatEngineName(resolvedEng)}");
             Console.WriteLine($"Settings saved to: {GlacierSettings.GetSettingsFilePath()}");
             return 0;
         }
 
-        Console.WriteLine("Usage: glacier config [--device <id|name>] [--engine <cuda|directml|cpu>] [--reset]");
+        Console.WriteLine("Usage: glacier config [--device <id|name>] [--engine <baremetal|directml|cpu>] [--reset]");
         return 1;
     }
+
+    private static string FormatEngineName(InferenceEngineType engine) => engine switch
+    {
+        InferenceEngineType.BareMetal => "BareMetal (SASS)",
+        InferenceEngineType.DirectML => "DirectML",
+        InferenceEngineType.Cpu => "Cpu",
+        _ => engine.ToString()
+    };
 }

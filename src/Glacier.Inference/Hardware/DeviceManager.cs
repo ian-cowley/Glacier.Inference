@@ -22,10 +22,10 @@ public static class DeviceManager
     public static DeviceInfo GetOptimalDevice()
     {
         var list = GetDevices();
-        // 1. Prefer NVIDIA discrete GPU with CUDA if available
+        // 1. Prefer NVIDIA discrete GPU with Bare-Metal SASS if available
         foreach (var dev in list)
         {
-            if (dev.Vendor == GpuVendor.Nvidia && dev.SupportedEngines.Contains(InferenceEngineType.Cuda))
+            if (dev.Vendor == GpuVendor.Nvidia && dev.SupportedEngines.Contains(InferenceEngineType.BareMetal))
                 return dev;
         }
 
@@ -87,7 +87,7 @@ public static class DeviceManager
         }
 
         // Vendor keyword shortcuts
-        if (q is "nvidia" or "rtx" or "cuda")
+        if (q is "nvidia" or "rtx" or "cuda" or "baremetal" or "sass")
         {
             foreach (var dev in list)
                 if (dev.Vendor == GpuVendor.Nvidia) return dev;
@@ -176,12 +176,12 @@ public static class DeviceManager
 
                             if (vendor == GpuVendor.Nvidia)
                             {
-                                bool cudaAvail = GpuContext.IsSupported;
-                                if (cudaAvail)
-                                    supportedEngines.Add(InferenceEngineType.Cuda);
+                                bool bareMetalAvail = GpuContext.IsSupported;
+                                if (bareMetalAvail)
+                                    supportedEngines.Add(InferenceEngineType.BareMetal);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = cudaAvail ? InferenceEngineType.Cuda : InferenceEngineType.DirectML;
-                                safetyNotes = "Optimal high-throughput bare-metal CUDA driver (~43 t/s on 7B). DirectML also supported.";
+                                recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : InferenceEngineType.DirectML;
+                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime (~43 t/s on 7B). DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {

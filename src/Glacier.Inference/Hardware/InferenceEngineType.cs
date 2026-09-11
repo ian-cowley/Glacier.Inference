@@ -1,5 +1,6 @@
 namespace Glacier.Inference.Hardware;
 
+using System;
 using System.Text.Json.Serialization;
 
 /// <summary>
@@ -14,9 +15,10 @@ public enum InferenceEngineType
     Auto,
 
     /// <summary>
-    /// Bare-Metal NVIDIA CUDA driver engine (nvcuda.dll). Optimal for NVIDIA GPUs.
+    /// Pure C# Bare-Metal SASS engine. Bypasses the CUDA Toolkit and cudart64.dll runtime,
+    /// directly driving NVIDIA streaming multiprocessors with sub-microsecond latency.
     /// </summary>
-    Cuda,
+    BareMetal,
 
     /// <summary>
     /// Microsoft DirectML / DirectX 12 Compute engine (directml.dll / d3d12.dll).
@@ -27,5 +29,11 @@ public enum InferenceEngineType
     /// <summary>
     /// SIMD-vectorized CPU execution engine (AVX-512 / AVX2 / ARM Neon).
     /// </summary>
-    Cpu
+    Cpu,
+
+    /// <summary>
+    /// Backward-compatible alias for BareMetal.
+    /// </summary>
+    [Obsolete("Use BareMetal instead. Glacier does not use the CUDA Toolkit runtime.")]
+    Cuda = BareMetal
 }

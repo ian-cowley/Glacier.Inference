@@ -97,13 +97,30 @@ public sealed class GlacierSettings
         InferenceEngineType engine = InferenceEngineType.Auto;
         if (!string.IsNullOrWhiteSpace(cliEngine))
         {
-            if (Enum.TryParse<InferenceEngineType>(cliEngine, ignoreCase: true, out var parsed))
+            string clean = cliEngine.Trim().ToLowerInvariant();
+            if (clean is "baremetal" or "bare-metal" or "sass" or "cuda")
+            {
+                engine = InferenceEngineType.BareMetal;
+            }
+            else if (clean is "directml" or "dml" or "dx12")
+            {
+                engine = InferenceEngineType.DirectML;
+            }
+            else if (clean is "cpu" or "simd")
+            {
+                engine = InferenceEngineType.Cpu;
+            }
+            else if (clean is "auto")
+            {
+                engine = InferenceEngineType.Auto;
+            }
+            else if (Enum.TryParse<InferenceEngineType>(cliEngine, ignoreCase: true, out var parsed))
             {
                 engine = parsed;
             }
             else
             {
-                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, cuda, directml, cpu");
+                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, baremetal, directml, cpu");
             }
         }
         else if (string.IsNullOrWhiteSpace(cliDevice) && settings.Engine != InferenceEngineType.Auto)
