@@ -66,8 +66,8 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Deployment Footprint** | 🟩 **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 🟩 **300x Lighter Distribution** |
 | **Engine Cold-Start** | 🟩 **1.65 s (In-process, sub-50ms engine)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
 | **Short Generation (25 tok)** | 🟩 **43.50 tokens/sec** | 32.30 tokens/sec | 🟩 **+34.7% FASTER** |
-| **Total Wall Time (50 tok)** | 🟩 **1.71 seconds** | 3.64 seconds | 🟩 **>2.1x FASTER (113% speedup)** |
-| **Sustained Rate (50 tok)** | **40.51 tokens/sec** | **43.20 tokens/sec** | Within 6% of compiled C++ cuBLAS |
+| **Total Wall Time (50 tok)** | 🟩 **1.54 seconds** | 3.64 seconds | 🟩 **>2.3x FASTER (136% speedup)** |
+| **Sustained Rate (50 tok)** | **40.53 tokens/sec** | **43.20 tokens/sec** | Within 6% of compiled C++ cuBLAS |
 | **Prompt Eval Rate** | **109.8 tokens/sec** | 125.4 tokens/sec | Near Parity |
 | **Memory Bus Saturation** | **203.6 GB/s (79.5% of peak bus)** | **216.8 GB/s (84.8% of peak bus)** | Saturating 128-bit hardware limits |
 
