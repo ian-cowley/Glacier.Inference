@@ -317,7 +317,6 @@ public unsafe class GpuKernelValidationTests
 
         // Launch standard
         uint blockSize = 128;
-        uint numWarps = 4;
         uint gridSize = (uint)((mRows + 3) / 4);
         int kCols = dim; int m_rows = mRows;
         void* pDYS = &dYStd; void* pDX = &dX; void* pDWS = &dWStd; void* pK = &kCols; void* pM = &m_rows;
@@ -371,6 +370,294 @@ public unsafe class GpuKernelValidationTests
 
         gpu.FreeDevice(dX); gpu.FreeDevice(dYStd); gpu.FreeDevice(dYAln);
         gpu.FreeDevice(dWStd); gpu.FreeDevice(dWQs); gpu.FreeDevice(dWScales);
+    }
+
+    [Fact]
+    public void TestGemvFastKernels()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
+
+        using var gguf = GgufFile.Open(ModelPath);
+        var qInfo = gguf.Tensors["blk.0.attn_q.weight"];
+        var vInfo = gguf.Tensors["blk.0.attn_v.weight"];
+        var gateInfo = gguf.Tensors["blk.0.ffn_gate.weight"];
+        var upInfo = gguf.Tensors["blk.0.ffn_up.weight"];
+
+        int dim = (int)qInfo.Dimensions[0];
+        int mRows = 128;
+        int nb = dim / 256;
+
+        using var gpu = new GpuContext();
+        byte[] cubin = KernelCompiler.GetOrCompileKernels("sm_89");
+        CuDriver.Check(CuDriver.ModuleLoadData(out IntPtr module, cubin), "ModuleLoadData");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemvQ4K, module, "gemv_q4_k"), "ModuleGetFunction(gemv_q4_k)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemvQ4KFast, module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemvQ6K, module, "gemv_q6_k"), "ModuleGetFunction(gemv_q6_k)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemvQ6KFast, module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnSwigluFused, module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
+
+        BlockQ4_K* pW = (BlockQ4_K*)gguf.GetTensorPointer(qInfo);
+        BlockQ6_K* pWV = (BlockQ6_K*)gguf.GetTensorPointer(vInfo);
+        BlockQ4_K* pGate = (BlockQ4_K*)gguf.GetTensorPointer(gateInfo);
+        BlockQ4_K* pUp = (BlockQ4_K*)gguf.GetTensorPointer(upInfo);
+
+        float[] x = new float[dim];
+        for (int i = 0; i < dim; i++) x[i] = 0.05f * ((i % 11) - 5);
+
+        // 1. Verify Q4_K Fast vs Standard vs CPU
+        IntPtr dX = gpu.AllocateDevice((nuint)(dim * sizeof(float)));
+        IntPtr dYStd = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        IntPtr dYFast = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        nuint wBytes = (nuint)(mRows * nb * sizeof(BlockQ4_K));
+        IntPtr dW = gpu.AllocateDevice(wBytes);
+
+        fixed (float* pX = x) gpu.CopyToDevice(dX, (IntPtr)pX, (nuint)(dim * sizeof(float)));
+        gpu.CopyToDevice(dW, (IntPtr)pW, wBytes);
+
+        uint blockSize = 128;
+        uint gridSize = (uint)((mRows + 3) / 4);
+        IntPtr nullBias = IntPtr.Zero;
+        IntPtr nullResidual = IntPtr.Zero;
+        void* pNB = &nullBias; void* pNR = &nullResidual;
+
+        int kCols = dim; int m_rows = mRows;
+        void* pDYS = &dYStd; void* pDYF = &dYFast; void* pDX = &dX; void* pDW = &dW; void* pK = &kCols; void* pM = &m_rows;
+        void*[] argsStd = [pDYS, pDX, pDW, pK, pM];
+        void*[] argsFast = [pDYF, pDX, pDW, pK, pM, pNB, pNR];
+
+        fixed (void** pArgs = argsStd) CuDriver.LaunchKernel(fnGemvQ4K, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        fixed (void** pArgs = argsFast) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+
+        float[] yStd = new float[mRows];
+        float[] yFast = new float[mRows];
+        fixed (float* p1 = yStd, p2 = yFast)
+        {
+            gpu.CopyToHost((IntPtr)p1, dYStd, (nuint)(mRows * sizeof(float)));
+            gpu.CopyToHost((IntPtr)p2, dYFast, (nuint)(mRows * sizeof(float)));
+        }
+
+        float maxDiffQ4 = 0f;
+        for (int i = 0; i < mRows; i++)
+        {
+            float diff = Math.Abs(yStd[i] - yFast[i]);
+            if (diff > maxDiffQ4) maxDiffQ4 = diff;
+        }
+        _output.WriteLine($"[TestGemvFastKernels] Q4_K Fast vs Standard MaxDiff: {maxDiffQ4:F6}");
+        Assert.True(maxDiffQ4 < 0.001f, $"Q4_K Fast maxDiff too high: {maxDiffQ4}");
+
+        // 2. Verify Q6_K Fast vs Standard
+        IntPtr dYVStd = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        IntPtr dYVFast = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        nuint wVBytes = (nuint)(mRows * nb * sizeof(BlockQ6_K));
+        IntPtr dWV = gpu.AllocateDevice(wVBytes);
+        gpu.CopyToDevice(dWV, (IntPtr)pWV, wVBytes);
+
+        void* pDYVS = &dYVStd; void* pDYVF = &dYVFast; void* pDWV = &dWV;
+        void*[] argsVStd = [pDYVS, pDX, pDWV, pK, pM];
+        void*[] argsVFast = [pDYVF, pDX, pDWV, pK, pM, pNB, pNR];
+
+        fixed (void** pArgs = argsVStd) CuDriver.LaunchKernel(fnGemvQ6K, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        fixed (void** pArgs = argsVFast) CuDriver.LaunchKernel(fnGemvQ6KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+
+        float[] yVStd = new float[mRows];
+        float[] yVFast = new float[mRows];
+        fixed (float* p1 = yVStd, p2 = yVFast)
+        {
+            gpu.CopyToHost((IntPtr)p1, dYVStd, (nuint)(mRows * sizeof(float)));
+            gpu.CopyToHost((IntPtr)p2, dYVFast, (nuint)(mRows * sizeof(float)));
+        }
+
+        float maxDiffQ6 = 0f;
+        for (int i = 0; i < mRows; i++)
+        {
+            float diff = Math.Abs(yVStd[i] - yVFast[i]);
+            if (diff > maxDiffQ6) maxDiffQ6 = diff;
+        }
+        _output.WriteLine($"[TestGemvFastKernels] Q6_K Fast vs Standard MaxDiff: {maxDiffQ6:F6}");
+        Assert.True(maxDiffQ6 < 0.001f, $"Q6_K Fast maxDiff too high: {maxDiffQ6}");
+
+        // 3. Verify Fused SwiGLU vs Sequential Gate + Up + SwiGLU
+        IntPtr dGate = gpu.AllocateDevice(wBytes);
+        IntPtr dUp = gpu.AllocateDevice(wBytes);
+        IntPtr dYFused = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        gpu.CopyToDevice(dGate, (IntPtr)pGate, wBytes);
+        gpu.CopyToDevice(dUp, (IntPtr)pUp, wBytes);
+
+        void* pDYFused = &dYFused; void* pDGate = &dGate; void* pDUp = &dUp;
+        void*[] argsFused = [pDYFused, pDX, pDGate, pDUp, pK, pM];
+        fixed (void** pArgs = argsFused) CuDriver.LaunchKernel(fnSwigluFused, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+
+        float[] yFused = new float[mRows];
+        fixed (float* pF = yFused) gpu.CopyToHost((IntPtr)pF, dYFused, (nuint)(mRows * sizeof(float)));
+
+        // Run Gate + Up separately with Fast GEMV and compute reference SwiGLU on host
+        IntPtr dGateOut = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        IntPtr dUpOut = gpu.AllocateDevice((nuint)(mRows * sizeof(float)));
+        void* pDGO = &dGateOut; void* pDUO = &dUpOut;
+        void*[] argsGO = [pDGO, pDX, pDGate, pK, pM, pNB, pNR];
+        void*[] argsUO = [pDUO, pDX, pDUp, pK, pM, pNB, pNR];
+        fixed (void** pArgs = argsGO) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        fixed (void** pArgs = argsUO) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+
+        float[] gateHost = new float[mRows];
+        float[] upHost = new float[mRows];
+        fixed (float* pG = gateHost, pU = upHost)
+        {
+            gpu.CopyToHost((IntPtr)pG, dGateOut, (nuint)(mRows * sizeof(float)));
+            gpu.CopyToHost((IntPtr)pU, dUpOut, (nuint)(mRows * sizeof(float)));
+        }
+
+        float maxDiffFused = 0f;
+        for (int i = 0; i < mRows; i++)
+        {
+            float g = gateHost[i];
+            float silu = g / (1.0f + MathF.Exp(-g));
+            float expected = silu * upHost[i];
+            float diff = Math.Abs(expected - yFused[i]);
+            if (diff > maxDiffFused) maxDiffFused = diff;
+        }
+        _output.WriteLine($"[TestGemvFastKernels] Fused SwiGLU vs Ref MaxDiff: {maxDiffFused:F6}");
+        Assert.True(maxDiffFused < 0.001f, $"Fused SwiGLU diff too high: {maxDiffFused}");
+
+        // 4. Microbenchmark Standard vs Fast (1,000 iterations)
+        int iters = 1000;
+        CuDriver.CtxSynchronize();
+
+        var swStd = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+        {
+            fixed (void** pArgs = argsStd) CuDriver.LaunchKernel(fnGemvQ4K, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        }
+        CuDriver.CtxSynchronize();
+        swStd.Stop();
+
+        var swFast = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+        {
+            fixed (void** pArgs = argsFast) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        }
+        CuDriver.CtxSynchronize();
+        swFast.Stop();
+
+        double usStd = swStd.Elapsed.TotalMilliseconds / iters * 1000.0;
+        double usFast = swFast.Elapsed.TotalMilliseconds / iters * 1000.0;
+        _output.WriteLine($"[Microbenchmark 128 rows x 3584 cols]: Standard Q4 = {usStd:F2} µs | Fast Q4 = {usFast:F2} µs ({usStd / usFast:F2}x speedup!)");
+
+        gpu.FreeDevice(dX); gpu.FreeDevice(dYStd); gpu.FreeDevice(dYFast); gpu.FreeDevice(dW);
+        gpu.FreeDevice(dYVStd); gpu.FreeDevice(dYVFast); gpu.FreeDevice(dWV);
+        gpu.FreeDevice(dGate); gpu.FreeDevice(dUp); gpu.FreeDevice(dYFused); gpu.FreeDevice(dGateOut); gpu.FreeDevice(dUpOut);
+    }
+
+    [Fact]
+    public void TestBatchedKernels()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
+
+        using var gguf = GgufFile.Open(ModelPath);
+        var qInfo = gguf.Tensors["blk.0.attn_q.weight"];
+        int dim = (int)qInfo.Dimensions[0];
+        int mRows = 128;
+        int nb = dim / 256;
+        int batchSize = 8;
+
+        using var gpu = new GpuContext();
+        byte[] cubin = KernelCompiler.GetOrCompileKernels("sm_89");
+        CuDriver.Check(CuDriver.ModuleLoadData(out IntPtr module, cubin), "ModuleLoadData");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemvQ4KFast, module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out IntPtr fnGemmBatch, module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
+
+        BlockQ4_K* pW = (BlockQ4_K*)gguf.GetTensorPointer(qInfo);
+        float[] xBatch = new float[batchSize * dim];
+        for (int b = 0; b < batchSize; b++)
+        {
+            for (int i = 0; i < dim; i++)
+            {
+                xBatch[b * dim + i] = 0.05f * (((i + b * 3) % 11) - 5);
+            }
+        }
+
+        IntPtr dXBatch = gpu.AllocateDevice((nuint)(batchSize * dim * sizeof(float)));
+        IntPtr dYSeq = gpu.AllocateDevice((nuint)(batchSize * mRows * sizeof(float)));
+        IntPtr dYBatch = gpu.AllocateDevice((nuint)(batchSize * mRows * sizeof(float)));
+        nuint wBytes = (nuint)(mRows * nb * sizeof(BlockQ4_K));
+        IntPtr dW = gpu.AllocateDevice(wBytes);
+
+        fixed (float* pX = xBatch) gpu.CopyToDevice(dXBatch, (IntPtr)pX, (nuint)(batchSize * dim * sizeof(float)));
+        gpu.CopyToDevice(dW, (IntPtr)pW, wBytes);
+
+        uint blockSize = 128;
+        uint gridSize = (uint)((mRows + 3) / 4);
+        int kCols = dim; int m_rows = mRows;
+
+        IntPtr nullBias = IntPtr.Zero;
+        IntPtr nullResidual = IntPtr.Zero;
+        void* pNB = &nullBias; void* pNR = &nullResidual;
+
+        // 1. Run sequentially (like old prefill)
+        for (int b = 0; b < batchSize; b++)
+        {
+            IntPtr dXSingle = dXBatch + b * dim * sizeof(float);
+            IntPtr dYSingle = dYSeq + b * mRows * sizeof(float);
+            void* pDY = &dYSingle; void* pDX = &dXSingle; void* pDW = &dW; void* pK = &kCols; void* pM = &m_rows;
+            void*[] args = [pDY, pDX, pDW, pK, pM, pNB, pNR];
+            fixed (void** pArgs = args) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        }
+
+        // 2. Run batched in a single kernel launch!
+        int bSize = batchSize;
+        void* pDYB = &dYBatch; void* pDXB = &dXBatch; void* pDWB = &dW; void* pKB = &kCols; void* pMB = &m_rows; void* pBS = &bSize;
+        void*[] argsBatch = [pDYB, pDXB, pDWB, pKB, pMB, pBS, pNB, pNR];
+        fixed (void** pArgs = argsBatch) CuDriver.LaunchKernel(fnGemmBatch, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+
+        float[] ySeq = new float[batchSize * mRows];
+        float[] yBatch = new float[batchSize * mRows];
+        fixed (float* p1 = ySeq, p2 = yBatch)
+        {
+            gpu.CopyToHost((IntPtr)p1, dYSeq, (nuint)(batchSize * mRows * sizeof(float)));
+            gpu.CopyToHost((IntPtr)p2, dYBatch, (nuint)(batchSize * mRows * sizeof(float)));
+        }
+
+        float maxDiff = 0f;
+        for (int i = 0; i < batchSize * mRows; i++)
+        {
+            float diff = Math.Abs(ySeq[i] - yBatch[i]);
+            if (diff > maxDiff) maxDiff = diff;
+        }
+        _output.WriteLine($"[TestBatchedKernels] Sequential vs Batched (B={batchSize}) MaxDiff: {maxDiff:F6}");
+        Assert.True(maxDiff < 0.001f, $"Batched maxDiff too high: {maxDiff}");
+
+        // 3. Benchmark sequential vs batched (500 iterations)
+        int iters = 500;
+        CuDriver.CtxSynchronize();
+
+        var swSeq = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+        {
+            for (int b = 0; b < batchSize; b++)
+            {
+                IntPtr dXSingle = dXBatch + b * dim * sizeof(float);
+                IntPtr dYSingle = dYSeq + b * mRows * sizeof(float);
+                void* pDY = &dYSingle; void* pDX = &dXSingle; void* pDW = &dW; void* pK = &kCols; void* pM = &m_rows;
+                void*[] args = [pDY, pDX, pDW, pK, pM, pNB, pNR];
+                fixed (void** pArgs = args) CuDriver.LaunchKernel(fnGemvQ4KFast, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+            }
+        }
+        CuDriver.CtxSynchronize();
+        swSeq.Stop();
+
+        var swBatch = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+        {
+            fixed (void** pArgs = argsBatch) CuDriver.LaunchKernel(fnGemmBatch, gridSize, 1, 1, blockSize, 1, 1, 0, IntPtr.Zero, (IntPtr)pArgs, IntPtr.Zero);
+        }
+        CuDriver.CtxSynchronize();
+        swBatch.Stop();
+
+        double usSeq = swSeq.Elapsed.TotalMilliseconds / iters * 1000.0;
+        double usBatch = swBatch.Elapsed.TotalMilliseconds / iters * 1000.0;
+        _output.WriteLine($"[Benchmark B={batchSize} x 128 rows]: Sequential = {usSeq:F2} µs | Batched = {usBatch:F2} µs ({usSeq / usBatch:F2}x faster!)");
+
+        gpu.FreeDevice(dXBatch); gpu.FreeDevice(dYSeq); gpu.FreeDevice(dYBatch); gpu.FreeDevice(dW);
     }
 
     [Fact]
@@ -639,5 +926,172 @@ public unsafe class GpuKernelValidationTests
             if (d > maxDiff) maxDiff = d;
         }
         _output.WriteLine($"Max Logits Diff: {maxDiff:F4}");
+    }
+
+    [Fact]
+    public void TestBatchedPromptPrefillVsSequential()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported)
+        {
+            _output.WriteLine("Model or GPU not available, skipping.");
+            return;
+        }
+
+        using var gguf = GgufFile.Open(ModelPath);
+        var weights = new ModelWeights(gguf);
+        using var gpu = new GpuContext();
+        using var kvDummy = new KVCache(weights.BlockCount, weights.HeadCountKv, weights.HeadDim, 128);
+
+        int[] promptTokens = [9707, 11, 1879, 374, 279, 151644, 872, 198, 271, 1059, 318, 555]; // 12 tokens
+        float[] logitsSeq = new float[weights.VocabSize];
+        float[] logitsBatch = new float[weights.VocabSize];
+
+        // 1. Run Sequential Forward
+        using (var gpuModelSeq = new Qwen2GpuModel(gpu, weights))
+        {
+            var swSeq = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < promptTokens.Length - 1; i++)
+            {
+                gpuModelSeq.Forward(promptTokens[i], i, kvDummy, Span<float>.Empty, computeLogits: false);
+            }
+            gpuModelSeq.Forward(promptTokens[^1], promptTokens.Length - 1, kvDummy, logitsSeq, computeLogits: true);
+            swSeq.Stop();
+            _output.WriteLine($"Sequential Prefill ({promptTokens.Length} tokens): {swSeq.Elapsed.TotalMilliseconds:F2} ms ({(promptTokens.Length / swSeq.Elapsed.TotalSeconds):F1} t/s)");
+        }
+
+        // 2. Run Batched Forward
+        using (var gpuModelBatch = new Qwen2GpuModel(gpu, weights))
+        {
+            var swBatch = System.Diagnostics.Stopwatch.StartNew();
+            gpuModelBatch.ForwardBatch(promptTokens, 0, logitsBatch, computeLogits: true);
+            swBatch.Stop();
+            _output.WriteLine($"Batched Prefill    ({promptTokens.Length} tokens): {swBatch.Elapsed.TotalMilliseconds:F2} ms ({(promptTokens.Length / swBatch.Elapsed.TotalSeconds):F1} t/s)");
+        }
+
+        // Find argmax for Seq
+        int bestSeqToken = 0;
+        float bestSeqLogit = float.MinValue;
+        for (int i = 0; i < weights.VocabSize; i++)
+        {
+            if (logitsSeq[i] > bestSeqLogit)
+            {
+                bestSeqLogit = logitsSeq[i];
+                bestSeqToken = i;
+            }
+        }
+
+        // Find argmax for Batch
+        int bestBatchToken = 0;
+        float bestBatchLogit = float.MinValue;
+        for (int i = 0; i < weights.VocabSize; i++)
+        {
+            if (logitsBatch[i] > bestBatchLogit)
+            {
+                bestBatchLogit = logitsBatch[i];
+                bestBatchToken = i;
+            }
+        }
+
+        _output.WriteLine($"Sequential Best Token: {bestSeqToken} (logit={bestSeqLogit:F4})");
+        _output.WriteLine($"Batched Best Token:    {bestBatchToken} (logit={bestBatchLogit:F4})");
+
+        float maxDiff = 0f;
+        for (int i = 0; i < weights.VocabSize; i++)
+        {
+            float d = Math.Abs(logitsSeq[i] - logitsBatch[i]);
+            if (d > maxDiff) maxDiff = d;
+        }
+        _output.WriteLine($"Max Logits Diff (Seq vs Batch): {maxDiff:F6}");
+
+        Assert.Equal(bestSeqToken, bestBatchToken);
+        Assert.True(maxDiff < 0.01f, $"Max diff between batched and sequential prefill too high: {maxDiff}");
+    }
+
+    [Fact]
+    public void ProfileForwardPassBreakdown()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
+
+        using var gguf = GgufFile.Open(ModelPath);
+        var weights = new ModelWeights(gguf);
+        using var gpu = new GpuContext();
+        using var kvDummy = new KVCache(weights.BlockCount, weights.HeadCountKv, weights.HeadDim, 128);
+        using var model = new Qwen2GpuModel(gpu, weights);
+
+        float[] logits = new float[weights.VocabSize];
+
+        // Warmup
+        model.Forward(9707, 0, kvDummy, logits, computeLogits: true);
+
+        CuDriver.EventCreate(out IntPtr evStart, 0);
+        CuDriver.EventCreate(out IntPtr evMid, 0);
+        CuDriver.EventCreate(out IntPtr evEnd, 0);
+
+        // Run 10 iterations to get average GPU layer time
+        int iters = 10;
+        CuDriver.EventRecord(evStart, IntPtr.Zero);
+        for (int i = 0; i < iters; i++)
+        {
+            model.Forward(9707, i + 1, kvDummy, Span<float>.Empty, computeLogits: false);
+        }
+        CuDriver.EventRecord(evMid, IntPtr.Zero);
+
+        for (int i = 0; i < iters; i++)
+        {
+            model.Forward(9707, i + 1, kvDummy, logits, computeLogits: true);
+        }
+        CuDriver.EventRecord(evEnd, IntPtr.Zero);
+        CuDriver.EventSynchronize(evEnd);
+
+        CuDriver.EventElapsedTime(out float layersOnlyMs, evStart, evMid);
+        CuDriver.EventElapsedTime(out float fullMs, evMid, evEnd);
+
+        float avgLayersMs = layersOnlyMs / iters;
+        float avgFullMs = fullMs / iters;
+        float avgLmHeadMs = avgFullMs - avgLayersMs;
+
+        _output.WriteLine($"[PROFILE] 28 Transformer Layers: {avgLayersMs:F2} ms ({(1000f / avgLayersMs):F1} t/s)");
+        _output.WriteLine($"[PROFILE] LM Head (Vocab 152K):  {avgLmHeadMs:F2} ms");
+        _output.WriteLine($"[PROFILE] Full Forward Pass:     {avgFullMs:F2} ms ({(1000f / avgFullMs):F1} t/s)");
+
+        CuDriver.EventDestroy(evStart);
+        CuDriver.EventDestroy(evMid);
+        CuDriver.EventDestroy(evEnd);
+    }
+
+    [Fact]
+    public void ProfileBatchedPrefill()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
+
+        using var gguf = GgufFile.Open(ModelPath);
+        var weights = new ModelWeights(gguf);
+        using var gpu = new GpuContext();
+        using var model = new Qwen2GpuModel(gpu, weights);
+
+        float[] logits = new float[weights.VocabSize];
+
+        foreach (int promptLen in new[] { 32, 64, 128 })
+        {
+            int[] tokens = new int[promptLen];
+            for (int i = 0; i < promptLen; i++) tokens[i] = 1000 + i;
+
+            // Warmup
+            model.ForwardBatch(tokens, 0, logits, computeLogits: true);
+            CuDriver.CtxSynchronize();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int iters = 5;
+            for (int it = 0; it < iters; it++)
+            {
+                model.ForwardBatch(tokens, 0, logits, computeLogits: true);
+            }
+            CuDriver.CtxSynchronize();
+            sw.Stop();
+
+            double ms = sw.Elapsed.TotalMilliseconds / iters;
+            double tps = promptLen / (ms / 1000.0);
+            _output.WriteLine($"[BATCH PREFILL] Prompt {promptLen,3} tokens: {ms:F2} ms ({tps:F1} tokens/sec)");
+        }
     }
 }

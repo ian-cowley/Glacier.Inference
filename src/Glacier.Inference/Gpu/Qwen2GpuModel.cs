@@ -57,6 +57,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _module;
     private IntPtr _fnGemvQ4K;
     private IntPtr _fnGemvQ6K;
+    private IntPtr _fnSwigluFused;
     private IntPtr _fnRmsNorm;
     private IntPtr _fnSwiglu;
     private IntPtr _fnAddBias;
@@ -64,6 +65,34 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _fnRope;
     private IntPtr _fnKvCacheStore;
     private IntPtr _fnAttentionGqa;
+
+    // Batched Prefill Kernels & Buffers (batchSize <= 32)
+    public const int MaxBatchSize = 32;
+    private IntPtr _fnGemmQ4KBatch;
+    private IntPtr _fnGemmQ6KBatch;
+    private IntPtr _fnGemmSwigluBatch;
+    private IntPtr _fnRmsNormBatch;
+    private IntPtr _fnAddBiasBatch;
+    private IntPtr _fnVecAddBatch;
+    private IntPtr _fnRopeBatch;
+    private IntPtr _fnKvCacheStoreBatch;
+    private IntPtr _fnAttentionGqaBatch;
+
+    private IntPtr _dXBatch;
+    private IntPtr _dNormXBatch;
+    private IntPtr _dQBatch;
+    private IntPtr _dKBatch;
+    private IntPtr _dVBatch;
+    private IntPtr _dAttnOutBatch;
+    private IntPtr _dAttnProjBatch;
+    private IntPtr _dFfnActBatch;
+    private IntPtr _dFfnOutBatch;
+    private IntPtr _dScoresBufBatch;
+    private float[] _hXBatch;
+
+    // CUDA Non-Blocking Streams for Concurrent Projections
+    private IntPtr _streamK;
+    private IntPtr _streamV;
 
     // GPU VRAM Weights
     private IntPtr _dOutNormWeight;
@@ -114,9 +143,10 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         byte[] cubin = KernelCompiler.GetOrCompileKernels("sm_89");
         CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), "cuModuleLoadData(kernels.cubin)");
 
-        // 2. Retrieve kernel function handles
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k"), "ModuleGetFunction(gemv_q4_k)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k"), "ModuleGetFunction(gemv_q6_k)");
+        // 2. Retrieve kernel function handles (using fast vectorized kernels)
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBias, _module, "add_bias_kernel"), "ModuleGetFunction(add_bias_kernel)");
@@ -125,7 +155,22 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
 
-        // 3. Allocate GPU VRAM scratch buffers
+        // 2b. Retrieve batched prefill kernels
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBiasBatch, _module, "add_bias_batch"), "ModuleGetFunction(add_bias_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddBatch, _module, "vec_add_batch"), "ModuleGetFunction(vec_add_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
+
+        // 2c. Create non-blocking streams for concurrent Q/K/V projections
+        CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
+        CuDriver.Check(CuDriver.StreamCreate(out _streamV, 1), "StreamCreate(streamV)");
+
+        // 3. Allocate GPU VRAM scratch buffers (single token)
         _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dNormX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dQ = _gpu.AllocateDevice((nuint)(_nHeads * _headDim * sizeof(float)));
@@ -139,6 +184,19 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         _dFfnOut = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dLogits = _gpu.AllocateDevice((nuint)(_weights.VocabSize * sizeof(float)));
         _dScoresBuf = _gpu.AllocateDevice((nuint)((long)_nHeads * _maxSeqLen * sizeof(float)));
+
+        // 3b. Allocate GPU VRAM batch scratch buffers (prefill batch <= 32)
+        _dXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dNormXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dQBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
+        _dKBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+        _dVBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+        _dAttnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dAttnProjBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dFfnActBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
+        _dFfnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dScoresBufBatch = _gpu.AllocateDevice((nuint)((long)MaxBatchSize * _nHeads * _maxSeqLen * sizeof(float)));
+        _hXBatch = new float[MaxBatchSize * _dim];
 
         // 4. Allocate GPU VRAM KV Cache per layer
         _dKeyCache = new IntPtr[_weights.BlockCount];
@@ -267,15 +325,10 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             // Attention pre-norm in VRAM
             LaunchRmsNorm(_dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
 
-            // Q, K, V projections on GPU
-            LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim);
-            LaunchAddBias(_dQ, lw.QBias, qDim);
-
-            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim);
-            LaunchAddBias(_dK, lw.KBias, kvDim);
-
-            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim);
-            LaunchAddBias(_dV, lw.VBias, kvDim);
+            // Q, K, V projections on GPU (fused bias addition)
+            LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias);
+            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias);
+            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias);
 
             // Rotary Position Embedding (RoPE) directly in VRAM
             LaunchRope(_dQ, _dK, pos);
@@ -286,29 +339,137 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             // Multi-Head / Grouped Query Attention (GQA) in VRAM
             LaunchAttention(l, pos);
 
-            // Attention out projection
-            LaunchGemv(lw.AttnOutType, _dAttnProj, _dAttnOut, lw.AttnOutWeight, _dim, _dim);
-
-            // Residual connection: dX += dAttnProj
-            LaunchVecAdd(_dX, _dAttnProj, _dim);
+            // Attention out projection (fused residual accumulation directly into _dX: _dX += attnProj)
+            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, _dim, _dim, IntPtr.Zero, _dX);
 
             // FFN pre-norm
             LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
 
-            // SwiGLU FFN projections on GPU
-            LaunchGemv(lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim);
-            LaunchGemv(lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim);
-            LaunchSwiglu(_dGate, _dUp, _dFfnAct, _ffnDim);
-            LaunchGemv(lw.FfnDownType, _dFfnOut, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim);
+            // SwiGLU FFN projections on GPU (Fused kernel computes Gate + Up in registers and applies SiLU)
+            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            {
+                LaunchSwigluFused(_dFfnAct, _dNormX, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim);
+            }
+            else
+            {
+                LaunchGemv(lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim);
+                LaunchGemv(lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim);
+                LaunchSwiglu(_dGate, _dUp, _dFfnAct, _ffnDim);
+            }
 
-            // Residual connection: dX += dFfnOut
-            LaunchVecAdd(_dX, _dFfnOut, _dim);
+            // FFN down projection (fused residual accumulation directly into _dX: _dX += ffnDown)
+            LaunchGemv(lw.FfnDownType, IntPtr.Zero, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, IntPtr.Zero, _dX);
         }
 
         if (computeLogits)
         {
             // Final RMSNorm
             LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+
+            // Output projection (LM Head) on GPU
+            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+
+            // Copy logits from GPU to CPU
+            fixed (float* pLogits = logits)
+            {
+                _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executes batched transformer prompt prefill directly on NVIDIA GPU.
+    /// Weights are loaded once from VRAM and multiplied across up to MaxBatchSize tokens simultaneously.
+    /// </summary>
+    public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
+    {
+        int offset = 0;
+        while (offset < tokens.Length)
+        {
+            int batchSize = Math.Min(tokens.Length - offset, MaxBatchSize);
+            bool isLastChunk = (offset + batchSize == tokens.Length);
+            ForwardBatchChunk(
+                tokens.Slice(offset, batchSize),
+                startPos + offset,
+                isLastChunk && computeLogits ? logits : Span<float>.Empty,
+                isLastChunk && computeLogits);
+            offset += batchSize;
+        }
+    }
+
+    private void ForwardBatchChunk(ReadOnlySpan<int> chunkTokens, int chunkStartPos, Span<float> logits, bool computeLogits)
+    {
+        int batchSize = chunkTokens.Length;
+        int qDim = _nHeads * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+
+        // 1. Extract embeddings into host batch buffer and copy to GPU
+        fixed (float* pXBatch = _hXBatch)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, chunkTokens[t], pXBatch + t * _dim, _dim);
+            }
+            _gpu.CopyToDevice(_dXBatch, (IntPtr)pXBatch, (nuint)(batchSize * _dim * sizeof(float)));
+        }
+
+        // 2. Transformer layers in batch
+        for (int l = 0; l < _weights.BlockCount; l++)
+        {
+            var lw = _layerWeights[l];
+
+            // Attention pre-norm in batch
+            LaunchRmsNormBatch(_dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
+
+            // Q, K, V projections in batch (fused bias addition directly into Q, K, V)
+            LaunchGemmBatch(lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, batchSize, lw.QBias);
+            LaunchGemmBatch(lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, batchSize, lw.KBias);
+            LaunchGemmBatch(lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, batchSize, lw.VBias);
+
+            // Rotary Position Embedding in batch
+            LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
+
+            // Store K and V in GPU VRAM KV Cache in batch
+            LaunchKvCacheStoreBatch(l, chunkStartPos, batchSize);
+
+            // GQA Attention in batch across all batch tokens and heads in 1 launch!
+            LaunchAttentionBatch(l, chunkStartPos, batchSize);
+
+            // Attention out projection in batch (fused residual accumulation directly into _dXBatch: _dXBatch += attnProj)
+            LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, _dim, _dim, batchSize, IntPtr.Zero, _dXBatch);
+
+            // FFN pre-norm in batch
+            LaunchRmsNormBatch(_dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
+
+            // SwiGLU FFN projections in batch
+            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            {
+                LaunchSwigluBatch(_dFfnActBatch, _dNormXBatch, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim, batchSize);
+            }
+            else
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    IntPtr dNorm = _dNormXBatch + t * _dim * sizeof(float);
+                    IntPtr dAct = _dFfnActBatch + t * _ffnDim * sizeof(float);
+                    LaunchGemv(lw.FfnGateType, _dGate, dNorm, lw.FfnGateWeight, _dim, _ffnDim);
+                    LaunchGemv(lw.FfnUpType, _dUp, dNorm, lw.FfnUpWeight, _dim, _ffnDim);
+                    LaunchSwiglu(_dGate, _dUp, dAct, _ffnDim);
+                }
+            }
+
+            // FFN Down projection in batch (fused residual accumulation directly into _dXBatch: _dXBatch += ffnDown)
+            LaunchGemmBatch(lw.FfnDownType, IntPtr.Zero, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
+        }
+
+        if (computeLogits)
+        {
+            // We only need logits for the last token in the batch
+            int lastTokenIdx = batchSize - 1;
+            IntPtr dXLast = _dXBatch + lastTokenIdx * _dim * sizeof(float);
+
+            // Final RMSNorm
+            LaunchRmsNorm(dXLast, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
 
             // Output projection (LM Head) on GPU
             LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
@@ -334,26 +495,23 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         float freqBase = _weights.RopeFreqBase;
         float freqScale = 1.0f;
 
-        void* pQ = &dQ;
-        void* pK = &dK;
-        void* pHQ = &nHeadsQ;
-        void* pHKv = &nHeadsKv;
-        void* pHD = &headDim;
-        void* pPos = &pos;
-        void* pFB = &freqBase;
-        void* pFS = &freqScale;
-        void*[] args = [pQ, pK, pHQ, pHKv, pHD, pPos, pFB, pFS];
+        void** pArgs = stackalloc void*[8];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dK;
+        pArgs[2] = &nHeadsQ;
+        pArgs[3] = &nHeadsKv;
+        pArgs[4] = &headDim;
+        pArgs[5] = &pos;
+        pArgs[6] = &freqBase;
+        pArgs[7] = &freqScale;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnRope,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(rope)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRope,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rope)");
     }
 
     private void LaunchKvStore(int layer, int pos)
@@ -367,40 +525,37 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         int nHeadsKv = _nHeadsKv;
         int headDim = _headDim;
         int maxSeq = _maxSeqLen;
-
         IntPtr dK = _dK;
         IntPtr dV = _dV;
-        void* pKC = &dKCache;
-        void* pVC = &dVCache;
-        void* pK = &dK;
-        void* pV = &dV;
-        void* pHKv = &nHeadsKv;
-        void* pHD = &headDim;
-        void* pMax = &maxSeq;
-        void* pPos = &pos;
-        void*[] args = [pKC, pVC, pK, pV, pHKv, pHD, pMax, pPos];
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnKvCacheStore,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(kv_cache_store)");
-        }
+        void** pArgs = stackalloc void*[8];
+        pArgs[0] = &dKCache;
+        pArgs[1] = &dVCache;
+        pArgs[2] = &dK;
+        pArgs[3] = &dV;
+        pArgs[4] = &nHeadsKv;
+        pArgs[5] = &headDim;
+        pArgs[6] = &maxSeq;
+        pArgs[7] = &pos;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnKvCacheStore,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(kv_cache_store)");
     }
 
-    private void LaunchAttention(int layer, int pos)
+    private void LaunchAttention(int layer, int pos) => LaunchAttention(layer, pos, _dQ, _dAttnOut);
+
+    private void LaunchAttention(int layer, int pos, IntPtr dQ, IntPtr dOut)
     {
         uint gridSize = (uint)_nHeads;
         uint blockSize = (uint)_headDim;
 
         IntPtr dKCache = _dKeyCache[layer];
         IntPtr dVCache = _dValCache[layer];
-        IntPtr dQ = _dQ;
-        IntPtr dOut = _dAttnOut;
         IntPtr dScores = _dScoresBuf;
         int nHeadsQ = _nHeads;
         int nHeadsKv = _nHeadsKv;
@@ -408,32 +563,78 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         int maxSeq = _maxSeqLen;
         float attnScale = _attnScale;
 
-        void* pQ = &dQ;
-        void* pKC = &dKCache;
-        void* pVC = &dVCache;
-        void* pOut = &dOut;
-        void* pScores = &dScores;
-        void* pHQ = &nHeadsQ;
-        void* pHKv = &nHeadsKv;
-        void* pHD = &headDim;
-        void* pMax = &maxSeq;
-        void* pPos = &pos;
-        void* pScale = &attnScale;
-        void*[] args = [pQ, pKC, pVC, pOut, pScores, pHQ, pHKv, pHD, pMax, pPos, pScale];
+        void** pArgs = stackalloc void*[11];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKCache;
+        pArgs[2] = &dVCache;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dScores;
+        pArgs[5] = &nHeadsQ;
+        pArgs[6] = &nHeadsKv;
+        pArgs[7] = &headDim;
+        pArgs[8] = &maxSeq;
+        pArgs[9] = &pos;
+        pArgs[10] = &attnScale;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnAttentionGqa,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(attention_gqa)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAttentionGqa,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(attention_gqa)");
     }
 
-    private void LaunchGemv(GgufType type, IntPtr dY, IntPtr dX, IntPtr dW, int kCols, int mRows)
+    private void LaunchAttentionBatch(int layer, int chunkStartPos, int batchSize)
+    {
+        uint gridX = (uint)_nHeads;
+        uint gridY = (uint)batchSize;
+        uint blockSize = (uint)_headDim;
+
+        IntPtr dQ = _dQBatch;
+        IntPtr dKCache = _dKeyCache[layer];
+        IntPtr dVCache = _dValCache[layer];
+        IntPtr dOut = _dAttnOutBatch;
+        IntPtr dScores = _dScoresBufBatch;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int maxSeq = _maxSeqLen;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[12];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKCache;
+        pArgs[2] = &dVCache;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dScores;
+        pArgs[5] = &nHeadsQ;
+        pArgs[6] = &nHeadsKv;
+        pArgs[7] = &headDim;
+        pArgs[8] = &maxSeq;
+        pArgs[9] = &chunkStartPos;
+        pArgs[10] = &batchSize;
+        pArgs[11] = &attnScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAttentionGqaBatch,
+            gridX, gridY, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(attention_gqa_batch)");
+    }
+
+    private void LaunchGemv(
+        GgufType type,
+        IntPtr dY,
+        IntPtr dX,
+        IntPtr dW,
+        int kCols,
+        int mRows,
+        IntPtr dBias = default,
+        IntPtr dResidual = default,
+        IntPtr hStream = default)
     {
         IntPtr fn = type switch
         {
@@ -446,23 +647,45 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         uint numWarps = 4;
         uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
 
-        void* pDY = &dY;
-        void* pDX = &dX;
-        void* pDW = &dW;
-        void* pK = &kCols;
-        void* pM = &mRows;
-        void*[] args = [pDY, pDX, pDW, pK, pM];
+        void** pArgs = stackalloc void*[7];
+        pArgs[0] = &dY;
+        pArgs[1] = &dX;
+        pArgs[2] = &dW;
+        pArgs[3] = &kCols;
+        pArgs[4] = &mRows;
+        pArgs[5] = &dBias;
+        pArgs[6] = &dResidual;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                fn,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(gemv)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(gemv)");
+    }
+
+    private void LaunchSwigluFused(IntPtr dDst, IntPtr dX, IntPtr dWGate, IntPtr dWUp, int kCols, int mRows)
+    {
+        uint blockSize = 128;
+        uint numWarps = 4;
+        uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+
+        void** pArgs = stackalloc void*[6];
+        pArgs[0] = &dDst;
+        pArgs[1] = &dX;
+        pArgs[2] = &dWGate;
+        pArgs[3] = &dWUp;
+        pArgs[4] = &kCols;
+        pArgs[5] = &mRows;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnSwigluFused,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(gemv_q4_k_swiglu_fused)");
     }
 
     private void LaunchRmsNorm(IntPtr dX, IntPtr dWeight, IntPtr dDst, int size, float eps)
@@ -470,23 +693,20 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         uint blockSize = 256;
         uint gridSize = 1;
 
-        void* pDX = &dX;
-        void* pDW = &dWeight;
-        void* pDDst = &dDst;
-        void* pSize = &size;
-        void* pEps = &eps;
-        void*[] args = [pDX, pDW, pDDst, pSize, pEps];
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dX;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &dDst;
+        pArgs[3] = &size;
+        pArgs[4] = &eps;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnRmsNorm,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(rms_norm)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNorm,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm)");
     }
 
     private void LaunchSwiglu(IntPtr dGate, IntPtr dUp, IntPtr dDst, int size)
@@ -494,44 +714,38 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         uint blockSize = 256;
         uint gridSize = (uint)((size + (int)blockSize - 1) / (int)blockSize);
 
-        void* pDGate = &dGate;
-        void* pDUp = &dUp;
-        void* pDDst = &dDst;
-        void* pSize = &size;
-        void*[] args = [pDGate, pDUp, pDDst, pSize];
+        void** pArgs = stackalloc void*[4];
+        pArgs[0] = &dGate;
+        pArgs[1] = &dUp;
+        pArgs[2] = &dDst;
+        pArgs[3] = &size;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnSwiglu,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(swiglu)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnSwiglu,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(swiglu)");
     }
 
-    private void LaunchAddBias(IntPtr dY, IntPtr dBias, int size)
+    private void LaunchAddBias(IntPtr dY, IntPtr dBias, int size, IntPtr hStream = default)
     {
         uint blockSize = 256;
         uint gridSize = (uint)((size + (int)blockSize - 1) / (int)blockSize);
 
-        void* pDY = &dY;
-        void* pDBias = &dBias;
-        void* pSize = &size;
-        void*[] args = [pDY, pDBias, pSize];
+        void** pArgs = stackalloc void*[3];
+        pArgs[0] = &dY;
+        pArgs[1] = &dBias;
+        pArgs[2] = &size;
 
-        fixed (void** pArgs = args)
-        {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnAddBias,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(add_bias)");
-        }
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAddBias,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(add_bias)");
     }
 
     private void LaunchVecAdd(IntPtr dA, IntPtr dB, int size)
@@ -539,27 +753,222 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         uint blockSize = 256;
         uint gridSize = (uint)((size + (int)blockSize - 1) / (int)blockSize);
 
-        void* pDA = &dA;
-        void* pDB = &dB;
-        void* pSize = &size;
-        void*[] args = [pDA, pDB, pSize];
+        void** pArgs = stackalloc void*[3];
+        pArgs[0] = &dA;
+        pArgs[1] = &dB;
+        pArgs[2] = &size;
 
-        fixed (void** pArgs = args)
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnVecAdd,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(vec_add)");
+    }
+
+    private void LaunchGemmBatch(
+        GgufType type,
+        IntPtr dY,
+        IntPtr dX,
+        IntPtr dW,
+        int kCols,
+        int mRows,
+        int batchSize,
+        IntPtr dBias = default,
+        IntPtr dResidual = default,
+        IntPtr hStream = default)
+    {
+        IntPtr fn = type switch
         {
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnVecAdd,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pArgs,
-                IntPtr.Zero), "LaunchKernel(vec_add)");
-        }
+            GgufType.Q4_K => _fnGemmQ4KBatch,
+            GgufType.Q6_K => _fnGemmQ6KBatch,
+            _ => throw new NotSupportedException($"GPU batch GEMM does not support type {type}")
+        };
+
+        uint blockSize = 128;
+        uint numWarps = 4;
+        uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+
+        void** pArgs = stackalloc void*[8];
+        pArgs[0] = &dY;
+        pArgs[1] = &dX;
+        pArgs[2] = &dW;
+        pArgs[3] = &kCols;
+        pArgs[4] = &mRows;
+        pArgs[5] = &batchSize;
+        pArgs[6] = &dBias;
+        pArgs[7] = &dResidual;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(gemm_batch)");
+    }
+
+    private void LaunchSwigluBatch(IntPtr dDst, IntPtr dX, IntPtr dWGate, IntPtr dWUp, int kCols, int mRows, int batchSize)
+    {
+        uint blockSize = 128;
+        uint numWarps = 4;
+        uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+
+        void** pArgs = stackalloc void*[7];
+        pArgs[0] = &dDst;
+        pArgs[1] = &dX;
+        pArgs[2] = &dWGate;
+        pArgs[3] = &dWUp;
+        pArgs[4] = &kCols;
+        pArgs[5] = &mRows;
+        pArgs[6] = &batchSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnGemmSwigluBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(gemm_q4_k_swiglu_batch)");
+    }
+
+    private void LaunchRmsNormBatch(IntPtr dX, IntPtr dWeight, IntPtr dDst, int size, float eps, int batchSize)
+    {
+        uint blockSize = 256;
+        uint gridSize = (uint)batchSize;
+
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dX;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &dDst;
+        pArgs[3] = &size;
+        pArgs[4] = &eps;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNormBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm_batch)");
+    }
+
+    private void LaunchAddBiasBatch(IntPtr dY, IntPtr dBias, int size, int batchSize, IntPtr hStream = default)
+    {
+        int totalElements = size * batchSize;
+        uint blockSize = 256;
+        uint gridSize = (uint)((totalElements + (int)blockSize - 1) / (int)blockSize);
+
+        void** pArgs = stackalloc void*[4];
+        pArgs[0] = &dY;
+        pArgs[1] = &dBias;
+        pArgs[2] = &size;
+        pArgs[3] = &totalElements;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAddBiasBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(add_bias_batch)");
+    }
+
+    private void LaunchVecAddBatch(IntPtr dA, IntPtr dB, int totalElements)
+    {
+        uint blockSize = 256;
+        uint gridSize = (uint)((totalElements + (int)blockSize - 1) / (int)blockSize);
+
+        void** pArgs = stackalloc void*[3];
+        pArgs[0] = &dA;
+        pArgs[1] = &dB;
+        pArgs[2] = &totalElements;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnVecAddBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(vec_add_batch)");
+    }
+
+    private void LaunchRopeBatch(IntPtr dQ, IntPtr dK, int startPos, int batchSize)
+    {
+        int halfDim = _headDim / 2;
+        int totalHalf = (_nHeads + _nHeadsKv) * halfDim;
+        int totalAll = totalHalf * batchSize;
+        uint blockSize = 256;
+        uint gridSize = (uint)((totalAll + (int)blockSize - 1) / (int)blockSize);
+
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        float freqBase = _weights.RopeFreqBase;
+        float freqScale = 1.0f;
+
+        void** pArgs = stackalloc void*[9];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dK;
+        pArgs[2] = &nHeadsQ;
+        pArgs[3] = &nHeadsKv;
+        pArgs[4] = &headDim;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &freqBase;
+        pArgs[8] = &freqScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRopeBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rope_batch)");
+    }
+
+    private void LaunchKvCacheStoreBatch(int layer, int startPos, int batchSize)
+    {
+        int total = _nHeadsKv * _headDim * batchSize;
+        uint blockSize = 256;
+        uint gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+
+        IntPtr dKCache = _dKeyCache[layer];
+        IntPtr dVCache = _dValCache[layer];
+        IntPtr dK = _dKBatch;
+        IntPtr dV = _dVBatch;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int maxSeq = _maxSeqLen;
+
+        void** pArgs = stackalloc void*[9];
+        pArgs[0] = &dKCache;
+        pArgs[1] = &dVCache;
+        pArgs[2] = &dK;
+        pArgs[3] = &dV;
+        pArgs[4] = &nHeadsKv;
+        pArgs[5] = &headDim;
+        pArgs[6] = &maxSeq;
+        pArgs[7] = &startPos;
+        pArgs[8] = &batchSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnKvCacheStoreBatch,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(kv_cache_store_batch)");
     }
 
     public void Dispose()
     {
         if (!_disposed)
         {
+            if (_streamK != IntPtr.Zero) CuDriver.StreamDestroy(_streamK);
+            if (_streamV != IntPtr.Zero) CuDriver.StreamDestroy(_streamV);
+
             _gpu.FreeDevice(_dX);
             _gpu.FreeDevice(_dNormX);
             _gpu.FreeDevice(_dQ);
@@ -575,6 +984,17 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             _gpu.FreeDevice(_dScoresBuf);
             _gpu.FreeDevice(_dOutNormWeight);
             _gpu.FreeDevice(_dOutWeight);
+
+            _gpu.FreeDevice(_dXBatch);
+            _gpu.FreeDevice(_dNormXBatch);
+            _gpu.FreeDevice(_dQBatch);
+            _gpu.FreeDevice(_dKBatch);
+            _gpu.FreeDevice(_dVBatch);
+            _gpu.FreeDevice(_dAttnOutBatch);
+            _gpu.FreeDevice(_dAttnProjBatch);
+            _gpu.FreeDevice(_dFfnActBatch);
+            _gpu.FreeDevice(_dFfnOutBatch);
+            _gpu.FreeDevice(_dScoresBufBatch);
 
             if (_dKeyCache != null)
             {

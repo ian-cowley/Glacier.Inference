@@ -148,15 +148,22 @@ public sealed class InferenceSession : IDisposable
         var promptStopwatch = Stopwatch.StartNew();
 
         // 2. Prefill prompt tokens
-        for (int i = 0; i < promptTokens.Length - 1; i++)
+        if (_gpuModel != null)
         {
-            ct.ThrowIfCancellationRequested();
-            ForwardToken(promptTokens[i], i, computeLogits: false);
+            _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
         }
+        else
+        {
+            for (int i = 0; i < promptTokens.Length - 1; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                ForwardToken(promptTokens[i], i, computeLogits: false);
+            }
 
-        // Forward last prompt token to get first logits
-        int lastPromptIdx = promptTokens.Length - 1;
-        ForwardToken(promptTokens[lastPromptIdx], lastPromptIdx, computeLogits: true);
+            // Forward last prompt token to get first logits
+            int lastPromptIdx = promptTokens.Length - 1;
+            ForwardToken(promptTokens[lastPromptIdx], lastPromptIdx, computeLogits: true);
+        }
         promptStopwatch.Stop();
 
         // 3. Autoregressive token generation loop

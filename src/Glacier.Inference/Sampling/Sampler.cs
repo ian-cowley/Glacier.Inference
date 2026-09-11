@@ -75,25 +75,22 @@ public sealed class Sampler
             return bestId;
         }
 
-        // Apply temperature
-        float invTemp = 1.0f / options.Temperature;
-        for (int i = 0; i < vocabSize; i++)
-        {
-            logits[i] *= invTemp;
-        }
-
-        // Find top-K candidates
+        // Find top-K candidates using zero-allocation min-heap
         int k = Math.Min(options.TopK, vocabSize);
-        var candidates = new (int Id, float Logit)[vocabSize];
-        for (int i = 0; i < vocabSize; i++)
+        Span<(int Id, float Logit)> candidates = k <= 128
+            ? stackalloc (int, float)[k]
+            : new (int, float)[k];
+
+        SelectTopK(logits, k, candidates);
+
+        // Apply temperature only to top-K candidates
+        float invTemp = 1.0f / options.Temperature;
+        for (int i = 0; i < k; i++)
         {
-            candidates[i] = (i, logits[i]);
+            candidates[i].Logit *= invTemp;
         }
 
-        // Partial sort top-k
-        Array.Sort(candidates, (a, b) => b.Logit.CompareTo(a.Logit));
-
-        // Softmax over top-K candidates
+        // Softmax over top-K candidates (candidates[0] is maxLogit)
         float maxLogit = candidates[0].Logit;
         float sumExp = 0f;
         for (int i = 0; i < k; i++)
@@ -130,5 +127,63 @@ public sealed class Sampler
         }
 
         return candidates[0].Id;
+    }
+
+    private static void SelectTopK(ReadOnlySpan<float> logits, int k, Span<(int Id, float Logit)> heap)
+    {
+        for (int i = 0; i < k; i++)
+        {
+            heap[i] = (i, logits[i]);
+        }
+
+        // Build min-heap in place: heap[0] has lowest logit
+        for (int i = (k / 2) - 1; i >= 0; i--)
+        {
+            SiftDown(heap, i, k);
+        }
+
+        float minLogit = heap[0].Logit;
+        int vocabSize = logits.Length;
+
+        for (int i = k; i < vocabSize; i++)
+        {
+            float val = logits[i];
+            if (val > minLogit)
+            {
+                heap[0] = (i, val);
+                SiftDown(heap, 0, k);
+                minLogit = heap[0].Logit;
+            }
+        }
+
+        // Sort descending: highest logit first
+        heap.Sort((a, b) => b.Logit.CompareTo(a.Logit));
+    }
+
+    private static void SiftDown(Span<(int Id, float Logit)> heap, int i, int n)
+    {
+        while (true)
+        {
+            int left = 2 * i + 1;
+            int right = 2 * i + 2;
+            int smallest = i;
+
+            if (left < n && heap[left].Logit < heap[smallest].Logit)
+                smallest = left;
+            if (right < n && heap[right].Logit < heap[smallest].Logit)
+                smallest = right;
+
+            if (smallest != i)
+            {
+                var temp = heap[i];
+                heap[i] = heap[smallest];
+                heap[smallest] = temp;
+                i = smallest;
+            }
+            else
+            {
+                break;
+            }
+        }
     }
 }

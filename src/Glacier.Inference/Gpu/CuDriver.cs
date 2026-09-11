@@ -99,6 +99,21 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuStreamDestroy_v2")]
     public static extern int StreamDestroy(IntPtr hStream);
 
+    [DllImport(CudaLib, EntryPoint = "cuEventCreate")]
+    public static extern int EventCreate(out IntPtr phEvent, uint flags);
+
+    [DllImport(CudaLib, EntryPoint = "cuEventRecord")]
+    public static extern int EventRecord(IntPtr hEvent, IntPtr hStream);
+
+    [DllImport(CudaLib, EntryPoint = "cuEventSynchronize")]
+    public static extern int EventSynchronize(IntPtr hEvent);
+
+    [DllImport(CudaLib, EntryPoint = "cuEventElapsedTime")]
+    public static extern int EventElapsedTime(out float pMilliseconds, IntPtr hStart, IntPtr hEnd);
+
+    [DllImport(CudaLib, EntryPoint = "cuEventDestroy_v2")]
+    public static extern int EventDestroy(IntPtr hEvent);
+
     public static string GetDeviceName(int device)
     {
         var buf = new byte[256];
