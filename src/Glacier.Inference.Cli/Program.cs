@@ -161,6 +161,7 @@ public static class Program
         int targetTokens = 25;
         string prompt = "Explain in two sentences what a CPU cache is.";
         string? compareOllamaUrl = null;
+        string? compareModel = null;
         string? device = null;
         string? engineStr = null;
 
@@ -172,6 +173,8 @@ public static class Program
                 prompt = args[++i];
             else if (args[i] == "--compare-ollama" && i + 1 < args.Length)
                 compareOllamaUrl = args[++i];
+            else if (args[i] == "--compare-model" && i + 1 < args.Length)
+                compareModel = args[++i];
             else if (args[i] == "--device" && i + 1 < args.Length)
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
@@ -216,13 +219,17 @@ public static class Program
 
         if (!string.IsNullOrEmpty(compareOllamaUrl))
         {
-            Console.WriteLine($"\n>> Querying Remote Ollama Benchmark ({compareOllamaUrl})...");
+            bool isLocalOllama = compareOllamaUrl.Contains("localhost") || compareOllamaUrl.Contains("127.0.0.1");
+            string targetOllamaModel = compareModel ?? (isLocalOllama ? "qwen-7b" : "qwen2.5:7b-instruct-32k");
+            string hardwareLabel = isLocalOllama ? "Same RTX 4060 GPU" : "Remote GPU";
+
+            Console.WriteLine($"\n>> Querying Ollama Benchmark ({compareOllamaUrl} | Model: {targetOllamaModel})...");
             try
             {
                 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
                 var reqBody = new
                 {
-                    model = "qwen2.5:7b-instruct-32k",
+                    model = targetOllamaModel,
                     prompt = prompt,
                     stream = false,
                     options = new { num_predict = targetTokens, temperature = 0.7 }
@@ -252,16 +259,16 @@ public static class Program
                     Console.WriteLine("\n=======================================================================");
                     Console.WriteLine("                    COMPARATIVE BENCHMARK SUMMARY                      ");
                     Console.WriteLine("=======================================================================");
-                    Console.WriteLine($"{"Metric",-28} | {"Glacier.Inference (C#)",-24} | {"Ollama (Remote GPU)",-22}");
-                    Console.WriteLine(new string('-', 80));
-                    Console.WriteLine($"{"Runtime",-28} | {"Pure C# .NET 10 Native AOT",-24} | {"Go + C++ CUDA / llama.cpp",-22}");
-                    Console.WriteLine($"{"Dependencies",-28} | {"Zero Native DLLs",-24} | {"CUDA, cuBLAS, LibLLAMA",-22}");
-                    Console.WriteLine($"{"Cold Start Latency",-28} | {$"{loadSw.ElapsedMilliseconds} ms",-24} | {"Daemon / Warm",-22}");
-                    Console.WriteLine($"{"Prompt Eval Rate",-28} | {$"{glacierResult.Metrics.PromptTokensPerSecond:F1} t/s",-24} | {$"{oPromptTps:F1} t/s",-22}");
-                    Console.WriteLine($"{"Token Generation Rate",-28} | {$"{glacierResult.Metrics.GenerationTokensPerSecond:F1} t/s",-24} | {$"{oGenTps:F1} t/s",-22}");
-                    Console.WriteLine($"{"Generated Tokens",-28} | {$"{glacierResult.Metrics.GeneratedTokens}",-24} | {$"{evalCount}",-22}");
-                    Console.WriteLine($"{"Total Wall Time",-28} | {$"{glacierResult.Metrics.TotalDuration.TotalSeconds:F2} s",-24} | {$"{oSw.Elapsed.TotalSeconds:F2} s",-22}");
-                    Console.WriteLine(new string('-', 80));
+                    Console.WriteLine($"{"Metric",-28} | {"Glacier.Inference (C#)",-24} | {$"Ollama ({hardwareLabel})",-24}");
+                    Console.WriteLine(new string('-', 82));
+                    Console.WriteLine($"{"Runtime",-28} | {"Pure C# .NET 10 Native AOT",-24} | {"Go + C++ CUDA / llama.cpp",-24}");
+                    Console.WriteLine($"{"Dependencies",-28} | {"Zero Native DLLs",-24} | {"CUDA Toolkit, cuBLAS",-24}");
+                    Console.WriteLine($"{"Cold Start Latency",-28} | {$"{loadSw.ElapsedMilliseconds} ms",-24} | {"Daemon / Warm",-24}");
+                    Console.WriteLine($"{"Prompt Eval Rate",-28} | {$"{glacierResult.Metrics.PromptTokensPerSecond:F1} t/s",-24} | {$"{oPromptTps:F1} t/s",-24}");
+                    Console.WriteLine($"{"Token Generation Rate",-28} | {$"{glacierResult.Metrics.GenerationTokensPerSecond:F1} t/s",-24} | {$"{oGenTps:F1} t/s",-24}");
+                    Console.WriteLine($"{"Generated Tokens",-28} | {$"{glacierResult.Metrics.GeneratedTokens}",-24} | {$"{evalCount}",-24}");
+                    Console.WriteLine($"{"Total Wall Time",-28} | {$"{glacierResult.Metrics.TotalDuration.TotalSeconds:F2} s",-24} | {$"{oSw.Elapsed.TotalSeconds:F2} s",-24}");
+                    Console.WriteLine(new string('-', 82));
                 }
                 else
                 {
