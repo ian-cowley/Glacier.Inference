@@ -49,14 +49,14 @@ glacier serve "path/to/model.gguf" --port 11434
 
 Measured directly against a remote Ollama daemon running on an NVIDIA GeForce RTX 3060 GPU (`192.168.1.108:11434`):
 
-| Metric | Glacier.Inference (Pure C# .NET 10) | Ollama (NVIDIA RTX 3060 CUDA) |
-| :--- | :--- | :--- |
-| **Runtime** | Pure C# .NET 10 Native AOT | Go + C++ CUDA / llama.cpp |
-| **Dependencies** | **Zero Native DLLs** | CUDA, cuBLAS, LibLLAMA |
-| **Cold Start / Load** | **60 ms** (Memory-mapped zero-copy) | Daemon / Warm |
-| **Prompt Eval Rate** | 2.8 tokens/sec | 183.1 tokens/sec |
-| **Generation Rate** | 2.4 tokens/sec | 65.9 tokens/sec |
-| **Semantic Fidelity** | **100% Identical predictions** | Ground Truth |
+| Metric | Glacier.Inference (RTX 4060 GPU) | Glacier.Inference (CPU SIMD) | Ollama (Remote RTX 3060 GPU) |
+| :--- | :--- | :--- | :--- |
+| **Runtime** | Pure C# .NET 10 (Bare-Metal CUDA) | Pure C# .NET 10 (AVX2 / AVX-512) | Go + C++ CUDA / llama.cpp |
+| **Dependencies** | **Zero C++ DLLs** (direct `nvcuda.dll`) | **Zero Native DLLs** | CUDA, cuBLAS, LibLLAMA |
+| **Cold Start / Load** | **1.51 s** (VRAM Direct Upload) | **60 ms** (Memory-mapped zero-copy) | Daemon / Preloaded |
+| **Prompt Eval Rate** | **30.5 tokens/sec** | 2.8 tokens/sec | 183.1 tokens/sec |
+| **Generation Rate** | **21.0 – 28.4 tokens/sec** | 2.4 tokens/sec | 64.7 tokens/sec |
+| **Output Coherence** | `"CPU cache is a small amount of high-speed memory..."` | Identical | `"CPU cache is a small amount of fast memory..."` |
 
 ---
 

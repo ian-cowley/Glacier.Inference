@@ -149,6 +149,7 @@ public static class Program
         int targetTokens = 25;
         string prompt = "Explain in two sentences what a CPU cache is.";
         string? compareOllamaUrl = null;
+        InferenceDevice device = InferenceDevice.Auto;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -158,6 +159,16 @@ public static class Program
                 prompt = args[++i];
             else if (args[i] == "--compare-ollama" && i + 1 < args.Length)
                 compareOllamaUrl = args[++i];
+            else if (args[i] == "--device" && i + 1 < args.Length)
+            {
+                string d = args[++i].ToLowerInvariant();
+                device = d switch
+                {
+                    "gpu" or "cuda" => InferenceDevice.Gpu,
+                    "cpu" => InferenceDevice.Cpu,
+                    _ => InferenceDevice.Auto
+                };
+            }
         }
 
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -174,11 +185,12 @@ public static class Program
 
         Console.WriteLine(">> Loading model into zero-copy virtual address space...");
         var loadSw = Stopwatch.StartNew();
-        using var session = new InferenceSession(modelPath, maxSeqLen: 1024);
+        using var session = new InferenceSession(modelPath, maxSeqLen: 1024, device: device);
         loadSw.Stop();
         Console.WriteLine($"   Cold load completed in: {loadSw.ElapsedMilliseconds} ms ({loadSw.Elapsed.TotalSeconds:F2} s)");
+        Console.WriteLine($"   Execution Device: {session.ActiveDevice}");
 
-        Console.WriteLine("\n>> Running Glacier.Inference (Pure C# .NET 10)...");
+        Console.WriteLine("\n>> Running Glacier.Inference...");
         var options = new SamplingOptions { MaxTokens = targetTokens, Temperature = 0.7f };
         var glacierResult = await session.GenerateAsync(prompt, options, formatChat: true);
 
@@ -264,14 +276,34 @@ public static class Program
         }
 
         string modelPath = args[0];
-        string? initialPrompt = args.Length > 1 ? string.Join(" ", args[1..]) : null;
+        InferenceDevice device = InferenceDevice.Auto;
+        var promptParts = new List<string>();
+
+        for (int i = 1; i < args.Length; i++)
+        {
+            if (args[i] == "--device" && i + 1 < args.Length)
+            {
+                string d = args[++i].ToLowerInvariant();
+                device = d switch
+                {
+                    "gpu" or "cuda" => InferenceDevice.Gpu,
+                    "cpu" => InferenceDevice.Cpu,
+                    _ => InferenceDevice.Auto
+                };
+            }
+            else
+            {
+                promptParts.Add(args[i]);
+            }
+        }
+        string? initialPrompt = promptParts.Count > 0 ? string.Join(" ", promptParts) : null;
 
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference...");
         Console.ResetColor();
 
-        using var session = new InferenceSession(modelPath, maxSeqLen: 4096);
-        Console.WriteLine("Model ready. Pure C# .NET 10 autoregressive inference active.\n");
+        using var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device);
+        Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
         var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f, TopP = 0.9f };
 

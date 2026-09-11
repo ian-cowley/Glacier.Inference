@@ -3,15 +3,27 @@ namespace Glacier.Inference.Engine;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Gpu;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Tokenizer;
+
+/// <summary>
+/// Target computing hardware for inference execution.
+/// </summary>
+public enum InferenceDevice
+{
+    Auto,
+    Gpu,
+    Cpu
+}
 
 /// <summary>
 /// Telemetry metrics for a generation session.
@@ -43,12 +55,15 @@ public sealed record GenerationResult
 
 /// <summary>
 /// High-performance LLM generation session managing KV cache, model forward passes, and token streaming.
+/// Supports both Bare-Metal GPU execution on NVIDIA GPUs and multi-threaded SIMD CPU fallback.
 /// </summary>
 public sealed class InferenceSession : IDisposable
 {
     private readonly GgufFile _gguf;
     private readonly ModelWeights _weights;
-    private readonly Qwen2Model _model;
+    private readonly GpuContext? _gpu;
+    private readonly Qwen2GpuModel? _gpuModel;
+    private readonly Qwen2Model? _cpuModel;
     private readonly KVCache _kvCache;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
@@ -59,16 +74,45 @@ public sealed class InferenceSession : IDisposable
     public ModelWeights Weights => _weights;
     public BpeTokenizer Tokenizer => _tokenizer;
     public KVCache KVCache => _kvCache;
+    public string ActiveDevice { get; }
+    public bool IsGpuAccelerated => _gpuModel != null;
 
-    public InferenceSession(string modelPath, int maxSeqLen = 4096)
+    public InferenceSession(string modelPath, int maxSeqLen = 4096, InferenceDevice device = InferenceDevice.Auto)
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
-        _model = new Qwen2Model(_weights, maxSeqLen);
         _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
         _tokenizer = new BpeTokenizer(_gguf);
         _sampler = new Sampler();
         _logits = new float[_weights.VocabSize];
+
+        bool wantGpu = device != InferenceDevice.Cpu && GpuContext.IsSupported;
+        if (wantGpu)
+        {
+            try
+            {
+                _gpu = new GpuContext();
+                _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen);
+                ActiveDevice = $"{_gpu.DeviceName} (CUDA Bare-Metal)";
+            }
+            catch (Exception ex)
+            {
+                if (device == InferenceDevice.Gpu)
+                    throw new InvalidOperationException($"Failed to initialize GPU inference: {ex.Message}", ex);
+
+                // Graceful fallback to CPU
+                _gpu?.Dispose();
+                _gpu = null;
+                _gpuModel = null;
+                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                ActiveDevice = "Host CPU (SIMD AVX2)";
+            }
+        }
+        else
+        {
+            _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+            ActiveDevice = "Host CPU (SIMD AVX2)";
+        }
     }
 
     /// <summary>
@@ -107,12 +151,12 @@ public sealed class InferenceSession : IDisposable
         for (int i = 0; i < promptTokens.Length - 1; i++)
         {
             ct.ThrowIfCancellationRequested();
-            _model.Forward(promptTokens[i], i, _kvCache, _logits.AsSpan(), computeLogits: false);
+            ForwardToken(promptTokens[i], i, computeLogits: false);
         }
 
         // Forward last prompt token to get first logits
         int lastPromptIdx = promptTokens.Length - 1;
-        _model.Forward(promptTokens[lastPromptIdx], lastPromptIdx, _kvCache, _logits.AsSpan(), computeLogits: true);
+        ForwardToken(promptTokens[lastPromptIdx], lastPromptIdx, computeLogits: true);
         promptStopwatch.Stop();
 
         // 3. Autoregressive token generation loop
@@ -143,10 +187,10 @@ public sealed class InferenceSession : IDisposable
             onToken?.Invoke(piece);
 
             // Forward next token
-            _model.Forward(nextToken, currentPos, _kvCache, _logits.AsSpan(), computeLogits: true);
+            ForwardToken(nextToken, currentPos, computeLogits: true);
             currentPos++;
 
-            // Yield control briefly to keep async responsive
+            // Yield control briefly
             if ((step & 15) == 0)
             {
                 await Task.Yield();
@@ -171,11 +215,26 @@ public sealed class InferenceSession : IDisposable
         };
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ForwardToken(int token, int pos, bool computeLogits)
+    {
+        if (_gpuModel != null)
+        {
+            _gpuModel.Forward(token, pos, _kvCache, _logits.AsSpan(), computeLogits);
+        }
+        else
+        {
+            _cpuModel!.Forward(token, pos, _kvCache, _logits.AsSpan(), computeLogits);
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)
         {
-            _model.Dispose();
+            _gpuModel?.Dispose();
+            _gpu?.Dispose();
+            _cpuModel?.Dispose();
             _kvCache.Dispose();
             _gguf.Dispose();
             _disposed = true;
