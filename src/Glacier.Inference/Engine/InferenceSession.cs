@@ -81,12 +81,14 @@ public sealed class InferenceSession : IDisposable
     public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
     public bool IsGpuAccelerated => _gpuModel != null;
+    public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
 
     public InferenceSession(
         string modelPath,
         int maxSeqLen = 4096,
         string? device = null,
-        InferenceEngineType engine = InferenceEngineType.Auto)
+        InferenceEngineType engine = InferenceEngineType.Auto,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
@@ -104,9 +106,9 @@ public sealed class InferenceSession : IDisposable
             try
             {
                 _gpu = new GpuContext(targetDevice.Index);
-                _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen);
+                _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen, kvPrecision);
                 _kvCache = null; // GPU maintains all KV states in device VRAM
-                ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS]";
+                ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision}]";
             }
             catch (Exception ex)
             {
@@ -137,7 +139,7 @@ public sealed class InferenceSession : IDisposable
         }
     }
 
-    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device)
+    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device, KvCachePrecision kvPrecision = KvCachePrecision.Auto)
         : this(modelPath, maxSeqLen, device switch
         {
             InferenceDevice.Gpu => "gpu",
@@ -148,7 +150,7 @@ public sealed class InferenceSession : IDisposable
             InferenceDevice.Gpu => InferenceEngineType.BareMetal,
             InferenceDevice.Cpu => InferenceEngineType.Cpu,
             _ => InferenceEngineType.Auto
-        })
+        }, kvPrecision: kvPrecision)
     {
     }
 

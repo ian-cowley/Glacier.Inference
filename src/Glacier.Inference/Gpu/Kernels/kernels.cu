@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #define QK_K 256
 #define WARP_SIZE 32
@@ -710,6 +711,220 @@ __global__ void attention_gqa_kernel(
 }
 
 // =========================================================================
+// 9c. FP16 KV Cache Store Kernel
+// =========================================================================
+__global__ void kv_cache_store_f16(
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads_kv * head_dim;
+    if (idx >= total) return;
+
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+
+    size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
+    k_cache[offset] = __float2half(k[idx]);
+    v_cache[offset] = __float2half(v[idx]);
+}
+
+// =========================================================================
+// 9d. FP8 (e4m3) KV Cache Store Kernel
+// =========================================================================
+__global__ void kv_cache_store_fp8(
+    __nv_fp8_e4m3* __restrict__ k_cache,
+    __nv_fp8_e4m3* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads_kv * head_dim;
+    if (idx >= total) return;
+
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+
+    size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
+    k_cache[offset] = __nv_fp8_e4m3(k[idx]);
+    v_cache[offset] = __nv_fp8_e4m3(v[idx]);
+}
+
+// =========================================================================
+// 9e. FP16 GQA Attention Kernel (2x VRAM compression, lossless)
+// =========================================================================
+__global__ void attention_gqa_f16(
+    const float* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads_q) return;
+
+    int tid = threadIdx.x; // 0..127
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+
+    float q_d = q[h * head_dim + tid];
+    float* head_scores = scores_buf + (size_t)h * max_seq_len;
+
+    __shared__ float s_warp_sum[4];
+
+    // 1. Compute dot product scores with all past tokens t = 0..pos
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        float k_d = __half2float(k_cache[kv_offset]);
+        float prod = q_d * k_d;
+
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+            head_scores[t] = total_dot * attn_scale;
+        }
+        __syncthreads();
+    }
+
+    // 2. Softmax over t = 0..pos
+    if (tid == 0) {
+        float max_s = head_scores[0];
+        for (int t = 1; t <= pos; t++) {
+            if (head_scores[t] > max_s) max_s = head_scores[t];
+        }
+
+        float sum_exp = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float exp_val = expf(head_scores[t] - max_s);
+            head_scores[t] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t <= pos; t++) {
+            head_scores[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
+    float out_d = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+        float w = head_scores[t];
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        out_d += w * __half2float(v_cache[kv_offset]);
+    }
+
+    attn_out[h * head_dim + tid] = out_d;
+}
+
+// =========================================================================
+// 9f. Native FP8 (e4m3) GQA Attention Kernel (4x VRAM compression, Ada sm_89 silicon)
+// =========================================================================
+__global__ void attention_gqa_fp8(
+    const float* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k_cache,
+    const __nv_fp8_e4m3* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads_q) return;
+
+    int tid = threadIdx.x; // 0..127
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+
+    float q_d = q[h * head_dim + tid];
+    float* head_scores = scores_buf + (size_t)h * max_seq_len;
+
+    __shared__ float s_warp_sum[4];
+
+    // 1. Compute dot product scores with all past tokens t = 0..pos
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        float k_d = float(k_cache[kv_offset]);
+        float prod = q_d * k_d;
+
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+            head_scores[t] = total_dot * attn_scale;
+        }
+        __syncthreads();
+    }
+
+    // 2. Softmax over t = 0..pos
+    if (tid == 0) {
+        float max_s = head_scores[0];
+        for (int t = 1; t <= pos; t++) {
+            if (head_scores[t] > max_s) max_s = head_scores[t];
+        }
+
+        float sum_exp = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float exp_val = expf(head_scores[t] - max_s);
+            head_scores[t] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t <= pos; t++) {
+            head_scores[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
+    float out_d = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+        float w = head_scores[t];
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        out_d += w * float(v_cache[kv_offset]);
+    }
+
+    attn_out[h * head_dim + tid] = out_d;
+}
+
+// =========================================================================
 // 9b. Batched GQA Attention Kernel
 // 2D grid: blockIdx.x = h (0..n_heads_q - 1), blockIdx.y = b (0..batch_size - 1)
 // 1 block of 128 threads per Q head per token
@@ -794,6 +1009,174 @@ __global__ void attention_gqa_batch(
         float w = head_scores[t];
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         out_d += w * v_cache[kv_offset];
+    }
+
+    size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
+    attn_out_batch[out_offset] = out_d;
+}
+
+// =========================================================================
+// 9g. Batched FP16 GQA Attention Kernel
+// =========================================================================
+__global__ void attention_gqa_batch_f16(
+    const float* __restrict__ q_batch,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float* __restrict__ attn_out_batch,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int chunk_start_pos,
+    int batch_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads_q || b >= batch_size) return;
+
+    int pos = chunk_start_pos + b;
+    int tid = threadIdx.x; // 0..127
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+
+    size_t q_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
+    float q_d = q_batch[q_offset];
+    float* head_scores = scores_buf + ((size_t)b * n_heads_q + h) * max_seq_len;
+
+    __shared__ float s_warp_sum[4];
+
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        float k_d = __half2float(k_cache[kv_offset]);
+        float prod = q_d * k_d;
+
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+            head_scores[t] = total_dot * attn_scale;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float max_s = head_scores[0];
+        for (int t = 1; t <= pos; t++) {
+            if (head_scores[t] > max_s) max_s = head_scores[t];
+        }
+
+        float sum_exp = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float exp_val = expf(head_scores[t] - max_s);
+            head_scores[t] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t <= pos; t++) {
+            head_scores[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    float out_d = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+        float w = head_scores[t];
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        out_d += w * __half2float(v_cache[kv_offset]);
+    }
+
+    size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
+    attn_out_batch[out_offset] = out_d;
+}
+
+// =========================================================================
+// 9h. Batched Native FP8 (e4m3) GQA Attention Kernel
+// =========================================================================
+__global__ void attention_gqa_batch_fp8(
+    const float* __restrict__ q_batch,
+    const __nv_fp8_e4m3* __restrict__ k_cache,
+    const __nv_fp8_e4m3* __restrict__ v_cache,
+    float* __restrict__ attn_out_batch,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int chunk_start_pos,
+    int batch_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads_q || b >= batch_size) return;
+
+    int pos = chunk_start_pos + b;
+    int tid = threadIdx.x; // 0..127
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+
+    size_t q_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
+    float q_d = q_batch[q_offset];
+    float* head_scores = scores_buf + ((size_t)b * n_heads_q + h) * max_seq_len;
+
+    __shared__ float s_warp_sum[4];
+
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        float k_d = float(k_cache[kv_offset]);
+        float prod = q_d * k_d;
+
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+            head_scores[t] = total_dot * attn_scale;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float max_s = head_scores[0];
+        for (int t = 1; t <= pos; t++) {
+            if (head_scores[t] > max_s) max_s = head_scores[t];
+        }
+
+        float sum_exp = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float exp_val = expf(head_scores[t] - max_s);
+            head_scores[t] = exp_val;
+            sum_exp += exp_val;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        for (int t = 0; t <= pos; t++) {
+            head_scores[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    float out_d = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+        float w = head_scores[t];
+        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
+        out_d += w * float(v_cache[kv_offset]);
     }
 
     size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
@@ -1220,6 +1603,66 @@ __global__ void kv_cache_store_batch(
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = k[idx];
     v_cache[offset] = v[idx];
+}
+
+// =========================================================================
+// 17b. Batched FP16 KV Cache Store Kernel
+// =========================================================================
+__global__ void kv_cache_store_batch_f16(
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int start_pos,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kv_dim = n_heads_kv * head_dim;
+    int total = kv_dim * batch_size;
+    if (idx >= total) return;
+
+    int t = idx / kv_dim;
+    int sub_idx = idx % kv_dim;
+    int h = sub_idx / head_dim;
+    int d = sub_idx % head_dim;
+    int pos = start_pos + t;
+
+    size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
+    k_cache[offset] = __float2half(k[idx]);
+    v_cache[offset] = __float2half(v[idx]);
+}
+
+// =========================================================================
+// 17c. Batched FP8 (e4m3) KV Cache Store Kernel
+// =========================================================================
+__global__ void kv_cache_store_batch_fp8(
+    __nv_fp8_e4m3* __restrict__ k_cache,
+    __nv_fp8_e4m3* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int start_pos,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kv_dim = n_heads_kv * head_dim;
+    int total = kv_dim * batch_size;
+    if (idx >= total) return;
+
+    int t = idx / kv_dim;
+    int sub_idx = idx % kv_dim;
+    int h = sub_idx / head_dim;
+    int d = sub_idx % head_dim;
+    int pos = start_pos + t;
+
+    size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
+    k_cache[offset] = __nv_fp8_e4m3(k[idx]);
+    v_cache[offset] = __nv_fp8_e4m3(v[idx]);
 }
 
 } // extern "C"

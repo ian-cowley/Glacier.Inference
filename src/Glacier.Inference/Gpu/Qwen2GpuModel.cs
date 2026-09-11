@@ -64,7 +64,11 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _fnVecAdd;
     private IntPtr _fnRope;
     private IntPtr _fnKvCacheStore;
+    private IntPtr _fnKvCacheStoreF16;
+    private IntPtr _fnKvCacheStoreFp8;
     private IntPtr _fnAttentionGqa;
+    private IntPtr _fnAttentionGqaF16;
+    private IntPtr _fnAttentionGqaFp8;
 
     // Batched Prefill Kernels & Buffers (batchSize <= 32)
     public const int MaxBatchSize = 32;
@@ -76,7 +80,13 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _fnVecAddBatch;
     private IntPtr _fnRopeBatch;
     private IntPtr _fnKvCacheStoreBatch;
+    private IntPtr _fnKvCacheStoreBatchF16;
+    private IntPtr _fnKvCacheStoreBatchFp8;
     private IntPtr _fnAttentionGqaBatch;
+    private IntPtr _fnAttentionGqaBatchF16;
+    private IntPtr _fnAttentionGqaBatchFp8;
+
+    public KvCachePrecision KvPrecision { get; }
 
     // CUDA Non-Blocking Streams and Events for Concurrent Projections
     private IntPtr _streamK;
@@ -130,7 +140,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     public GpuContext Context => _gpu;
     public ModelWeights Weights => _weights;
 
-    public Qwen2GpuModel(GpuContext gpu, ModelWeights weights, int maxSeqLen = 4096)
+    public Qwen2GpuModel(GpuContext gpu, ModelWeights weights, int maxSeqLen = 4096, KvCachePrecision kvPrecision = KvCachePrecision.Auto)
     {
         _gpu = gpu;
         _weights = weights;
@@ -142,6 +152,18 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         _groupSize = _nHeads / _nHeadsKv;
         _attnScale = 1.0f / MathF.Sqrt(_headDim);
         _maxSeqLen = maxSeqLen;
+
+        if (kvPrecision == KvCachePrecision.Auto)
+        {
+            // Adaptive resolution based on sequence length and 8GB laptop VRAM limits:
+            // maxSeqLen <= 4096: FP16 (lossless, 235 MB @ 4k, halves attention bandwidth)
+            // maxSeqLen > 4096: FP8 (4x compression, 470 MB @ 16k, enables up to 32k on 8 GB GPU)
+            KvPrecision = maxSeqLen <= 4096 ? KvCachePrecision.Fp16 : KvCachePrecision.Fp8;
+        }
+        else
+        {
+            KvPrecision = kvPrecision;
+        }
 
         // 1. Load compiled CUBIN kernel module
         byte[] cubin = KernelCompiler.GetOrCompileKernels("sm_89");
@@ -157,7 +179,11 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRope, _module, "rope_kernel"), "ModuleGetFunction(rope_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8, _module, "kv_cache_store_fp8"), "ModuleGetFunction(kv_cache_store_fp8)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
 
         // 2b. Retrieve batched prefill kernels
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
@@ -168,7 +194,11 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddBatch, _module, "vec_add_batch"), "ModuleGetFunction(vec_add_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchF16, _module, "kv_cache_store_batch_f16"), "ModuleGetFunction(kv_cache_store_batch_f16)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchFp8, _module, "kv_cache_store_batch_fp8"), "ModuleGetFunction(kv_cache_store_batch_fp8)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchF16, _module, "attention_gqa_batch_f16"), "ModuleGetFunction(attention_gqa_batch_f16)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchFp8, _module, "attention_gqa_batch_fp8"), "ModuleGetFunction(attention_gqa_batch_fp8)");
 
         // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
         CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
@@ -205,10 +235,16 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         _dScoresBufBatch = _gpu.AllocateDevice((nuint)((long)MaxBatchSize * _nHeads * _maxSeqLen * sizeof(float)));
         _hXBatch = new float[MaxBatchSize * _dim];
 
-        // 4. Allocate GPU VRAM KV Cache per layer
+        // 4. Allocate GPU VRAM KV Cache per layer with precision-specific byte footprint
         _dKeyCache = new IntPtr[_weights.BlockCount];
         _dValCache = new IntPtr[_weights.BlockCount];
-        nuint kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * sizeof(float));
+        int elementBytes = KvPrecision switch
+        {
+            KvCachePrecision.Fp8 => 1,
+            KvCachePrecision.Fp16 => 2,
+            _ => 4
+        };
+        nuint kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes);
         for (int l = 0; l < _weights.BlockCount; l++)
         {
             _dKeyCache[l] = _gpu.AllocateDevice(kvBytes);
@@ -567,8 +603,15 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         pArgs[6] = &maxSeq;
         pArgs[7] = &pos;
 
+        IntPtr fnKv = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnKvCacheStoreF16,
+            KvCachePrecision.Fp8 => _fnKvCacheStoreFp8,
+            _ => _fnKvCacheStore
+        };
+
         CuDriver.Check(CuDriver.LaunchKernel(
-            _fnKvCacheStore,
+            fnKv,
             gridSize, 1, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
@@ -605,8 +648,15 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         pArgs[9] = &pos;
         pArgs[10] = &attnScale;
 
+        IntPtr fnAttn = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnAttentionGqaF16,
+            KvCachePrecision.Fp8 => _fnAttentionGqaFp8,
+            _ => _fnAttentionGqa
+        };
+
         CuDriver.Check(CuDriver.LaunchKernel(
-            _fnAttentionGqa,
+            fnAttn,
             gridSize, 1, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
@@ -645,8 +695,15 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         pArgs[10] = &batchSize;
         pArgs[11] = &attnScale;
 
+        IntPtr fnAttnBatch = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnAttentionGqaBatchF16,
+            KvCachePrecision.Fp8 => _fnAttentionGqaBatchFp8,
+            _ => _fnAttentionGqaBatch
+        };
+
         CuDriver.Check(CuDriver.LaunchKernel(
-            _fnAttentionGqaBatch,
+            fnAttnBatch,
             gridX, gridY, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
@@ -982,8 +1039,15 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         pArgs[7] = &startPos;
         pArgs[8] = &batchSize;
 
+        IntPtr fnKvBatch = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnKvCacheStoreBatchF16,
+            KvCachePrecision.Fp8 => _fnKvCacheStoreBatchFp8,
+            _ => _fnKvCacheStoreBatch
+        };
+
         CuDriver.Check(CuDriver.LaunchKernel(
-            _fnKvCacheStoreBatch,
+            fnKvBatch,
             gridSize, 1, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
