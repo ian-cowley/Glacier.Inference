@@ -28,7 +28,9 @@ jobs:
           dotnet-version: 10.0.x
 
       - name: Setup NuGet sources
-        run: dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
+        run: |
+          mkdir -p ../nuget-local || true
+          dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
 
       - name: Restore dependencies
         run: dotnet restore
