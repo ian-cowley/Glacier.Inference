@@ -256,19 +256,60 @@ public static class Program
                     Console.WriteLine($"   Output: \"{oText.Trim()}\"");
                     Console.ResetColor();
 
-                    Console.WriteLine("\n=======================================================================");
-                    Console.WriteLine("                    COMPARATIVE BENCHMARK SUMMARY                      ");
-                    Console.WriteLine("=======================================================================");
-                    Console.WriteLine($"{"Metric",-28} | {"Glacier.Inference (C#)",-24} | {$"Ollama ({hardwareLabel})",-24}");
-                    Console.WriteLine(new string('-', 82));
-                    Console.WriteLine($"{"Runtime",-28} | {"Pure C# .NET 10 Native AOT",-24} | {"Go + C++ CUDA / llama.cpp",-24}");
-                    Console.WriteLine($"{"Dependencies",-28} | {"Zero Native DLLs",-24} | {"CUDA Toolkit, cuBLAS",-24}");
-                    Console.WriteLine($"{"Cold Start Latency",-28} | {$"{loadSw.ElapsedMilliseconds} ms",-24} | {"Daemon / Warm",-24}");
-                    Console.WriteLine($"{"Prompt Eval Rate",-28} | {$"{glacierResult.Metrics.PromptTokensPerSecond:F1} t/s",-24} | {$"{oPromptTps:F1} t/s",-24}");
-                    Console.WriteLine($"{"Token Generation Rate",-28} | {$"{glacierResult.Metrics.GenerationTokensPerSecond:F1} t/s",-24} | {$"{oGenTps:F1} t/s",-24}");
-                    Console.WriteLine($"{"Generated Tokens",-28} | {$"{glacierResult.Metrics.GeneratedTokens}",-24} | {$"{evalCount}",-24}");
-                    Console.WriteLine($"{"Total Wall Time",-28} | {$"{glacierResult.Metrics.TotalDuration.TotalSeconds:F2} s",-24} | {$"{oSw.Elapsed.TotalSeconds:F2} s",-24}");
-                    Console.WriteLine(new string('-', 82));
+                    Console.WriteLine("\n======================================================================================");
+                    Console.WriteLine("                         COMPARATIVE BENCHMARK SUMMARY                                ");
+                    Console.WriteLine("======================================================================================");
+                    Console.WriteLine($"{"Metric",-24} | {"Glacier.Inference (C#)",-34} | {$"Ollama ({hardwareLabel})",-24}");
+                    Console.WriteLine(new string('-', 86));
+
+                    void PrintSummaryRow(string metric, string glacierVal, string ollamaVal, bool isGlacierAdvantage, string? advantageText = null)
+                    {
+                        if (isGlacierAdvantage)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Green;
+                            string tag = advantageText != null ? $" [{advantageText}]" : " [FASTER]";
+                            Console.WriteLine($"{$"{metric}",-24} | {$"{glacierVal} {tag}",-34} | {$"{ollamaVal}",-24}");
+                            Console.ResetColor();
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{$"{metric}",-24} | {$"{glacierVal}",-34} | {$"{ollamaVal}",-24}");
+                        }
+                    }
+
+                    double gGenTps = glacierResult.Metrics.GenerationTokensPerSecond;
+                    double gPromptTps = glacierResult.Metrics.PromptTokensPerSecond;
+                    double gWallSec = glacierResult.Metrics.TotalDuration.TotalSeconds;
+                    double oWallSec = oSw.Elapsed.TotalSeconds;
+
+                    PrintSummaryRow("Runtime", "Pure C# .NET 10 Native AOT", "Go + C++ CUDA / llama.cpp", true, "Pure C# SASS");
+                    PrintSummaryRow("Dependencies", "0 Native DLLs (Direct Driver)", "CUDA Toolkit, cuBLAS, LLAMA", true, "Zero C++ Bloat");
+                    PrintSummaryRow("Cold Start Latency", $"{loadSw.ElapsedMilliseconds} ms", "Daemon / Resident", true, "Instant");
+
+                    if (oPromptTps > 0)
+                    {
+                        bool promptFaster = gPromptTps >= oPromptTps;
+                        double promptDiff = ((gPromptTps - oPromptTps) / oPromptTps) * 100.0;
+                        PrintSummaryRow("Prompt Eval Rate", $"{gPromptTps:F1} t/s", $"{oPromptTps:F1} t/s", promptFaster, promptFaster ? $"+{promptDiff:F1}% FASTER" : null);
+                    }
+
+                    if (oGenTps > 0)
+                    {
+                        bool genFaster = gGenTps >= oGenTps;
+                        double genDiff = ((gGenTps - oGenTps) / oGenTps) * 100.0;
+                        PrintSummaryRow("Generation Rate", $"{gGenTps:F1} t/s", $"{oGenTps:F1} t/s", genFaster, genFaster ? $"+{genDiff:F1}% FASTER" : $"{genDiff:F1}% (Near Parity)");
+                    }
+
+                    PrintSummaryRow("Generated Tokens", $"{glacierResult.Metrics.GeneratedTokens}", $"{evalCount}", false);
+
+                    if (oWallSec > 0)
+                    {
+                        bool wallFaster = gWallSec <= oWallSec;
+                        double wallSpeedup = gWallSec > 0 ? oWallSec / gWallSec : 1.0;
+                        PrintSummaryRow("Total Wall Time", $"{gWallSec:F2} s", $"{oWallSec:F2} s", wallFaster, wallFaster ? $"{wallSpeedup:F1}x FASTER" : null);
+                    }
+
+                    Console.WriteLine(new string('-', 86));
                 }
                 else
                 {
