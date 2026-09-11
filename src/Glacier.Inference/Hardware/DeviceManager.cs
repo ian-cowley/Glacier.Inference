@@ -180,15 +180,13 @@ public static class DeviceManager
                                 if (cudaAvail)
                                     supportedEngines.Add(InferenceEngineType.Cuda);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                supportedEngines.Add(InferenceEngineType.Cpu);
                                 recommendedEngine = cudaAvail ? InferenceEngineType.Cuda : InferenceEngineType.DirectML;
-                                safetyNotes = "Optimal high-throughput bare-metal CUDA driver (~43 t/s on 7B). DirectML & CPU supported.";
+                                safetyNotes = "Optimal high-throughput bare-metal CUDA driver (~43 t/s on 7B). DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {
                                 // Display iGPU: DirectML is cooperative with Windows DWM; avoids uncooperative TDR timeouts
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                supportedEngines.Add(InferenceEngineType.Cpu);
                                 recommendedEngine = InferenceEngineType.DirectML;
                                 safetyNotes = isDisplay
                                     ? "Display iGPU: DirectML / DX12 engine cooperates with Windows DWM, eliminating TDR driver timeouts."
@@ -197,7 +195,6 @@ public static class DeviceManager
                             else
                             {
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                supportedEngines.Add(InferenceEngineType.Cpu);
                                 recommendedEngine = InferenceEngineType.DirectML;
                                 safetyNotes = "DirectML / DirectX 12 Compute engine supported.";
                             }

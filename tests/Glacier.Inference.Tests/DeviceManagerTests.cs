@@ -77,8 +77,8 @@ public class DeviceManagerTests
         if (amd != null)
         {
             Assert.Contains(InferenceEngineType.DirectML, amd.SupportedEngines);
-            Assert.Contains(InferenceEngineType.Cpu, amd.SupportedEngines);
             Assert.DoesNotContain(InferenceEngineType.Cuda, amd.SupportedEngines);
+            Assert.DoesNotContain(InferenceEngineType.Cpu, amd.SupportedEngines);
 
             bool safe = GlacierSettings.ValidateSafety(amd, InferenceEngineType.Cuda, out string? error);
             Assert.False(safe);
@@ -97,7 +97,7 @@ public class DeviceManagerTests
         {
             Assert.Contains(InferenceEngineType.Cuda, nvidia.SupportedEngines);
             Assert.Contains(InferenceEngineType.DirectML, nvidia.SupportedEngines);
-            Assert.Contains(InferenceEngineType.Cpu, nvidia.SupportedEngines);
+            Assert.DoesNotContain(InferenceEngineType.Cpu, nvidia.SupportedEngines);
 
             bool safeCuda = GlacierSettings.ValidateSafety(nvidia, InferenceEngineType.Cuda, out string? errCuda);
             Assert.True(safeCuda);
