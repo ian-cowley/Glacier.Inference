@@ -1,0 +1,190 @@
+namespace Glacier.Inference.Engine;
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
+using Glacier.Inference.Model;
+using Glacier.Inference.Sampling;
+using Glacier.Inference.Tokenizer;
+
+/// <summary>
+/// Telemetry metrics for a generation session.
+/// </summary>
+public sealed record GenerationMetrics
+{
+    public int PromptTokens { get; init; }
+    public int GeneratedTokens { get; init; }
+    public TimeSpan PromptEvalDuration { get; init; }
+    public TimeSpan GenerationDuration { get; init; }
+    public TimeSpan TotalDuration { get; init; }
+
+    public double PromptTokensPerSecond =>
+        PromptEvalDuration.TotalSeconds > 0 ? PromptTokens / PromptEvalDuration.TotalSeconds : 0;
+
+    public double GenerationTokensPerSecond =>
+        GenerationDuration.TotalSeconds > 0 ? GeneratedTokens / GenerationDuration.TotalSeconds : 0;
+}
+
+/// <summary>
+/// Result of an autoregressive inference generation.
+/// </summary>
+public sealed record GenerationResult
+{
+    public required string Text { get; init; }
+    public required GenerationMetrics Metrics { get; init; }
+    public required string FinishReason { get; init; }
+}
+
+/// <summary>
+/// High-performance LLM generation session managing KV cache, model forward passes, and token streaming.
+/// </summary>
+public sealed class InferenceSession : IDisposable
+{
+    private readonly GgufFile _gguf;
+    private readonly ModelWeights _weights;
+    private readonly Qwen2Model _model;
+    private readonly KVCache _kvCache;
+    private readonly BpeTokenizer _tokenizer;
+    private readonly Sampler _sampler;
+    private readonly float[] _logits;
+    private bool _disposed;
+
+    public GgufFile Gguf => _gguf;
+    public ModelWeights Weights => _weights;
+    public BpeTokenizer Tokenizer => _tokenizer;
+    public KVCache KVCache => _kvCache;
+
+    public InferenceSession(string modelPath, int maxSeqLen = 4096)
+    {
+        _gguf = GgufFile.Open(modelPath);
+        _weights = new ModelWeights(_gguf);
+        _model = new Qwen2Model(_weights, maxSeqLen);
+        _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+        _tokenizer = new BpeTokenizer(_gguf);
+        _sampler = new Sampler();
+        _logits = new float[_weights.VocabSize];
+    }
+
+    /// <summary>
+    /// Generates text autoregressively with real-time token streaming callback.
+    /// </summary>
+    public async Task<GenerationResult> GenerateAsync(
+        string prompt,
+        SamplingOptions? options = null,
+        bool formatChat = true,
+        Action<string>? onToken = null,
+        CancellationToken ct = default)
+    {
+        options ??= new SamplingOptions();
+
+        // 1. Format and encode prompt
+        string formattedPrompt = formatChat ? _tokenizer.FormatChatML(prompt) : prompt;
+        int[] promptTokens = _tokenizer.Encode(formattedPrompt);
+
+        if (promptTokens.Length == 0)
+        {
+            return new GenerationResult
+            {
+                Text = "",
+                Metrics = new GenerationMetrics(),
+                FinishReason = "empty_prompt"
+            };
+        }
+
+        // Reset KV cache
+        _kvCache.Reset();
+
+        var totalStopwatch = Stopwatch.StartNew();
+        var promptStopwatch = Stopwatch.StartNew();
+
+        // 2. Prefill prompt tokens
+        for (int i = 0; i < promptTokens.Length - 1; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            _model.Forward(promptTokens[i], i, _kvCache, _logits.AsSpan(), computeLogits: false);
+        }
+
+        // Forward last prompt token to get first logits
+        int lastPromptIdx = promptTokens.Length - 1;
+        _model.Forward(promptTokens[lastPromptIdx], lastPromptIdx, _kvCache, _logits.AsSpan(), computeLogits: true);
+        promptStopwatch.Stop();
+
+        // 3. Autoregressive token generation loop
+        var genStopwatch = Stopwatch.StartNew();
+        var recentTokens = new List<int>(options.MaxTokens + 16);
+        var responseSb = new StringBuilder();
+        string finishReason = "length";
+
+        int currentPos = promptTokens.Length;
+        for (int step = 0; step < options.MaxTokens && currentPos < _kvCache.MaxSeqLen; step++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Sample next token
+            int nextToken = _sampler.Sample(_logits.AsSpan(), options, CollectionsMarshal.AsSpan(recentTokens));
+            recentTokens.Add(nextToken);
+
+            // Check for stop tokens
+            if (nextToken == _tokenizer.EosTokenId || nextToken == 151645 || nextToken == 151643)
+            {
+                finishReason = "stop";
+                break;
+            }
+
+            // Decode token piece
+            string piece = _tokenizer.DecodeToken(nextToken);
+            responseSb.Append(piece);
+            onToken?.Invoke(piece);
+
+            // Forward next token
+            _model.Forward(nextToken, currentPos, _kvCache, _logits.AsSpan(), computeLogits: true);
+            currentPos++;
+
+            // Yield control briefly to keep async responsive
+            if ((step & 15) == 0)
+            {
+                await Task.Yield();
+            }
+        }
+
+        genStopwatch.Stop();
+        totalStopwatch.Stop();
+
+        return new GenerationResult
+        {
+            Text = responseSb.ToString(),
+            FinishReason = finishReason,
+            Metrics = new GenerationMetrics
+            {
+                PromptTokens = promptTokens.Length,
+                GeneratedTokens = recentTokens.Count,
+                PromptEvalDuration = promptStopwatch.Elapsed,
+                GenerationDuration = genStopwatch.Elapsed,
+                TotalDuration = totalStopwatch.Elapsed
+            }
+        };
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _model.Dispose();
+            _kvCache.Dispose();
+            _gguf.Dispose();
+            _disposed = true;
+        }
+        GC.SuppressFinalize(this);
+    }
+
+    ~InferenceSession()
+    {
+        Dispose();
+    }
+}

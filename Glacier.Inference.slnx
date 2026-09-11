@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Glacier.Inference/Glacier.Inference.csproj" />
+    <Project Path="src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Glacier.Inference.Tests/Glacier.Inference.Tests.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Glacier.Inference.Benchmarks/Glacier.Inference.Benchmarks.csproj" />
+  </Folder>
+</Solution>

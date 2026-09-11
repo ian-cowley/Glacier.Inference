@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <AssemblyName>glacier</AssemblyName>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>glacier</ToolCommandName>
+    <PackageId>Glacier.Inference.Cli</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>High-performance pure C# .NET 10 LLM command-line application (glacier). Features interactive chat REPL, side-by-side comparative benchmarking against Ollama GPU, model inspection, and Ollama/OpenAI-compatible HTTP serving.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Inference</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Inference.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>llm;inference;ollama;vllm;cli;terminal;gguf;qwen;simd;aot;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\Glacier.Inference\Glacier.Inference.csproj" />
+  </ItemGroup>
+</Project>
