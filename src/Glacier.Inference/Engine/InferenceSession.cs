@@ -8,8 +8,10 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Inference.Config;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
+using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
@@ -74,10 +76,16 @@ public sealed class InferenceSession : IDisposable
     public ModelWeights Weights => _weights;
     public BpeTokenizer Tokenizer => _tokenizer;
     public KVCache KVCache => _kvCache;
+    public DeviceInfo Device { get; }
+    public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
     public bool IsGpuAccelerated => _gpuModel != null;
 
-    public InferenceSession(string modelPath, int maxSeqLen = 4096, InferenceDevice device = InferenceDevice.Auto)
+    public InferenceSession(
+        string modelPath,
+        int maxSeqLen = 4096,
+        string? device = null,
+        InferenceEngineType engine = InferenceEngineType.Auto)
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
@@ -86,33 +94,57 @@ public sealed class InferenceSession : IDisposable
         _sampler = new Sampler();
         _logits = new float[_weights.VocabSize];
 
-        bool wantGpu = device != InferenceDevice.Cpu && GpuContext.IsSupported;
-        if (wantGpu)
+        var (targetDevice, targetEngine) = GlacierSettings.ResolveTarget(device, engine != InferenceEngineType.Auto ? engine.ToString() : null);
+        Device = targetDevice;
+        Engine = targetEngine;
+
+        if (targetEngine == InferenceEngineType.Cuda && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
         {
             try
             {
-                _gpu = new GpuContext();
+                _gpu = new GpuContext(targetDevice.Index);
                 _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen);
-                ActiveDevice = $"{_gpu.DeviceName} (CUDA Bare-Metal)";
+                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal CUDA]";
             }
             catch (Exception ex)
             {
-                if (device == InferenceDevice.Gpu)
-                    throw new InvalidOperationException($"Failed to initialize GPU inference: {ex.Message}", ex);
+                var settings = GlacierSettings.Load();
+                if (!settings.FallbackToCpu)
+                    throw new InvalidOperationException($"Failed to initialize CUDA inference on {targetDevice.Name}: {ex.Message}", ex);
 
-                // Graceful fallback to CPU
                 _gpu?.Dispose();
                 _gpu = null;
                 _gpuModel = null;
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                ActiveDevice = "Host CPU (SIMD AVX2)";
+                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from CUDA]";
             }
+        }
+        else if (targetEngine == InferenceEngineType.DirectML)
+        {
+            // DirectML cooperative execution path
+            _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+            ActiveDevice = $"{targetDevice.Name} [Engine: DirectML / DX12 Compute]";
         }
         else
         {
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = "Host CPU (SIMD AVX2)";
+            ActiveDevice = $"{targetDevice.Name} [Engine: SIMD AVX-512/AVX2]";
         }
+    }
+
+    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device)
+        : this(modelPath, maxSeqLen, device switch
+        {
+            InferenceDevice.Gpu => "gpu",
+            InferenceDevice.Cpu => "cpu",
+            _ => "auto"
+        }, device switch
+        {
+            InferenceDevice.Gpu => InferenceEngineType.Cuda,
+            InferenceDevice.Cpu => InferenceEngineType.Cpu,
+            _ => InferenceEngineType.Auto
+        })
+    {
     }
 
     /// <summary>

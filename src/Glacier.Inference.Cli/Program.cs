@@ -14,8 +14,10 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
+using Glacier.Inference.Config;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Hardware;
 using Glacier.Inference.Sampling;
 
 public static class Program
@@ -37,6 +39,8 @@ public static class Program
         {
             return command switch
             {
+                "devices" => RunDevices(cmdArgs),
+                "config" => RunConfig(cmdArgs),
                 "inspect" => RunInspect(cmdArgs),
                 "bench" => await RunBenchAsync(cmdArgs),
                 "run" => await RunChatAsync(cmdArgs),
@@ -64,11 +68,19 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("Usage: glacier <command> [options]");
         Console.WriteLine();
-        Console.WriteLine("Commands:");
+        Console.WriteLine("Hardware & Configuration Commands:");
+        Console.WriteLine("  devices                              Enumerate detected GPUs, VRAM, and safe driver engines");
+        Console.WriteLine("  config  [options]                    View or set persistent hardware & engine preferences");
+        Console.WriteLine();
+        Console.WriteLine("Model Execution Commands:");
         Console.WriteLine("  inspect <model.gguf>                 Inspect model architecture, metadata & tensors");
         Console.WriteLine("  bench   <model.gguf> [options]       Run speed & comparative benchmark");
         Console.WriteLine("  run     <model.gguf> [prompt]        Interactive streaming chat or single prompt");
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
+        Console.WriteLine();
+        Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
+        Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
+        Console.WriteLine("  --engine <cuda|directml|cpu|auto>    Execution engine (default: auto safe selection)");
         Console.WriteLine();
         Console.WriteLine("Options for 'bench':");
         Console.WriteLine("  --tokens <n>                         Number of tokens to generate (default: 32)");
@@ -149,7 +161,8 @@ public static class Program
         int targetTokens = 25;
         string prompt = "Explain in two sentences what a CPU cache is.";
         string? compareOllamaUrl = null;
-        InferenceDevice device = InferenceDevice.Auto;
+        string? device = null;
+        string? engineStr = null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -160,15 +173,15 @@ public static class Program
             else if (args[i] == "--compare-ollama" && i + 1 < args.Length)
                 compareOllamaUrl = args[++i];
             else if (args[i] == "--device" && i + 1 < args.Length)
-            {
-                string d = args[++i].ToLowerInvariant();
-                device = d switch
-                {
-                    "gpu" or "cuda" => InferenceDevice.Gpu,
-                    "cpu" => InferenceDevice.Cpu,
-                    _ => InferenceDevice.Auto
-                };
-            }
+                device = args[++i];
+            else if (args[i] == "--engine" && i + 1 < args.Length)
+                engineStr = args[++i];
+        }
+
+        InferenceEngineType engine = InferenceEngineType.Auto;
+        if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
+        {
+            engine = parsedEngine;
         }
 
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -185,7 +198,7 @@ public static class Program
 
         Console.WriteLine(">> Loading model into zero-copy virtual address space...");
         var loadSw = Stopwatch.StartNew();
-        using var session = new InferenceSession(modelPath, maxSeqLen: 1024, device: device);
+        using var session = new InferenceSession(modelPath, maxSeqLen: 1024, device: device, engine: engine);
         loadSw.Stop();
         Console.WriteLine($"   Cold load completed in: {loadSw.ElapsedMilliseconds} ms ({loadSw.Elapsed.TotalSeconds:F2} s)");
         Console.WriteLine($"   Execution Device: {session.ActiveDevice}");
@@ -276,21 +289,16 @@ public static class Program
         }
 
         string modelPath = args[0];
-        InferenceDevice device = InferenceDevice.Auto;
+        string? device = null;
+        string? engineStr = null;
         var promptParts = new List<string>();
 
         for (int i = 1; i < args.Length; i++)
         {
             if (args[i] == "--device" && i + 1 < args.Length)
-            {
-                string d = args[++i].ToLowerInvariant();
-                device = d switch
-                {
-                    "gpu" or "cuda" => InferenceDevice.Gpu,
-                    "cpu" => InferenceDevice.Cpu,
-                    _ => InferenceDevice.Auto
-                };
-            }
+                device = args[++i];
+            else if (args[i] == "--engine" && i + 1 < args.Length)
+                engineStr = args[++i];
             else
             {
                 promptParts.Add(args[i]);
@@ -298,11 +306,17 @@ public static class Program
         }
         string? initialPrompt = promptParts.Count > 0 ? string.Join(" ", promptParts) : null;
 
+        InferenceEngineType engine = InferenceEngineType.Auto;
+        if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
+        {
+            engine = parsedEngine;
+        }
+
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference...");
         Console.ResetColor();
 
-        using var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device);
+        using var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device, engine: engine);
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
         var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f, TopP = 0.9f };
@@ -373,6 +387,8 @@ public static class Program
         string modelPath = args[0];
         int port = 11434;
         string host = "0.0.0.0";
+        string? device = null;
+        string? engineStr = null;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -380,6 +396,16 @@ public static class Program
                 port = p;
             else if (args[i] == "--host" && i + 1 < args.Length)
                 host = args[++i];
+            else if (args[i] == "--device" && i + 1 < args.Length)
+                device = args[++i];
+            else if (args[i] == "--engine" && i + 1 < args.Length)
+                engineStr = args[++i];
+        }
+
+        InferenceEngineType engine = InferenceEngineType.Auto;
+        if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
+        {
+            engine = parsedEngine;
         }
 
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -393,7 +419,7 @@ public static class Program
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
-        var session = new InferenceSession(modelPath, maxSeqLen: 4096);
+        var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device, engine: engine);
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         var appBuilder = WebApplication.CreateBuilder();
@@ -550,5 +576,137 @@ public static class Program
 
         await app.RunAsync();
         return 0;
+    }
+
+    // =========================================================================
+    // 5. DEVICES COMMAND
+    // =========================================================================
+    private static int RunDevices(string[] args)
+    {
+        var devices = DeviceManager.GetDevices();
+        var (activeDevice, activeEngine) = GlacierSettings.ResolveTarget(null, null);
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("============================================================================================================");
+        Console.WriteLine("                                  GLACIER DETECTED ACCELERATORS & ENGINES                                   ");
+        Console.WriteLine("============================================================================================================");
+        Console.ResetColor();
+        Console.WriteLine($"{"[ID]",-18} | {"Device Name",-34} | {"Memory",-15} | {"Safe Driver Engines",-25}");
+        Console.WriteLine(new string('-', 108));
+
+        foreach (var dev in devices)
+        {
+            string memStr;
+            if (dev.Vendor == GpuVendor.Cpu)
+            {
+                memStr = $"{dev.SharedVramGb:F1} GB RAM";
+            }
+            else if (dev.DedicatedVramGb < 1.0 && dev.SharedVramGb > 0)
+            {
+                memStr = $"{dev.SharedVramGb:F1} GB Unified";
+            }
+            else
+            {
+                memStr = $"{dev.DedicatedVramGb:F1} GB VRAM";
+            }
+
+            string safeEngines = string.Join(", ", dev.SupportedEngines);
+            bool isCurrent = dev.Id == activeDevice.Id;
+
+            if (isCurrent) Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"{dev.Id,-18} | {dev.Name,-34} | {memStr,-15} | {safeEngines,-25} {(isCurrent ? $"[ACTIVE: {activeEngine}]" : "")}");
+            if (isCurrent) Console.ResetColor();
+
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.WriteLine($"  └─ Driver Safety: {dev.SafetyNotes}");
+            Console.ResetColor();
+        }
+
+        Console.WriteLine(new string('-', 108));
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("* To switch your active hardware & driver engine:");
+        Console.WriteLine("  glacier config --device <id|name> [--engine <cuda|directml|cpu>]");
+        Console.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine cuda");
+        Console.WriteLine("  Example: glacier config --device amd-890m --engine directml");
+        Console.ResetColor();
+
+        return 0;
+    }
+
+    // =========================================================================
+    // 6. CONFIG COMMAND
+    // =========================================================================
+    private static int RunConfig(string[] args)
+    {
+        var settings = GlacierSettings.Load();
+
+        if (args.Length == 0)
+        {
+            var (activeDev, activeEng) = GlacierSettings.ResolveTarget(null, null);
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("=======================================================================");
+            Console.WriteLine("                     GLACIER PERSISTENT SETTINGS                      ");
+            Console.WriteLine("=======================================================================");
+            Console.ResetColor();
+            Console.WriteLine($"Config File:       {GlacierSettings.GetSettingsFilePath()}");
+            Console.WriteLine($"Default Device:    {settings.DeviceId ?? "auto"} (Resolved: {activeDev.Name})");
+            Console.WriteLine($"Default Engine:    {settings.Engine} (Resolved: {activeEng})");
+            Console.WriteLine($"CPU Fallback:      {settings.FallbackToCpu}");
+            Console.WriteLine($"Max Seq Length:    {settings.MaxSeqLen}");
+            Console.WriteLine($"Default Temp:      {settings.DefaultTemperature}");
+            Console.WriteLine($"Default Top-K:     {settings.DefaultTopK}");
+            Console.WriteLine($"Default Top-P:     {settings.DefaultTopP}");
+            Console.WriteLine();
+            Console.WriteLine("Commands to configure:");
+            Console.WriteLine("  glacier config --device <id|name> [--engine <cuda|directml|cpu>]");
+            Console.WriteLine("  glacier config --reset");
+            return 0;
+        }
+
+        if (args[0] is "--reset" or "reset")
+        {
+            settings.DeviceId = "auto";
+            settings.Engine = InferenceEngineType.Auto;
+            settings.Save();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("Settings successfully reset to auto-detect defaults.");
+            Console.ResetColor();
+            return 0;
+        }
+
+        string? targetDev = null;
+        string? targetEng = null;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--device" && i + 1 < args.Length)
+                targetDev = args[++i];
+            else if (args[i] == "--engine" && i + 1 < args.Length)
+                targetEng = args[++i];
+        }
+
+        if (targetDev != null || targetEng != null)
+        {
+            // Validate safety before saving
+            var (resolvedDev, resolvedEng) = GlacierSettings.ResolveTarget(
+                targetDev ?? settings.DeviceId,
+                targetEng ?? (settings.Engine != InferenceEngineType.Auto ? settings.Engine.ToString() : null));
+
+            if (targetDev != null) settings.DeviceId = resolvedDev.Id;
+            if (targetEng != null) settings.Engine = resolvedEng;
+            settings.Save();
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("Successfully updated settings!");
+            Console.ResetColor();
+            Console.WriteLine($"Active Device: {resolvedDev.Name} ({resolvedDev.Id})");
+            Console.WriteLine($"Active Engine: {resolvedEng}");
+            Console.WriteLine($"Settings saved to: {GlacierSettings.GetSettingsFilePath()}");
+            return 0;
+        }
+
+        Console.WriteLine("Usage: glacier config [--device <id|name>] [--engine <cuda|directml|cpu>] [--reset]");
+        return 1;
     }
 }
