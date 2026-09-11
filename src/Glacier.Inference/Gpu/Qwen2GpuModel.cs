@@ -78,21 +78,12 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _fnKvCacheStoreBatch;
     private IntPtr _fnAttentionGqaBatch;
 
-    private IntPtr _dXBatch;
-    private IntPtr _dNormXBatch;
-    private IntPtr _dQBatch;
-    private IntPtr _dKBatch;
-    private IntPtr _dVBatch;
-    private IntPtr _dAttnOutBatch;
-    private IntPtr _dAttnProjBatch;
-    private IntPtr _dFfnActBatch;
-    private IntPtr _dFfnOutBatch;
-    private IntPtr _dScoresBufBatch;
-    private float[] _hXBatch;
-
-    // CUDA Non-Blocking Streams for Concurrent Projections
+    // CUDA Non-Blocking Streams and Events for Concurrent Projections
     private IntPtr _streamK;
     private IntPtr _streamV;
+    private IntPtr _eventNormDone;
+    private IntPtr _eventKDone;
+    private IntPtr _eventVDone;
 
     // GPU VRAM Weights
     private IntPtr _dOutNormWeight;
@@ -113,6 +104,19 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _dFfnOut;
     private IntPtr _dLogits;
     private IntPtr _dScoresBuf;
+
+    // GPU VRAM Batch Scratch Buffers
+    private IntPtr _dXBatch;
+    private IntPtr _dNormXBatch;
+    private IntPtr _dQBatch;
+    private IntPtr _dKBatch;
+    private IntPtr _dVBatch;
+    private IntPtr _dAttnOutBatch;
+    private IntPtr _dAttnProjBatch;
+    private IntPtr _dFfnActBatch;
+    private IntPtr _dFfnOutBatch;
+    private IntPtr _dScoresBufBatch;
+    private float[] _hXBatch;
 
     // GPU VRAM KV Cache
     private readonly IntPtr[] _dKeyCache;
@@ -166,9 +170,12 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
 
-        // 2c. Create non-blocking streams for concurrent Q/K/V projections
+        // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
         CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
         CuDriver.Check(CuDriver.StreamCreate(out _streamV, 1), "StreamCreate(streamV)");
+        CuDriver.Check(CuDriver.EventCreate(out _eventNormDone, 0), "EventCreate(eventNormDone)");
+        CuDriver.Check(CuDriver.EventCreate(out _eventKDone, 0), "EventCreate(eventKDone)");
+        CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 0), "EventCreate(eventVDone)");
 
         // 3. Allocate GPU VRAM scratch buffers (single token)
         _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
@@ -305,7 +312,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     /// Executes transformer forward pass directly on NVIDIA GPU with zero intermediate PCIe round-trips.
     /// RoPE, GQA Attention, RMSNorm, GEMV, SwiGLU, and residual additions all execute in-VRAM.
     /// </summary>
-    public void Forward(int token, int pos, KVCache kvCache, Span<float> logits, bool computeLogits = true)
+    public void Forward(int token, int pos, KVCache? kvCache = null, Span<float> logits = default, bool computeLogits = true)
     {
         // 1. Extract embedding into host buffer and copy to GPU
         fixed (float* pX = _hX)
@@ -325,10 +332,21 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             // Attention pre-norm in VRAM
             LaunchRmsNorm(_dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
 
-            // Q, K, V projections on GPU (fused bias addition)
+            // Wait on GPU for RMSNorm output to be ready before K and V read it on their streams
+            CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
+            CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
+            CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
+
+            // Q, K, V projections on GPU (fused bias addition; K and V launched concurrently on dedicated CUDA streams)
             LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias);
-            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias);
-            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias);
+            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias, hStream: _streamK);
+            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias, hStream: _streamV);
+
+            // Instruct default stream to wait on GPU for K and V completion prior to RoPE and KV cache storage
+            CuDriver.EventRecord(_eventKDone, _streamK);
+            CuDriver.EventRecord(_eventVDone, _streamV);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
 
             // Rotary Position Embedding (RoPE) directly in VRAM
             LaunchRope(_dQ, _dK, pos);
@@ -421,10 +439,21 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             // Attention pre-norm in batch
             LaunchRmsNormBatch(_dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
 
-            // Q, K, V projections in batch (fused bias addition directly into Q, K, V)
+            // Wait on GPU for batched RMSNorm output to be ready before K and V read it on their streams
+            CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
+            CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
+            CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
+
+            // Q, K, V projections in batch (fused bias addition directly into Q, K, V; K and V run concurrently)
             LaunchGemmBatch(lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, batchSize, lw.QBias);
-            LaunchGemmBatch(lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, batchSize, lw.KBias);
-            LaunchGemmBatch(lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, batchSize, lw.VBias);
+            LaunchGemmBatch(lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, batchSize, lw.KBias, hStream: _streamK);
+            LaunchGemmBatch(lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, batchSize, lw.VBias, hStream: _streamV);
+
+            // Instruct default stream to wait on GPU for batched K and V completion prior to RoPE and KV cache storage
+            CuDriver.EventRecord(_eventKDone, _streamK);
+            CuDriver.EventRecord(_eventVDone, _streamV);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
 
             // Rotary Position Embedding in batch
             LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
@@ -966,6 +995,9 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     {
         if (!_disposed)
         {
+            if (_eventNormDone != IntPtr.Zero) CuDriver.EventDestroy(_eventNormDone);
+            if (_eventKDone != IntPtr.Zero) CuDriver.EventDestroy(_eventKDone);
+            if (_eventVDone != IntPtr.Zero) CuDriver.EventDestroy(_eventVDone);
             if (_streamK != IntPtr.Zero) CuDriver.StreamDestroy(_streamK);
             if (_streamV != IntPtr.Zero) CuDriver.StreamDestroy(_streamV);
 

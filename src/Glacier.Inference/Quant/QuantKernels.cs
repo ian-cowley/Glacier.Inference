@@ -603,41 +603,49 @@ public static unsafe class QuantKernels
     {
         int halfDim = headDim / 2;
 
-        // Apply to Q heads
-        for (int h = 0; h < nHeadsQ; h++)
+        Span<float> cosTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
+        Span<float> sinTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
+
+        for (int i = 0; i < halfDim; i++)
         {
-            float* head = q + h * headDim;
-            for (int i = 0; i < halfDim; i++)
-            {
-                float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
-                float theta = pos * freq * freqScale;
-                float cos = MathF.Cos(theta);
-                float sin = MathF.Sin(theta);
-
-                float v0 = head[i];
-                float v1 = head[i + halfDim];
-
-                head[i] = v0 * cos - v1 * sin;
-                head[i + halfDim] = v0 * sin + v1 * cos;
-            }
+            float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
+            float theta = pos * freq * freqScale;
+            cosTable[i] = MathF.Cos(theta);
+            sinTable[i] = MathF.Sin(theta);
         }
 
-        // Apply to K heads
-        for (int h = 0; h < nHeadsKv; h++)
+        fixed (float* pCos = cosTable, pSin = sinTable)
         {
-            float* head = k + h * headDim;
-            for (int i = 0; i < halfDim; i++)
+            // Apply to Q heads
+            for (int h = 0; h < nHeadsQ; h++)
             {
-                float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
-                float theta = pos * freq * freqScale;
-                float cos = MathF.Cos(theta);
-                float sin = MathF.Sin(theta);
+                float* head = q + h * headDim;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float c = pCos[i];
+                    float s = pSin[i];
+                    float v0 = head[i];
+                    float v1 = head[i + halfDim];
 
-                float v0 = head[i];
-                float v1 = head[i + halfDim];
+                    head[i] = v0 * c - v1 * s;
+                    head[i + halfDim] = v0 * s + v1 * c;
+                }
+            }
 
-                head[i] = v0 * cos - v1 * sin;
-                head[i + halfDim] = v0 * sin + v1 * cos;
+            // Apply to K heads
+            for (int h = 0; h < nHeadsKv; h++)
+            {
+                float* head = k + h * headDim;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float c = pCos[i];
+                    float s = pSin[i];
+                    float v0 = head[i];
+                    float v1 = head[i + halfDim];
+
+                    head[i] = v0 * c - v1 * s;
+                    head[i + halfDim] = v0 * s + v1 * c;
+                }
             }
         }
     }

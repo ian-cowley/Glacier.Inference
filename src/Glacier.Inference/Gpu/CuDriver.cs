@@ -114,6 +114,9 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuEventDestroy_v2")]
     public static extern int EventDestroy(IntPtr hEvent);
 
+    [DllImport(CudaLib, EntryPoint = "cuStreamWaitEvent")]
+    public static extern int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
+
     public static string GetDeviceName(int device)
     {
         var buf = new byte[256];

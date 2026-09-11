@@ -66,7 +66,8 @@ public sealed class InferenceSession : IDisposable
     private readonly GpuContext? _gpu;
     private readonly Qwen2GpuModel? _gpuModel;
     private readonly Qwen2Model? _cpuModel;
-    private readonly KVCache _kvCache;
+    private readonly KVCache? _kvCache;
+    private readonly int _maxSeqLen;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
     private readonly float[] _logits;
@@ -75,7 +76,7 @@ public sealed class InferenceSession : IDisposable
     public GgufFile Gguf => _gguf;
     public ModelWeights Weights => _weights;
     public BpeTokenizer Tokenizer => _tokenizer;
-    public KVCache KVCache => _kvCache;
+    public KVCache? KVCache => _kvCache;
     public DeviceInfo Device { get; }
     public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
@@ -89,7 +90,7 @@ public sealed class InferenceSession : IDisposable
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
-        _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+        _maxSeqLen = maxSeqLen;
         _tokenizer = new BpeTokenizer(_gguf);
         _sampler = new Sampler();
         _logits = new float[_weights.VocabSize];
@@ -104,6 +105,7 @@ public sealed class InferenceSession : IDisposable
             {
                 _gpu = new GpuContext(targetDevice.Index);
                 _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen);
+                _kvCache = null; // GPU maintains all KV states in device VRAM
                 ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS]";
             }
             catch (Exception ex)
@@ -115,6 +117,7 @@ public sealed class InferenceSession : IDisposable
                 _gpu?.Dispose();
                 _gpu = null;
                 _gpuModel = null;
+                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
                 ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
             }
@@ -122,11 +125,13 @@ public sealed class InferenceSession : IDisposable
         else if (targetEngine == InferenceEngineType.DirectML)
         {
             // DirectML cooperative execution path
+            _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
             ActiveDevice = $"{targetDevice.Name} [Engine: DirectML / DX12 Compute]";
         }
         else
         {
+            _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
             ActiveDevice = $"{targetDevice.Name} [Engine: SIMD AVX-512/AVX2]";
         }
@@ -173,8 +178,8 @@ public sealed class InferenceSession : IDisposable
             };
         }
 
-        // Reset KV cache
-        _kvCache.Reset();
+        // Reset KV cache if active
+        _kvCache?.Reset();
 
         var totalStopwatch = Stopwatch.StartNew();
         var promptStopwatch = Stopwatch.StartNew();
@@ -204,8 +209,9 @@ public sealed class InferenceSession : IDisposable
         var responseSb = new StringBuilder();
         string finishReason = "length";
 
+        int maxSeq = _gpuModel != null ? _maxSeqLen : (_kvCache?.MaxSeqLen ?? _maxSeqLen);
         int currentPos = promptTokens.Length;
-        for (int step = 0; step < options.MaxTokens && currentPos < _kvCache.MaxSeqLen; step++)
+        for (int step = 0; step < options.MaxTokens && currentPos < maxSeq; step++)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -259,11 +265,11 @@ public sealed class InferenceSession : IDisposable
     {
         if (_gpuModel != null)
         {
-            _gpuModel.Forward(token, pos, _kvCache, _logits.AsSpan(), computeLogits);
+            _gpuModel.Forward(token, pos, null, _logits.AsSpan(), computeLogits);
         }
         else
         {
-            _cpuModel!.Forward(token, pos, _kvCache, _logits.AsSpan(), computeLogits);
+            _cpuModel!.Forward(token, pos, _kvCache!, _logits.AsSpan(), computeLogits);
         }
     }
 
@@ -274,7 +280,7 @@ public sealed class InferenceSession : IDisposable
             _gpuModel?.Dispose();
             _gpu?.Dispose();
             _cpuModel?.Dispose();
-            _kvCache.Dispose();
+            _kvCache?.Dispose();
             _gguf.Dispose();
             _disposed = true;
         }
