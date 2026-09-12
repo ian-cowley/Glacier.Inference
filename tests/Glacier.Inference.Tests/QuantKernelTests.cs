@@ -113,4 +113,61 @@ public unsafe class QuantKernelTests
             Assert.Equal(35.0f, dot, 0.001f);
         }
     }
+
+    [Fact]
+    public void ComputeBlockSums32_ComputesExactChunkSums()
+    {
+        const int nCols = 64;
+        float[] x = new float[nCols];
+        for (int i = 0; i < nCols; i++) x[i] = i + 1;
+
+        float[] sums = new float[nCols / 32];
+        fixed (float* pX = x, pSums = sums)
+        {
+            QuantKernels.ComputeBlockSums32(pX, pSums, nCols);
+        }
+
+        // Sum of 1..32 is (32 * 33) / 2 = 528
+        // Sum of 33..64 is 528 + 32 * 32 = 1552
+        Assert.Equal(528f, sums[0], 0.001f);
+        Assert.Equal(1552f, sums[1], 0.001f);
+    }
+
+    [Fact]
+    public void MatMulBatch_MatchesMatVecMul()
+    {
+        const int nCols = 256;
+        const int nRows = 8;
+        const int batchSize = 4;
+
+        // Allocate a dummy Q4_K row
+        int rowBytes = (int)Glacier.Inference.Gguf.GgufTypes.GetRowBytes(Glacier.Inference.Gguf.GgufType.Q4_K, nCols);
+        byte[] weights = new byte[rowBytes * nRows];
+        new Random(42).NextBytes(weights);
+
+        float[] xBatch = new float[batchSize * nCols];
+        for (int i = 0; i < xBatch.Length; i++) xBatch[i] = (i % 17) - 8.0f;
+
+        float[] yBatch = new float[batchSize * nRows];
+        float[] ySingle = new float[batchSize * nRows];
+
+        fixed (byte* pW = weights)
+        fixed (float* pX = xBatch, pYBatch = yBatch, pYSingle = ySingle)
+        {
+            // Compute via MatMulBatch
+            QuantKernels.MatMulBatch(Glacier.Inference.Gguf.GgufType.Q4_K, pW, pX, pYBatch, nCols, nRows, batchSize);
+
+            // Compute individually via MatVecMul
+            for (int b = 0; b < batchSize; b++)
+            {
+                QuantKernels.MatVecMul(Glacier.Inference.Gguf.GgufType.Q4_K, pW, pX + b * nCols, pYSingle + b * nRows, nCols, nRows);
+            }
+        }
+
+        for (int i = 0; i < yBatch.Length; i++)
+        {
+            Assert.Equal(ySingle[i], yBatch[i], 0.0001f);
+        }
+    }
 }
+

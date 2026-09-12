@@ -12,7 +12,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>glacier</ToolCommandName>
     <PackageId>Glacier.Inference.Cli</PackageId>
-    <Version>1.1.3</Version>
+    <Version>1.1.4</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>High-performance pure C# .NET 10 LLM command-line application (glacier). Features interactive chat REPL, side-by-side comparative benchmarking against Ollama GPU, model inspection, and Ollama/OpenAI-compatible HTTP serving.</Description>

@@ -75,12 +75,18 @@ public static unsafe class QuantKernels
 
     /// <summary>
     /// Computes dot product between a Q4_K quantized row and a float vector x of length k.
+    /// Uses vectorized AVX2/FMA nibble extraction and precalculated block sums.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public static float VecDotQ4_K(BlockQ4_K* row, float* x, int k)
+    public static float VecDotQ4_K(BlockQ4_K* row, float* x, int k) => VecDotQ4_K(row, x, null, k);
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotQ4_K(BlockQ4_K* row, float* x, float* xSums, int k)
     {
         int nb = k / QK_K;
         float sum = 0f;
+        var vmaskLow = Vector128.Create((byte)0x0F);
+        int sumIdx = 0;
 
         for (int i = 0; i < nb; i++)
         {
@@ -92,42 +98,64 @@ public static unsafe class QuantKernels
             int is_idx = 0;
             for (int j = 0; j < QK_K; j += 64)
             {
-                GetScaleMinK4(is_idx + 0, scales, out byte sc0, out byte m0);
+                byte sc0, m0, sc1, m1_val;
+                if (is_idx < 4)
+                {
+                    sc0 = (byte)(scales[is_idx] & 63);
+                    m0 = (byte)(scales[is_idx + 4] & 63);
+                    sc1 = (byte)(scales[is_idx + 1] & 63);
+                    m1_val = (byte)(scales[is_idx + 5] & 63);
+                }
+                else
+                {
+                    sc0 = (byte)((scales[is_idx + 4] & 0x0F) | ((scales[is_idx - 4] >> 6) << 4));
+                    m0 = (byte)((scales[is_idx + 4] >> 4) | ((scales[is_idx] >> 6) << 4));
+                    sc1 = (byte)((scales[is_idx + 5] & 0x0F) | ((scales[is_idx - 3] >> 6) << 4));
+                    m1_val = (byte)((scales[is_idx + 5] >> 4) | ((scales[is_idx + 1] >> 6) << 4));
+                }
+
                 float d1 = d * sc0;
                 float m1 = min * m0;
-
-                GetScaleMinK4(is_idx + 1, scales, out byte sc1, out byte m1_val);
                 float d2 = d * sc1;
                 float m2 = min * m1_val;
 
-                if (Vector256.IsHardwareAccelerated)
+                if (Avx2.IsSupported)
                 {
                     var vSubSum1 = Vector256<float>.Zero;
-                    var vSubMin1 = Vector256<float>.Zero;
                     for (int l = 0; l < 32; l += 8)
                     {
                         var vx = Vector256.Load(x + l);
-                        var vq = Vector256.Create(
-                            (float)(q[l + 0] & 0x0F), (float)(q[l + 1] & 0x0F), (float)(q[l + 2] & 0x0F), (float)(q[l + 3] & 0x0F),
-                            (float)(q[l + 4] & 0x0F), (float)(q[l + 5] & 0x0F), (float)(q[l + 6] & 0x0F), (float)(q[l + 7] & 0x0F));
-                        vSubSum1 += vx * vq;
-                        vSubMin1 += vx;
+                        ulong q64 = *(ulong*)(q + l);
+                        var v8 = Vector128.CreateScalar(q64).As<ulong, byte>();
+                        var vLow = Avx2.And(v8, vmaskLow);
+                        var vInt = Avx2.ConvertToVector256Int32(vLow);
+                        var vFloat = Vector256.ConvertToSingle(vInt);
+                        if (Fma.IsSupported)
+                            vSubSum1 = Fma.MultiplyAdd(vx, vFloat, vSubSum1);
+                        else
+                            vSubSum1 += vx * vFloat;
                     }
-                    sum += (d1 * Vector256.Sum(vSubSum1)) - (m1 * Vector256.Sum(vSubMin1));
+                    float subMin1 = xSums != null ? xSums[sumIdx++] : ComputeChunk32Sum(x);
+                    sum += (d1 * Vector256.Sum(vSubSum1)) - (m1 * subMin1);
                     x += 32;
 
                     var vSubSum2 = Vector256<float>.Zero;
-                    var vSubMin2 = Vector256<float>.Zero;
                     for (int l = 0; l < 32; l += 8)
                     {
                         var vx = Vector256.Load(x + l);
-                        var vq = Vector256.Create(
-                            (float)(q[l + 0] >> 4), (float)(q[l + 1] >> 4), (float)(q[l + 2] >> 4), (float)(q[l + 3] >> 4),
-                            (float)(q[l + 4] >> 4), (float)(q[l + 5] >> 4), (float)(q[l + 6] >> 4), (float)(q[l + 7] >> 4));
-                        vSubSum2 += vx * vq;
-                        vSubMin2 += vx;
+                        ulong q64 = *(ulong*)(q + l);
+                        var v8 = Vector128.CreateScalar(q64).As<ulong, byte>();
+                        var vShift = Avx2.ShiftRightLogical(v8.As<byte, int>(), 4).As<int, byte>();
+                        var vHigh = Avx2.And(vShift, vmaskLow);
+                        var vInt = Avx2.ConvertToVector256Int32(vHigh);
+                        var vFloat = Vector256.ConvertToSingle(vInt);
+                        if (Fma.IsSupported)
+                            vSubSum2 = Fma.MultiplyAdd(vx, vFloat, vSubSum2);
+                        else
+                            vSubSum2 += vx * vFloat;
                     }
-                    sum += (d2 * Vector256.Sum(vSubSum2)) - (m2 * Vector256.Sum(vSubMin2));
+                    float subMin2 = xSums != null ? xSums[sumIdx++] : ComputeChunk32Sum(x);
+                    sum += (d2 * Vector256.Sum(vSubSum2)) - (m2 * subMin2);
                     x += 32;
                 }
                 else
@@ -140,7 +168,8 @@ public static unsafe class QuantKernels
                         subSum1 += (q[l] & 0x0F) * val_x;
                         subMin1 += val_x;
                     }
-                    sum += (d1 * subSum1) - (m1 * subMin1);
+                    float s1 = xSums != null ? xSums[sumIdx++] : subMin1;
+                    sum += (d1 * subSum1) - (m1 * s1);
                     x += 32;
 
                     float subSum2 = 0f;
@@ -151,7 +180,8 @@ public static unsafe class QuantKernels
                         subSum2 += (q[l] >> 4) * val_x;
                         subMin2 += val_x;
                     }
-                    sum += (d2 * subSum2) - (m2 * subMin2);
+                    float s2 = xSums != null ? xSums[sumIdx++] : subMin2;
+                    sum += (d2 * subSum2) - (m2 * s2);
                     x += 32;
                 }
 
@@ -162,6 +192,36 @@ public static unsafe class QuantKernels
 
         return sum;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float ComputeChunk32Sum(float* x)
+    {
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var v0 = Vector256.Load(x);
+            var v1 = Vector256.Load(x + 8);
+            var v2 = Vector256.Load(x + 16);
+            var v3 = Vector256.Load(x + 24);
+            return Vector256.Sum((v0 + v1) + (v2 + v3));
+        }
+        float s = 0;
+        for (int l = 0; l < 32; l++) s += x[l];
+        return s;
+    }
+
+    /// <summary>
+    /// Computes 32-element chunk sums of vector x across all chunks (nCols / 32).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void ComputeBlockSums32(float* x, float* xSums, int nCols)
+    {
+        int nChunks = nCols / 32;
+        for (int c = 0; c < nChunks; c++)
+        {
+            xSums[c] = ComputeChunk32Sum(x + c * 32);
+        }
+    }
+
 
     /// <summary>
     /// Dequantizes a row of Q6_K blocks into 32-bit floating point array.
@@ -522,7 +582,21 @@ public static unsafe class QuantKernels
     /// Automatically multithreads row calculations across all available CPU cores.
     /// </summary>
     public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows)
+        => MatVecMul(type, weightData, x, y, nCols, nRows, null);
+
+    /// <summary>
+    /// Multiplies a quantized matrix W [nRows, nCols] by vector x [nCols] producing y [nRows] using precomputed block sums.
+    /// </summary>
+    public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows, float* xSums)
     {
+        if (type == GgufType.Q4_K && xSums == null && nCols >= 32)
+        {
+            int nChunks = nCols / 32;
+            float* localSums = stackalloc float[nChunks];
+            ComputeBlockSums32(x, localSums, nCols);
+            xSums = localSums;
+        }
+
         int rowBytes = (int)GgufTypes.GetRowBytes(type, nCols);
         int threads = Environment.ProcessorCount;
 
@@ -531,7 +605,7 @@ public static unsafe class QuantKernels
             for (int i = 0; i < nRows; i++)
             {
                 byte* rowPtr = weightData + (long)i * rowBytes;
-                y[i] = ComputeDot(type, rowPtr, x, nCols);
+                y[i] = ComputeDot(type, rowPtr, x, xSums, nCols);
             }
             return;
         }
@@ -544,17 +618,75 @@ public static unsafe class QuantKernels
             for (int i = startRow; i < endRow; i++)
             {
                 byte* rowPtr = weightData + (long)i * rowBytes;
-                y[i] = ComputeDot(type, rowPtr, x, nCols);
+                y[i] = ComputeDot(type, rowPtr, x, xSums, nCols);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Multiplies a quantized matrix W [nRows, nCols] by a batch of vectors xBatch [batchSize, nCols]
+    /// producing yBatch [batchSize, nRows].
+    /// Weights are streamed from memory once and reused across all vectors in the batch.
+    /// </summary>
+    public static void MatMulBatch(
+        GgufType type,
+        byte* weightData,
+        float* xBatch,
+        float* yBatch,
+        int nCols,
+        int nRows,
+        int batchSize,
+        float* xSumsBatch = null)
+    {
+        if (batchSize == 1)
+        {
+            MatVecMul(type, weightData, xBatch, yBatch, nCols, nRows, xSumsBatch);
+            return;
+        }
+
+        int rowBytes = (int)GgufTypes.GetRowBytes(type, nCols);
+        int threads = Environment.ProcessorCount;
+        int sumsStride = nCols / 32;
+
+        if (nRows < threads * 2)
+        {
+            for (int r = 0; r < nRows; r++)
+            {
+                byte* rowPtr = weightData + (long)r * rowBytes;
+                for (int b = 0; b < batchSize; b++)
+                {
+                    float* x = xBatch + b * nCols;
+                    float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
+                    yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
+                }
+            }
+            return;
+        }
+
+        int rowsPerThread = (nRows + threads - 1) / threads;
+        Parallel.For(0, threads, t =>
+        {
+            int startRow = t * rowsPerThread;
+            int endRow = Math.Min(startRow + rowsPerThread, nRows);
+            for (int r = startRow; r < endRow; r++)
+            {
+                byte* rowPtr = weightData + (long)r * rowBytes;
+                for (int b = 0; b < batchSize; b++)
+                {
+                    float* x = xBatch + b * nCols;
+                    float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
+                    yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
+                }
             }
         });
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float ComputeDot(GgufType type, byte* rowPtr, float* x, int nCols)
+    private static float ComputeDot(GgufType type, byte* rowPtr, float* x, float* xSums, int nCols)
     {
         return type switch
         {
-            GgufType.Q4_K => VecDotQ4_K((BlockQ4_K*)rowPtr, x, nCols),
+            GgufType.Q4_K => VecDotQ4_K((BlockQ4_K*)rowPtr, x, xSums, nCols),
             GgufType.Q6_K => VecDotQ6_K((BlockQ6_K*)rowPtr, x, nCols),
             GgufType.Q8_0 => VecDotQ8_0((BlockQ8_0*)rowPtr, x, nCols),
             GgufType.Q4_0 => VecDotQ4_0((BlockQ4_0*)rowPtr, x, nCols),

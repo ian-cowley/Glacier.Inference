@@ -102,7 +102,7 @@ public sealed class GlacierSettings
             {
                 engine = InferenceEngineType.BareMetal;
             }
-            else if (clean is "directml" or "dml" or "dx12")
+            else if (clean is "directml" or "dml" or "dx12" or "d3d12" or "direct3d12")
             {
                 engine = InferenceEngineType.DirectML;
             }

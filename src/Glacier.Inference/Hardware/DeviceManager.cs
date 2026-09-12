@@ -206,9 +206,7 @@ public static class DeviceManager
                             {
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = isDisplay
-                                    ? "AMD Radeon / Ryzen iGPU: DirectML / DX12 engine cooperates with Windows DWM across unified system RAM."
-                                    : "AMD Radeon GPU: DirectML / DX12 Compute engine supported.";
+                                safetyNotes = "AMD Radeon / Ryzen APU: Pure C# Direct3D 12 Compute engine (HLSL Wave32) across unified system memory.";
                             }
                             else if (vendor == GpuVendor.Intel)
                             {

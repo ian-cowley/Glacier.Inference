@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Glacier.Inference.Config;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
+using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
@@ -65,6 +66,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     private readonly ModelWeights _weights;
     private readonly GpuContext? _gpu;
     private readonly Qwen2GpuModel? _gpuModel;
+    private readonly Qwen2D3D12Model? _d3d12Model;
     private readonly Qwen2Model? _cpuModel;
     private readonly KVCache? _kvCache;
     private readonly int _maxSeqLen;
@@ -80,9 +82,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public DeviceInfo Device { get; }
     public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
-    public bool IsGpuAccelerated => _gpuModel != null || (Engine == InferenceEngineType.DirectML && Device.Vendor != GpuVendor.Cpu);
+    public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null;
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
+    public Qwen2D3D12Model? D3D12Model => _d3d12Model;
     public Qwen2Model? CpuModel => _cpuModel;
     public int MaxSeqLen => _maxSeqLen;
 
@@ -127,24 +130,34 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
             }
         }
-        else if (targetEngine == InferenceEngineType.DirectML)
+        else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+                 targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
         {
-            // DirectML cooperative execution path for AMD Ryzen iGPUs, Intel Arc/Xe, and NVIDIA GPUs
-            bool dmlAvail = OperatingSystem.IsWindows() &&
-                            NativeLibrary.TryLoad("DirectML.dll", out IntPtr hDml) && hDml != IntPtr.Zero &&
-                            NativeLibrary.TryLoad("d3d12.dll", out IntPtr hD3d) && hD3d != IntPtr.Zero;
+            try
+            {
+                var d3dCtx = new D3D12Context(targetDevice.Index);
+                _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                _kvCache = null; // GPU maintains all KV states in device VRAM
+                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32) | KV: FP32]";
+            }
+            catch (Exception ex)
+            {
+                var settings = GlacierSettings.Load();
+                if (!settings.FallbackToCpu)
+                    throw new InvalidOperationException($"Failed to initialize Direct3D 12 Compute inference on {targetDevice.Name}: {ex.Message}", ex);
 
-            _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
-            _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = dmlAvail
-                ? $"{targetDevice.Name} [Engine: DirectML / DX12 Compute]"
-                : $"{targetDevice.Name} [Engine: SIMD Fallback (DirectML unavailable)]";
+                _d3d12Model?.Dispose();
+                _d3d12Model = null;
+                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12]";
+            }
         }
         else
         {
             _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = $"{targetDevice.Name} [Engine: SIMD AVX-512/AVX2]";
+            ActiveDevice = $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
         }
     }
 
@@ -200,6 +213,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
         }
+        else if (_d3d12Model != null)
+        {
+            _d3d12Model.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
+        }
+        else if (_cpuModel != null && _kvCache != null)
+        {
+            _cpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), _kvCache, computeLogits: true);
+        }
         else
         {
             for (int i = 0; i < promptTokens.Length - 1; i++)
@@ -220,7 +241,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         var responseSb = new StringBuilder();
         string finishReason = "length";
 
-        int maxSeq = _gpuModel != null ? _maxSeqLen : (_kvCache?.MaxSeqLen ?? _maxSeqLen);
+        int maxSeq = _gpuModel != null ? _maxSeqLen : (_d3d12Model != null ? _maxSeqLen : (_kvCache?.MaxSeqLen ?? _maxSeqLen));
         int currentPos = promptTokens.Length;
         for (int step = 0; step < options.MaxTokens && currentPos < maxSeq; step++)
         {
@@ -293,6 +314,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
         }
+        else if (_d3d12Model != null)
+        {
+            _d3d12Model.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
+        }
+        else if (_cpuModel != null && _kvCache != null)
+        {
+            _cpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), _kvCache, computeLogits: true);
+        }
         else
         {
             for (int i = 0; i < promptTokens.Length - 1; i++)
@@ -343,6 +372,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             _gpuModel.Forward(token, pos, null, Span<float>.Empty, computeLogits);
         }
+        else if (_d3d12Model != null)
+        {
+            _d3d12Model.Forward(token, pos, computeLogits ? _logits.AsSpan() : Span<float>.Empty, computeLogits);
+        }
         else
         {
             _cpuModel!.Forward(token, pos, _kvCache!, _logits.AsSpan(), computeLogits);
@@ -355,6 +388,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             _gpuModel?.Dispose();
             _gpu?.Dispose();
+            _d3d12Model?.Dispose();
             _cpuModel?.Dispose();
             _kvCache?.Dispose();
             _gguf.Dispose();
