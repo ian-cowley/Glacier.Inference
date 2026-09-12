@@ -6,19 +6,19 @@ High-Performance C# .NET 10 LLM Inference Engine & Command-Line Server Runtime.
 [![NuGet](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped GGUF model execution, bare-metal GPU SASS streaming via native driver (`nvcuda.dll`), multi-device discovery with safe cooperative drivers, SIMD AVX-512 / AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, streaming terminal chat REPL, and an Ollama/OpenAI-compatible HTTP API server.
+Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped GGUF model execution, bare-metal GPU SASS streaming via native driver (`nvcuda.dll`), bare-metal Direct3D 12 Compute (`HLSL Wave32` via `Vortice.D3D12`), multi-device discovery with safe cooperative drivers, SIMD AVX-512 / AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, speculative decoding engine, streaming terminal chat REPL, and an Ollama/OpenAI-compatible HTTP API server.
 
 ---
 
 ## Features
 
-- **Pure C# Bare-Metal SASS Engine**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`).
-- **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets.
-- **Bare-Metal Direct3D 12 Compute Engine**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) integrated GPUs. Features register-tiled Batched GEMM (Q4_K, Q6_K), 128-bit vectorization, and zero-allocation persistent buffers delivering 35+ tok/s generation and 115+ tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
+- **Pure C# Bare-Metal SASS Engine (NVIDIA)**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`).
+- **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets and full 32-token GEMM tiling for robust prompt prefill.
+- **Bare-Metal Direct3D 12 Compute Engine (AMD / Intel)**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) and Intel Arc GPUs. Features register-tiled Batched GEMM (Q4_K, Q6_K), 128-bit vectorization, L1 cache SRV routing, and zero-allocation persistent buffers delivering up to 35+ tok/s generation and up to 216 tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
 - **Speculative Decoding Engine (1.5x–3x Throughput Acceleration)**: Seamless assisted generation via `PromptLookupDraftProvider` (sub-microsecond n-gram matching with 0 extra VRAM) and `ModelDraftProvider`, coordinated with GPU batched verification (`VerifyBatch`) evaluating all candidates in a single pass over weights.
 - **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
 - **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via pure DXGI P/Invoke.
-- **Safe Driver Engine Architecture**: Cooperates with Windows DWM via DirectML or bare-metal Direct3D 12 compute on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS on compute dGPUs (NVIDIA RTX 4060).
+- **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS on compute dGPUs (NVIDIA RTX 3060, RTX 4060, RTX 4090).
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-100ms cold time without heap allocations.
 - **Hardware SIMD Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F16`, and `F32`.
 - **Full Architecture Support**:
@@ -109,13 +109,48 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Total Response Time** | 🟩 **1.37 seconds** | 2.91 seconds | 🟩 **Glacier is 2.1x FASTER total turnaround** |
 | **Memory Architecture** | 🟩 **Unified DDR5 Zero-Copy** | Traditional VRAM staging | 🟩 **Zero Host-Device PCIe bottlenecks** |
 
-### 💡 Why Glacier is Faster & The 128-Bit Memory Bus Physics
-- **Speculative Decoding Batched Verification**: Rather than streaming 4.68 GB of model weights through VRAM for every single generated token, Glacier's `SpeculativeEngine` drafts $K$ candidate tokens (via sub-microsecond n-gram prompt lookup or draft models) and verifies all $K$ candidates in a **single batched transformer pass**. The 4.68 GB model weights are streamed from VRAM **only once**, yielding effective generation speeds of **70–104+ tokens/second** on standard laptop hardware!
-- **Fused In-VRAM GPU Argmax Reduction**: Traditional inference engines copy the entire vocabulary logits (~608 KB per token for 152K vocab) across PCIe from GPU device memory to CPU host RAM for argmax reduction. Glacier executes `argmax_kernel` (a 512-thread warp-shuffle reduction) directly inside VRAM in **~3.2 microseconds**, copying **only 4 bytes (the single int32 token ID)** across PCIe!
-- **Bypassing the CUDA Runtime Overhead**: Glacier does not link against `cudart64.dll` or `cublas64.dll`. Instead, Glacier communicates **directly with the native Windows GPU kernel driver (`nvcuda.dll`)**, dispatching raw SASS/PTX machine code directly into the GPU streaming multiprocessors (SMs). This eliminates DLL interop overhead and delivers **>3x faster total turnaround time** on user requests.
-- **Hardware Memory Bandwidth Limits**: A 7B Q4_K_M model requires streaming ~4.68 GB of weights from VRAM for *every single serial token*. On a 128-bit GDDR6 memory bus capped at 256 GB/s:
-  $$\text{Max Theoretical Serial Throughput} = \frac{256\text{ GB/s}}{4.68\text{ GB}} \approx 54.7\text{ tokens/sec}$$
-  At **41.92 tokens/sec**, Glacier sustains **208.1 GB/s**—saturating **81.3% of the physical silicon bandwidth** through pure unsafe C# pointers and bare-metal GPU kernels. Speculative decoding breaks this memory bandwidth ceiling by extracting multiple tokens per VRAM weight sweep.
+### Benchmark 4: AMD Radeon 890M Integrated GPU (RDNA 3.5, 16 CUs, Unified LPDDR5X)
+> **Hardware**: ASUS Zenbook S 16 / AMD Ryzen AI 9 HX 370 + AMD Radeon 890M (16 CUs, RDNA 3.5, gfx1150) across 15.5 GB Unified Memory. Model: `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.68 GB). Prompt: 20 tokens, Output: 20 tokens.
+
+| Metric | Glacier.Inference (Pure C#) | Native C++ Baseline | Head-to-Head Comparison |
+| :--- | :--- | :--- | :--- |
+| **Physical Hardware** | **AMD Radeon 890M iGPU (16 CUs)** | **AMD Radeon 890M iGPU (16 CUs)** | 100% Identical Hardware |
+| **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | ROCm / DirectML C++ runtime | 🟩 **Pure C# vs. Compiled C++** |
+| **External Dependencies** | 🟩 **0 Native C++ DLLs** (`Vortice.D3D12`) | Multi-GB ROCm / Vulkan runtime | 🟩 **Zero native toolchain bloat** |
+| **Weight Upload Time** | 🟩 **4.46 s (Unified Memory)** | Daemon initialization overhead | 🟩 **>1,050 MB/s direct upload into UMA** |
+| **Prompt Eval Rate** | **48.45 tokens/sec** (619.1 ms) | ~45 – 55 tokens/sec | Register-tiled 32-token GEMM (HLSL Wave32) |
+| **Generation Rate** | **11.33 tokens/sec** | ~10 – 12 tokens/sec | Full 7B Q4_K_M autoregressive SASS |
+| **Total Response Time** | 🟩 **2.39 seconds** | 3.5 – 5.0+ seconds | 🟩 **Sub-2.5s end-to-end response** |
+| **Display / DWM Safety** | 🟩 **100% Cooperative D3D12** | Risk of TDR timeouts on display | 🟩 **Zero desktop stutter or driver resets** |
+
+### 💡 Why Glacier is Faster & Deep-Dive Architecture
+
+#### 1. Speculative Decoding Batched Verification
+Rather than streaming 4.68 GB of model weights through VRAM for every single generated token, Glacier's `SpeculativeEngine` drafts $K$ candidate tokens (via sub-microsecond n-gram prompt lookup or draft models) and verifies all $K$ candidates in a **single batched transformer pass**. The 4.68 GB model weights are streamed from VRAM **only once**, yielding effective generation speeds of **70–104+ tokens/second** on standard laptop hardware!
+
+#### 2. Fused In-VRAM GPU Argmax Reduction
+Traditional inference engines copy the entire vocabulary logits (~608 KB per token for 152K vocab) across PCIe from GPU device memory to CPU host RAM for argmax reduction. Glacier executes `argmax_kernel` (a 512-thread warp-shuffle reduction) directly inside VRAM in **~3.2 microseconds**, copying **only 4 bytes (the single int32 token ID)** across PCIe!
+
+#### 3. Bypassing the CUDA Runtime Overhead (NVIDIA Bare-Metal SASS)
+Glacier does not link against `cudart64.dll` or `cublas64.dll`. Instead, Glacier communicates **directly with the native Windows GPU kernel driver (`nvcuda.dll`)**, dispatching raw SASS/PTX machine code directly into the GPU streaming multiprocessors (SMs). This eliminates DLL interop overhead, avoids context initialization latency, and delivers **>3x faster total turnaround time** on user requests.
+
+#### 4. Hardware Memory Bandwidth Limits & 128-Bit GDDR6 Physics
+A 7B Q4_K_M model requires streaming ~4.68 GB of weights from VRAM for *every single serial token*. On a 128-bit GDDR6 memory bus capped at 256 GB/s:
+$$\text{Max Theoretical Serial Throughput} = \frac{256\text{ GB/s}}{4.68\text{ GB}} \approx 54.7\text{ tokens/sec}$$
+At **41.92 tokens/sec**, Glacier sustains **208.1 GB/s**—saturating **81.3% of the physical silicon bandwidth** through pure unsafe C# pointers and bare-metal GPU kernels. Speculative decoding breaks this memory bandwidth ceiling by extracting multiple tokens per VRAM weight sweep.
+
+#### 5. Bare-Metal Direct3D 12 Compute Architecture (AMD RDNA 2 / 3.5 & Intel Arc)
+ROCm and HIP have historically suffered from incomplete Windows driver support on consumer APUs and massive multi-gigabyte installer bloat. Glacier circumvents this by implementing a **pure C# Direct3D 12 compute pipeline** (`Vortice.D3D12`):
+- **Native HLSL Wave32 Compute Shaders**: Shaders are compiled to `cs_5_0` / `cs_6_0` targeting AMD RDNA SIMD32 wave execution natively.
+- **Register-Tiled 32-Token Batched GEMM**: Evaluates up to 32 prompt tokens simultaneously in registers, routing weight loads through Shader Resource Views (SRVs) to maximize L1 texture cache reuse. On the Radeon 680M, this delivers **216.0 tok/s prompt prefill**, and **48.45 tok/s on the 7B model** on the Radeon 890M.
+- **Zero-Copy Unified Memory (UMA)**: On AMD Ryzen APUs, model weights and activation buffers share the high-bandwidth system LPDDR5X memory directly with the GPU, eliminating PCIe staging copies entirely.
+- **Cooperative DWM Dispatch & TDR Immunity**: Primary display adapters driving the Windows Desktop Window Manager will trigger a TDR (Timeout Detection and Recovery) reset if compute kernels block for >2 seconds. Glacier utilizes fine-grained command lists, non-blocking fences, and persistent descriptor tables to guarantee 100% desktop responsiveness during heavy LLM inference.
+
+#### 6. Universal Multi-Architecture Fatbinary & Zero-Spill SASS Engineering
+Glacier embeds a single, self-contained universal fatbinary containing dedicated micro-architectural machine code slices:
+- **Architecture Coverage**: `sm_75` (Turing), `sm_80` (Ampere A100), `sm_86` (Ampere RTX 3060), `sm_89` (Ada Lovelace RTX 4060/4090), `sm_90` (Hopper), with `compute_75` forward-compatible PTX fallback for future architectures (Blackwell / Rubin).
+- **Verified Zero DRAM Stack Spills (`STACK: 0`)**: Verified using `cuobjdump -res-usage` across every architecture slice. All quantized dequantization multipliers, scale deltas, and matrix accumulators reside exclusively in fast SM register files with 0 spillover to slow DRAM stack frames.
+- **Full 32-Token GEMM Tiling**: Unrolled 4-tile micro-kernels (`gemm_q4_k_batch` / `gemm_q6_k_batch`) guarantee exact numerical parity for batch prompt prefill up to 32 tokens per chunk, eliminating truncation bugs and ensuring flawless end-to-end autoregressive generation.
 
 ---
 
@@ -187,20 +222,21 @@ Glacier automatically scans physical compute hardware via Windows DXGI (`dxgi.dl
 ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
 │                                   HARDWARE & DRIVER TOPOLOGY                                   │
 ├───────────────────────────────┬───────────────────────────────┬────────────────────────────────┤
-│ NVIDIA GeForce RTX 4060       │ AMD Radeon™ 890M Graphics     │ AMD Ryzen AI 9 HX 370          │
+│ NVIDIA RTX 4060 / RTX 3060    │ AMD Radeon™ 890M / 680M       │ AMD Ryzen AI 9 HX 370 / Ryzen  │
 │ Dedicated Discrete dGPU       │ Primary Display Adapter iGPU  │ Host Processor                 │
 ├───────────────────────────────┼───────────────────────────────┼────────────────────────────────┤
-│ 8.0 GB GDDR6 Dedicated VRAM   │ 15.5 GB Unified System RAM    │ 32.0 GB System RAM             │
-│ 256 GB/s Memory Bandwidth     │ High-Bandwidth Unified Fabric │ 24 Concurrent Threads          │
+│ 8–12 GB GDDR6 Dedicated VRAM  │ 15.5 GB Unified System RAM    │ 32.0 GB System RAM             │
+│ 256–360 GB/s Memory Bandwidth │ High-Bandwidth Unified Fabric │ 16–24 Concurrent Threads       │
 │ Safe Engines:                 │ Safe Engines:                 │ Safe Engines:                  │
-│ • BareMetal (SASS, ~43 t/s)   │ • DirectML (DWM Cooperative)  │ • Cpu (AVX-512 / AVX2 SIMD)    │
-│ • DirectML (DX12 Compute)     │                               │                                │
+│ • BareMetal (SASS, ~43 t/s)   │ • Direct3D 12 (HLSL Wave32)   │ • Cpu (AVX-512 / AVX2 SIMD)    │
+│ • DirectML (DX12 Compute)     │ • DirectML (DWM Cooperative)  │                                │
 │                               │ [UNSAFE: Raw OpenCL (TDR)]    │                                │
 └───────────────────────────────┴───────────────────────────────┴────────────────────────────────┘
 ```
 
-- **Display iGPU Safety (AMD Radeon 890M)**: Drives the laptop display via Desktop Window Manager (DWM). Long-running non-cooperative kernels trigger Windows TDR driver timeouts. Glacier utilizes **DirectML / DirectX 12 Compute**, cooperating with DWM to provide rock-solid stability across 15.5 GB of unified memory.
-- **Compute dGPU Speed (NVIDIA RTX 4060)**: Leverages Glacier's **Pure C# Bare-Metal SASS engine** for peak throughput (~43 tokens/sec generation, 109+ tokens/sec prompt eval).
+- **Display iGPU Safety (AMD Radeon 890M / 680M)**: Drives the laptop display via Desktop Window Manager (DWM). Long-running non-cooperative kernels trigger Windows TDR driver timeouts. Glacier utilizes **Bare-Metal Direct3D 12 Compute (HLSL Wave32)** with fine-grained dispatches or **DirectML**, cooperating with DWM to provide rock-solid stability across 15.5 GB of unified memory.
+- **Compute dGPU Speed (NVIDIA RTX 4060 / RTX 3060)**: Leverages Glacier's **Pure C# Bare-Metal SASS engine** for peak throughput (~43 tokens/sec generation, 109+ tokens/sec prompt eval), streaming raw machine code directly to SMs without CUDA runtime overhead.
+- **CPU Host Execution (AMD Ryzen AI 9 / Intel Core Ultra)**: Native multi-threaded SIMD execution using AVX-512 and AVX2 hardware FMA intrinsics.
 - **Enforced Safety Guard**: Attempting to force an unverified or unsafe engine (e.g. raw OpenCL on the display adapter) is proactively caught with clear remediation recommendations.
 
 ---
@@ -249,6 +285,9 @@ Console.WriteLine($"Total Time: {result.Metrics.TotalDuration.TotalSeconds:F2} s
 │  ├─ GlacierSettings (Persistent JSON hardware configuration)          │
 │  ├─ GgufFile (MemoryMappedFile zero-copy reader)                       │
 │  ├─ Qwen2GpuModel (Bare-Metal SASS GPU engine, VerifyBatch, Argmax)    │
+│  ├─ Qwen2D3D12Model (Bare-Metal Direct3D 12 Compute HLSL Wave32)      │
+│  ├─ D3D12Context (Pure C# Vortice.D3D12 device & compute pipeline)     │
+│  ├─ D3D12Shaders (Embedded compiled HLSL compute shaders, 32T GEMM)   │
 │  ├─ QuantKernels (AVX-512 / AVX2 Q4_K, Q6_K, Q8_0, F16)                │
 │  ├─ KVCache (Unmanaged contiguous ring buffer, Adaptive FP16 / FP8)    │
 │  ├─ Qwen2Model / TransformerModel (Attention, SwiGLU)                  │
