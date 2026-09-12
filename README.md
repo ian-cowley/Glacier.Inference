@@ -13,6 +13,7 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 ## Features
 
 - **Pure C# Bare-Metal SASS Engine**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`).
+- **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets.
 - **Bare-Metal Direct3D 12 Compute Engine**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) integrated GPUs. Features register-tiled Batched GEMM (Q4_K, Q6_K), 128-bit vectorization, and zero-allocation persistent buffers delivering 35+ tok/s generation and 115+ tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
 - **Speculative Decoding Engine (1.5x–3x Throughput Acceleration)**: Seamless assisted generation via `PromptLookupDraftProvider` (sub-microsecond n-gram matching with 0 extra VRAM) and `ModelDraftProvider`, coordinated with GPU batched verification (`VerifyBatch`) evaluating all candidates in a single pass over weights.
 - **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
@@ -90,7 +91,7 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Cold Start Latency** | 🟩 **1.93 s (Zero-copy VRAM upload)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
 | **Generation Rate (Serial)** | **42.8 – 43.0 tokens/sec** | **64.5 – 69.3 tokens/sec** | Full 7B Q4_K_M autoregressive SASS |
 | **Speculative Decoding Rate** | 🟩 **70 – 100+ tokens/sec** | N/A (Standard serial decode) | 🟩 **Up to 1.5x FASTER than Ollama** |
-| **Prompt Eval Rate** | **62.29 tokens/sec** | 52.0 – 335.1 tokens/sec | Optimized register-tiled SASS prefill |
+| **Prompt Eval Rate** | **72.75 tokens/sec** | 52.0 – 335.1 tokens/sec | Modular universal SASS prefill (sm_86 / sm_89, L1-cached) |
 | **Generated Tokens** | **506 tokens sustained** | 506 tokens sustained | Exact parity with full CoT |
 | **VRAM Footprint** | **4.68 GB Model + 235 MB KV (FP16)** | ~5.2 GB Total Process | 🟩 **Zero memory bloat** |
 
