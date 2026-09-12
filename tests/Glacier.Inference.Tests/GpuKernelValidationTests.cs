@@ -2,11 +2,14 @@ namespace Glacier.Inference.Tests;
 
 using System;
 using System.IO;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
+using Glacier.Inference.Sampling;
+using Glacier.Inference.Tokenizer;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -1093,5 +1096,27 @@ public unsafe class GpuKernelValidationTests
             double tps = promptLen / (ms / 1000.0);
             _output.WriteLine($"[BATCH PREFILL] Prompt {promptLen,3} tokens: {ms:F2} ms ({tps:F1} tokens/sec)");
         }
+    }
+
+    [CudaFact]
+    public void TestEndToEndAutoregressiveGeneration()
+    {
+        if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
+
+        using var session = new InferenceSession(ModelPath, maxSeqLen: 512, device: "nvidia-rtx-4060");
+        _output.WriteLine($"Session active device: {session.ActiveDevice}");
+
+        var options = new SamplingOptions { MaxTokens = 30, Temperature = 0.0f }; // Greedy
+        var result = session.GenerateAsync(
+            "Why is the sky blue?",
+            options,
+            formatChat: true,
+            onToken: t => _output.WriteLine($"[TOKEN EMIT] '{t}'")).GetAwaiter().GetResult();
+
+        _output.WriteLine($"FinishReason: {result.FinishReason}");
+        _output.WriteLine($"Generated tokens: {result.Metrics.GeneratedTokens}");
+        _output.WriteLine($"Full text: \"{result.Text}\"");
+
+        Assert.Contains("blue", result.Text, StringComparison.OrdinalIgnoreCase);
     }
 }
