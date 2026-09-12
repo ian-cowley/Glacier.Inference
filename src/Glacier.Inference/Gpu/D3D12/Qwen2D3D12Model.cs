@@ -563,10 +563,10 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         cmdList.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
 
         cmdList.SetComputeRootShaderResourceView(1, W.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(2, bias?.GPUVirtualAddress ?? 0);
+        cmdList.SetComputeRootShaderResourceView(2, bias?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, residual?.GPUVirtualAddress ?? 0);
-        cmdList.SetComputeRootUnorderedAccessView(5, y?.GPUVirtualAddress ?? 0);
+        cmdList.SetComputeRootUnorderedAccessView(4, residual?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(5, y?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
 
         cmdList.Dispatch(((uint)m_rows + 3) / 4, 1, 1);
     }
@@ -681,10 +681,10 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmdList.SetComputeRootShaderResourceView(1, w.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(2, bias != null ? bias.GPUVirtualAddress : 0);
+        cmdList.SetComputeRootShaderResourceView(2, bias != null ? bias.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootShaderResourceView(3, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : 0);
-        cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : 0);
+        cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
 
 
         cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);

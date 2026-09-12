@@ -26,6 +26,7 @@ public sealed unsafe class D3D12Context : IDisposable
     private ulong _fenceValue;
     private AutoResetEvent _fenceEvent = null!;
 
+    private ID3D12Resource _dummyBuffer = null!;
     private string _deviceName = string.Empty;
     private bool _disposed;
 
@@ -33,6 +34,7 @@ public sealed unsafe class D3D12Context : IDisposable
     public ID3D12CommandQueue Queue => _queue;
     public ID3D12GraphicsCommandList CommandList => _cmdList;
     public string DeviceName => _deviceName;
+    public ID3D12Resource DummyBuffer => _dummyBuffer;
 
     public D3D12Context(int adapterIndex = -1)
     {
@@ -105,6 +107,8 @@ public sealed unsafe class D3D12Context : IDisposable
         _fence = _device.CreateFence(0);
         _fenceValue = 0;
         _fenceEvent = new AutoResetEvent(false);
+
+        _dummyBuffer = CreateDeviceBuffer(256);
     }
 
     public ID3D12Resource CreateDeviceBuffer(ulong sizeInBytes, ResourceFlags flags = ResourceFlags.AllowUnorderedAccess)
@@ -190,7 +194,12 @@ public sealed unsafe class D3D12Context : IDisposable
         Synchronize();
 
         void* pRead = null;
-        readbackBuffer.Map(0, null, &pRead);
+        var mapRes = readbackBuffer.Map(0, null, &pRead);
+        if (pRead == null || !mapRes.Success)
+        {
+            var reason = _device.DeviceRemovedReason;
+            throw new InvalidOperationException($"readbackBuffer.Map failed: {mapRes}, DeviceRemovedReason: {reason}");
+        }
         Buffer.MemoryCopy(pRead, (void*)pHostData, sizeInBytes, sizeInBytes);
         readbackBuffer.Unmap(0);
     }
@@ -255,6 +264,7 @@ public sealed unsafe class D3D12Context : IDisposable
             _disposed = true;
             Synchronize();
 
+            _dummyBuffer?.Dispose();
             _fenceEvent?.Dispose();
             _fence?.Dispose();
             _cmdList?.Dispose();

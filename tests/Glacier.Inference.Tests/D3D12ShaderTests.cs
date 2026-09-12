@@ -138,9 +138,9 @@ public class D3D12ShaderTests
         cmd.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
-        cmd.SetComputeRootShaderResourceView(2, 0);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
-        cmd.SetComputeRootUnorderedAccessView(4, 0);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
         cmd.Dispatch(1, 1, 1);
@@ -225,9 +225,9 @@ public class D3D12ShaderTests
         cmd.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
-        cmd.SetComputeRootShaderResourceView(2, 0);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
-        cmd.SetComputeRootUnorderedAccessView(4, 0);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
         cmd.Dispatch(1, 1, 1);
@@ -298,9 +298,10 @@ public class D3D12ShaderTests
             }));
         var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmQ4KBatch));
 
+        int allocBatch = Math.Max(32, batchSize);
         using var dW = ctx.CreateDeviceBuffer((ulong)(mRows * 144));
-        using var dX = ctx.CreateDeviceBuffer((ulong)(batchSize * kCols * sizeof(float)));
-        using var dY = ctx.CreateDeviceBuffer((ulong)(batchSize * mRows * sizeof(float)));
+        using var dX = ctx.CreateDeviceBuffer((ulong)(allocBatch * kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(allocBatch * mRows * sizeof(float)));
 
         fixed (BlockQ4_K* pB = blocks)
         fixed (float* pX = x)
@@ -324,9 +325,9 @@ public class D3D12ShaderTests
         cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
-        cmd.SetComputeRootShaderResourceView(2, 0);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(3, dX.GPUVirtualAddress);
-        cmd.SetComputeRootUnorderedAccessView(4, 0);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
         cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
@@ -416,8 +417,9 @@ public class D3D12ShaderTests
         var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
 
         using var dW = ctx.CreateDeviceBuffer((ulong)aligned.Length);
-        using var dX = ctx.CreateDeviceBuffer((ulong)(batchSize * kCols * sizeof(float)));
-        using var dY = ctx.CreateDeviceBuffer((ulong)(batchSize * mRows * sizeof(float)));
+        int allocBatch = Math.Max(32, batchSize);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(allocBatch * kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(allocBatch * mRows * sizeof(float)));
 
         ctx.CopyToDevice(dW, aligned);
         fixed (float* pX = x)
@@ -440,9 +442,9 @@ public class D3D12ShaderTests
         cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
-        cmd.SetComputeRootShaderResourceView(2, 0);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(3, dX.GPUVirtualAddress);
-        cmd.SetComputeRootUnorderedAccessView(4, 0);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
         cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
