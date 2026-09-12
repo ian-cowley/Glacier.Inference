@@ -204,16 +204,11 @@ public static class DeviceManager
                             }
                             else if (vendor == GpuVendor.Amd)
                             {
-                                bool hipAvail = OperatingSystem.IsWindows() &&
-                                                NativeLibrary.TryLoad("amdhip64.dll", out IntPtr hHip) &&
-                                                hHip != IntPtr.Zero;
-                                if (hipAvail)
-                                    supportedEngines.Add(InferenceEngineType.BareMetal);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = isDisplay ? InferenceEngineType.DirectML : (hipAvail ? InferenceEngineType.BareMetal : InferenceEngineType.DirectML);
+                                recommendedEngine = InferenceEngineType.DirectML;
                                 safetyNotes = isDisplay
                                     ? "AMD Radeon / Ryzen iGPU: DirectML / DX12 engine cooperates with Windows DWM across unified system RAM."
-                                    : (hipAvail ? "AMD Radeon dGPU: Bare-Metal ROCm/HIP (amdhip64.dll) and DirectML both supported." : "AMD Radeon dGPU: DirectML / DX12 Compute engine supported.");
+                                    : "AMD Radeon GPU: DirectML / DX12 Compute engine supported.";
                             }
                             else if (vendor == GpuVendor.Intel)
                             {
