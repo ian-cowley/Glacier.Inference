@@ -280,16 +280,17 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         _sigArgmax = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, argmaxParams));
         _psoArgmax = _ctx.CreatePipelineState(_sigArgmax, _ctx.CompileShader(D3D12Shaders.Argmax));
 
-        // 9. Batched GEMM Root Signature: (Params b0, W t0, bias t1, x u0, residual u1, y u2)
+        // 9. Batched GEMM Root Signature: (Params b0, W t0, bias t1, x t2, residual u0, y u1)
         var gemmBatchParams = new RootParameter[]
         {
             new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
+            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All), // t0: W
+            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All), // t1: bias
+            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(2, 0), ShaderVisibility.All), // t2: x (SRV for L1 cache)
+            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All), // u0: residual
+            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)  // u1: y
         };
+
         _sigGemmBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemmBatchParams));
         _psoGemmQ4KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ4KBatch));
         _psoGemmQ6KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
@@ -681,12 +682,15 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
 
         cmdList.SetComputeRootShaderResourceView(1, w.GPUVirtualAddress);
         cmdList.SetComputeRootShaderResourceView(2, bias != null ? bias.GPUVirtualAddress : 0);
-        cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
+        cmdList.SetComputeRootShaderResourceView(3, x.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : 0);
         cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : 0);
 
-        cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 7) / 8, 1);
+
+        cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
     }
+
+
 
     private void DispatchRmsNormBatch(
         ID3D12GraphicsCommandList cmdList,
@@ -925,7 +929,7 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
                 }
             }
 
-            // 2. Record full chunk of transformer passes into ONE command list
+            var swRec = Stopwatch.StartNew();
             _ctx.BeginCommands();
             var cmd = _ctx.CommandList;
 
@@ -982,6 +986,8 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
                 // Batched FFN Down projection with fused residual addition (_dXBatch += ffnDown)
                 DispatchGemmBatch(cmd, lw.FfnDownType, null, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, chunkSize, null, residual: _dXBatch);
                 cmd.ResourceBarrierUnorderedAccessView(null!);
+
+
             }
 
             if (isLastChunk && computeLogits)
@@ -1007,9 +1013,13 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
                     cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
                 }
             }
-
+            swRec.Stop();
+            var swGpu = Stopwatch.StartNew();
             _ctx.EndCommandsAndExecute();
             _ctx.Synchronize();
+            swGpu.Stop();
+            LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
+
 
             if (isLastChunk && computeLogits && !logits.IsEmpty)
             {

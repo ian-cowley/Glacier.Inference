@@ -614,11 +614,11 @@ cbuffer Params : register(b0)
 
 ByteAddressBuffer W : register(t0);
 StructuredBuffer<float> bias : register(t1);
-RWByteAddressBuffer x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+ByteAddressBuffer x : register(t2);
+RWStructuredBuffer<float> residual : register(u0);
+RWStructuredBuffer<float> y : register(u1);
 
-groupshared float s_mem[1024];
+groupshared float s_mem[4096];
 
 void get_scale_min(uint j, uint s0, uint s1, uint s2, out float d, out float m, float d_val, float min_val)
 {
@@ -644,11 +644,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint warp_id = gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
-    uint t_base = gid.y * 8;
+    uint t_base = gid.y * 32;
 
-    float acc[8];
+    float acc[32];
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         acc[i] = 0.0f;
     }
@@ -661,8 +661,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         uint chunk = lane_id / 8;
         uint chunk_lane = lane_id % 8;
         uint is_idx = chunk * 2;
-        uint x_offset1 = chunk * 64 + chunk_lane * 4;
-        uint x_offset2 = x_offset1 + 32;
+        uint x_offset1 = (chunk * 64 + chunk_lane * 4) * 4;
+        uint stride_bytes = k_cols * 4;
+        uint t_base_bytes = t_base * stride_bytes;
 
         for (uint b = 0; b < nb; b++)
         {
@@ -686,37 +687,30 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             uint q2 = (q >> 16) & 0xFF;
             uint q3 = q >> 24;
 
-            float w0 = d1 * (float)(q0 & 0x0F) - min1;
-            float w1 = d1 * (float)(q1 & 0x0F) - min1;
-            float w2 = d1 * (float)(q2 & 0x0F) - min1;
-            float w3 = d1 * (float)(q3 & 0x0F) - min1;
+            float4 w_vec1 = d1 * float4((float)(q0 & 0x0F), (float)(q1 & 0x0F), (float)(q2 & 0x0F), (float)(q3 & 0x0F)) - min1;
+            float4 w_vec2 = d2 * float4((float)(q0 >> 4), (float)(q1 >> 4), (float)(q2 >> 4), (float)(q3 >> 4)) - min2;
 
-            float w4 = d2 * (float)(q0 >> 4) - min2;
-            float w5 = d2 * (float)(q1 >> 4) - min2;
-            float w6 = d2 * (float)(q2 >> 4) - min2;
-            float w7 = d2 * (float)(q3 >> 4) - min2;
-
-            uint x_blk = b * 256;
+            uint x_addr_base = t_base_bytes + (b * 256 * 4) + x_offset1;
 
             [unroll]
-            for (uint i = 0; i < 8; i++)
+            for (uint i = 0; i < 32; i++)
             {
                 uint t = t_base + i;
                 if (t < batch_size)
                 {
-                    uint t_x_base = t * k_cols + x_blk;
-                    float4 x1 = asfloat(x.Load4((t_x_base + x_offset1) * 4));
-                    float4 x2 = asfloat(x.Load4((t_x_base + x_offset2) * 4));
+                    uint cur_addr = x_addr_base + i * stride_bytes;
+                    float4 x1 = asfloat(x.Load4(cur_addr));
+                    float4 x2 = asfloat(x.Load4(cur_addr + 128));
 
-                    acc[i] += (w0 * x1.x + w1 * x1.y + w2 * x1.z + w3 * x1.w)
-                            + (w4 * x2.x + w5 * x2.y + w6 * x2.z + w7 * x2.w);
+                    acc[i] += dot(w_vec1, x1) + dot(w_vec2, x2);
                 }
             }
         }
+
     }
 
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         uint t = t_base + i;
         s_mem[i * 128 + s_idx] = (t < batch_size && warp_id < m_rows) ? acc[i] : 0.0f;
@@ -726,38 +720,38 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id < 16)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 8)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 4)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 2)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 1)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
     }
 
     if (lane_id == 0 && warp_id < m_rows)
     {
         float b_val = (has_bias != 0) ? bias[warp_id] : 0.0f;
         [unroll]
-        for (uint i = 0; i < 8; i++)
+        for (uint i = 0; i < 32; i++)
         {
             uint t = t_base + i;
             if (t < batch_size)
@@ -785,11 +779,11 @@ cbuffer Params : register(b0)
 
 ByteAddressBuffer W : register(t0);
 StructuredBuffer<float> bias : register(t1);
-RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+StructuredBuffer<float> x : register(t2);
+RWStructuredBuffer<float> residual : register(u0);
+RWStructuredBuffer<float> y : register(u1);
 
-groupshared float s_mem[1024];
+groupshared float s_mem[4096];
 
 int decode_signed_byte_batch(uint b)
 {
@@ -803,11 +797,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint warp_id = gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
-    uint t_base = gid.y * 8;
+    uint t_base = gid.y * 32;
 
-    float acc[8];
+    float acc[32];
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         acc[i] = 0.0f;
     }
@@ -859,7 +853,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                 float w4 = d * (float)s4 * (float)q4;
 
                 [unroll]
-                for (uint i = 0; i < 8; i++)
+                for (uint i = 0; i < 32; i++)
                 {
                     uint t = t_base + i;
                     if (t < batch_size)
@@ -876,7 +870,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     }
 
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         uint t = t_base + i;
         s_mem[i * 128 + s_idx] = (t < batch_size && warp_id < m_rows) ? acc[i] : 0.0f;
@@ -886,38 +880,38 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id < 16)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 8)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 4)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 2)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 1)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
     }
 
     if (lane_id == 0 && warp_id < m_rows)
     {
         float b_val = (has_bias != 0) ? bias[warp_id] : 0.0f;
         [unroll]
-        for (uint i = 0; i < 8; i++)
+        for (uint i = 0; i < 32; i++)
         {
             uint t = t_base + i;
             if (t < batch_size)
@@ -945,11 +939,11 @@ cbuffer Params : register(b0)
 
 StructuredBuffer<float> W : register(t0);
 StructuredBuffer<float> bias : register(t1);
-RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+StructuredBuffer<float> x : register(t2);
+RWStructuredBuffer<float> residual : register(u0);
+RWStructuredBuffer<float> y : register(u1);
 
-groupshared float s_mem[1024];
+groupshared float s_mem[4096];
 
 [numthreads(32, 4, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
@@ -958,11 +952,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint warp_id = gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
-    uint t_base = gid.y * 8;
+    uint t_base = gid.y * 32;
 
-    float acc[8];
+    float acc[32];
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         acc[i] = 0.0f;
     }
@@ -975,7 +969,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         {
             float w = W[row_offset + k];
             [unroll]
-            for (uint i = 0; i < 8; i++)
+            for (uint i = 0; i < 32; i++)
             {
                 uint t = t_base + i;
                 if (t < batch_size)
@@ -987,7 +981,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     }
 
     [unroll]
-    for (uint i = 0; i < 8; i++)
+    for (uint i = 0; i < 32; i++)
     {
         uint t = t_base + i;
         s_mem[i * 128 + s_idx] = (t < batch_size && warp_id < m_rows) ? acc[i] : 0.0f;
@@ -997,38 +991,38 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id < 16)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 8)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 4)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 2)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2];
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane_id < 1)
     {
         [unroll]
-        for (uint i = 0; i < 8; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
+        for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1];
     }
 
     if (lane_id == 0 && warp_id < m_rows)
     {
         float b_val = (has_bias != 0) ? bias[warp_id] : 0.0f;
         [unroll]
-        for (uint i = 0; i < 8; i++)
+        for (uint i = 0; i < 32; i++)
         {
             uint t = t_base + i;
             if (t < batch_size)

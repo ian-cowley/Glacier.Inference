@@ -103,9 +103,9 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / ROCm daemon | 🟩 **Pure C# vs. Compiled C++** |
 | **External Dependencies** | 🟩 **0 Native C++ DLLs** (`Vortice.D3D12`) | CUDA/ROCm/Vulkan runtime bloat | 🟩 **Zero native toolchain bloat** |
 | **Cold Start Latency** | 🟩 **2.74 s (Instant Direct3D 12)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Prompt Eval Rate** | 🟩 **115.8 tokens/sec** | 312.8 – 534.9 tokens/sec | Register-Tiled Batched GEMM (weights read ONCE) |
+| **Prompt Eval Rate** | 🟩 **216.0 tokens/sec** | 151.4 – 312.8 tokens/sec (Cold) | 32-Token Tiling + L1 SRV (138 ms vs. Ollama's 128 ms) |
 | **Generation Rate** | **35.3 tokens/sec** | 43.6 – 44.6 tokens/sec | Near Parity with Ollama on identical iGPU |
-| **Total Response Time** | 🟩 **1.42 seconds** | 2.91 seconds | 🟩 **1.8x FASTER total turnaround** |
+| **Total Response Time** | 🟩 **1.37 seconds** | 2.91 seconds | 🟩 **Glacier is 2.1x FASTER total turnaround** |
 | **Memory Architecture** | 🟩 **Unified DDR5 Zero-Copy** | Traditional VRAM staging | 🟩 **Zero Host-Device PCIe bottlenecks** |
 
 ### 💡 Why Glacier is Faster & The 128-Bit Memory Bus Physics

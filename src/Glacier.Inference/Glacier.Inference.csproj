@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.1.4</Version>
+    <Version>1.1.5</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>High-performance pure C# .NET 10 LLM inference engine. Native AOT compatible, zero-copy memory-mapped GGUF models, SIMD AVX-512 and AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, and embedded BPE tokenizers. Pure C# alternative to Ollama and vLLM.</Description>

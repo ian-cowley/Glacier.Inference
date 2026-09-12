@@ -292,9 +292,9 @@ public class D3D12ShaderTests
                 new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
-                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
-                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All)
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All)
             }));
         var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmQ4KBatch));
 
@@ -325,11 +325,12 @@ public class D3D12ShaderTests
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(2, 0);
-        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(3, dX.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(4, 0);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
-        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 7) / 8, 1);
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+
         ctx.EndCommandsAndExecute();
         ctx.Synchronize();
 
@@ -408,9 +409,9 @@ public class D3D12ShaderTests
                 new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
-                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
-                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All)
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All)
             }));
         var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
 
@@ -440,11 +441,12 @@ public class D3D12ShaderTests
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(2, 0);
-        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(3, dX.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(4, 0);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
-        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 7) / 8, 1);
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+
         ctx.EndCommandsAndExecute();
         ctx.Synchronize();
 
@@ -582,5 +584,35 @@ public class D3D12ShaderTests
         Console.WriteLine($"Sequential Top: {topSeq} ({maxSeq:F4}), Batched Top: {topBatch} ({maxBatch:F4})");
         Assert.Equal(topSeq, topBatch);
         Assert.Equal(maxSeq, maxBatch, 0.01f);
+    }
+
+    [Fact]
+    public unsafe void D3D12_Profile_ForwardBatch_Kernels()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string modelPath = @"C:\Users\spuri\.ollama\models\blobs\sha256-183715c435899236895da3869489cc30ac241476b4971a20285b1a462818a5b4";
+        if (!File.Exists(modelPath)) return;
+
+        using var gguf = GgufFile.Open(modelPath);
+        var weights = new ModelWeights(gguf);
+
+        int[] prompt = new int[30];
+        for (int i = 0; i < 30; i++) prompt[i] = 9707 + i;
+
+        using var ctx = new D3D12Context();
+        using var model = new Qwen2D3D12Model(ctx, weights, 128);
+        float[] logits = new float[weights.VocabSize];
+
+        // Warmup
+        model.ForwardBatch(prompt.AsSpan(0, 5), 0, logits.AsSpan(), computeLogits: true);
+
+        // Run 3 times to get accurate GPU execution time
+        for (int run = 0; run < 3; run++)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            model.ForwardBatch(prompt, 0, logits.AsSpan(), computeLogits: true);
+            sw.Stop();
+            Console.WriteLine($"[RUN {run + 1}] 30 tokens evaluated in {sw.ElapsedMilliseconds} ms ({30.0 / sw.Elapsed.TotalSeconds:F1} tok/s)");
+        }
     }
 }
