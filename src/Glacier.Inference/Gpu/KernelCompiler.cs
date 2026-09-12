@@ -15,14 +15,6 @@ public static class KernelCompiler
 
     public static byte[] GetOrCompileKernels(string targetArch = "auto")
     {
-        Directory.CreateDirectory(CacheDir);
-        string cachedPath = Path.Combine(CacheDir, $"kernels_{targetArch}.cubin");
-
-        if (File.Exists(cachedPath))
-        {
-            return File.ReadAllBytes(cachedPath);
-        }
-
         // 1. Try to load embedded universal fatbinary resource (supports sm_75, sm_80, sm_86, sm_89, sm_90, and PTX compute_75)
         var asm = Assembly.GetExecutingAssembly();
         using var stream = asm.GetManifestResourceStream("Glacier.Inference.Gpu.Kernels.kernels.cubin");
@@ -30,18 +22,21 @@ public static class KernelCompiler
         {
             using var ms = new MemoryStream();
             stream.CopyTo(ms);
-            byte[] bytes = ms.ToArray();
-            File.WriteAllBytes(cachedPath, bytes);
-            return bytes;
+            return ms.ToArray();
         }
 
         // 2. Check for local file next to source if running from development
         string localSourceCubin = Path.Combine(AppContext.BaseDirectory, "Gpu", "Kernels", "kernels.cubin");
         if (File.Exists(localSourceCubin))
         {
-            byte[] bytes = File.ReadAllBytes(localSourceCubin);
-            File.WriteAllBytes(cachedPath, bytes);
-            return bytes;
+            return File.ReadAllBytes(localSourceCubin);
+        }
+
+        Directory.CreateDirectory(CacheDir);
+        string cachedPath = Path.Combine(CacheDir, $"kernels_{targetArch}.cubin");
+        if (File.Exists(cachedPath))
+        {
+            return File.ReadAllBytes(cachedPath);
         }
 
         throw new FileNotFoundException(

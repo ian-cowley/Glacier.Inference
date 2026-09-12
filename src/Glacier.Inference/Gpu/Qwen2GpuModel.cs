@@ -589,41 +589,28 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         {
             var lw = _layerWeights[l];
 
-            // Attention pre-norm in batch
             LaunchRmsNormBatch(_dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
-
-            // Wait on GPU for batched RMSNorm output to be ready before K and V read it on their streams
             CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
             CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
             CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
 
-            // Q, K, V projections in batch (fused bias addition directly into Q, K, V; K and V run concurrently)
             LaunchGemmBatch(lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, batchSize, lw.QBias);
             LaunchGemmBatch(lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, batchSize, lw.KBias, hStream: _streamK);
             LaunchGemmBatch(lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, batchSize, lw.VBias, hStream: _streamV);
-
-            // Instruct default stream to wait on GPU for batched K and V completion prior to RoPE and KV cache storage
             CuDriver.EventRecord(_eventKDone, _streamK);
             CuDriver.EventRecord(_eventVDone, _streamV);
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
 
-            // Rotary Position Embedding in batch
             LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
-
-            // Store K and V in GPU VRAM KV Cache in batch
             LaunchKvCacheStoreBatch(l, chunkStartPos, batchSize);
 
-            // GQA Attention in batch across all batch tokens and heads in 1 launch!
             LaunchAttentionBatch(l, chunkStartPos, batchSize);
 
-            // Attention out projection in batch (fused residual accumulation directly into _dXBatch: _dXBatch += attnProj)
             LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, _dim, _dim, batchSize, IntPtr.Zero, _dXBatch);
 
-            // FFN pre-norm in batch
             LaunchRmsNormBatch(_dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
 
-            // SwiGLU FFN projections in batch
             if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
             {
                 LaunchSwigluBatch(_dFfnActBatch, _dNormXBatch, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim, batchSize);
@@ -640,7 +627,6 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
                 }
             }
 
-            // FFN Down projection in batch (fused residual accumulation directly into _dXBatch: _dXBatch += ffnDown)
             LaunchGemmBatch(lw.FfnDownType, IntPtr.Zero, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
         }
 
@@ -991,7 +977,8 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
 
         uint blockSize = 128;
         uint numWarps = 4;
-        uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+        uint gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+        uint gridY = 1;
 
         void** pArgs = stackalloc void*[8];
         pArgs[0] = &dY;
@@ -1005,7 +992,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
 
         CuDriver.Check(CuDriver.LaunchKernel(
             fn,
-            gridSize, 1, 1,
+            gridX, gridY, 1,
             blockSize, 1, 1,
             0, hStream,
             (IntPtr)pArgs,
@@ -1016,7 +1003,8 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     {
         uint blockSize = 128;
         uint numWarps = 4;
-        uint gridSize = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+        uint gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+        uint gridY = 1;
 
         void** pArgs = stackalloc void*[7];
         pArgs[0] = &dDst;
@@ -1029,7 +1017,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
 
         CuDriver.Check(CuDriver.LaunchKernel(
             _fnGemmSwigluBatch,
-            gridSize, 1, 1,
+            gridX, gridY, 1,
             blockSize, 1, 1,
             0, IntPtr.Zero,
             (IntPtr)pArgs,

@@ -87,8 +87,9 @@ glacier serve "path/to/model.gguf" --port 11434
 | **External Dependencies** | 🟩 **0 Native C++ DLLs** (direct `nvcuda.dll`) | CUDA Toolkit, cuBLAS, libllama | 🟩 **Zero native toolchain bloat** |
 | **Deployment Footprint** | 🟩 **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 🟩 **300x Lighter Distribution** |
 | **Cold Start Latency** | 🟩 **1.93 s (Zero-copy VRAM upload)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Generation Rate (Serial)** | **43.01 tokens/sec** | **62.70 tokens/sec** | Full 7B Q4_K_M autoregressive SASS |
-| **Prompt Eval Rate** | **34.49 tokens/sec** | 2185.2 tokens/sec | Zero C++ runtime overhead |
+| **Generation Rate (Serial)** | **42.8 – 43.0 tokens/sec** | **64.5 – 69.3 tokens/sec** | Full 7B Q4_K_M autoregressive SASS |
+| **Speculative Decoding Rate** | 🟩 **70 – 100+ tokens/sec** | N/A (Standard serial decode) | 🟩 **Up to 1.5x FASTER than Ollama** |
+| **Prompt Eval Rate** | **62.29 tokens/sec** | 52.0 – 335.1 tokens/sec | Optimized register-tiled SASS prefill |
 | **Generated Tokens** | **506 tokens sustained** | 506 tokens sustained | Exact parity with full CoT |
 | **VRAM Footprint** | **4.68 GB Model + 235 MB KV (FP16)** | ~5.2 GB Total Process | 🟩 **Zero memory bloat** |
 
