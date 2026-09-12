@@ -175,6 +175,12 @@ Console.WriteLine($"Total Time: {result.Metrics.TotalDuration.TotalSeconds:F2} s
 
 ---
 
+## Credits
+
+Developed by Ian Cowley and Antigravity (Google DeepMind).
+
+---
+
 ## License
 
 MIT License. (c) 2026 Ian Cowley.
