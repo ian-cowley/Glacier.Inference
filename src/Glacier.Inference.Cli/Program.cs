@@ -27,14 +27,25 @@ public static class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
 
-        if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+        if (args.Length == 0 || args[0] is "-h" or "--help" or "help" or "/?" or "-?")
         {
+            if (args.Length > 1 && args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintCommandHelp(args[1]);
+                return 0;
+            }
             PrintHelp();
             return 0;
         }
 
         string command = args[0].ToLowerInvariant();
         string[] cmdArgs = args.Length > 1 ? args[1..] : [];
+
+        if (HasHelpFlag(cmdArgs))
+        {
+            PrintCommandHelp(command);
+            return 0;
+        }
 
         try
         {
@@ -56,6 +67,16 @@ public static class Program
             Console.ResetColor();
             return 1;
         }
+    }
+
+    private static bool HasHelpFlag(string[] args)
+    {
+        foreach (var a in args)
+        {
+            if (a is "-h" or "--help" or "help" or "/?" or "-?")
+                return true;
+        }
+        return false;
     }
 
     private static void PrintHelp()
@@ -82,17 +103,214 @@ public static class Program
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto safe selection)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>    KV-cache precision (default: auto adaptive)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto adaptive)");
         Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
         Console.WriteLine();
-        Console.WriteLine("Options for 'bench':");
-        Console.WriteLine("  --tokens <n>                         Number of tokens to generate (default: 32)");
-        Console.WriteLine("  --prompt \"<text>\"                    Custom benchmark prompt");
-        Console.WriteLine("  --compare-ollama <url>               Compare against remote/local Ollama (e.g. http://192.168.1.108:11434)");
+        Console.WriteLine("Subcommand Help:");
+        Console.WriteLine("  glacier <command> --help             Detailed help, options, and examples for any command");
+        Console.WriteLine("  glacier help <command>               Alternative syntax for subcommand help");
+        Console.WriteLine("  Example: glacier run --help");
+        Console.WriteLine("  Example: glacier bench --help");
+        Console.WriteLine("  Example: glacier serve --help");
+    }
+
+    private static void PrintCommandHelp(string command)
+    {
+        switch (command.ToLowerInvariant())
+        {
+            case "devices":
+                PrintDevicesHelp();
+                break;
+            case "config":
+                PrintConfigHelp();
+                break;
+            case "inspect":
+                PrintInspectHelp();
+                break;
+            case "bench":
+                PrintBenchHelp();
+                break;
+            case "run":
+                PrintRunHelp();
+                break;
+            case "serve":
+                PrintServeHelp();
+                break;
+            default:
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"Unknown command: '{command}'\n");
+                Console.ResetColor();
+                PrintHelp();
+                break;
+        }
+    }
+
+    private static void PrintDevicesHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier devices - Enumerate compute hardware and safe driver engines");
+        Console.ResetColor();
         Console.WriteLine();
-        Console.WriteLine("Options for 'serve':");
-        Console.WriteLine("  --port <p>                           Listening port (default: 11434)");
-        Console.WriteLine("  --host <h>                           Listening host (default: 0.0.0.0)");
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier devices");
+        Console.WriteLine();
+        Console.WriteLine("Description:");
+        Console.WriteLine("  Scans the system for all physical GPU accelerators and host CPUs using pure DXGI");
+        Console.WriteLine("  and native driver queries. Displays total dedicated VRAM, unified system RAM,");
+        Console.WriteLine("  and lists which execution engines (BareMetal SASS, Direct3D 12 Compute, DirectML, CPU)");
+        Console.WriteLine("  are safe for each device (preventing Windows DWM display driver TDR timeouts).");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier devices");
+    }
+
+    private static void PrintConfigHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier config - View or set persistent hardware & engine preferences");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier config [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  --device <id|name>                   Set default target device (e.g. nvidia-rtx-4060, amd-890m, cpu, auto)");
+        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Set default execution engine");
+        Console.WriteLine("  --reset                              Reset configuration to auto-detected defaults");
+        Console.WriteLine("  -h, --help                           Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Description:");
+        Console.WriteLine("  Persists configuration preferences across sessions in ~/.glacier/settings.json.");
+        Console.WriteLine("  When set, commands (run, bench, serve) automatically use these preferences unless overridden.");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier config                                     # View current persistent configuration");
+        Console.WriteLine("  glacier config --device nvidia-rtx-4060            # Default to NVIDIA discrete GPU");
+        Console.WriteLine("  glacier config --device amd-890m --engine directml  # Default to AMD iGPU with D3D12/DirectML");
+        Console.WriteLine("  glacier config --reset                             # Reset to factory auto-selection");
+    }
+
+    private static void PrintInspectHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier inspect - Inspect GGUF model architecture, metadata & tensors");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier inspect <model.gguf>");
+        Console.WriteLine("  glacier inspect -m <model.gguf>");
+        Console.WriteLine();
+        Console.WriteLine("Arguments & Options:");
+        Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
+        Console.WriteLine("  -h, --help                           Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Description:");
+        Console.WriteLine("  Zero-copy memory-maps the GGUF header and metadata to display architecture family,");
+        Console.WriteLine("  transformer layer count, attention heads, GQA ratio, RoPE frequencies, context window,");
+        Console.WriteLine("  and total parameter storage size in gigabytes.");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier inspect models/Qwen2.5-Coder-7B-Enterprise-Q8_0.gguf");
+        Console.WriteLine("  glacier inspect -m models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf");
+    }
+
+    private static void PrintBenchHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier bench - Run speed & comparative performance benchmark");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier bench <model.gguf> [options]");
+        Console.WriteLine("  glacier bench -m <model.gguf> [options]");
+        Console.WriteLine();
+        Console.WriteLine("Arguments & Options:");
+        Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
+        Console.WriteLine("  -n, --tokens <count>                 Number of tokens to generate (default: 25)");
+        Console.WriteLine("  -p, --prompt \"<text>\"                Custom benchmark prompt (default: CPU cache question)");
+        Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
+        Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
+        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --compare-ollama <url>               Ollama base URL for side-by-side comparison");
+        Console.WriteLine("                                       (e.g. http://127.0.0.1:11434 or http://192.168.1.108:11434)");
+        Console.WriteLine("  --compare-model <name>               Ollama model tag to query (default: qwen2.5:7b-instruct-32k)");
+        Console.WriteLine("  -h, --help                           Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Description:");
+        Console.WriteLine("  Measures cold load time, prompt prefill rate (tokens/sec), autoregressive generation rate");
+        Console.WriteLine("  (tokens/sec), and total turnaround latency. When --compare-ollama is provided, executes an");
+        Console.WriteLine("  identical prompt on the Ollama endpoint and generates a head-to-head performance table.");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier bench model.gguf -n 50");
+        Console.WriteLine("  glacier bench model.gguf -c 4096 --device nvidia-rtx-4060 --engine baremetal");
+        Console.WriteLine("  glacier bench model.gguf --compare-ollama http://127.0.0.1:11434 --compare-model qwen2.5:7b");
+    }
+
+    private static void PrintRunHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier run - Interactive streaming chat REPL or single-shot prompt");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier run <model.gguf> [prompt] [options]");
+        Console.WriteLine("  glacier run -m <model.gguf> [prompt] [options]");
+        Console.WriteLine();
+        Console.WriteLine("Arguments & Options:");
+        Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
+        Console.WriteLine("  [prompt]                             Single-shot prompt. If omitted, launches interactive REPL.");
+        Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
+        Console.WriteLine("  -n, --tokens, --max-tokens <count>   Maximum tokens to generate per response (default: 512)");
+        Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7)");
+        Console.WriteLine("  --top-p <float>                      Top-p nucleus sampling cutoff (default: 0.9)");
+        Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
+        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  -h, --help                           Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("Interactive REPL Commands:");
+        Console.WriteLine("  exit, quit                           Terminate the interactive chat session");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier run model.gguf                                # Launch interactive chat REPL");
+        Console.WriteLine("  glacier run model.gguf \"Explain quicksort in C#\"       # Single-shot streaming answer");
+        Console.WriteLine("  glacier run model.gguf -c 4096 --temp 0.2              # Low-temperature coding mode");
+        Console.WriteLine("  glacier run model.gguf --device amd-890m --engine directml");
+    }
+
+    private static void PrintServeHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier serve - Start Ollama & OpenAI compatible HTTP inference server");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier serve <model.gguf> [options]");
+        Console.WriteLine("  glacier serve -m <model.gguf> [options]");
+        Console.WriteLine();
+        Console.WriteLine("Arguments & Options:");
+        Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
+        Console.WriteLine("  --port <port>                        Listening port (default: 11434)");
+        Console.WriteLine("  --host <host>                        Listening host IP (default: 0.0.0.0)");
+        Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
+        Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
+        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  -h, --help                           Show this help message");
+        Console.WriteLine();
+        Console.WriteLine("HTTP API Endpoints:");
+        Console.WriteLine("  POST /api/generate                   Ollama generation (supports streaming ndjson & non-streaming)");
+        Console.WriteLine("  POST /api/chat                       Ollama multi-turn chat format");
+        Console.WriteLine("  GET  /api/tags                       Ollama model tags listing");
+        Console.WriteLine("  POST /v1/chat/completions            OpenAI-compatible chat completions");
+        Console.WriteLine("  GET  /v1/models                      OpenAI-compatible model list");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  glacier serve model.gguf                              # Listen on port 11434 (Ollama default)");
+        Console.WriteLine("  glacier serve model.gguf --port 8080 --host 127.0.0.1  # Bind to localhost:8080");
+        Console.WriteLine("  glacier serve model.gguf --device nvidia-rtx-4060 --engine baremetal");
     }
 
     private static int HandleUnknownCommand(string command)
@@ -100,6 +318,7 @@ public static class Program
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine($"Unknown command: '{command}'");
         Console.ResetColor();
+        Console.WriteLine();
         PrintHelp();
         return 1;
     }
@@ -109,13 +328,31 @@ public static class Program
     // =========================================================================
     private static int RunInspect(string[] args)
     {
-        if (args.Length == 0)
+        if (args.Length == 0 || HasHelpFlag(args))
         {
-            Console.WriteLine("Error: Model file path required. Example: glacier inspect model.gguf");
+            PrintInspectHelp();
+            return args.Length == 0 ? 1 : 0;
+        }
+
+        string? modelPath = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
+                modelPath = args[++i];
+            else if (!args[i].StartsWith("-") && modelPath == null)
+                modelPath = args[i];
+        }
+
+        if (string.IsNullOrEmpty(modelPath))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Error: Model file path required.");
+            Console.ResetColor();
+            Console.WriteLine();
+            PrintInspectHelp();
             return 1;
         }
 
-        string modelPath = args[0];
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine($"Inspecting model: {modelPath}");
         Console.ResetColor();
@@ -154,6 +391,12 @@ public static class Program
     // =========================================================================
     private static async Task<int> RunBenchAsync(string[] args)
     {
+        if (args.Length == 0 || HasHelpFlag(args))
+        {
+            PrintBenchHelp();
+            return args.Length == 0 ? 1 : 0;
+        }
+
         string? modelPath = null;
         int targetTokens = 25;
         string prompt = "Explain in two sentences what a CPU cache is.";
@@ -170,7 +413,7 @@ public static class Program
                 modelPath = args[++i];
             else if ((args[i] == "-n" || args[i] == "--tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int n))
                 targetTokens = n;
-            else if (args[i] == "--prompt" && i + 1 < args.Length)
+            else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
                 prompt = args[++i];
             else if (args[i] == "--compare-ollama" && i + 1 < args.Length)
                 compareOllamaUrl = args[++i];
@@ -190,7 +433,11 @@ public static class Program
 
         if (string.IsNullOrEmpty(modelPath))
         {
-            Console.WriteLine("Error: Model file path required. Example: glacier bench <model.gguf> or -m <model.gguf>");
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Error: Model file path required.");
+            Console.ResetColor();
+            Console.WriteLine();
+            PrintBenchHelp();
             return 1;
         }
 
@@ -351,11 +598,20 @@ public static class Program
     // =========================================================================
     private static async Task<int> RunChatAsync(string[] args)
     {
+        if (args.Length == 0 || HasHelpFlag(args))
+        {
+            PrintRunHelp();
+            return args.Length == 0 ? 1 : 0;
+        }
+
         string? modelPath = null;
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
         int maxSeqLen = 2048;
+        int maxTokens = 512;
+        float temperature = 0.7f;
+        float topP = 0.9f;
         var promptParts = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
@@ -370,6 +626,12 @@ public static class Program
                 kvPrecisionStr = args[++i];
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
+            else if ((args[i] == "-n" || args[i] == "--tokens" || args[i] == "--max-tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int tok))
+                maxTokens = tok;
+            else if ((args[i] == "--temp" || args[i] == "--temperature") && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float t))
+                temperature = t;
+            else if (args[i] == "--top-p" && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float p))
+                topP = p;
             else if (!args[i].StartsWith("-") && modelPath == null)
                 modelPath = args[i];
             else
@@ -380,7 +642,11 @@ public static class Program
 
         if (string.IsNullOrEmpty(modelPath))
         {
-            Console.WriteLine("Error: Model file path required. Example: glacier run <model.gguf> [prompt] or -m <model.gguf>");
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Error: Model file path required.");
+            Console.ResetColor();
+            Console.WriteLine();
+            PrintRunHelp();
             return 1;
         }
 
@@ -405,7 +671,7 @@ public static class Program
         using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
-        var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f, TopP = 0.9f };
+        var options = new SamplingOptions { MaxTokens = maxTokens, Temperature = temperature, TopP = topP };
 
         // Single-shot prompt mode
         if (!string.IsNullOrEmpty(initialPrompt))
@@ -464,22 +730,25 @@ public static class Program
     // =========================================================================
     private static async Task<int> RunServeAsync(string[] args)
     {
-        if (args.Length == 0)
+        if (args.Length == 0 || HasHelpFlag(args))
         {
-            Console.WriteLine("Error: Model file path required. Example: glacier serve model.gguf [--port 11434]");
-            return 1;
+            PrintServeHelp();
+            return args.Length == 0 ? 1 : 0;
         }
 
-        string modelPath = args[0];
+        string? modelPath = null;
         int port = 11434;
         string host = "0.0.0.0";
         string? device = null;
         string? engineStr = null;
+        string? kvPrecisionStr = null;
         int maxSeqLen = 2048;
 
-        for (int i = 1; i < args.Length; i++)
+        for (int i = 0; i < args.Length; i++)
         {
-            if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[++i], out int p))
+            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
+                modelPath = args[++i];
+            else if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[++i], out int p))
                 port = p;
             else if (args[i] == "--host" && i + 1 < args.Length)
                 host = args[++i];
@@ -487,8 +756,22 @@ public static class Program
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];
+            else if (args[i] == "--kv-precision" && i + 1 < args.Length)
+                kvPrecisionStr = args[++i];
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
+            else if (!args[i].StartsWith("-") && modelPath == null)
+                modelPath = args[i];
+        }
+
+        if (string.IsNullOrEmpty(modelPath))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Error: Model file path required.");
+            Console.ResetColor();
+            Console.WriteLine();
+            PrintServeHelp();
+            return 1;
         }
 
         InferenceEngineType engine = InferenceEngineType.Auto;
@@ -497,19 +780,26 @@ public static class Program
             engine = parsedEngine;
         }
 
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto;
+        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+        {
+            kvPrecision = parsedPrecision;
+        }
+
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine("=======================================================================");
         Console.WriteLine("            GLACIER.INFERENCE HIGH-PERFORMANCE HTTP SERVER            ");
         Console.WriteLine("        Ollama & OpenAI Compatible | Sub-100ms Cold Start | Pure C#    ");
         Console.WriteLine("=======================================================================");
         Console.ResetColor();
-        Console.WriteLine($"Model:       {Path.GetFileName(modelPath)}");
-        Console.WriteLine($"Endpoint:    http://{host}:{port}");
-        Console.WriteLine($"Context Len: {maxSeqLen}");
+        Console.WriteLine($"Model:        {Path.GetFileName(modelPath)}");
+        Console.WriteLine($"Endpoint:     http://{host}:{port}");
+        Console.WriteLine($"Context Len:  {maxSeqLen}");
+        Console.WriteLine($"KV Precision: {kvPrecision}");
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
-        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine);
+        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         var appBuilder = WebApplication.CreateBuilder();
@@ -659,6 +949,75 @@ public static class Program
             }
         }));
 
+        // 5. POST /api/chat (Ollama chat endpoint)
+        app.MapPost("/api/chat", async (HttpContext ctx) =>
+        {
+            var req = await ctx.Request.ReadFromJsonAsync<JsonElement>();
+            if (!req.TryGetProperty("messages", out var messages))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Messages array required.");
+                return;
+            }
+
+            bool stream = !req.TryGetProperty("stream", out var s) || s.GetBoolean();
+            var sb = new StringBuilder();
+            foreach (var m in messages.EnumerateArray())
+            {
+                string role = m.TryGetProperty("role", out var r) ? r.GetString() ?? "user" : "user";
+                string content = m.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
+                sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
+            }
+            sb.Append("<|im_start|>assistant\n");
+
+            var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f };
+
+            if (!stream)
+            {
+                var result = await session.GenerateAsync(sb.ToString(), options, formatChat: false);
+                var respObj = new
+                {
+                    model = modelName,
+                    created_at = DateTime.UtcNow.ToString("o"),
+                    message = new { role = "assistant", content = result.Text },
+                    done = true,
+                    total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
+                    prompt_eval_count = result.Metrics.PromptTokens,
+                    prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
+                    eval_count = result.Metrics.GeneratedTokens,
+                    eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                };
+                await ctx.Response.WriteAsJsonAsync(respObj);
+                return;
+            }
+
+            ctx.Response.ContentType = "application/x-ndjson";
+            var genResult = await session.GenerateAsync(sb.ToString(), options, formatChat: false, onToken: token =>
+            {
+                var chunk = new
+                {
+                    model = modelName,
+                    created_at = DateTime.UtcNow.ToString("o"),
+                    message = new { role = "assistant", content = token },
+                    done = false
+                };
+                string line = JsonSerializer.Serialize(chunk) + "\n";
+                ctx.Response.WriteAsync(line).GetAwaiter().GetResult();
+            });
+
+            var finalChunk = new
+            {
+                model = modelName,
+                created_at = DateTime.UtcNow.ToString("o"),
+                message = new { role = "assistant", content = "" },
+                done = true,
+                total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
+                eval_count = genResult.Metrics.GeneratedTokens,
+                eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
+            };
+            await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n");
+        });
+
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine($"\n>>> Glacier.Inference server running on http://{host}:{port}");
         Console.WriteLine("    Compatible with Ollama CLI, LangChain, AutoGen, and OpenAI SDKs!");
@@ -673,6 +1032,12 @@ public static class Program
     // =========================================================================
     private static int RunDevices(string[] args)
     {
+        if (HasHelpFlag(args))
+        {
+            PrintDevicesHelp();
+            return 0;
+        }
+
         var devices = DeviceManager.GetDevices();
         var (activeDevice, activeEngine) = GlacierSettings.ResolveTarget(null, null);
 
@@ -729,6 +1094,12 @@ public static class Program
     // =========================================================================
     private static int RunConfig(string[] args)
     {
+        if (HasHelpFlag(args))
+        {
+            PrintConfigHelp();
+            return 0;
+        }
+
         var settings = GlacierSettings.Load();
 
         if (args.Length == 0)

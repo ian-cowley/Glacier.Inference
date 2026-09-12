@@ -32,29 +32,59 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 
 ---
 
-## Quick Start (CLI)
+## CLI Usage & Complete Help System
+
+Glacier provides a full hierarchical `--help` system. You can view top-level help or deep contextual help for any individual command:
+
+```bash
+# Global overview of all commands & global flags
+glacier --help
+# Or: glacier -h, glacier help
+
+# Detailed help, argument descriptions, defaults, and examples for any subcommand:
+glacier devices --help     # (or: glacier help devices)
+glacier config  --help     # (or: glacier help config)
+glacier inspect --help     # (or: glacier help inspect)
+glacier bench   --help     # (or: glacier help bench)
+glacier run     --help     # (or: glacier help run)
+glacier serve   --help     # (or: glacier help serve)
+```
+
+### CLI Command Quick Reference
 
 ```bash
 # 1. Enumerate detected hardware accelerators and safe driver engines
 glacier devices
 
-# 2. Configure persistent device and engine preference
+# 2. Configure persistent device and engine preferences (~/.glacier/settings.json)
 glacier config --device nvidia-rtx-4060 --engine baremetal
 glacier config --device amd-890m --engine directml
+glacier config --reset
 
-# 3. Inspect any GGUF model
+# 3. Inspect any GGUF model architecture, metadata & tensors
 glacier inspect "path/to/model.gguf"
 
-# 4. Run interactive streaming chat
+# 4. Interactive streaming chat REPL or single-shot prompt
 glacier run "path/to/model.gguf"
+glacier run "path/to/model.gguf" "Explain quicksort in C#" --temp 0.2
+glacier run "path/to/model.gguf" --ctx 4096 --device nvidia-rtx-4060 --engine baremetal
 
-# 5. Benchmark generation throughput (with optional local/remote Ollama comparison)
+# 5. Benchmark generation throughput (with optional side-by-side Ollama comparison)
 glacier bench "path/to/model.gguf" --tokens 32
-glacier bench "path/to/model.gguf" --compare-ollama "http://127.0.0.1:11434"
+glacier bench "path/to/model.gguf" --compare-ollama "http://127.0.0.1:11434" --compare-model "qwen2.5:7b"
 
-# 6. Launch Ollama & OpenAI compatible HTTP server
+# 6. Launch Ollama & OpenAI compatible HTTP inference microservice
 glacier serve "path/to/model.gguf" --port 11434
+glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision fp8
 ```
+
+### Global Options (available across `bench`, `run`, `serve`):
+| Option | Description | Default |
+| :--- | :--- | :--- |
+| `--device <id\|name>` | Target GPU/CPU (e.g. `nvidia-rtx-4060`, `amd-890m`, `cpu`, `0`) | Auto-detect |
+| `--engine <baremetal\|directml\|cpu\|auto>` | Execution engine (`baremetal` for NVIDIA SASS, `directml` for AMD/Intel) | Auto-safe |
+| `--kv-precision <auto\|fp16\|fp8\|fp32>` | KV-cache precision (`auto` adapts to sequence length) | `auto` |
+| `-c, --ctx, --context-length <len>` | Maximum context sequence length | `2048` |
 
 ---
 
@@ -251,30 +281,98 @@ Glacier automatically scans physical compute hardware via Windows DXGI (`dxgi.dl
 
 ---
 
-## C# Library API
+## C# Library API Reference
+
+### 1. Hardware Enumeration & Device Discovery
+Query available GPUs, VRAM capacity, and safe driver engines dynamically in your application:
+
+```csharp
+using Glacier.Inference.Hardware;
+
+// Enumerate all physical GPUs, iGPUs, and CPUs
+IReadOnlyList<DeviceInfo> devices = DeviceManager.GetDevices();
+
+foreach (var dev in devices)
+{
+    Console.WriteLine($"Device: {dev.Name} (ID: {dev.Id})");
+    Console.WriteLine($"  Vendor:    {dev.Vendor}");
+    Console.WriteLine($"  VRAM:      {dev.DedicatedVramGb:F1} GB Dedicated | {dev.SharedVramGb:F1} GB Shared");
+    Console.WriteLine($"  Engines:   {string.Join(", ", dev.SupportedEngines)}");
+    Console.WriteLine($"  IsDisplay: {dev.IsPrimaryDisplay} (Safety: {dev.SafetyNotes})");
+}
+
+// Get system's optimal device automatically
+DeviceInfo optimal = DeviceManager.GetOptimalDevice();
+```
+
+### 2. Initializing an Inference Session
+Load and memory-map any GGUF model directly into GPU/CPU address space:
 
 ```csharp
 using Glacier.Inference.Engine;
-using Glacier.Inference.Hardware;
-using Glacier.Inference.Sampling;
+using Glacier.Inference.Memory;
 
-// 1. Initialize session with hardware-accelerated bare-metal engine
+// Initialize hardware-accelerated session
 using var session = new InferenceSession(
     modelPath: "models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
-    device: "nvidia-rtx-4060",
-    engine: InferenceEngineType.BareMetal);
+    maxSeqLen: 4096,                          // Context sequence limit
+    device: "nvidia-rtx-4060",                // Specific device ID or name (or null for auto)
+    engine: InferenceEngineType.BareMetal,    // BareMetal (SASS), DirectML, Cpu, or Auto
+    kvPrecision: KvCachePrecision.Auto);      // Auto, Fp16, Fp8, or Fp32
 
-// 2. Stream generation with live tokens
-var options = new SamplingOptions { Temperature = 0.7f, TopP = 0.95f, MaxTokens = 512 };
+Console.WriteLine($"Model loaded on: {session.ActiveDevice}");
+Console.WriteLine($"Active Engine:  {session.Engine}");
+```
+
+### 3. Streaming Real-Time Token Generation
+Stream generation tokens live to the console, UI, or WebSocket:
+
+```csharp
+using Glacier.Inference.Sampling;
+
+var options = new SamplingOptions
+{
+    MaxTokens = 512,
+    Temperature = 0.7f,
+    TopP = 0.95f,
+    TopK = 40,
+    RepeatPenalty = 1.1f
+};
 
 var result = await session.GenerateAsync(
-    prompt: "Explain in two sentences what a CPU cache is.",
+    prompt: "Explain the difference between stack and heap memory in C#.",
     options: options,
-    formatChat: true,
+    formatChat: true,                         // Applies model's native ChatML template
+    onToken: token => Console.Write(token));  // Invoked per-token in real time
+
+Console.WriteLine($"\nPrompt Rate:     {result.Metrics.PromptTokensPerSecond:F1} tok/s");
+Console.WriteLine($"Generation Rate: {result.Metrics.GenerationTokensPerSecond:F1} tok/s");
+Console.WriteLine($"Total Duration:  {result.Metrics.TotalDuration.TotalSeconds:F2} s");
+```
+
+### 4. Speculative Decoding (1.5x–3x Throughput Acceleration)
+Wraps any `InferenceSession` with batched verification:
+
+```csharp
+using Glacier.Inference.Engine;
+
+using var target = new InferenceSession("models/Qwen2.5-7B-Instruct-Q4_K_M.gguf");
+using var specEngine = new SpeculativeEngine(target); // Zero-cost PromptLookupDraftProvider
+
+var specOptions = new SpeculativeOptions
+{
+    MaxDraftTokens = 4,                       // Draft up to 4 candidate tokens per verification step
+    MaxTokens = 512,
+    Temperature = 0.7f
+};
+
+var specResult = await specEngine.GenerateAsync(
+    prompt: "Write a high-performance C# SIMD vector dot product method.",
+    options: specOptions,
     onToken: piece => Console.Write(piece));
 
-Console.WriteLine($"\nThroughput: {result.Metrics.GenerationTokensPerSecond:F1} tokens/sec");
-Console.WriteLine($"Total Time: {result.Metrics.TotalDuration.TotalSeconds:F2} s");
+Console.WriteLine($"\nEffective Rate: {specResult.Metrics.GenerationTokensPerSecond:F1} tok/s");
+Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRate * 100:F1}%");
 ```
 
 ---
