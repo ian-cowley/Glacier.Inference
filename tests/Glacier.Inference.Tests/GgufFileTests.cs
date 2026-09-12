@@ -7,7 +7,7 @@ using Xunit;
 
 public class GgufFileTests
 {
-    private const string LocalQwenPath = @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
+    private static readonly string LocalQwenPath = CudaFactAttribute.ModelPath;
 
     [Fact]
     public void Open_ParsesHeaderAndMetadata_WhenFileExists()

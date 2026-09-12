@@ -80,7 +80,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public DeviceInfo Device { get; }
     public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
-    public bool IsGpuAccelerated => _gpuModel != null;
+    public bool IsGpuAccelerated => _gpuModel != null || (Engine == InferenceEngineType.DirectML && Device.Vendor != GpuVendor.Cpu);
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
     public Qwen2Model? CpuModel => _cpuModel;
@@ -129,10 +129,16 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
         else if (targetEngine == InferenceEngineType.DirectML)
         {
-            // DirectML cooperative execution path
+            // DirectML cooperative execution path for AMD Ryzen iGPUs, Intel Arc/Xe, and NVIDIA GPUs
+            bool dmlAvail = OperatingSystem.IsWindows() &&
+                            NativeLibrary.TryLoad("DirectML.dll", out IntPtr hDml) && hDml != IntPtr.Zero &&
+                            NativeLibrary.TryLoad("d3d12.dll", out IntPtr hD3d) && hD3d != IntPtr.Zero;
+
             _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = $"{targetDevice.Name} [Engine: DirectML / DX12 Compute]";
+            ActiveDevice = dmlAvail
+                ? $"{targetDevice.Name} [Engine: DirectML / DX12 Compute]"
+                : $"{targetDevice.Name} [Engine: SIMD Fallback (DirectML unavailable)]";
         }
         else
         {

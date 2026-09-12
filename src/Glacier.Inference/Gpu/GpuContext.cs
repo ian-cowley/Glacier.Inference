@@ -14,6 +14,8 @@ public sealed class GpuContext : IDisposable
     public string DeviceName { get; }
     public ulong TotalVramBytes { get; }
     public int DeviceOrdinal { get; }
+    public (int Major, int Minor) ComputeCapability { get; }
+    public string ArchString { get; }
     public IntPtr Handle => _ctx;
 
     public static bool IsSupported
@@ -45,6 +47,16 @@ public sealed class GpuContext : IDisposable
         DeviceOrdinal = Math.Clamp(deviceOrdinal, 0, count - 1);
         CuDriver.Check(CuDriver.DeviceGet(out int dev, DeviceOrdinal), "cuDeviceGet");
         DeviceName = CuDriver.GetDeviceName(dev);
+
+        int major = 8, minor = 6;
+        if (CuDriver.DeviceGetAttribute(out int maj, CuDriver.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == 0 &&
+            CuDriver.DeviceGetAttribute(out int min, CuDriver.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == 0)
+        {
+            major = maj;
+            minor = min;
+        }
+        ComputeCapability = (major, minor);
+        ArchString = $"sm_{major}{minor}";
 
         CuDriver.Check(CuDriver.DeviceTotalMem(out nuint totalBytes, dev), "cuDeviceTotalMem");
         TotalVramBytes = (ulong)totalBytes;

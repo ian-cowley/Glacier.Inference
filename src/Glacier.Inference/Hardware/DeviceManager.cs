@@ -29,14 +29,28 @@ public static class DeviceManager
                 return dev;
         }
 
-        // 2. Prefer any discrete or integrated GPU with DirectML
+        // 2. Prefer AMD GPU (Ryzen iGPU or Radeon dGPU)
         foreach (var dev in list)
         {
-            if (dev.Vendor is GpuVendor.Amd or GpuVendor.Intel or GpuVendor.Nvidia)
+            if (dev.Vendor == GpuVendor.Amd)
                 return dev;
         }
 
-        // 3. Fall back to Host CPU
+        // 3. Prefer Intel GPU (Arc discrete or Core Ultra Xe integrated)
+        foreach (var dev in list)
+        {
+            if (dev.Vendor == GpuVendor.Intel)
+                return dev;
+        }
+
+        // 4. Prefer any other GPU
+        foreach (var dev in list)
+        {
+            if (dev.Vendor is not GpuVendor.Cpu)
+                return dev;
+        }
+
+        // 5. Fall back to Host CPU
         return list[^1];
     }
 
@@ -87,17 +101,22 @@ public static class DeviceManager
         }
 
         // Vendor keyword shortcuts
-        if (q is "nvidia" or "rtx" or "cuda" or "baremetal" or "sass")
+        if (q is "nvidia" or "geforce" or "rtx" or "gtx" or "cuda" or "baremetal" or "sass")
         {
             foreach (var dev in list)
                 if (dev.Vendor == GpuVendor.Nvidia) return dev;
         }
-        if (q is "amd" or "radeon" or "890m")
+        if (q is "amd" or "radeon" or "rdna" or "890m" or "880m" or "780m" or "760m" or "680m" or "660m" or "apu" or "igpu" or "rx")
         {
             foreach (var dev in list)
                 if (dev.Vendor == GpuVendor.Amd) return dev;
         }
-        if (q is "cpu" or "host" or "simd")
+        if (q is "intel" or "arc" or "xe" or "iris" or "uhd" or "battlemage" or "alchemist")
+        {
+            foreach (var dev in list)
+                if (dev.Vendor == GpuVendor.Intel) return dev;
+        }
+        if (q is "cpu" or "host" or "simd" or "ryzen" or "core")
         {
             foreach (var dev in list)
                 if (dev.Vendor == GpuVendor.Cpu) return dev;
@@ -181,22 +200,32 @@ public static class DeviceManager
                                     supportedEngines.Add(InferenceEngineType.BareMetal);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : InferenceEngineType.DirectML;
-                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime (~43 t/s on 7B). DirectML also supported.";
+                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime. DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {
-                                // Display iGPU: DirectML is cooperative with Windows DWM; avoids uncooperative TDR timeouts
+                                bool hipAvail = OperatingSystem.IsWindows() &&
+                                                NativeLibrary.TryLoad("amdhip64.dll", out IntPtr hHip) &&
+                                                hHip != IntPtr.Zero;
+                                if (hipAvail)
+                                    supportedEngines.Add(InferenceEngineType.BareMetal);
+                                supportedEngines.Add(InferenceEngineType.DirectML);
+                                recommendedEngine = isDisplay ? InferenceEngineType.DirectML : (hipAvail ? InferenceEngineType.BareMetal : InferenceEngineType.DirectML);
+                                safetyNotes = isDisplay
+                                    ? "AMD Radeon / Ryzen iGPU: DirectML / DX12 engine cooperates with Windows DWM across unified system RAM."
+                                    : (hipAvail ? "AMD Radeon dGPU: Bare-Metal ROCm/HIP (amdhip64.dll) and DirectML both supported." : "AMD Radeon dGPU: DirectML / DX12 Compute engine supported.");
+                            }
+                            else if (vendor == GpuVendor.Intel)
+                            {
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = isDisplay
-                                    ? "Display iGPU: DirectML / DX12 engine cooperates with Windows DWM, eliminating TDR driver timeouts."
-                                    : "DirectML / DX12 Compute engine supported. Direct access to high-bandwidth memory.";
+                                safetyNotes = "Intel Arc / Core Ultra Xe GPU: DirectML / DX12 Compute engine supported.";
                             }
                             else
                             {
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = "DirectML / DirectX 12 Compute engine supported.";
+                                safetyNotes = "DirectML / DX12 Compute engine supported.";
                             }
 
                             results.Add(new DeviceInfo
@@ -231,9 +260,25 @@ public static class DeviceManager
 
     private static DeviceInfo GetHostCpuDevice(int index)
     {
-        string cpuName = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "Host CPU";
-        if (cpuName.Length > 40)
-            cpuName = "AMD Ryzen AI 9 HX 370"; // Clean brand name for primary target
+        string cpuName = "Host CPU";
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+                var val = key?.GetValue("ProcessorNameString") as string;
+                if (!string.IsNullOrWhiteSpace(val))
+                    cpuName = val.Trim();
+            }
+            catch
+            {
+                // Fallback if registry read fails
+            }
+        }
+        if (cpuName == "Host CPU")
+        {
+            cpuName = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "Host CPU";
+        }
 
         ulong totalRam = GetPhysicalMemoryBytes();
         string simdSupport = Vector512.IsHardwareAccelerated ? "AVX-512" : (Vector256.IsHardwareAccelerated ? "AVX2" : "SIMD");
@@ -258,22 +303,55 @@ public static class DeviceManager
         string clean = description.ToLowerInvariant();
         if (vendor == GpuVendor.Nvidia)
         {
-            if (clean.Contains("4060")) return "nvidia-rtx-4060";
-            if (clean.Contains("4070")) return "nvidia-rtx-4070";
-            if (clean.Contains("4080")) return "nvidia-rtx-4080";
+            if (clean.Contains("5090")) return "nvidia-rtx-5090";
+            if (clean.Contains("5080")) return "nvidia-rtx-5080";
+            if (clean.Contains("5070")) return "nvidia-rtx-5070";
             if (clean.Contains("4090")) return "nvidia-rtx-4090";
+            if (clean.Contains("4080")) return "nvidia-rtx-4080";
+            if (clean.Contains("4070")) return "nvidia-rtx-4070";
+            if (clean.Contains("4060")) return "nvidia-rtx-4060";
+            if (clean.Contains("4050")) return "nvidia-rtx-4050";
+            if (clean.Contains("3090")) return "nvidia-rtx-3090";
+            if (clean.Contains("3080")) return "nvidia-rtx-3080";
+            if (clean.Contains("3070")) return "nvidia-rtx-3070";
             if (clean.Contains("3060")) return "nvidia-rtx-3060";
+            if (clean.Contains("3050")) return "nvidia-rtx-3050";
+            if (clean.Contains("2080")) return "nvidia-rtx-2080";
+            if (clean.Contains("2070")) return "nvidia-rtx-2070";
+            if (clean.Contains("2060")) return "nvidia-rtx-2060";
+            if (clean.Contains("1660")) return "nvidia-gtx-1660";
+            if (clean.Contains("1650")) return "nvidia-gtx-1650";
             return $"nvidia-gpu-{index}";
         }
         if (vendor == GpuVendor.Amd)
         {
             if (clean.Contains("890m")) return "amd-890m";
+            if (clean.Contains("880m")) return "amd-880m";
             if (clean.Contains("780m")) return "amd-780m";
+            if (clean.Contains("760m")) return "amd-760m";
+            if (clean.Contains("680m")) return "amd-680m";
+            if (clean.Contains("660m")) return "amd-660m";
+            if (clean.Contains("7900")) return "amd-rx-7900";
+            if (clean.Contains("7800")) return "amd-rx-7800";
+            if (clean.Contains("7700")) return "amd-rx-7700";
+            if (clean.Contains("7600")) return "amd-rx-7600";
+            if (clean.Contains("6900") || clean.Contains("6800")) return "amd-rx-6800";
+            if (clean.Contains("6700") || clean.Contains("6600")) return "amd-rx-6600";
+            if (clean.Contains("radeon") && (clean.Contains("graphics") || clean.Contains("tm"))) return "amd-radeon-graphics";
             return $"amd-gpu-{index}";
         }
         if (vendor == GpuVendor.Intel)
         {
+            if (clean.Contains("b580")) return "intel-arc-b580";
+            if (clean.Contains("b570")) return "intel-arc-b570";
+            if (clean.Contains("a770")) return "intel-arc-a770";
+            if (clean.Contains("a750")) return "intel-arc-a750";
+            if (clean.Contains("a580")) return "intel-arc-a580";
+            if (clean.Contains("a380")) return "intel-arc-a380";
             if (clean.Contains("arc")) return "intel-arc";
+            if (clean.Contains("iris")) return "intel-iris";
+            if (clean.Contains("uhd")) return "intel-uhd";
+            if (clean.Contains("xe")) return "intel-xe";
             return $"intel-gpu-{index}";
         }
         return $"gpu-{index}";

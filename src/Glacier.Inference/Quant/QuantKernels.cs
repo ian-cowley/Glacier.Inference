@@ -524,22 +524,44 @@ public static unsafe class QuantKernels
     public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows)
     {
         int rowBytes = (int)GgufTypes.GetRowBytes(type, nCols);
+        int threads = Environment.ProcessorCount;
 
-        Parallel.For(0, nRows, i =>
+        if (nRows < threads * 2)
         {
-            byte* rowPtr = weightData + (long)i * rowBytes;
-            float dot = type switch
+            for (int i = 0; i < nRows; i++)
             {
-                GgufType.Q4_K => VecDotQ4_K((BlockQ4_K*)rowPtr, x, nCols),
-                GgufType.Q6_K => VecDotQ6_K((BlockQ6_K*)rowPtr, x, nCols),
-                GgufType.Q8_0 => VecDotQ8_0((BlockQ8_0*)rowPtr, x, nCols),
-                GgufType.Q4_0 => VecDotQ4_0((BlockQ4_0*)rowPtr, x, nCols),
-                GgufType.F16 => VecDotF16((Half*)rowPtr, x, nCols),
-                GgufType.F32 => VecDotF32((float*)rowPtr, x, nCols),
-                _ => throw new NotSupportedException($"Quantization type {type} is not supported in hardware GEMV kernels.")
-            };
-            y[i] = dot;
+                byte* rowPtr = weightData + (long)i * rowBytes;
+                y[i] = ComputeDot(type, rowPtr, x, nCols);
+            }
+            return;
+        }
+
+        int rowsPerThread = (nRows + threads - 1) / threads;
+        Parallel.For(0, threads, t =>
+        {
+            int startRow = t * rowsPerThread;
+            int endRow = Math.Min(startRow + rowsPerThread, nRows);
+            for (int i = startRow; i < endRow; i++)
+            {
+                byte* rowPtr = weightData + (long)i * rowBytes;
+                y[i] = ComputeDot(type, rowPtr, x, nCols);
+            }
         });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float ComputeDot(GgufType type, byte* rowPtr, float* x, int nCols)
+    {
+        return type switch
+        {
+            GgufType.Q4_K => VecDotQ4_K((BlockQ4_K*)rowPtr, x, nCols),
+            GgufType.Q6_K => VecDotQ6_K((BlockQ6_K*)rowPtr, x, nCols),
+            GgufType.Q8_0 => VecDotQ8_0((BlockQ8_0*)rowPtr, x, nCols),
+            GgufType.Q4_0 => VecDotQ4_0((BlockQ4_0*)rowPtr, x, nCols),
+            GgufType.F16 => VecDotF16((Half*)rowPtr, x, nCols),
+            GgufType.F32 => VecDotF32((float*)rowPtr, x, nCols),
+            _ => throw new NotSupportedException($"Quantization type {type} is not supported in hardware GEMV kernels.")
+        };
     }
 
     /// <summary>

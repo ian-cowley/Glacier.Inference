@@ -16,6 +16,9 @@ public static class CuDriver
     public const uint CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
     public const uint CU_MEMHOSTALLOC_WRITECOMBINED = 0x04;
 
+    public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
+    public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+
     static CuDriver()
     {
         NativeLibrary.SetDllImportResolver(typeof(CuDriver).Assembly, (libraryName, assembly, searchPath) =>
@@ -70,6 +73,9 @@ public static class CuDriver
 
     [DllImport(CudaLib, EntryPoint = "cuDeviceGetName")]
     public static extern int DeviceGetName(byte[] name, int len, int dev);
+
+    [DllImport(CudaLib, EntryPoint = "cuDeviceGetAttribute")]
+    public static extern int DeviceGetAttribute(out int pi, int attrib, int dev);
 
     [DllImport(CudaLib, EntryPoint = "cuDeviceTotalMem_v2")]
     public static extern int DeviceTotalMem(out nuint bytes, int dev);

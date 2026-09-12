@@ -172,9 +172,9 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             KvPrecision = kvPrecision;
         }
 
-        // 1. Load compiled CUBIN kernel module
-        byte[] cubin = KernelCompiler.GetOrCompileKernels("sm_89");
-        CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), "cuModuleLoadData(kernels.cubin)");
+        // 1. Load compiled CUBIN kernel module for target GPU architecture
+        byte[] cubin = KernelCompiler.GetOrCompileKernels(_gpu.ArchString);
+        CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), $"cuModuleLoadData(kernels.cubin, {_gpu.ArchString})");
 
         // 2. Retrieve kernel function handles (using fast vectorized kernels)
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");

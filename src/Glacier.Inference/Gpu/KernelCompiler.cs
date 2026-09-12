@@ -13,7 +13,7 @@ public static class KernelCompiler
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Glacier", "Inference", "Kernels");
 
-    public static byte[] GetOrCompileKernels(string targetArch = "sm_89")
+    public static byte[] GetOrCompileKernels(string targetArch = "auto")
     {
         Directory.CreateDirectory(CacheDir);
         string cachedPath = Path.Combine(CacheDir, $"kernels_{targetArch}.cubin");
@@ -23,10 +23,10 @@ public static class KernelCompiler
             return File.ReadAllBytes(cachedPath);
         }
 
-        // Try to load embedded resource if matches sm_89
+        // 1. Try to load embedded universal fatbinary resource (supports sm_75, sm_80, sm_86, sm_89, sm_90, and PTX compute_75)
         var asm = Assembly.GetExecutingAssembly();
         using var stream = asm.GetManifestResourceStream("Glacier.Inference.Gpu.Kernels.kernels.cubin");
-        if (stream != null && targetArch == "sm_89")
+        if (stream != null)
         {
             using var ms = new MemoryStream();
             stream.CopyTo(ms);
@@ -35,7 +35,7 @@ public static class KernelCompiler
             return bytes;
         }
 
-        // Check for local file next to source if running from development
+        // 2. Check for local file next to source if running from development
         string localSourceCubin = Path.Combine(AppContext.BaseDirectory, "Gpu", "Kernels", "kernels.cubin");
         if (File.Exists(localSourceCubin))
         {

@@ -236,8 +236,8 @@ public static class Program
         if (!string.IsNullOrEmpty(compareOllamaUrl))
         {
             bool isLocalOllama = compareOllamaUrl.Contains("localhost") || compareOllamaUrl.Contains("127.0.0.1");
-            string targetOllamaModel = compareModel ?? (isLocalOllama ? "qwen-7b" : "qwen2.5:7b-instruct-32k");
-            string hardwareLabel = isLocalOllama ? "Same RTX 4060 GPU" : "Remote GPU";
+            string targetOllamaModel = compareModel ?? "qwen2.5:7b-instruct-32k";
+            string hardwareLabel = isLocalOllama ? $"Same {session.Device.Name}" : "Remote GPU";
 
             Console.WriteLine($"\n>> Querying Ollama Benchmark ({compareOllamaUrl} | Model: {targetOllamaModel})...");
             try
