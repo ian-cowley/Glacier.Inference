@@ -83,6 +83,7 @@ public static class Program
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto safe selection)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>    KV-cache precision (default: auto adaptive)");
+        Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
         Console.WriteLine();
         Console.WriteLine("Options for 'bench':");
         Console.WriteLine("  --tokens <n>                         Number of tokens to generate (default: 32)");
@@ -161,6 +162,7 @@ public static class Program
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
+        int maxSeqLen = 2048;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -180,6 +182,8 @@ public static class Program
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
                 kvPrecisionStr = args[++i];
+            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+                maxSeqLen = cLen;
             else if (!args[i].StartsWith("-") && modelPath == null)
                 modelPath = args[i];
         }
@@ -210,6 +214,7 @@ public static class Program
         Console.WriteLine($"Model:        {Path.GetFileName(modelPath)}");
         Console.WriteLine($"Tokens:       {targetTokens}");
         Console.WriteLine($"Prompt:       \"{prompt}\"");
+        Console.WriteLine($"Context Len:  {maxSeqLen}");
         Console.WriteLine($"KV Precision: {kvPrecision}");
         if (!string.IsNullOrEmpty(compareOllamaUrl))
             Console.WriteLine($"Comparative:  Ollama at {compareOllamaUrl}");
@@ -217,7 +222,7 @@ public static class Program
 
         Console.WriteLine(">> Loading model into zero-copy virtual address space...");
         var loadSw = Stopwatch.StartNew();
-        using var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device, engine: engine, kvPrecision: kvPrecision);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
         loadSw.Stop();
         Console.WriteLine($"   Cold load completed in: {loadSw.ElapsedMilliseconds} ms ({loadSw.Elapsed.TotalSeconds:F2} s)");
         Console.WriteLine($"   Execution Device: {session.ActiveDevice}");
@@ -350,6 +355,7 @@ public static class Program
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
+        int maxSeqLen = 2048;
         var promptParts = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
@@ -362,6 +368,8 @@ public static class Program
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
                 kvPrecisionStr = args[++i];
+            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+                maxSeqLen = cLen;
             else if (!args[i].StartsWith("-") && modelPath == null)
                 modelPath = args[i];
             else
@@ -394,7 +402,7 @@ public static class Program
         Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference...");
         Console.ResetColor();
 
-        using var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device, engine: engine, kvPrecision: kvPrecision);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
         var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f, TopP = 0.9f };
@@ -467,6 +475,7 @@ public static class Program
         string host = "0.0.0.0";
         string? device = null;
         string? engineStr = null;
+        int maxSeqLen = 2048;
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -478,6 +487,8 @@ public static class Program
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];
+            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+                maxSeqLen = cLen;
         }
 
         InferenceEngineType engine = InferenceEngineType.Auto;
@@ -494,10 +505,11 @@ public static class Program
         Console.ResetColor();
         Console.WriteLine($"Model:       {Path.GetFileName(modelPath)}");
         Console.WriteLine($"Endpoint:    http://{host}:{port}");
+        Console.WriteLine($"Context Len: {maxSeqLen}");
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
-        var session = new InferenceSession(modelPath, maxSeqLen: 4096, device: device, engine: engine);
+        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine);
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         var appBuilder = WebApplication.CreateBuilder();

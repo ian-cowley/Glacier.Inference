@@ -328,4 +328,74 @@ __global__ void gemm_q4_k_swiglu_batch(
     }
 }
 
+// =========================================================================
+// 12. Batched GEMV/GEMM Q8_0 for Prompt Prefill Acceleration
+// Model weights W are read from VRAM ONCE!
+// Warp-cooperative register-tiled accumulation: STACK: 0, 100% occupancy
+// =========================================================================
+__global__ void gemm_q8_0_batch(
+    float* __restrict__ Y,          // [batch_size, m_rows]
+    const float* __restrict__ X,    // [batch_size, k_cols]
+    const BlockQ8_0* __restrict__ W,// [m_rows, k_cols / 32]
+    int k_cols,
+    int m_rows,
+    int batch_size,
+    const float* __restrict__ bias,     // optional [m_rows]
+    float* __restrict__ residual    // optional [batch_size, m_rows]
+) {
+    int warp_id = threadIdx.x / WARP_SIZE; // 0..3
+    int lane_id = threadIdx.x % WARP_SIZE; // 0..31
+    int row = blockIdx.x * 4 + warp_id;
+
+    if (row >= m_rows) return;
+
+    int nb = k_cols / QK8_0;
+    const BlockQ8_0* row_w = W + (size_t)row * nb;
+
+    for (int tile = 0; tile < 4; tile++) {
+        int t_base = tile * 8;
+        if (t_base >= batch_size) break;
+
+        float acc[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            acc[i] = 0.0f;
+        }
+
+        for (int b = 0; b < nb; b++) {
+            const BlockQ8_0* blk = &row_w[b];
+            float d = __half2float(blk->d);
+            float q = (float)blk->qs[lane_id];
+            float w_val = d * q;
+
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int t = t_base + i;
+                if (t < batch_size) {
+                    float x_val = X[(size_t)t * k_cols + b * QK8_0 + lane_id];
+                    acc[i] += w_val * x_val;
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int t = t_base + i;
+            if (t < batch_size) {
+                float sum = warp_reduce_sum(acc[i]);
+                if (lane_id == 0) {
+                    size_t out_idx = (size_t)t * m_rows + row;
+                    if (bias != nullptr) sum += bias[row];
+                    if (residual != nullptr) {
+                        residual[out_idx] += sum;
+                    }
+                    if (Y != nullptr) {
+                        Y[out_idx] = sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // extern "C"

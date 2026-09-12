@@ -74,6 +74,7 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
     private ID3D12RootSignature _sigGemv = null!;
     private ID3D12PipelineState _psoGemvQ4K = null!;
     private ID3D12PipelineState _psoGemvQ6K = null!;
+    private ID3D12PipelineState _psoGemvQ8_0 = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
 
     private ID3D12RootSignature _sigRmsNorm = null!;
@@ -101,6 +102,7 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
     private ID3D12RootSignature _sigGemmBatch = null!;
     private ID3D12PipelineState _psoGemmQ4KBatch = null!;
     private ID3D12PipelineState _psoGemmQ6KBatch = null!;
+    private ID3D12PipelineState _psoGemmQ8_0Batch = null!;
     private ID3D12PipelineState _psoGemmFp32Batch = null!;
 
     private ID3D12RootSignature _sigRmsNormBatch = null!;
@@ -201,6 +203,7 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         _sigGemv = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemvParams));
         _psoGemvQ4K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ4K));
         _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
+        _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
 
         // 2. RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
@@ -294,6 +297,7 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         _sigGemmBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemmBatchParams));
         _psoGemmQ4KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ4KBatch));
         _psoGemmQ6KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
+        _psoGemmQ8_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ8_0Batch));
         _psoGemmFp32Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmFp32Batch));
 
         // 10. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
@@ -413,14 +417,58 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         return aligned;
     }
 
+    private static byte[] AlignQ8_0(ReadOnlySpan<byte> rawQ8_0, int totalBlocks)
+    {
+        byte[] aligned = GC.AllocateUninitializedArray<byte>(totalBlocks * 36);
+        fixed (byte* pSrc = rawQ8_0, pDst = aligned)
+        {
+            nint srcAddr = (nint)pSrc;
+            nint dstAddr = (nint)pDst;
+            int numThreads = Math.Max(1, Environment.ProcessorCount);
+            int chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+            Parallel.For(0, numThreads, t =>
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, totalBlocks);
+                byte* pS = (byte*)srcAddr;
+                byte* pD = (byte*)dstAddr;
+                for (int b = start; b < end; b++)
+                {
+                    byte* srcBlk = pS + (long)b * 34;
+                    byte* dstBlk = pD + (long)b * 36;
+                    *(ushort*)dstBlk = *(ushort*)srcBlk;
+                    dstBlk[2] = 0;
+                    dstBlk[3] = 0;
+                    Buffer.MemoryCopy(srcBlk + 2, dstBlk + 4, 32, 32);
+                }
+            });
+        }
+        return aligned;
+    }
+
     private ID3D12Resource UploadTensor(GgufType type, IntPtr pData, int rows, int cols)
     {
+        if (type != GgufType.Q4_K && type != GgufType.Q6_K && type != GgufType.Q8_0 && type != GgufType.F32 && type != GgufType.F16)
+        {
+            throw new NotSupportedException($"Direct3D 12 compute engine does not yet support tensor quantization type {type}. Supported GPU types: Q4_K, Q6_K, Q8_0, F32, F16.");
+        }
+
         if (type == GgufType.Q6_K)
         {
             int nb = cols / 256;
             int totalBlocks = rows * nb;
             ReadOnlySpan<byte> raw = new ReadOnlySpan<byte>((void*)pData, totalBlocks * 210);
             byte[] aligned = AlignQ6K(raw, totalBlocks);
+            var buf = _ctx.CreateDeviceBuffer((ulong)aligned.Length);
+            _ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        else if (type == GgufType.Q8_0)
+        {
+            int nb = cols / 32;
+            int totalBlocks = rows * nb;
+            ReadOnlySpan<byte> raw = new ReadOnlySpan<byte>((void*)pData, totalBlocks * 34);
+            byte[] aligned = AlignQ8_0(raw, totalBlocks);
             var buf = _ctx.CreateDeviceBuffer((ulong)aligned.Length);
             _ctx.CopyToDevice(buf, aligned);
             return buf;
@@ -550,7 +598,9 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         {
             GgufType.Q4_K => _psoGemvQ4K,
             GgufType.Q6_K => _psoGemvQ6K,
-            _ => _psoGemvFp32
+            GgufType.Q8_0 => _psoGemvQ8_0,
+            GgufType.F32 => _psoGemvFp32,
+            _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
         };
         cmdList.SetPipelineState(pso);
 
@@ -668,8 +718,12 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
             cmdList.SetPipelineState(_psoGemmQ4KBatch);
         else if (type == GgufType.Q6_K)
             cmdList.SetPipelineState(_psoGemmQ6KBatch);
-        else
+        else if (type == GgufType.Q8_0)
+            cmdList.SetPipelineState(_psoGemmQ8_0Batch);
+        else if (type == GgufType.F32)
             cmdList.SetPipelineState(_psoGemmFp32Batch);
+        else
+            throw new NotSupportedException($"Direct3D 12 batch GEMM does not support tensor quantization type {type}.");
 
         uint* pConsts = stackalloc uint[6];
         pConsts[0] = (uint)kCols;
@@ -1089,11 +1143,13 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
 
             _psoGemvQ4K?.Dispose();
             _psoGemvQ6K?.Dispose();
+            _psoGemvQ8_0?.Dispose();
             _psoGemvFp32?.Dispose();
             _sigGemv?.Dispose();
 
             _psoGemmQ4KBatch?.Dispose();
             _psoGemmQ6KBatch?.Dispose();
+            _psoGemmQ8_0Batch?.Dispose();
             _psoGemmFp32Batch?.Dispose();
             _sigGemmBatch?.Dispose();
 

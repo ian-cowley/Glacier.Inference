@@ -12,9 +12,9 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 
 ## Features
 
-- **Pure C# Bare-Metal SASS Engine (NVIDIA)**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`).
+- **Pure C# Bare-Metal SASS Engine (NVIDIA)**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`). Supports `Q4_K`, `Q6_K`, `Q8_0`, `FP16`, and `FP32`.
 - **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets and full 32-token GEMM tiling for robust prompt prefill.
-- **Bare-Metal Direct3D 12 Compute Engine (AMD / Intel)**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) and Intel Arc GPUs. Features register-tiled Batched GEMM (Q4_K, Q6_K), 128-bit vectorization, L1 cache SRV routing, and zero-allocation persistent buffers delivering up to 35+ tok/s generation and up to 216 tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
+- **Bare-Metal Direct3D 12 Compute Engine (AMD / Intel)**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) and Intel Arc GPUs. Features register-tiled Batched GEMM (`Q4_K`, `Q6_K`, `Q8_0`), 128-bit vectorization, 36-byte aligned `ByteAddressBuffer` routing, and zero-allocation persistent buffers delivering up to 35+ tok/s generation and up to 216 tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
 - **Speculative Decoding Engine (1.5x–3x Throughput Acceleration)**: Seamless assisted generation via `PromptLookupDraftProvider` (sub-microsecond n-gram matching with 0 extra VRAM) and `ModelDraftProvider`, coordinated with GPU batched verification (`VerifyBatch`) evaluating all candidates in a single pass over weights.
 - **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
 - **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via pure DXGI P/Invoke.
@@ -122,6 +122,16 @@ glacier serve "path/to/model.gguf" --port 11434
 | **Generation Rate** | **11.33 tokens/sec** | ~10 – 12 tokens/sec | Full 7B Q4_K_M autoregressive SASS |
 | **Total Response Time** | 🟩 **2.39 seconds** | 3.5 – 5.0+ seconds | 🟩 **Sub-2.5s end-to-end response** |
 | **Display / DWM Safety** | 🟩 **100% Cooperative D3D12** | Risk of TDR timeouts on display | 🟩 **Zero desktop stutter or driver resets** |
+
+### Benchmark 5: Enterprise Post-Trained Developer Model (7B Q8_0 High-Precision, 7.54 GB)
+> **Model**: `Qwen2.5-Coder-7B-Enterprise-GGUF` (`qwen2.5-coder-7b-enterprise-q8_0.gguf`, 7.54 GB). High-precision 8-bit quantization post-trained on full-stack web & enterprise development (C# .NET 10, ASP.NET Core, ADO.NET `Microsoft.Data.SqlClient`, HTML5, CSS, JS, SQL Server).
+> **Prompt**: *"Explain in two sentences what a CPU cache is."* (30 tokens prefill, 25 tokens output).
+
+| Accelerator / Hardware Engine | Engine Implementation | Cold Load / Upload | Prompt Rate (Prefill) | Generation Rate | Total Turnaround | Speedup vs. CPU SIMD |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **NVIDIA GeForce RTX 4060 Laptop GPU** | **Pure C# Bare-Metal SASS (`nvcuda.dll`)** | **2.42 – 5.74 s** | **26.67 tok/s** (1.12 s) | **28.43 tok/s** (0.88 s) | **2.00 s** | 🟩 **11.2x Faster Generation (9.7x Wall Clock)** |
+| **AMD Radeon 890M Graphics (iGPU)** | **Direct3D 12 Compute (HLSL Wave32)** | **4.51 – 7.86 s** | **15.37 tok/s** (1.95 s) | **6.77 tok/s** (3.69 s) | **5.64 s** | 🟩 **2.7x Faster Generation (3.4x Wall Clock)** |
+| **AMD Ryzen AI 9 HX 370 (24 Threads)** | **SIMD AVX-512 / AVX2 Hardware Intrinsics** | **0.66 s (Zero-Copy MMap)** | **3.15 tok/s** (9.53 s) | **2.54 tok/s** (9.83 s) | **19.36 s** | **1.0x Baseline** |
 
 ### 💡 Why Glacier is Faster & Deep-Dive Architecture
 

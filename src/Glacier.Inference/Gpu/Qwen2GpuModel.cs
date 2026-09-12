@@ -57,6 +57,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _module;
     private IntPtr _fnGemvQ4K;
     private IntPtr _fnGemvQ6K;
+    private IntPtr _fnGemvQ8_0;
     private IntPtr _fnSwigluFused;
     private IntPtr _fnRmsNorm;
     private IntPtr _fnSwiglu;
@@ -74,6 +75,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     public const int MaxBatchSize = 32;
     private IntPtr _fnGemmQ4KBatch;
     private IntPtr _fnGemmQ6KBatch;
+    private IntPtr _fnGemmQ8_0Batch;
     private IntPtr _fnGemmSwigluBatch;
     private IntPtr _fnRmsNormBatch;
     private IntPtr _fnAddBiasBatch;
@@ -179,6 +181,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         // 2. Retrieve kernel function handles (using fast vectorized kernels)
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
@@ -195,6 +198,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         // 2b. Retrieve batched prefill kernels
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBiasBatch, _module, "add_bias_batch"), "ModuleGetFunction(add_bias_batch)");
@@ -829,6 +833,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         {
             GgufType.Q4_K => _fnGemvQ4K,
             GgufType.Q6_K => _fnGemvQ6K,
+            GgufType.Q8_0 => _fnGemvQ8_0,
             _ => throw new NotSupportedException($"GPU GEMV does not support type {type}")
         };
 
@@ -972,6 +977,7 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         {
             GgufType.Q4_K => _fnGemmQ4KBatch,
             GgufType.Q6_K => _fnGemmQ6KBatch,
+            GgufType.Q8_0 => _fnGemmQ8_0Batch,
             _ => throw new NotSupportedException($"GPU batch GEMM does not support type {type}")
         };
 

@@ -440,4 +440,66 @@ __global__ void gemv_q6_k_fast(
     }
 }
 
+// =========================================================================
+// 3. GEMV Q8_0: Matrix-Vector Multiplication (y = W * x)
+// Each warp of 32 threads computes 1 row of output y
+// Lane_id (0..31) loads exactly 1 signed byte from qs and 1 float from x
+// =========================================================================
+__global__ void gemv_q8_0(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const BlockQ8_0* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE; // 0..31
+
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols / QK8_0;
+    const BlockQ8_0* row_w = W + (size_t)warp_id * nb;
+    float row_sum = 0.0f;
+
+    int b = 0;
+    for (; b + 1 < nb; b += 2) {
+        const BlockQ8_0* blk0 = &row_w[b];
+        const BlockQ8_0* blk1 = &row_w[b + 1];
+
+        float d0 = __half2float(blk0->d);
+        float d1 = __half2float(blk1->d);
+
+        float q0 = (float)blk0->qs[lane_id];
+        float q1 = (float)blk1->qs[lane_id];
+
+        float x0 = x[b * QK8_0 + lane_id];
+        float x1 = x[(b + 1) * QK8_0 + lane_id];
+
+        row_sum += d0 * (q0 * x0) + d1 * (q1 * x1);
+    }
+    if (b < nb) {
+        const BlockQ8_0* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        float q = (float)blk->qs[lane_id];
+        float xv = x[b * QK8_0 + lane_id];
+        row_sum += d * (q * xv);
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+
+    if (lane_id == 0) {
+        if (bias != nullptr) {
+            row_sum += bias[warp_id];
+        }
+        if (residual != nullptr) {
+            residual[warp_id] += row_sum;
+        }
+        if (y != nullptr) {
+            y[warp_id] = row_sum;
+        }
+    }
+}
+
 } // extern "C"
