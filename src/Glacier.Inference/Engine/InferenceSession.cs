@@ -59,7 +59,7 @@ public sealed record GenerationResult
 /// High-performance LLM generation session managing KV cache, model forward passes, and token streaming.
 /// Supports both Bare-Metal GPU execution on NVIDIA GPUs and multi-threaded SIMD CPU fallback.
 /// </summary>
-public sealed class InferenceSession : IDisposable
+public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 {
     private readonly GgufFile _gguf;
     private readonly ModelWeights _weights;
@@ -82,6 +82,9 @@ public sealed class InferenceSession : IDisposable
     public string ActiveDevice { get; }
     public bool IsGpuAccelerated => _gpuModel != null;
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
+    public Qwen2GpuModel? GpuModel => _gpuModel;
+    public Qwen2Model? CpuModel => _cpuModel;
+    public int MaxSeqLen => _maxSeqLen;
 
     public InferenceSession(
         string modelPath,
@@ -217,8 +220,10 @@ public sealed class InferenceSession : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
-            // Sample next token
-            int nextToken = _sampler.Sample(_logits.AsSpan(), options, CollectionsMarshal.AsSpan(recentTokens));
+            // Sample next token (pure GPU reduction in ~3 us for GPU model; CPU sampler for CPU model)
+            int nextToken = (_gpuModel != null && step > 0)
+                ? _gpuModel.SampleToken(options, CollectionsMarshal.AsSpan(recentTokens))
+                : _sampler.Sample(_logits.AsSpan(), options, CollectionsMarshal.AsSpan(recentTokens));
             recentTokens.Add(nextToken);
 
             // Check for stop tokens
@@ -262,12 +267,75 @@ public sealed class InferenceSession : IDisposable
         };
     }
 
+    /// <summary>
+    /// Resets the key-value cache.
+    /// </summary>
+    public void ResetKvCache()
+    {
+        _kvCache?.Reset();
+    }
+
+    /// <summary>
+    /// Evaluates prompt tokens and computes initial logits.
+    /// </summary>
+    public void Prefill(ReadOnlySpan<int> promptTokens)
+    {
+        if (promptTokens.IsEmpty) return;
+        ResetKvCache();
+
+        if (_gpuModel != null)
+        {
+            _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
+        }
+        else
+        {
+            for (int i = 0; i < promptTokens.Length - 1; i++)
+            {
+                ForwardToken(promptTokens[i], i, computeLogits: false);
+            }
+            ForwardToken(promptTokens[^1], promptTokens.Length - 1, computeLogits: true);
+        }
+    }
+
+    /// <summary>
+    /// Samples the next token using the active sampler or GPU reduction kernel.
+    /// </summary>
+    public int SampleNextToken(SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
+    {
+        return _gpuModel != null
+            ? _gpuModel.SampleToken(options, recentTokens)
+            : _sampler.Sample(_logits.AsSpan(), options, recentTokens);
+    }
+
+    /// <summary>
+    /// Executes batched candidate token verification.
+    /// In GPU mode, evaluates all candidate positions in a single batched transformer pass.
+    /// In CPU mode, verifies candidates with cached attention.
+    /// </summary>
+    public void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens)
+    {
+        if (tokens.IsEmpty) return;
+
+        if (_gpuModel != null)
+        {
+            _gpuModel.VerifyBatch(tokens, startPos, predictedTokens);
+        }
+        else
+        {
+            for (int t = 0; t < tokens.Length; t++)
+            {
+                ForwardToken(tokens[t], startPos + t, computeLogits: true);
+                predictedTokens[t] = _sampler.Sample(_logits.AsSpan(), SamplingOptions.Greedy);
+            }
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ForwardToken(int token, int pos, bool computeLogits)
+    public void ForwardToken(int token, int pos, bool computeLogits)
     {
         if (_gpuModel != null)
         {
-            _gpuModel.Forward(token, pos, null, _logits.AsSpan(), computeLogits);
+            _gpuModel.Forward(token, pos, null, Span<float>.Empty, computeLogits);
         }
         else
         {

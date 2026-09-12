@@ -96,6 +96,21 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<|endoftext|>");
     }
 
+    public BpeTokenizer(IEnumerable<string> vocab, int eosTokenId = 151643, int bosTokenId = 151644)
+    {
+        EosTokenId = eosTokenId;
+        BosTokenId = bosTokenId;
+        PadTokenId = bosTokenId;
+
+        var tokenList = new List<string>(vocab);
+        _idToToken = tokenList.ToArray();
+        for (int i = 0; i < tokenList.Count; i++)
+        {
+            _tokenToId[tokenList[i]] = i;
+            _specialTokens[tokenList[i]] = i;
+        }
+    }
+
     private void RegisterSpecialToken(string token)
     {
         if (_tokenToId.TryGetValue(token, out int id))

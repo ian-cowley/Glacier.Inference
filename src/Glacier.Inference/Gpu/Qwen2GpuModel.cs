@@ -85,6 +85,8 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _fnAttentionGqaBatch;
     private IntPtr _fnAttentionGqaBatchF16;
     private IntPtr _fnAttentionGqaBatchFp8;
+    private IntPtr _fnArgmax;
+    private IntPtr _fnRepetitionPenalty;
 
     public KvCachePrecision KvPrecision { get; }
 
@@ -114,6 +116,11 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
     private IntPtr _dFfnOut;
     private IntPtr _dLogits;
     private IntPtr _dScoresBuf;
+    private IntPtr _dBestToken;
+    private IntPtr _dBestLogit;
+    private IntPtr _dRecentTokens;
+    private float[]? _hostLogits;
+    private readonly Sampling.Sampler _sampler = new();
 
     // GPU VRAM Batch Scratch Buffers
     private IntPtr _dXBatch;
@@ -199,6 +206,8 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchF16, _module, "attention_gqa_batch_f16"), "ModuleGetFunction(attention_gqa_batch_f16)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchFp8, _module, "attention_gqa_batch_fp8"), "ModuleGetFunction(attention_gqa_batch_fp8)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnArgmax, _module, "argmax_kernel"), "ModuleGetFunction(argmax_kernel)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRepetitionPenalty, _module, "apply_repetition_penalty_kernel"), "ModuleGetFunction(apply_repetition_penalty_kernel)");
 
         // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
         CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
@@ -221,6 +230,9 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
         _dFfnOut = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dLogits = _gpu.AllocateDevice((nuint)(_weights.VocabSize * sizeof(float)));
         _dScoresBuf = _gpu.AllocateDevice((nuint)((long)_nHeads * _maxSeqLen * sizeof(float)));
+        _dBestToken = _gpu.AllocateDevice((nuint)sizeof(int));
+        _dBestLogit = _gpu.AllocateDevice((nuint)sizeof(float));
+        _dRecentTokens = _gpu.AllocateDevice((nuint)(1024 * sizeof(int)));
 
         // 3b. Allocate GPU VRAM batch scratch buffers (prefill batch <= 32)
         _dXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
@@ -423,10 +435,13 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             // Output projection (LM Head) on GPU
             LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
 
-            // Copy logits from GPU to CPU
-            fixed (float* pLogits = logits)
+            // Copy logits from GPU to CPU (skipped when logits buffer is empty for pure GPU sampling)
+            if (!logits.IsEmpty)
             {
-                _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                fixed (float* pLogits = logits)
+                {
+                    _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                }
             }
         }
     }
@@ -449,6 +464,108 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
                 isLastChunk && computeLogits);
             offset += batchSize;
         }
+    }
+
+    /// <summary>
+    /// Executes batched speculative verification directly on GPU.
+    /// Evaluates all candidate tokens in a single batched transformer pass,
+    /// computes LM Head and fast GPU argmax for each position,
+    /// and writes the predicted next token for each candidate position.
+    /// </summary>
+    public void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens)
+    {
+        int batchSize = tokens.Length;
+        if (batchSize == 0) return;
+        if (batchSize > MaxBatchSize)
+            throw new ArgumentException($"Batch size {batchSize} exceeds MaxBatchSize {MaxBatchSize}");
+
+        // Forward through all transformer layers in batch
+        ForwardBatchChunk(tokens, startPos, Span<float>.Empty, computeLogits: false);
+
+        // For each token position in the batch, compute RMSNorm + LM Head + GPU argmax
+        for (int t = 0; t < batchSize; t++)
+        {
+            IntPtr dXt = _dXBatch + t * _dim * sizeof(float);
+            LaunchRmsNorm(dXt, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+            predictedTokens[t] = SampleGreedy();
+        }
+    }
+
+    /// <summary>
+    /// Executes fast GPU argmax reduction directly across the 152K vocab logits in ~3 microseconds.
+    /// Transfers only 4 bytes (the sampled token ID) across PCIe, bypassing 608 KB host copies.
+    /// </summary>
+    public int SampleGreedy(ReadOnlySpan<int> recentTokens = default, float repetitionPenalty = 1.0f)
+    {
+        IntPtr dLogits = _dLogits;
+        IntPtr dBestToken = _dBestToken;
+        IntPtr dBestLogit = _dBestLogit;
+        IntPtr dRecentTokens = _dRecentTokens;
+
+        if (repetitionPenalty != 1.0f && !recentTokens.IsEmpty)
+        {
+            int count = Math.Min(recentTokens.Length, 1024);
+            fixed (int* pRecent = recentTokens)
+            {
+                _gpu.CopyToDevice(dRecentTokens, (IntPtr)pRecent, (nuint)(count * sizeof(int)));
+            }
+
+            void** pPenArgs = stackalloc void*[4];
+            pPenArgs[0] = &dLogits;
+            pPenArgs[1] = &dRecentTokens;
+            pPenArgs[2] = &count;
+            pPenArgs[3] = &repetitionPenalty;
+
+            uint blockSize = 64;
+            uint gridSize = (uint)((count + (int)blockSize - 1) / (int)blockSize);
+
+            CuDriver.Check(CuDriver.LaunchKernel(
+                _fnRepetitionPenalty,
+                gridSize, 1, 1,
+                blockSize, 1, 1,
+                0, IntPtr.Zero,
+                (IntPtr)pPenArgs,
+                IntPtr.Zero), "LaunchKernel(apply_repetition_penalty)");
+        }
+
+        int vocabSize = _weights.VocabSize;
+        void** pArgs = stackalloc void*[4];
+        pArgs[0] = &dLogits;
+        pArgs[1] = &vocabSize;
+        pArgs[2] = &dBestToken;
+        pArgs[3] = &dBestLogit;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnArgmax,
+            1, 1, 1,
+            512, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(argmax)");
+
+        int bestToken = 0;
+        _gpu.CopyToHost((IntPtr)(&bestToken), dBestToken, (nuint)sizeof(int));
+        return bestToken;
+    }
+
+    /// <summary>
+    /// Samples next token with support for greedy GPU reduction and CPU temperature / top-P sampling.
+    /// </summary>
+    public int SampleToken(Sampling.SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
+    {
+        if (options.Temperature <= 0.001f || options.TopK == 1)
+        {
+            return SampleGreedy(recentTokens, options.RepetitionPenalty);
+        }
+
+        _hostLogits ??= new float[_weights.VocabSize];
+        fixed (float* pLogits = _hostLogits)
+        {
+            _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+        }
+
+        return _sampler.Sample(_hostLogits.AsSpan(), options, recentTokens);
     }
 
     private void ForwardBatchChunk(ReadOnlySpan<int> chunkTokens, int chunkStartPos, Span<float> logits, bool computeLogits)
@@ -1078,6 +1195,9 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
             _gpu.FreeDevice(_dFfnOut);
             _gpu.FreeDevice(_dLogits);
             _gpu.FreeDevice(_dScoresBuf);
+            _gpu.FreeDevice(_dBestToken);
+            _gpu.FreeDevice(_dBestLogit);
+            _gpu.FreeDevice(_dRecentTokens);
             _gpu.FreeDevice(_dOutNormWeight);
             _gpu.FreeDevice(_dOutWeight);
 

@@ -44,6 +44,48 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_max_128(float val, float* s_warp_mem) {
+    val = warp_reduce_max(val);
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (lane_id == 0) {
+        s_warp_mem[warp_id] = val;
+    }
+    __syncthreads();
+    float block_max = (threadIdx.x < 4) ? s_warp_mem[threadIdx.x] : -1e30f;
+    block_max = warp_reduce_max(block_max);
+    if (threadIdx.x == 0) {
+        s_warp_mem[0] = block_max;
+    }
+    __syncthreads();
+    return s_warp_mem[0];
+}
+
+__device__ __forceinline__ float block_reduce_sum_128(float val, float* s_warp_mem) {
+    val = warp_reduce_sum(val);
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (lane_id == 0) {
+        s_warp_mem[warp_id] = val;
+    }
+    __syncthreads();
+    float block_sum = (threadIdx.x < 4) ? s_warp_mem[threadIdx.x] : 0.0f;
+    block_sum = warp_reduce_sum(block_sum);
+    if (threadIdx.x == 0) {
+        s_warp_mem[0] = block_sum;
+    }
+    __syncthreads();
+    return s_warp_mem[0];
+}
+
 extern "C" {
 
 // =========================================================================
@@ -652,16 +694,21 @@ __global__ void attention_gqa_kernel(
     int h_kv = h / group_size;
 
     float q_d = q[h * head_dim + tid];
-    float* head_scores = scores_buf + (size_t)h * max_seq_len;
 
     __shared__ float s_warp_sum[4];
 
-    // 1. Compute dot product scores with all past tokens t = 0..pos
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    // Single fused pass over past tokens t = 0..pos
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = k_cache[kv_offset];
-        float prod = q_d * k_d;
+        float v_d = v_cache[kv_offset];
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -671,43 +718,22 @@ __global__ void attention_gqa_kernel(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        // Numerically stable online softmax update
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    // 2. Softmax over t = 0..pos
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * v_cache[kv_offset];
-    }
-
-    attn_out[h * head_dim + tid] = out_d;
+    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -784,16 +810,20 @@ __global__ void attention_gqa_f16(
     int h_kv = h / group_size;
 
     float q_d = q[h * head_dim + tid];
-    float* head_scores = scores_buf + (size_t)h * max_seq_len;
 
     __shared__ float s_warp_sum[4];
 
-    // 1. Compute dot product scores with all past tokens t = 0..pos
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = __half2float(k_cache[kv_offset]);
-        float prod = q_d * k_d;
+        float v_d = __half2float(v_cache[kv_offset]);
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -803,43 +833,21 @@ __global__ void attention_gqa_f16(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    // 2. Softmax over t = 0..pos
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * __half2float(v_cache[kv_offset]);
-    }
-
-    attn_out[h * head_dim + tid] = out_d;
+    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -866,16 +874,20 @@ __global__ void attention_gqa_fp8(
     int h_kv = h / group_size;
 
     float q_d = q[h * head_dim + tid];
-    float* head_scores = scores_buf + (size_t)h * max_seq_len;
 
     __shared__ float s_warp_sum[4];
 
-    // 1. Compute dot product scores with all past tokens t = 0..pos
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = float(k_cache[kv_offset]);
-        float prod = q_d * k_d;
+        float v_d = float(v_cache[kv_offset]);
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -885,43 +897,21 @@ __global__ void attention_gqa_fp8(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    // 2. Softmax over t = 0..pos
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * float(v_cache[kv_offset]);
-    }
-
-    attn_out[h * head_dim + tid] = out_d;
+    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -956,16 +946,20 @@ __global__ void attention_gqa_batch(
 
     size_t q_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
     float q_d = q_batch[q_offset];
-    float* head_scores = scores_buf + ((size_t)b * n_heads_q + h) * max_seq_len;
 
     __shared__ float s_warp_sum[4];
 
-    // 1. Compute dot product scores with all past tokens t = 0..pos
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = k_cache[kv_offset];
-        float prod = q_d * k_d;
+        float v_d = v_cache[kv_offset];
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -975,44 +969,22 @@ __global__ void attention_gqa_batch(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    // 2. Softmax over t = 0..pos
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    // 3. Aggregate values: out[d] = sum_{t=0..pos} (score[t] * V[t, d])
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * v_cache[kv_offset];
-    }
-
     size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
-    attn_out_batch[out_offset] = out_d;
+    attn_out_batch[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -1043,15 +1015,20 @@ __global__ void attention_gqa_batch_f16(
 
     size_t q_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
     float q_d = q_batch[q_offset];
-    float* head_scores = scores_buf + ((size_t)b * n_heads_q + h) * max_seq_len;
 
     __shared__ float s_warp_sum[4];
+
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
 
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = __half2float(k_cache[kv_offset]);
-        float prod = q_d * k_d;
+        float v_d = __half2float(v_cache[kv_offset]);
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -1061,42 +1038,22 @@ __global__ void attention_gqa_batch_f16(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * __half2float(v_cache[kv_offset]);
-    }
-
     size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
-    attn_out_batch[out_offset] = out_d;
+    attn_out_batch[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -1127,15 +1084,20 @@ __global__ void attention_gqa_batch_fp8(
 
     size_t q_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
     float q_d = q_batch[q_offset];
-    float* head_scores = scores_buf + ((size_t)b * n_heads_q + h) * max_seq_len;
 
     __shared__ float s_warp_sum[4];
+
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
 
     for (int t = 0; t <= pos; t++) {
         size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
         float k_d = float(k_cache[kv_offset]);
-        float prod = q_d * k_d;
+        float v_d = float(v_cache[kv_offset]);
 
+        float prod = q_d * k_d;
         prod = warp_reduce_sum(prod);
         int warp_id = tid / WARP_SIZE;
         int lane_id = tid % WARP_SIZE;
@@ -1145,42 +1107,22 @@ __global__ void attention_gqa_batch_fp8(
         }
         __syncthreads();
 
-        if (tid == 0) {
-            float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
-            head_scores[t] = total_dot * attn_scale;
-        }
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
         __syncthreads();
     }
 
-    if (tid == 0) {
-        float max_s = head_scores[0];
-        for (int t = 1; t <= pos; t++) {
-            if (head_scores[t] > max_s) max_s = head_scores[t];
-        }
-
-        float sum_exp = 0.0f;
-        for (int t = 0; t <= pos; t++) {
-            float exp_val = expf(head_scores[t] - max_s);
-            head_scores[t] = exp_val;
-            sum_exp += exp_val;
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        for (int t = 0; t <= pos; t++) {
-            head_scores[t] *= inv_sum;
-        }
-    }
-    __syncthreads();
-
-    float out_d = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-        float w = head_scores[t];
-        size_t kv_offset = ((size_t)h_kv * max_seq_len + t) * head_dim + tid;
-        out_d += w * float(v_cache[kv_offset]);
-    }
-
     size_t out_offset = (size_t)b * n_heads_q * head_dim + h * head_dim + tid;
-    attn_out_batch[out_offset] = out_d;
+    attn_out_batch[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
 // =========================================================================
@@ -1663,6 +1605,93 @@ __global__ void kv_cache_store_batch_fp8(
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = __nv_fp8_e4m3(k[idx]);
     v_cache[offset] = __nv_fp8_e4m3(v[idx]);
+}
+
+// =========================================================================
+// 18. GPU Argmax Reduction Kernel
+// Finds the token ID with the maximum logit across the entire vocabulary.
+// Runs in ~3 microseconds, completely eliminating 608 KB DtoH PCIe transfers!
+// =========================================================================
+__global__ void argmax_kernel(
+    const float* __restrict__ logits,
+    int vocab_size,
+    int* __restrict__ out_best_token,
+    float* __restrict__ out_best_logit
+) {
+    int tid = threadIdx.x; // 0..511 (512 threads)
+    float best_val = -1e30f;
+    int best_idx = -1;
+
+    // Grid-stride loop over vocab_size
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        float v = logits[i];
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        float other_val = __shfl_down_sync(0xffffffff, best_val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    __shared__ float s_max_val[16]; // 512 / 32 = 16 warps
+    __shared__ int s_max_idx[16];
+
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    if (lane_id == 0) {
+        s_max_val[warp_id] = best_val;
+        s_max_idx[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    // First warp reduces the 16 warp winners
+    if (warp_id == 0) {
+        float val = (lane_id < 16) ? s_max_val[lane_id] : -1e30f;
+        int idx = (lane_id < 16) ? s_max_idx[lane_id] : -1;
+
+        #pragma unroll
+        for (int offset = 8; offset > 0; offset /= 2) {
+            float other_val = __shfl_down_sync(0xffffffff, val, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, idx, offset);
+            if (other_val > val) {
+                val = other_val;
+                idx = other_idx;
+            }
+        }
+
+        if (lane_id == 0) {
+            if (out_best_token != nullptr) *out_best_token = idx;
+            if (out_best_logit != nullptr) *out_best_logit = val;
+        }
+    }
+}
+
+// =========================================================================
+// 19. Apply Repetition Penalty Directly on GPU Logits
+// =========================================================================
+__global__ void apply_repetition_penalty_kernel(
+    float* __restrict__ logits,
+    const int* __restrict__ recent_tokens,
+    int count,
+    float penalty
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    int tid = recent_tokens[idx];
+    if (tid >= 0) {
+        float val = logits[tid];
+        logits[tid] = (val > 0.0f) ? (val / penalty) : (val * penalty);
+    }
 }
 
 } // extern "C"
