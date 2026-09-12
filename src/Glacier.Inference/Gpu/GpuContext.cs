@@ -22,6 +22,7 @@ public sealed class GpuContext : IDisposable
         {
             try
             {
+                if (!CuDriver.IsAvailable()) return false;
                 int init = CuDriver.Init(0);
                 if (init != 0) return false;
                 int countRes = CuDriver.DeviceGetCount(out int count);

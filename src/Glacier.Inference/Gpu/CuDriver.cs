@@ -16,6 +16,46 @@ public static class CuDriver
     public const uint CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
     public const uint CU_MEMHOSTALLOC_WRITECOMBINED = 0x04;
 
+    static CuDriver()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(CuDriver).Assembly, (libraryName, assembly, searchPath) =>
+        {
+            if (libraryName == CudaLib)
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    if (NativeLibrary.TryLoad("nvcuda.dll", assembly, searchPath, out IntPtr handle))
+                        return handle;
+                }
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                {
+                    if (NativeLibrary.TryLoad("libcuda.so.1", assembly, searchPath, out IntPtr handle) ||
+                        NativeLibrary.TryLoad("libcuda.so", assembly, searchPath, out handle))
+                        return handle;
+                }
+            }
+            return IntPtr.Zero;
+        });
+    }
+
+    private static readonly Lazy<bool> _isAvailable = new(() =>
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                return NativeLibrary.TryLoad("nvcuda.dll", out IntPtr handle) && handle != IntPtr.Zero;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                return (NativeLibrary.TryLoad("libcuda.so.1", out IntPtr handle) || NativeLibrary.TryLoad("libcuda.so", out handle)) && handle != IntPtr.Zero;
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    });
+
+    public static bool IsAvailable() => _isAvailable.Value;
+
     [DllImport(CudaLib, EntryPoint = "cuInit")]
     public static extern int Init(uint flags);
 

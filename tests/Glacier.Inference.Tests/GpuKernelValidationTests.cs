@@ -20,7 +20,7 @@ public unsafe class GpuKernelValidationTests
         _output = output;
     }
 
-    [Fact]
+    [CudaFact]
     public void InspectLayer0TypesAndCompareCpuVsGpu()
     {
         if (!File.Exists(ModelPath))
@@ -238,7 +238,7 @@ public unsafe class GpuKernelValidationTests
         gpu.FreeDevice(dNormOut);
     }
 
-    [Fact]
+    [CudaFact]
     public void TestGemvQ4KAligned()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -372,7 +372,7 @@ public unsafe class GpuKernelValidationTests
         gpu.FreeDevice(dWStd); gpu.FreeDevice(dWQs); gpu.FreeDevice(dWScales);
     }
 
-    [Fact]
+    [CudaFact]
     public void TestGemvFastKernels()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -548,7 +548,7 @@ public unsafe class GpuKernelValidationTests
         gpu.FreeDevice(dGate); gpu.FreeDevice(dUp); gpu.FreeDevice(dYFused); gpu.FreeDevice(dGateOut); gpu.FreeDevice(dUpOut);
     }
 
-    [Fact]
+    [CudaFact]
     public void TestBatchedKernels()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -660,7 +660,7 @@ public unsafe class GpuKernelValidationTests
         gpu.FreeDevice(dXBatch); gpu.FreeDevice(dYSeq); gpu.FreeDevice(dYBatch); gpu.FreeDevice(dW);
     }
 
-    [Fact]
+    [CudaFact]
     public void ProfileForwardBreakdown()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -701,7 +701,7 @@ public unsafe class GpuKernelValidationTests
         _output.WriteLine($"[Profile] Total: {msTotal:F2} ms ({1000.0/msTotal:F1} t/s) | 28 Layers: {msLayers:F2} ms ({1000.0/msLayers:F1} t/s) | LM Head: {msLmHead:F2} ms");
     }
 
-    [Fact]
+    [CudaFact]
     public void DiagnoseLayerByLayer()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -866,7 +866,7 @@ public unsafe class GpuKernelValidationTests
         _output.WriteLine($"Step 3 [FFN Down GEMV] MaxDiff: {ffnDiff:F6}");
     }
 
-    [Fact]
+    [CudaFact]
     public void TestForwardPassCpuVsGpu()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported)
@@ -928,7 +928,7 @@ public unsafe class GpuKernelValidationTests
         _output.WriteLine($"Max Logits Diff: {maxDiff:F4}");
     }
 
-    [Fact]
+    [CudaFact]
     public void TestBatchedPromptPrefillVsSequential()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported)
@@ -1007,7 +1007,7 @@ public unsafe class GpuKernelValidationTests
         Assert.True(maxDiff < 0.01f, $"Max diff between batched and sequential prefill too high: {maxDiff}");
     }
 
-    [Fact]
+    [CudaFact]
     public void ProfileForwardPassBreakdown()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
@@ -1059,7 +1059,7 @@ public unsafe class GpuKernelValidationTests
         CuDriver.EventDestroy(evEnd);
     }
 
-    [Fact]
+    [CudaFact]
     public void ProfileBatchedPrefill()
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
