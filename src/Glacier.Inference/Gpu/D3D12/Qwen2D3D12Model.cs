@@ -10,54 +10,10 @@ using Vortice.Direct3D;
 using Vortice.Direct3D12;
 
 /// <summary>
-/// Direct3D 12 GPU transformer layer weights residing in high-speed GPU device memory.
-/// </summary>
-public sealed class D3D12LayerWeights : IDisposable
-{
-    public required ID3D12Resource AttnNormWeight { get; init; }
-    public required ID3D12Resource QWeight { get; init; }
-    public ID3D12Resource? QBias { get; init; }
-    public required ID3D12Resource KWeight { get; init; }
-    public ID3D12Resource? KBias { get; init; }
-    public required ID3D12Resource VWeight { get; init; }
-    public ID3D12Resource? VBias { get; init; }
-    public required ID3D12Resource AttnOutWeight { get; init; }
-
-    public required ID3D12Resource FfnNormWeight { get; init; }
-    public required ID3D12Resource FfnGateWeight { get; init; }
-    public required ID3D12Resource FfnUpWeight { get; init; }
-    public required ID3D12Resource FfnDownWeight { get; init; }
-
-    public required GgufType QType { get; init; }
-    public required GgufType KType { get; init; }
-    public required GgufType VType { get; init; }
-    public required GgufType AttnOutType { get; init; }
-    public required GgufType FfnGateType { get; init; }
-    public required GgufType FfnUpType { get; init; }
-    public required GgufType FfnDownType { get; init; }
-
-    public void Dispose()
-    {
-        AttnNormWeight?.Dispose();
-        QWeight?.Dispose();
-        QBias?.Dispose();
-        KWeight?.Dispose();
-        KBias?.Dispose();
-        VWeight?.Dispose();
-        VBias?.Dispose();
-        AttnOutWeight?.Dispose();
-        FfnNormWeight?.Dispose();
-        FfnGateWeight?.Dispose();
-        FfnUpWeight?.Dispose();
-        FfnDownWeight?.Dispose();
-    }
-}
-
-/// <summary>
 /// Bare-metal Direct3D 12 Compute transformer runtime for Qwen2 / Qwen2.5 models.
 /// Executes directly on AMD Radeon (Wave32 RDNA 2/3/3.5) and DirectX 12 hardware with zero external C++ DLL dependencies.
 /// </summary>
-public sealed unsafe class Qwen2D3D12Model : IDisposable
+public sealed unsafe partial class Qwen2D3D12Model : IDisposable
 {
     private readonly D3D12Context _ctx;
     private readonly ModelWeights _weights;
@@ -73,18 +29,26 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
     // Pipelines & Root Signatures
     private ID3D12RootSignature _sigGemv = null!;
     private ID3D12PipelineState _psoGemvQ4K = null!;
+    private ID3D12PipelineState _psoGemvQ5K = null!;
     private ID3D12PipelineState _psoGemvQ6K = null!;
+    private ID3D12PipelineState _psoGemvQ3K = null!;
     private ID3D12PipelineState _psoGemvQ8_0 = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
 
     private ID3D12RootSignature _sigRmsNorm = null!;
     private ID3D12PipelineState _psoRmsNorm = null!;
 
+    private ID3D12RootSignature _sigRmsNormHeads = null!;
+    private ID3D12PipelineState _psoRmsNormHeads = null!;
+
     private ID3D12RootSignature _sigSwiglu = null!;
     private ID3D12PipelineState _psoSwiglu = null!;
 
     private ID3D12RootSignature _sigVecAdd = null!;
     private ID3D12PipelineState _psoVecAdd = null!;
+
+    private ID3D12RootSignature _sigVecAddWeighted = null!;
+    private ID3D12PipelineState _psoVecAddWeighted = null!;
 
     private ID3D12RootSignature _sigRope = null!;
     private ID3D12PipelineState _psoRope = null!;
@@ -130,6 +94,19 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
     private ID3D12Resource _dLogits = null!;
     private ID3D12Resource _dBestToken = null!;
     private ID3D12Resource _dBestLogit = null!;
+
+    // MoE Scratch Buffers
+    private ID3D12Resource? _dRouterLogits;
+    private ID3D12Resource? _readbackRouterLogits;
+    private float* _pReadbackRouterLogits;
+    private ID3D12Resource? _dExpertGate;
+    private ID3D12Resource? _dExpertUp;
+    private ID3D12Resource? _dExpertAct;
+    private ID3D12Resource? _dExpertDownOut;
+    private ID3D12Resource? _dFfnOut;
+    private ID3D12Resource? _dShexpGate;
+    private ID3D12Resource? _dShexpUp;
+    private ID3D12Resource? _dShexpAct;
 
     // Batched GPU Scratch Buffers
     private ID3D12Resource _dXBatch = null!;
@@ -188,164 +165,6 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         UploadWeights();
     }
 
-    private void InitPipelines()
-    {
-        // 1. GEMV Root Signature: (Params b0, W t0, bias t1, x u0, residual u1, y u2)
-        var gemvParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 5), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
-        };
-        _sigGemv = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemvParams));
-        _psoGemvQ4K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ4K));
-        _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
-        _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
-        _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
-
-        // 2. RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
-        var rmsParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 2), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
-        };
-        _sigRmsNorm = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, rmsParams));
-        _psoRmsNorm = _ctx.CreatePipelineState(_sigRmsNorm, _ctx.CompileShader(D3D12Shaders.RmsNorm));
-
-        // 3. SwiGLU Root Signature: (Params b0, gate u0, up u1, dst u2)
-        var swigluParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 1), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
-        };
-        _sigSwiglu = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, swigluParams));
-        _psoSwiglu = _ctx.CreatePipelineState(_sigSwiglu, _ctx.CompileShader(D3D12Shaders.SwiGLU));
-
-        // 4. VecAdd Root Signature: (Params b0, b u0, a u1)
-        var vecAddParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 1), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
-        };
-        _sigVecAdd = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, vecAddParams));
-        _psoVecAdd = _ctx.CreatePipelineState(_sigVecAdd, _ctx.CompileShader(D3D12Shaders.VecAdd));
-
-        // 5. RoPE Root Signature: (Params b0, q u0, k u1)
-        var ropeParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
-        };
-        _sigRope = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, ropeParams));
-        _psoRope = _ctx.CreatePipelineState(_sigRope, _ctx.CompileShader(D3D12Shaders.RoPE));
-
-        // 6. KvStore Root Signature: (Params b0, k u0, v u1, k_cache u2, v_cache u3)
-        var kvStoreParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 4), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
-        };
-        _sigKvStore = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreParams));
-        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(D3D12Shaders.KvCacheStore));
-
-        // 7. Attention GQA Root Signature: (Params b0, q u0, k_cache u1, v_cache u2, attn_out u3)
-        var attnParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
-        };
-        _sigAttention = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnParams));
-        _psoAttention = _ctx.CreatePipelineState(_sigAttention, _ctx.CompileShader(D3D12Shaders.AttentionGqa));
-
-        // 8. Argmax Root Signature: (Params b0, logits u0, best_token u1, best_logit u2)
-        var argmaxParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 1), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
-        };
-        _sigArgmax = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, argmaxParams));
-        _psoArgmax = _ctx.CreatePipelineState(_sigArgmax, _ctx.CompileShader(D3D12Shaders.Argmax));
-
-        // 9. Batched GEMM Root Signature: (Params b0, W t0, bias t1, x t2, residual u0, y u1)
-        var gemmBatchParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All), // t0: W
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All), // t1: bias
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(2, 0), ShaderVisibility.All), // t2: x (SRV for L1 cache)
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All), // u0: residual
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)  // u1: y
-        };
-
-        _sigGemmBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemmBatchParams));
-        _psoGemmQ4KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ4KBatch));
-        _psoGemmQ6KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
-        _psoGemmQ8_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ8_0Batch));
-        _psoGemmFp32Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmFp32Batch));
-
-        // 10. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
-        var rmsNormBatchParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 3), ShaderVisibility.All),
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
-        };
-        _sigRmsNormBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, rmsNormBatchParams));
-        _psoRmsNormBatch = _ctx.CreatePipelineState(_sigRmsNormBatch, _ctx.CompileShader(D3D12Shaders.RmsNormBatch));
-
-        // 11. Batched RoPE Root Signature: (Params b0, q u0, k u1)
-        var ropeBatchParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 7), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
-        };
-        _sigRopeBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, ropeBatchParams));
-        _psoRopeBatch = _ctx.CreatePipelineState(_sigRopeBatch, _ctx.CompileShader(D3D12Shaders.RoPEBatch));
-
-        // 12. Batched KvStore Root Signature: (Params b0, k u0, v u1, k_cache u2, v_cache u3)
-        var kvStoreBatchParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 5), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
-        };
-        _sigKvStoreBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreBatchParams));
-        _psoKvStoreBatch = _ctx.CreatePipelineState(_sigKvStoreBatch, _ctx.CompileShader(D3D12Shaders.KvCacheStoreBatch));
-
-        // 13. Batched Attention Root Signature: (Params b0, q u0, k_cache u1, v_cache u2, attn_out u3)
-        var attnBatchParams = new RootParameter[]
-        {
-            new RootParameter(new RootConstants(0, 0, 7), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
-            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
-        };
-        _sigAttentionBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnBatchParams));
-        _psoAttentionBatch = _ctx.CreatePipelineState(_sigAttentionBatch, _ctx.CompileShader(D3D12Shaders.AttentionBatch));
-    }
-
     private void InitScratchBuffers()
     {
         int qDim = _nHeads * _headDim;
@@ -398,6 +217,93 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
             _dKeyCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
             _dValCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
         }
+
+        if (_weights.IsMoe)
+        {
+            int expertFfnDim = _weights.ExpertFeedForwardLength;
+            int numExperts = _weights.ExpertCount;
+
+            _dRouterLogits = _ctx.CreateDeviceBuffer((ulong)(numExperts * sizeof(float)));
+            _readbackRouterLogits = _ctx.CreateReadbackBuffer((ulong)(numExperts * sizeof(float)));
+            void* pReadbackRouter = null;
+            _readbackRouterLogits.Map(0, null, &pReadbackRouter);
+            _pReadbackRouterLogits = (float*)pReadbackRouter;
+
+            _dExpertGate = _ctx.CreateDeviceBuffer((ulong)(expertFfnDim * sizeof(float)));
+            _dExpertUp = _ctx.CreateDeviceBuffer((ulong)(expertFfnDim * sizeof(float)));
+            _dExpertAct = _ctx.CreateDeviceBuffer((ulong)(expertFfnDim * sizeof(float)));
+            _dExpertDownOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+            _dFfnOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+
+            int maxShexpFfnDim = expertFfnDim * 2;
+            bool hasShexp = false;
+            for (int l = 0; l < _weights.BlockCount; l++)
+            {
+                if (_weights.Layers[l].FfnGateShexpWeight != null)
+                {
+                    hasShexp = true;
+                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                    {
+                        if ((int)tShexp.Dimensions[1] > maxShexpFfnDim)
+                            maxShexpFfnDim = (int)tShexp.Dimensions[1];
+                    }
+                }
+            }
+            if (hasShexp)
+            {
+                _dShexpGate = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
+                _dShexpUp = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
+                _dShexpAct = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
+            }
+        }
+    }
+
+    private static byte[] AlignQ3K(ReadOnlySpan<byte> rawQ3K, int totalBlocks)
+    {
+        byte[] aligned = GC.AllocateUninitializedArray<byte>(totalBlocks * 112);
+        fixed (byte* pSrc = rawQ3K, pDst = aligned)
+        {
+            nint srcAddr = (nint)pSrc;
+            nint dstAddr = (nint)pDst;
+            int numThreads = Math.Max(1, Environment.ProcessorCount);
+            int chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+            Parallel.For(0, numThreads, t =>
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, totalBlocks);
+                byte* pS = (byte*)srcAddr;
+                byte* pD = (byte*)dstAddr;
+                for (int b = start; b < end; b++)
+                {
+                    byte* srcBlk = pS + (long)b * 110;
+                    byte* dstBlk = pD + (long)b * 112;
+                    Buffer.MemoryCopy(srcBlk, dstBlk, 110, 110);
+                    dstBlk[110] = 0;
+                    dstBlk[111] = 0;
+                }
+            });
+        }
+        return aligned;
+    }
+
+    private static ulong GetTensorSliceBytes(GgufType type, int rows, int cols)
+    {
+        if (type == GgufType.Q3_K)
+        {
+            int nb = cols / 256;
+            return (ulong)rows * (ulong)nb * 112UL;
+        }
+        if (type == GgufType.Q6_K)
+        {
+            int nb = cols / 256;
+            return (ulong)rows * (ulong)nb * 212UL;
+        }
+        if (type == GgufType.Q8_0)
+        {
+            int nb = cols / 32;
+            return (ulong)rows * (ulong)nb * 36UL;
+        }
+        return (ulong)rows * (ulong)GgufTypes.GetRowBytes(type, cols);
     }
 
     private static byte[] AlignQ6K(ReadOnlySpan<byte> rawQ6K, int totalBlocks)
@@ -448,12 +354,22 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
 
     private ID3D12Resource UploadTensor(GgufType type, IntPtr pData, int rows, int cols)
     {
-        if (type != GgufType.Q4_K && type != GgufType.Q6_K && type != GgufType.Q8_0 && type != GgufType.F32 && type != GgufType.F16)
+        if (type != GgufType.Q4_K && type != GgufType.Q5_K && type != GgufType.Q6_K && type != GgufType.Q3_K && type != GgufType.Q8_0 && type != GgufType.F32 && type != GgufType.F16)
         {
-            throw new NotSupportedException($"Direct3D 12 compute engine does not yet support tensor quantization type {type}. Supported GPU types: Q4_K, Q6_K, Q8_0, F32, F16.");
+            throw new NotSupportedException($"Direct3D 12 compute engine does not yet support tensor quantization type {type}. Supported GPU types: Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, F32, F16.");
         }
 
-        if (type == GgufType.Q6_K)
+        if (type == GgufType.Q3_K)
+        {
+            int nb = cols / 256;
+            int totalBlocks = rows * nb;
+            ReadOnlySpan<byte> raw = new ReadOnlySpan<byte>((void*)pData, totalBlocks * 110);
+            byte[] aligned = AlignQ3K(raw, totalBlocks);
+            var buf = _ctx.CreateDeviceBuffer((ulong)aligned.Length);
+            _ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        else if (type == GgufType.Q6_K)
         {
             int nb = cols / 256;
             int totalBlocks = rows * nb;
@@ -527,14 +443,71 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
                 _ctx.CopyToDevice(dVBias, (IntPtr)lw.VBias, (ulong)(kvDim * sizeof(float)));
             }
 
+            // Optional QK-Norm
+            ID3D12Resource? dAttnQNorm = null;
+            if (lw.AttnQNormWeight != null)
+            {
+                dAttnQNorm = _ctx.CreateDeviceBuffer((ulong)(_headDim * sizeof(float)));
+                _ctx.CopyToDevice(dAttnQNorm, (IntPtr)lw.AttnQNormWeight, (ulong)(_headDim * sizeof(float)));
+            }
+
+            ID3D12Resource? dAttnKNorm = null;
+            if (lw.AttnKNormWeight != null)
+            {
+                dAttnKNorm = _ctx.CreateDeviceBuffer((ulong)(_headDim * sizeof(float)));
+                _ctx.CopyToDevice(dAttnKNorm, (IntPtr)lw.AttnKNormWeight, (ulong)(_headDim * sizeof(float)));
+            }
+
             var dAttnOut = UploadTensor(lw.AttnOutType, (IntPtr)lw.AttnOutWeight, _dim, _dim);
 
             var dFfnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
             _ctx.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (ulong)(_dim * sizeof(float)));
 
-            var dFfnGate = UploadTensor(lw.FfnGateType, (IntPtr)lw.FfnGateWeight, _ffnDim, _dim);
-            var dFfnUp = UploadTensor(lw.FfnUpType, (IntPtr)lw.FfnUpWeight, _ffnDim, _dim);
-            var dFfnDown = UploadTensor(lw.FfnDownType, (IntPtr)lw.FfnDownWeight, _dim, _ffnDim);
+            ID3D12Resource? dFfnGate = null;
+            ID3D12Resource? dFfnUp = null;
+            ID3D12Resource? dFfnDown = null;
+            ID3D12Resource? dFfnGateInp = null;
+            ID3D12Resource? dFfnGateInpBias = null;
+            ID3D12Resource? dFfnGateExps = null;
+            ID3D12Resource? dFfnUpExps = null;
+            ID3D12Resource? dFfnDownExps = null;
+            ID3D12Resource? dFfnGateShexp = null;
+            ID3D12Resource? dFfnUpShexp = null;
+            ID3D12Resource? dFfnDownShexp = null;
+
+            if (lw.IsMoe)
+            {
+                int expertFfnDim = _weights.ExpertFeedForwardLength;
+                int numExperts = _weights.ExpertCount;
+
+                dFfnGateInp = UploadTensor(GgufType.F32, (IntPtr)lw.FfnGateInpWeight, numExperts, _dim);
+                if (lw.FfnGateInpBias != null)
+                {
+                    dFfnGateInpBias = _ctx.CreateDeviceBuffer((ulong)(numExperts * sizeof(float)));
+                    _ctx.CopyToDevice(dFfnGateInpBias, (IntPtr)lw.FfnGateInpBias, (ulong)(numExperts * sizeof(float)));
+                }
+
+                dFfnGateExps = UploadTensor(lw.FfnGateExpsType, (IntPtr)lw.FfnGateExpsWeight, numExperts * expertFfnDim, _dim);
+                dFfnUpExps = UploadTensor(lw.FfnUpExpsType, (IntPtr)lw.FfnUpExpsWeight, numExperts * expertFfnDim, _dim);
+                dFfnDownExps = UploadTensor(lw.FfnDownExpsType, (IntPtr)lw.FfnDownExpsWeight, numExperts * _dim, expertFfnDim);
+
+                if (lw.FfnGateShexpWeight != null)
+                {
+                    int shexpFfnDim = expertFfnDim * 2;
+                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                        shexpFfnDim = (int)tShexp.Dimensions[1];
+
+                    dFfnGateShexp = UploadTensor(lw.FfnGateShexpType, (IntPtr)lw.FfnGateShexpWeight, shexpFfnDim, _dim);
+                    dFfnUpShexp = UploadTensor(lw.FfnUpShexpType, (IntPtr)lw.FfnUpShexpWeight, shexpFfnDim, _dim);
+                    dFfnDownShexp = UploadTensor(lw.FfnDownShexpType, (IntPtr)lw.FfnDownShexpWeight, _dim, shexpFfnDim);
+                }
+            }
+            else
+            {
+                dFfnGate = UploadTensor(lw.FfnGateType, (IntPtr)lw.FfnGateWeight, _ffnDim, _dim);
+                dFfnUp = UploadTensor(lw.FfnUpType, (IntPtr)lw.FfnUpWeight, _ffnDim, _dim);
+                dFfnDown = UploadTensor(lw.FfnDownType, (IntPtr)lw.FfnDownWeight, _dim, _ffnDim);
+            }
 
             _layerWeights[l] = new D3D12LayerWeights
             {
@@ -545,11 +518,28 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
                 KBias = dKBias,
                 VWeight = dV,
                 VBias = dVBias,
+                AttnQNormWeight = dAttnQNorm,
+                AttnKNormWeight = dAttnKNorm,
                 AttnOutWeight = dAttnOut,
                 FfnNormWeight = dFfnNorm,
                 FfnGateWeight = dFfnGate,
                 FfnUpWeight = dFfnUp,
                 FfnDownWeight = dFfnDown,
+                IsMoe = lw.IsMoe,
+                FfnGateInpWeight = dFfnGateInp,
+                FfnGateInpBias = dFfnGateInpBias,
+                FfnGateExpsWeight = dFfnGateExps,
+                FfnUpExpsWeight = dFfnUpExps,
+                FfnDownExpsWeight = dFfnDownExps,
+                FfnGateExpsType = lw.FfnGateExpsType,
+                FfnUpExpsType = lw.FfnUpExpsType,
+                FfnDownExpsType = lw.FfnDownExpsType,
+                FfnGateShexpWeight = dFfnGateShexp,
+                FfnUpShexpWeight = dFfnUpShexp,
+                FfnDownShexpWeight = dFfnDownShexp,
+                FfnGateShexpType = lw.FfnGateShexpType,
+                FfnUpShexpType = lw.FfnUpShexpType,
+                FfnDownShexpType = lw.FfnDownShexpType,
                 QType = lw.QType,
                 KType = lw.KType,
                 VType = lw.VType,
@@ -564,527 +554,6 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
         Console.WriteLine($"   Weights uploaded to Direct3D 12 GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
         Console.ResetColor();
     }
-
-    private void DispatchRmsNorm(ID3D12GraphicsCommandList cmdList, ID3D12Resource x, ID3D12Resource weight, ID3D12Resource dst, int size, float eps)
-    {
-        cmdList.SetComputeRootSignature(_sigRmsNorm);
-        cmdList.SetPipelineState(_psoRmsNorm);
-
-        uint* pConsts = stackalloc uint[2];
-        pConsts[0] = (uint)size;
-        *(float*)(&pConsts[1]) = eps;
-        cmdList.SetComputeRoot32BitConstants(0, 2, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootShaderResourceView(1, weight.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, dst.GPUVirtualAddress);
-
-        cmdList.Dispatch(1, 1, 1);
-    }
-
-    private void DispatchGemv(
-        ID3D12GraphicsCommandList cmdList,
-        GgufType type,
-        ID3D12Resource? y,
-        ID3D12Resource x,
-        ID3D12Resource W,
-        int k_cols,
-        int m_rows,
-        ID3D12Resource? bias = null,
-        ID3D12Resource? residual = null)
-    {
-        cmdList.SetComputeRootSignature(_sigGemv);
-        var pso = type switch
-        {
-            GgufType.Q4_K => _psoGemvQ4K,
-            GgufType.Q6_K => _psoGemvQ6K,
-            GgufType.Q8_0 => _psoGemvQ8_0,
-            GgufType.F32 => _psoGemvFp32,
-            _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
-        };
-        cmdList.SetPipelineState(pso);
-
-        uint* pConsts = stackalloc uint[5];
-        pConsts[0] = (uint)k_cols;
-        pConsts[1] = (uint)m_rows;
-        pConsts[2] = bias != null ? 1u : 0u;
-        pConsts[3] = residual != null ? 1u : 0u;
-        pConsts[4] = y != null ? 1u : 0u;
-        cmdList.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootShaderResourceView(1, W.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(2, bias?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, residual?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(5, y?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-
-        cmdList.Dispatch(((uint)m_rows + 3) / 4, 1, 1);
-    }
-
-    private void DispatchRope(ID3D12GraphicsCommandList cmdList, ID3D12Resource q, ID3D12Resource k, int pos)
-    {
-        cmdList.SetComputeRootSignature(_sigRope);
-        cmdList.SetPipelineState(_psoRope);
-
-        uint* pConsts = stackalloc uint[6];
-        pConsts[0] = (uint)_nHeads;
-        pConsts[1] = (uint)_nHeadsKv;
-        pConsts[2] = (uint)_headDim;
-        pConsts[3] = (uint)pos;
-        *(float*)(&pConsts[4]) = _weights.RopeFreqBase;
-        *(float*)(&pConsts[5]) = 1.0f;
-        cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, q.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, k.GPUVirtualAddress);
-
-        uint totalHalf = (uint)((_nHeads + _nHeadsKv) * (_headDim / 2));
-        cmdList.Dispatch((totalHalf + 255) / 256, 1, 1);
-    }
-
-    private void DispatchKvStore(ID3D12GraphicsCommandList cmdList, int layerIdx, int pos)
-    {
-        cmdList.SetComputeRootSignature(_sigKvStore);
-        cmdList.SetPipelineState(_psoKvStore);
-
-        uint* pConsts = stackalloc uint[4];
-        pConsts[0] = (uint)_nHeadsKv;
-        pConsts[1] = (uint)_headDim;
-        pConsts[2] = (uint)_maxSeqLen;
-        pConsts[3] = (uint)pos;
-        cmdList.SetComputeRoot32BitConstants(0, 4, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, _dK.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, _dV.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, _dKeyCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, _dValCache[layerIdx].GPUVirtualAddress);
-
-        uint total = (uint)(_nHeadsKv * _headDim);
-        cmdList.Dispatch((total + 255) / 256, 1, 1);
-    }
-
-    private void DispatchAttention(ID3D12GraphicsCommandList cmdList, int layerIdx, int pos)
-    {
-        cmdList.SetComputeRootSignature(_sigAttention);
-        cmdList.SetPipelineState(_psoAttention);
-
-        uint* pConsts = stackalloc uint[6];
-        pConsts[0] = (uint)_nHeads;
-        pConsts[1] = (uint)_nHeadsKv;
-        pConsts[2] = (uint)_headDim;
-        pConsts[3] = (uint)_maxSeqLen;
-        pConsts[4] = (uint)pos;
-        *(float*)(&pConsts[5]) = _attnScale;
-        cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, _dKeyCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, _dValCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, _dAttnOut.GPUVirtualAddress);
-
-        cmdList.Dispatch((uint)_nHeads, 1, 1);
-    }
-
-    private void DispatchSwiglu(ID3D12GraphicsCommandList cmdList, ID3D12Resource gate, ID3D12Resource up, ID3D12Resource dst, int size)
-    {
-        cmdList.SetComputeRootSignature(_sigSwiglu);
-        cmdList.SetPipelineState(_psoSwiglu);
-
-        uint* pConsts = stackalloc uint[1];
-        pConsts[0] = (uint)size;
-        cmdList.SetComputeRoot32BitConstants(0, 1, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, gate.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, up.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, dst.GPUVirtualAddress);
-
-        cmdList.Dispatch(((uint)size + 255) / 256, 1, 1);
-    }
-
-    private void DispatchGemmBatch(
-        ID3D12GraphicsCommandList cmdList,
-        GgufType type,
-        ID3D12Resource? y,
-        ID3D12Resource x,
-        ID3D12Resource w,
-        int kCols,
-        int mRows,
-        int batchSize,
-        ID3D12Resource? bias = null,
-        ID3D12Resource? residual = null)
-    {
-        cmdList.SetComputeRootSignature(_sigGemmBatch);
-        if (type == GgufType.Q4_K)
-            cmdList.SetPipelineState(_psoGemmQ4KBatch);
-        else if (type == GgufType.Q6_K)
-            cmdList.SetPipelineState(_psoGemmQ6KBatch);
-        else if (type == GgufType.Q8_0)
-            cmdList.SetPipelineState(_psoGemmQ8_0Batch);
-        else if (type == GgufType.F32)
-            cmdList.SetPipelineState(_psoGemmFp32Batch);
-        else
-            throw new NotSupportedException($"Direct3D 12 batch GEMM does not support tensor quantization type {type}.");
-
-        uint* pConsts = stackalloc uint[6];
-        pConsts[0] = (uint)kCols;
-        pConsts[1] = (uint)mRows;
-        pConsts[2] = (uint)batchSize;
-        pConsts[3] = (uint)(bias != null ? 1 : 0);
-        pConsts[4] = (uint)(residual != null ? 1 : 0);
-        pConsts[5] = (uint)(y != null ? 1 : 0);
-        cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootShaderResourceView(1, w.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(2, bias != null ? bias.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(3, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
-
-
-        cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
-    }
-
-
-
-    private void DispatchRmsNormBatch(
-        ID3D12GraphicsCommandList cmdList,
-        ID3D12Resource x,
-        ID3D12Resource weight,
-        ID3D12Resource dst,
-        int size,
-        int batchSize,
-        float eps)
-    {
-        cmdList.SetComputeRootSignature(_sigRmsNormBatch);
-        cmdList.SetPipelineState(_psoRmsNormBatch);
-
-        uint* pConsts = stackalloc uint[3];
-        pConsts[0] = (uint)size;
-        *(float*)(&pConsts[1]) = eps;
-        pConsts[2] = (uint)batchSize;
-        cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootShaderResourceView(1, weight.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, x.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, dst.GPUVirtualAddress);
-
-        cmdList.Dispatch((uint)batchSize, 1, 1);
-    }
-
-    private void DispatchRopeBatch(ID3D12GraphicsCommandList cmdList, ID3D12Resource q, ID3D12Resource k, int startPos, int batchSize)
-    {
-        cmdList.SetComputeRootSignature(_sigRopeBatch);
-        cmdList.SetPipelineState(_psoRopeBatch);
-
-        uint* pConsts = stackalloc uint[7];
-        pConsts[0] = (uint)_nHeads;
-        pConsts[1] = (uint)_nHeadsKv;
-        pConsts[2] = (uint)_headDim;
-        pConsts[3] = (uint)startPos;
-        *(float*)(&pConsts[4]) = _weights.RopeFreqBase;
-        *(float*)(&pConsts[5]) = 1.0f;
-        pConsts[6] = (uint)batchSize;
-        cmdList.SetComputeRoot32BitConstants(0, 7, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, q.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, k.GPUVirtualAddress);
-
-        uint halfDim = (uint)(_headDim / 2);
-        uint totalHalfPerToken = (uint)((_nHeads + _nHeadsKv) * halfDim);
-        uint total = (uint)batchSize * totalHalfPerToken;
-        cmdList.Dispatch((total + 255) / 256, 1, 1);
-    }
-
-    private void DispatchKvStoreBatch(ID3D12GraphicsCommandList cmdList, int layerIdx, int startPos, int batchSize)
-    {
-        cmdList.SetComputeRootSignature(_sigKvStoreBatch);
-        cmdList.SetPipelineState(_psoKvStoreBatch);
-
-        uint* pConsts = stackalloc uint[5];
-        pConsts[0] = (uint)_nHeadsKv;
-        pConsts[1] = (uint)_headDim;
-        pConsts[2] = (uint)_maxSeqLen;
-        pConsts[3] = (uint)startPos;
-        pConsts[4] = (uint)batchSize;
-        cmdList.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, _dKBatch.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, _dVBatch.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, _dKeyCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, _dValCache[layerIdx].GPUVirtualAddress);
-
-        uint total = (uint)(batchSize * _nHeadsKv * _headDim);
-        cmdList.Dispatch((total + 255) / 256, 1, 1);
-    }
-
-    private void DispatchAttentionBatch(ID3D12GraphicsCommandList cmdList, int layerIdx, int startPos, int batchSize)
-    {
-        cmdList.SetComputeRootSignature(_sigAttentionBatch);
-        cmdList.SetPipelineState(_psoAttentionBatch);
-
-        uint* pConsts = stackalloc uint[7];
-        pConsts[0] = (uint)_nHeads;
-        pConsts[1] = (uint)_nHeadsKv;
-        pConsts[2] = (uint)_headDim;
-        pConsts[3] = (uint)_maxSeqLen;
-        pConsts[4] = (uint)startPos;
-        *(float*)(&pConsts[5]) = _attnScale;
-        pConsts[6] = (uint)batchSize;
-        cmdList.SetComputeRoot32BitConstants(0, 7, (IntPtr)pConsts, 0);
-
-        cmdList.SetComputeRootUnorderedAccessView(1, _dQBatch.GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(2, _dKeyCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(3, _dValCache[layerIdx].GPUVirtualAddress);
-        cmdList.SetComputeRootUnorderedAccessView(4, _dAttnOutBatch.GPUVirtualAddress);
-
-        cmdList.Dispatch((uint)_nHeads, (uint)batchSize, 1);
-    }
-
-    /// <summary>
-    /// Executes full transformer forward pass directly on Direct3D 12 GPU.
-    /// Zero CPU synchronization during layer execution.
-    /// </summary>
-    public void Forward(int token, int pos, Span<float> logits, bool computeLogits = true)
-    {
-        // 1. Extract embedding directly into persistently mapped upload buffer
-        QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
-
-        int qDim = _nHeads * _headDim;
-        int kvDim = _nHeadsKv * _headDim;
-
-        // 2. Record full transformer graph into command list
-        var swRec = Stopwatch.StartNew();
-        _ctx.BeginCommands();
-        var cmd = _ctx.CommandList;
-
-        // Copy embedding from upload buffer into _dX inside the same command list
-        cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-        cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
-        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
-
-        for (int l = 0; l < _weights.BlockCount; l++)
-        {
-            var lw = _layerWeights[l];
-
-            // Attention pre-norm
-            DispatchRmsNorm(cmd, _dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // Q, K, V projections
-            DispatchGemv(cmd, lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias);
-            DispatchGemv(cmd, lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias);
-            DispatchGemv(cmd, lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // RoPE
-            DispatchRope(cmd, _dQ, _dK, pos);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // KV Cache Store
-            DispatchKvStore(cmd, l, pos);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // GQA Attention
-            DispatchAttention(cmd, l, pos);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // Attn Out projection with fused residual addition (_dX += attnOut)
-            DispatchGemv(cmd, lw.AttnOutType, null, _dAttnOut, lw.AttnOutWeight, _dim, _dim, null, residual: _dX);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // FFN pre-norm
-            DispatchRmsNorm(cmd, _dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // FFN Gate and Up projections
-            DispatchGemv(cmd, lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim);
-            DispatchGemv(cmd, lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // SwiGLU activation
-            DispatchSwiglu(cmd, _dGate, _dUp, _dFfnAct, _ffnDim);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // FFN Down projection with fused residual addition (_dX += ffnDown)
-            DispatchGemv(cmd, lw.FfnDownType, null, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, null, residual: _dX);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-        }
-
-        if (computeLogits)
-        {
-            // Final RMSNorm
-            DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // Output projection (LM Head)
-            DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            if (!logits.IsEmpty)
-            {
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
-            }
-        }
-        swRec.Stop();
-
-        var swGpu = Stopwatch.StartNew();
-        _ctx.EndCommandsAndExecute();
-        _ctx.Synchronize();
-        swGpu.Stop();
-
-        LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
-
-        // 3. Read back logits if requested
-        if (computeLogits && !logits.IsEmpty)
-        {
-            fixed (float* pLogits = logits)
-            {
-                Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
-            }
-        }
-    }
-
-    /// <summary>
-    /// Batched prompt prefill execution on Direct3D 12 GPU.
-    /// Pipelined with register-tiled Batched GEMM (weights streamed ONCE per chunk).
-    /// </summary>
-    public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
-    {
-        if (tokens.IsEmpty) return;
-
-        if (tokens.Length == 1)
-        {
-            Forward(tokens[0], startPos, logits, computeLogits);
-            return;
-        }
-
-        int qDim = _nHeads * _headDim;
-        int kvDim = _nHeadsKv * _headDim;
-
-        for (int offset = 0; offset < tokens.Length; offset += MaxBatchChunk)
-        {
-            int chunkSize = Math.Min(MaxBatchChunk, tokens.Length - offset);
-            bool isLastChunk = (offset + chunkSize == tokens.Length);
-            int chunkStartPos = startPos + offset;
-
-            // 1. Vectorized host embedding extraction for the chunk
-            fixed (int* pTokens = tokens)
-            {
-                for (int t = 0; t < chunkSize; t++)
-                {
-                    QuantKernels.ExtractEmbedding(
-                        _weights.EmbdType,
-                        _weights.EmbdWeight,
-                        pTokens[offset + t],
-                        _pUploadEmbeddingBatch + t * _dim,
-                        _dim);
-                }
-            }
-
-            var swRec = Stopwatch.StartNew();
-            _ctx.BeginCommands();
-            var cmd = _ctx.CommandList;
-
-            // Copy entire chunk of embeddings into _dXBatch
-            cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopyDest);
-            cmd.CopyBufferRegion(_dXBatch, 0, _uploadEmbeddingBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
-            cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.Common);
-
-            // Execute all 28 layers across all tokens in the chunk simultaneously!
-            // Weights for each layer are read from VRAM ONCE per chunk!
-            for (int l = 0; l < _weights.BlockCount; l++)
-            {
-                var lw = _layerWeights[l];
-
-                // Attention pre-norm across all tokens in parallel
-                DispatchRmsNormBatch(cmd, _dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched Q, K, V projections (weights read ONCE into registers)
-                DispatchGemmBatch(cmd, lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, chunkSize, lw.QBias);
-                DispatchGemmBatch(cmd, lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, chunkSize, lw.KBias);
-                DispatchGemmBatch(cmd, lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, chunkSize, lw.VBias);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched RoPE
-                DispatchRopeBatch(cmd, _dQBatch, _dKBatch, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched KV Cache Store
-                DispatchKvStoreBatch(cmd, l, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched Attention GQA
-                DispatchAttentionBatch(cmd, l, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched Attn Out with fused residual addition (_dXBatch += attnOut)
-                DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch, lw.AttnOutWeight, _dim, _dim, chunkSize, null, residual: _dXBatch);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // FFN pre-norm across all tokens in parallel
-                DispatchRmsNormBatch(cmd, _dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched FFN Gate and Up projections
-                DispatchGemmBatch(cmd, lw.FfnGateType, _dGateBatch, _dNormXBatch, lw.FfnGateWeight, _dim, _ffnDim, chunkSize);
-                DispatchGemmBatch(cmd, lw.FfnUpType, _dUpBatch, _dNormXBatch, lw.FfnUpWeight, _dim, _ffnDim, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // SwiGLU activation across all tokens
-                DispatchSwiglu(cmd, _dGateBatch, _dUpBatch, _dFfnActBatch, chunkSize * _ffnDim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Batched FFN Down projection with fused residual addition (_dXBatch += ffnDown)
-                DispatchGemmBatch(cmd, lw.FfnDownType, null, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, chunkSize, null, residual: _dXBatch);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-
-            }
-
-            if (isLastChunk && computeLogits)
-            {
-                // Copy the final token's hidden state into _dX for LM Head evaluation
-                ulong lastTokenOffset = (ulong)((chunkSize - 1) * _dim * sizeof(float));
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-                cmd.CopyBufferRegion(_dX, 0, _dXBatch, lastTokenOffset, (ulong)(_dim * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
-
-                // Final RMSNorm on final token
-                DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Output projection (LM Head)
-                DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                if (!logits.IsEmpty)
-                {
-                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                    cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
-                }
-            }
-            swRec.Stop();
-            var swGpu = Stopwatch.StartNew();
-            _ctx.EndCommandsAndExecute();
-            _ctx.Synchronize();
-            swGpu.Stop();
-            LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
-
-
-            if (isLastChunk && computeLogits && !logits.IsEmpty)
-            {
-                fixed (float* pLogits = logits)
-                {
-                    Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
-                }
-            }
-        }
-    }
-
     public void Dispose()
     {
         if (!_disposed)
@@ -1141,11 +610,34 @@ public sealed unsafe class Qwen2D3D12Model : IDisposable
             _dOutNormWeight?.Dispose();
             _dOutWeight?.Dispose();
 
+            if (_readbackRouterLogits != null)
+            {
+                _readbackRouterLogits.Unmap(0);
+                _readbackRouterLogits.Dispose();
+            }
+            _dRouterLogits?.Dispose();
+            _dExpertGate?.Dispose();
+            _dExpertUp?.Dispose();
+            _dExpertAct?.Dispose();
+            _dExpertDownOut?.Dispose();
+            _dFfnOut?.Dispose();
+            _dShexpGate?.Dispose();
+            _dShexpUp?.Dispose();
+            _dShexpAct?.Dispose();
+
             _psoGemvQ4K?.Dispose();
+            _psoGemvQ5K?.Dispose();
             _psoGemvQ6K?.Dispose();
+            _psoGemvQ3K?.Dispose();
             _psoGemvQ8_0?.Dispose();
             _psoGemvFp32?.Dispose();
             _sigGemv?.Dispose();
+
+            _psoVecAddWeighted?.Dispose();
+            _sigVecAddWeighted?.Dispose();
+
+            _psoRmsNormHeads?.Dispose();
+            _sigRmsNormHeads?.Dispose();
 
             _psoGemmQ4KBatch?.Dispose();
             _psoGemmQ6KBatch?.Dispose();

@@ -183,11 +183,11 @@ To verify versatility and robustness across model sizes and model families, `Gla
 ### Benchmark 7: Mixture-of-Experts (MoE) & Next-Gen Quantization Benchmark (USA & Chinese Frontiers)
 To verify support for sparse Mixture-of-Experts architectures and next-generation quantization types (Microscaling FP4, Q3_K, Q5_K), `Glacier.Inference` was evaluated against frontier open MoE models ranging from 8B to 30B total parameters:
 
-| Model | Provenance / Family | Active / Total Params | Quant Type | Weight Size | Tested Accelerator | Generation Rate | Architectural Features |
+| Model | Provenance / Family | Active / Total Params | Quant Type | Weight Size | Tested Accelerator | Measured Generation Rate | Architectural Features |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen3-30B-A3B-Instruct** | 🇨🇳 Alibaba (China) | **3B Active** / 30B Total (128 Experts) | `Q3_K_L` | **13.58 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **0.6 – 1.0 tok/s** | 128 Experts, Top-8 routing, QK RMSNorm (`attn_q_norm`), 3D tensor slicing |
-| **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **1.7 tok/s** | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
-| **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **12.57 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **1.2 tok/s** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
+| **Qwen3-30B-A3B-Instruct** | 🇨🇳 Alibaba (China) | **3B Active** / 30B Total (128 Experts) | `Q3_K_L` | **13.58 GB** | **AMD Radeon 890M (D3D12 UMA)**<br>**Ryzen AI 9 HX 370 (CPU SIMD)** | 🟩 **21.68 tok/s (D3D12)**<br>0.89 tok/s (CPU AVX-512) | 128 Experts, Top-8 routing, QK RMSNorm (`attn_q_norm`), 3D tensor slicing (🟩 **24.4x speedup via D3D12**) |
+| **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **14.20 GB** | **AMD Radeon 890M (D3D12 UMA)** | 🟩 **19.23 tok/s (D3D12)** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
+| **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **3.08 tok/s** (CPU AVX-512) | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
 | **LiquidAI LFM2-8B-A1B** | 🇺🇸 Liquid AI (USA) | **1.5B Active** / 8B Total (32 Experts) | `Q4_K_M` | **4.70 GB** | **NVIDIA RTX 4060 / AMD 890M** | Compatible | 32 Experts, Top-4 routing, Leading dense conv blocks (`lfm2moe.shortconv`), QK-Norm |
 | **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **NVIDIA RTX 3060 / AMD 890M** | Compatible | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Shared Experts |
 
@@ -196,8 +196,21 @@ To verify support for sparse Mixture-of-Experts architectures and next-generatio
 | :--- | :--- | :--- | :--- |
 | **NVIDIA GeForce RTX 4060 Laptop** | 8 GB GDDR6 (256 GB/s) | Models $\le 7.5\text{ GB}$ (e.g. `LiquidAI LFM2-8B-A1B` at 4.70 GB, dense 7B models) | 100% VRAM Resident (Bare-Metal SASS) |
 | **NVIDIA GeForce RTX 3060 Desktop** | 12 GB GDDR6 (360 GB/s) | Models $\le 11.5\text{ GB}$ (e.g. `gpt-oss-20b-MXFP4` at 11.28 GB, `DeepSeek-Coder-V2-Lite` at 9.65 GB) | 100% VRAM Resident (Bare-Metal SASS) |
-| **AMD Radeon 890M iGPU** | 15.5 GB Unified Memory (LPDDR5X) | Models $\le 14.5\text{ GB}$ (e.g. `Qwen3-30B-A3B-Q3_K_L` at 13.58 GB, `ERNIE-4.5-21B-A3B` at 12.57 GB) | Unified Memory Direct3D 12 Compute |
+| **AMD Radeon 890M iGPU** | 15.5 GB Unified Memory (LPDDR5X) | Models $\le 14.5\text{ GB}$ (e.g. `Qwen3-30B-A3B-Q3_K_L` at 13.58 GB, `ERNIE-4.5-21B-A3B` at 14.20 GB) | Unified Memory Direct3D 12 Compute |
 | **AMD Ryzen AI 9 HX 370 CPU** | 31 GB System RAM (24 Threads AVX-512) | Models up to 28 GB (e.g. `Qwen3-30B-A3B-Q4_K_M` at 17.35 GB, `Mixtral-8x7B` at 26 GB) | Multi-threaded AVX-512 / AVX2 SIMD |
+
+---
+
+### Benchmark 8: Distributed Fleet Orchestration Benchmark (Heterogeneous Multi-GPU Cluster)
+`Glacier.Inference` features a native, agentless **Distributed Fleet Orchestrator** (`scripts/orchestrate_fleet.ps1`) that automatically broadcasts benchmarks across physical Windows 11 machines in parallel via secure WinRM:
+
+| Cluster Node | Hardware Target | Architecture | Driver / Acceleration Engine | Benchmark Model | Prompt Prefill Rate | Generation Rate | Total Turnaround |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Worker Node 1** | **NVIDIA GeForce RTX 3060 12 GB** | Ampere (sm_86) | **Pure C# Bare-Metal SASS (`nvcuda.dll`)** | `DeepSeek-R1-Distill-Qwen-7B` (4.68 GB) | **65.53 tok/s** | **45.19 tok/s** | **1.33 s** |
+| **Worker Node 2** | **AMD Radeon 680M iGPU** | RDNA 2 (Wave32) | **Direct3D 12 Compute (HLSL Wave32)** | `Qwen3-4B-Instruct` (2.33 GB) | **92.47 tok/s** | **19.98 tok/s** | **1.58 s** |
+| **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `Qwen3-30B-A3B` (13.58 GB MoE) | **24.20 tok/s** | **21.68 tok/s** | **1.54 s** |
+| **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `ERNIE-4.5-21B-A3B` (14.20 GB MoE) | **21.99 tok/s** | **19.23 tok/s** | **6.29 s** |
+| **Cluster Head** | **AMD Ryzen AI 9 HX 370 CPU** | Zen 5 (AVX-512) | **SIMD AVX-512 Hardware Intrinsics** | `gpt-oss-20b` (11.28 GB MXFP4 MoE) | **3.42 tok/s** | **3.08 tok/s** | **15.26 s** |
 
 ### 💡 Why Glacier is Faster & Deep-Dive Architecture
 

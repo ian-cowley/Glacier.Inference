@@ -236,7 +236,7 @@ public static class Program
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
         Console.WriteLine("  --compare-ollama <url>               Ollama base URL for side-by-side comparison");
-        Console.WriteLine("                                       (e.g. http://127.0.0.1:11434 or http://192.168.1.108:11434)");
+        Console.WriteLine("                                       (e.g. http://127.0.0.1:11434 or http://remote-host:11434)");
         Console.WriteLine("  --compare-model <name>               Ollama model tag to query (default: qwen2.5:7b-instruct-32k)");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();

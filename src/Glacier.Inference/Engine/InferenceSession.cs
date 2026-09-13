@@ -130,7 +130,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
             }
         }
-        else if (!_weights.IsMoe && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+        else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                  targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
         {
             try
@@ -138,7 +138,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 var d3dCtx = new D3D12Context(targetDevice.Index);
                 _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
                 _kvCache = null; // GPU maintains all KV states in device VRAM
-                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32) | KV: FP32]";
+                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32]";
             }
             catch (Exception ex)
             {
