@@ -42,6 +42,7 @@ public sealed unsafe class Qwen2Model : IDisposable
     private float* _ffnAct;
     private float* _ffnActSums;
     private float* _ffnOut;
+    private float* _expertDownOut;
     private float* _headScores;
 
     // Preallocated unmanaged scratch buffers (batched chunk prefill <= MaxBatchSize)
@@ -77,6 +78,10 @@ public sealed unsafe class Qwen2Model : IDisposable
         _attnScale = 1.0f / MathF.Sqrt(_headDim);
         _maxSeqLen = maxSeqLen;
 
+        int expFfn = weights.ExpertFeedForwardLength;
+        int maxFfn = Math.Max(_ffnDim, Math.Max(expFfn, expFfn * 2));
+        if (maxFfn == 0) maxFfn = _ffnDim;
+
         _x = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _normX = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _normXSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
@@ -86,11 +91,12 @@ public sealed unsafe class Qwen2Model : IDisposable
         _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
         _attnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _gate = (float*)NativeMemory.AllocZeroed((nuint)(_ffnDim * sizeof(float)));
-        _up = (float*)NativeMemory.AllocZeroed((nuint)(_ffnDim * sizeof(float)));
-        _ffnAct = (float*)NativeMemory.AllocZeroed((nuint)(_ffnDim * sizeof(float)));
-        _ffnActSums = (float*)NativeMemory.AllocZeroed((nuint)((_ffnDim / 32) * sizeof(float)));
+        _gate = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
+        _up = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
+        _ffnAct = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
+        _ffnActSums = (float*)NativeMemory.AllocZeroed((nuint)(((maxFfn + 31) / 32) * sizeof(float)));
         _ffnOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
+        _expertDownOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
 
         long scoreBufferSize = (long)_nHeads * _maxSeqLen * sizeof(float);
         _headScores = (float*)NativeMemory.AllocZeroed((nuint)scoreBufferSize);
@@ -105,10 +111,10 @@ public sealed unsafe class Qwen2Model : IDisposable
         _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
         _attnOutSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * (_dim / 32) * sizeof(float)));
         _attnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _gateBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
-        _upBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
-        _ffnActBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
-        _ffnActSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * (_ffnDim / 32) * sizeof(float)));
+        _gateBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
+        _upBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
+        _ffnActBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
+        _ffnActSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * ((maxFfn + 31) / 32) * sizeof(float)));
         _ffnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
     }
 
@@ -121,6 +127,10 @@ public sealed unsafe class Qwen2Model : IDisposable
     {
         // 1. Embedding lookup
         QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _x, _dim);
+
+        int maxTopK = _weights.ExpertUsedCount > 0 ? _weights.ExpertUsedCount : 1;
+        int* selectedIndices = stackalloc int[maxTopK];
+        float* selectedWeights = stackalloc float[maxTopK];
 
         // 2. Transformer layers
         for (int l = 0; l < _weights.BlockCount; l++)
@@ -143,6 +153,24 @@ public sealed unsafe class Qwen2Model : IDisposable
             if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
             if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
 
+            // Optional QK-Norm (e.g. Qwen3)
+            if (layer.AttnQNormWeight != null)
+            {
+                for (int h = 0; h < _nHeads; h++)
+                {
+                    float* qHead = _q + h * _headDim;
+                    QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
+                }
+            }
+            if (layer.AttnKNormWeight != null)
+            {
+                for (int h = 0; h < _nHeadsKv; h++)
+                {
+                    float* kHead = _k + h * _headDim;
+                    QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                }
+            }
+
             // Rotary Position Embedding (RoPE)
             QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
 
@@ -155,6 +183,7 @@ public sealed unsafe class Qwen2Model : IDisposable
             // Attention output projection
             QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, _dim);
             QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, _dim, _dim, _attnOutSums);
+            if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
 
             // Residual connection: x = x + attnProj
             AddVector(_x, _attnProj, _dim);
@@ -163,15 +192,80 @@ public sealed unsafe class Qwen2Model : IDisposable
             QuantKernels.RMSNorm(_x, layer.FfnNormWeight, _normX, _dim, _weights.RmsNormEps);
             QuantKernels.ComputeBlockSums32(_normX, _normXSums, _dim);
 
-            // SwiGLU FFN projections (reusing _normXSums for Gate and Up)
-            QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
-            QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
-            QuantKernels.SwiGLU(_gate, _up, _ffnAct, _ffnDim);
-            QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, _ffnDim);
-            QuantKernels.MatVecMul(layer.FfnDownType, layer.FfnDownWeight, _ffnAct, _ffnOut, _ffnDim, _dim, _ffnActSums);
+            if (layer.IsMoe)
+            {
+                int expertFfnDim = _weights.ExpertFeedForwardLength;
+                int numExperts = _weights.ExpertCount;
+                int topK = _weights.ExpertUsedCount;
 
-            // Residual connection: x = x + ffnOut
-            AddVector(_x, _ffnOut, _dim);
+                QuantKernels.RouterTopK(_normX, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights);
+
+                new Span<float>(_ffnOut, _dim).Clear();
+
+                long gateSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(layer.FfnGateExpsType, _dim);
+                long upSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(layer.FfnUpExpsType, _dim);
+                long downSliceBytes = (long)_dim * GgufTypes.GetRowBytes(layer.FfnDownExpsType, expertFfnDim);
+
+                for (int k = 0; k < topK; k++)
+                {
+                    int expertIdx = selectedIndices[k];
+                    float weight = selectedWeights[k];
+
+                    byte* expGateWeight = layer.FfnGateExpsWeight + expertIdx * gateSliceBytes;
+                    byte* expUpWeight = layer.FfnUpExpsWeight + expertIdx * upSliceBytes;
+                    byte* expDownWeight = layer.FfnDownExpsWeight + expertIdx * downSliceBytes;
+
+                    QuantKernels.MatVecMul(layer.FfnGateExpsType, expGateWeight, _normX, _gate, _dim, expertFfnDim, _normXSums);
+                    if (layer.FfnGateExpsBias != null) AddVector(_gate, layer.FfnGateExpsBias + (long)expertIdx * expertFfnDim, expertFfnDim);
+
+                    QuantKernels.MatVecMul(layer.FfnUpExpsType, expUpWeight, _normX, _up, _dim, expertFfnDim, _normXSums);
+                    if (layer.FfnUpExpsBias != null) AddVector(_up, layer.FfnUpExpsBias + (long)expertIdx * expertFfnDim, expertFfnDim);
+
+                    QuantKernels.SwiGLU(_gate, _up, _ffnAct, expertFfnDim);
+                    QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, expertFfnDim);
+
+                    QuantKernels.MatVecMul(layer.FfnDownExpsType, expDownWeight, _ffnAct, _expertDownOut, expertFfnDim, _dim, _ffnActSums);
+                    if (layer.FfnDownExpsBias != null) AddVector(_expertDownOut, layer.FfnDownExpsBias + (long)expertIdx * _dim, _dim);
+
+                    for (int d = 0; d < _dim; d++)
+                    {
+                        _ffnOut[d] += weight * _expertDownOut[d];
+                    }
+                }
+
+                // Shared Expert if present
+                if (layer.FfnGateShexpWeight != null)
+                {
+                    int shexpFfnDim = expertFfnDim * 2;
+                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                    {
+                        shexpFfnDim = (int)tShexp.Dimensions[1];
+                    }
+
+                    QuantKernels.MatVecMul(layer.FfnGateShexpType, layer.FfnGateShexpWeight, _normX, _gate, _dim, shexpFfnDim, _normXSums);
+                    QuantKernels.MatVecMul(layer.FfnUpShexpType, layer.FfnUpShexpWeight, _normX, _up, _dim, shexpFfnDim, _normXSums);
+                    QuantKernels.SwiGLU(_gate, _up, _ffnAct, shexpFfnDim);
+                    QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, shexpFfnDim);
+                    QuantKernels.MatVecMul(layer.FfnDownShexpType, layer.FfnDownShexpWeight, _ffnAct, _expertDownOut, shexpFfnDim, _dim, _ffnActSums);
+
+                    AddVector(_ffnOut, _expertDownOut, _dim);
+                }
+
+                // Residual connection: x = x + ffnOut
+                AddVector(_x, _ffnOut, _dim);
+            }
+            else
+            {
+                // SwiGLU FFN projections (reusing _normXSums for Gate and Up)
+                QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
+                QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
+                QuantKernels.SwiGLU(_gate, _up, _ffnAct, _ffnDim);
+                QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, _ffnDim);
+                QuantKernels.MatVecMul(layer.FfnDownType, layer.FfnDownWeight, _ffnAct, _ffnOut, _ffnDim, _dim, _ffnActSums);
+
+                // Residual connection: x = x + ffnOut
+                AddVector(_x, _ffnOut, _dim);
+            }
         }
 
         if (computeLogits)
@@ -218,6 +312,10 @@ public sealed unsafe class Qwen2Model : IDisposable
         int normXChunks = _dim / 32;
         int ffnChunks = _ffnDim / 32;
 
+        int maxTopK = _weights.ExpertUsedCount > 0 ? _weights.ExpertUsedCount : 1;
+        int* selectedIndices = stackalloc int[maxTopK];
+        float* selectedWeights = stackalloc float[maxTopK];
+
         // 1. Extract embeddings into batch buffer
         for (int t = 0; t < batchSize; t++)
         {
@@ -255,6 +353,24 @@ public sealed unsafe class Qwen2Model : IDisposable
                 if (layer.KBias != null) AddVector(k, layer.KBias, kvDim);
                 if (layer.VBias != null) AddVector(v, layer.VBias, kvDim);
 
+                // Optional QK-Norm (e.g. Qwen3)
+                if (layer.AttnQNormWeight != null)
+                {
+                    for (int h = 0; h < _nHeads; h++)
+                    {
+                        float* qHead = q + h * _headDim;
+                        QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
+                    }
+                }
+                if (layer.AttnKNormWeight != null)
+                {
+                    for (int h = 0; h < _nHeadsKv; h++)
+                    {
+                        float* kHead = k + h * _headDim;
+                        QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                    }
+                }
+
                 QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
                 kvCache.Store(l, pos, k, v);
 
@@ -267,6 +383,13 @@ public sealed unsafe class Qwen2Model : IDisposable
                 QuantKernels.ComputeBlockSums32(_attnOutBatch + t * _dim, _attnOutSumBatch + t * normXChunks, _dim);
             }
             QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, _dim, _dim, batchSize, _attnOutSumBatch);
+            if (layer.AttnOutBias != null)
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    AddVector(_attnProjBatch + t * _dim, layer.AttnOutBias, _dim);
+                }
+            }
 
             // Residual connection
             for (int t = 0; t < batchSize; t++)
@@ -283,25 +406,96 @@ public sealed unsafe class Qwen2Model : IDisposable
                 QuantKernels.ComputeBlockSums32(normXt, _normXSumBatch + t * normXChunks, _dim);
             }
 
-            // Batched Gate and Up projections (weights streamed once!)
-            QuantKernels.MatMulBatch(layer.FfnGateType, layer.FfnGateWeight, _normXBatch, _gateBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
-            QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _upBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
-
-            // SwiGLU activation
-            for (int t = 0; t < batchSize; t++)
+            if (layer.IsMoe)
             {
-                float* act = _ffnActBatch + t * _ffnDim;
-                QuantKernels.SwiGLU(_gateBatch + t * _ffnDim, _upBatch + t * _ffnDim, act, _ffnDim);
-                QuantKernels.ComputeBlockSums32(act, _ffnActSumBatch + t * ffnChunks, _ffnDim);
+                int expertFfnDim = _weights.ExpertFeedForwardLength;
+                int numExperts = _weights.ExpertCount;
+                int topK = _weights.ExpertUsedCount;
+
+                long gateSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(layer.FfnGateExpsType, _dim);
+                long upSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(layer.FfnUpExpsType, _dim);
+                long downSliceBytes = (long)_dim * GgufTypes.GetRowBytes(layer.FfnDownExpsType, expertFfnDim);
+
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* normXt = _normXBatch + t * _dim;
+                    float* normXSumst = _normXSumBatch + t * normXChunks;
+                    float* ffnOutt = _ffnOutBatch + t * _dim;
+
+                    QuantKernels.RouterTopK(normXt, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights);
+
+                    new Span<float>(ffnOutt, _dim).Clear();
+
+                    for (int k = 0; k < topK; k++)
+                    {
+                        int expertIdx = selectedIndices[k];
+                        float weight = selectedWeights[k];
+
+                        byte* expGateWeight = layer.FfnGateExpsWeight + expertIdx * gateSliceBytes;
+                        byte* expUpWeight = layer.FfnUpExpsWeight + expertIdx * upSliceBytes;
+                        byte* expDownWeight = layer.FfnDownExpsWeight + expertIdx * downSliceBytes;
+
+                        QuantKernels.MatVecMul(layer.FfnGateExpsType, expGateWeight, normXt, _gate, _dim, expertFfnDim, normXSumst);
+                        if (layer.FfnGateExpsBias != null) AddVector(_gate, layer.FfnGateExpsBias + (long)expertIdx * expertFfnDim, expertFfnDim);
+
+                        QuantKernels.MatVecMul(layer.FfnUpExpsType, expUpWeight, normXt, _up, _dim, expertFfnDim, normXSumst);
+                        if (layer.FfnUpExpsBias != null) AddVector(_up, layer.FfnUpExpsBias + (long)expertIdx * expertFfnDim, expertFfnDim);
+
+                        QuantKernels.SwiGLU(_gate, _up, _ffnAct, expertFfnDim);
+                        QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, expertFfnDim);
+
+                        QuantKernels.MatVecMul(layer.FfnDownExpsType, expDownWeight, _ffnAct, _expertDownOut, expertFfnDim, _dim, _ffnActSums);
+                        if (layer.FfnDownExpsBias != null) AddVector(_expertDownOut, layer.FfnDownExpsBias + (long)expertIdx * _dim, _dim);
+
+                        for (int d = 0; d < _dim; d++)
+                        {
+                            ffnOutt[d] += weight * _expertDownOut[d];
+                        }
+                    }
+
+                    // Shared Expert if present
+                    if (layer.FfnGateShexpWeight != null)
+                    {
+                        int shexpFfnDim = expertFfnDim * 2;
+                        if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                        {
+                            shexpFfnDim = (int)tShexp.Dimensions[1];
+                        }
+
+                        QuantKernels.MatVecMul(layer.FfnGateShexpType, layer.FfnGateShexpWeight, normXt, _gate, _dim, shexpFfnDim, normXSumst);
+                        QuantKernels.MatVecMul(layer.FfnUpShexpType, layer.FfnUpShexpWeight, normXt, _up, _dim, shexpFfnDim, normXSumst);
+                        QuantKernels.SwiGLU(_gate, _up, _ffnAct, shexpFfnDim);
+                        QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, shexpFfnDim);
+                        QuantKernels.MatVecMul(layer.FfnDownShexpType, layer.FfnDownShexpWeight, _ffnAct, _expertDownOut, shexpFfnDim, _dim, _ffnActSums);
+
+                        AddVector(ffnOutt, _expertDownOut, _dim);
+                    }
+
+                    AddVector(_xBatch + t * _dim, ffnOutt, _dim);
+                }
             }
-
-            // Batched FFN Down projection (weights streamed once!)
-            QuantKernels.MatMulBatch(layer.FfnDownType, layer.FfnDownWeight, _ffnActBatch, _ffnOutBatch, _ffnDim, _dim, batchSize, _ffnActSumBatch);
-
-            // Residual connection
-            for (int t = 0; t < batchSize; t++)
+            else
             {
-                AddVector(_xBatch + t * _dim, _ffnOutBatch + t * _dim, _dim);
+                // Batched Gate and Up projections (weights streamed once!)
+                QuantKernels.MatMulBatch(layer.FfnGateType, layer.FfnGateWeight, _normXBatch, _gateBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
+                QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _upBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
+
+                // SwiGLU activation
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* act = _ffnActBatch + t * _ffnDim;
+                    QuantKernels.SwiGLU(_gateBatch + t * _ffnDim, _upBatch + t * _ffnDim, act, _ffnDim);
+                    QuantKernels.ComputeBlockSums32(act, _ffnActSumBatch + t * ffnChunks, _ffnDim);
+                }
+
+                // Batched FFN Down projection (weights streamed once!)
+                QuantKernels.MatMulBatch(layer.FfnDownType, layer.FfnDownWeight, _ffnActBatch, _ffnOutBatch, _ffnDim, _dim, batchSize, _ffnActSumBatch);
+
+                // Residual connection
+                for (int t = 0; t < batchSize; t++)
+                {
+                    AddVector(_xBatch + t * _dim, _ffnOutBatch + t * _dim, _dim);
+                }
             }
         }
 
@@ -337,8 +531,10 @@ public sealed unsafe class Qwen2Model : IDisposable
                 scores[t] = dot * _attnScale;
             }
 
-            // Softmax over 0..pos
-            QuantKernels.Softmax(scores, pos + 1);
+            // Softmax over 0..pos with optional attention sink logit
+            var layerWeights = _weights.Layers[layer];
+            float? sinkLogit = layerWeights.AttnSinksWeight != null ? (float?)layerWeights.AttnSinksWeight[h] : null;
+            QuantKernels.Softmax(scores, pos + 1, sinkLogit);
 
             // Value aggregation
             float* outHead = outHeadBase + h * _headDim;
@@ -415,6 +611,7 @@ public sealed unsafe class Qwen2Model : IDisposable
             FreeIfAllocated(ref _ffnAct);
             FreeIfAllocated(ref _ffnActSums);
             FreeIfAllocated(ref _ffnOut);
+            FreeIfAllocated(ref _expertDownOut);
             FreeIfAllocated(ref _headScores);
 
             FreeIfAllocated(ref _xBatch);

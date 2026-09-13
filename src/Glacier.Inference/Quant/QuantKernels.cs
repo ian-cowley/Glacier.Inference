@@ -74,6 +74,128 @@ public static unsafe class QuantKernels
     }
 
     /// <summary>
+    /// Dequantizes a row of Q5_K blocks into 32-bit floating point array.
+    /// </summary>
+    public static void DequantizeQ5_K(BlockQ5_K* src, float* dst, int k)
+    {
+        int nb = k / QK_K;
+        for (int i = 0; i < nb; i++)
+        {
+            float d = (float)src[i].Delta;
+            float min = (float)src[i].DeltaMin;
+            byte* scales = src[i].Scales;
+            byte* ql = src[i].Qs;
+            byte* qh = src[i].Qh;
+
+            int is_idx = 0;
+            byte u1 = 1;
+            byte u2 = 2;
+            for (int j = 0; j < QK_K; j += 64)
+            {
+                GetScaleMinK4(is_idx + 0, scales, out byte sc0, out byte m0);
+                float d1 = d * sc0;
+                float m1 = min * m0;
+
+                GetScaleMinK4(is_idx + 1, scales, out byte sc1, out byte m1_val);
+                float d2 = d * sc1;
+                float m2 = min * m1_val;
+
+                for (int l = 0; l < 32; ++l)
+                {
+                    int q0 = (ql[l] & 0x0F) + ((qh[l] & u1) != 0 ? 16 : 0);
+                    *dst++ = d1 * q0 - m1;
+                }
+                for (int l = 0; l < 32; ++l)
+                {
+                    int q1 = (ql[l] >> 4) + ((qh[l] & u2) != 0 ? 16 : 0);
+                    *dst++ = d2 * q1 - m2;
+                }
+
+                ql += 32;
+                is_idx += 2;
+                u1 = (byte)(u1 << 2);
+                u2 = (byte)(u2 << 2);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dequantizes a row of Q3_K blocks into 32-bit floating point array.
+    /// </summary>
+    public static void DequantizeQ3_K(BlockQ3_K* src, float* dst, int k)
+    {
+        const uint kmask1 = 0x03030303;
+        const uint kmask2 = 0x0F0F0F0F;
+
+        int nb = k / QK_K;
+        uint* aux = stackalloc uint[4];
+        sbyte* scales = (sbyte*)aux;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d_all = (float)src[i].Delta;
+            byte* q = src[i].Qs;
+            byte* hm = src[i].Hmask;
+            byte m = 1;
+
+            Buffer.MemoryCopy(src[i].Scales, aux, 16, 12);
+            uint tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            int is_idx = 0;
+            for (int n = 0; n < QK_K; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j)
+                {
+                    float dl0 = d_all * (scales[is_idx++] - 32);
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int q0 = (sbyte)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) != 0 ? 0 : 4);
+                        *dst++ = dl0 * q0;
+                    }
+
+                    float dl1 = d_all * (scales[is_idx++] - 32);
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int q1 = (sbyte)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) != 0 ? 0 : 4);
+                        *dst++ = dl1 * q1;
+                    }
+
+                    shift += 2;
+                    m = (byte)(m << 1);
+                }
+                q += 32;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dequantizes a row of MXFP4 blocks into 32-bit floating point array.
+    /// </summary>
+    public static void DequantizeMXFP4(BlockMXFP4* src, float* dst, int k)
+    {
+        int nb = k / 32;
+        fixed (float* lut = E2M1Table)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float scale = MathF.ScaleB(1.0f, src[i].Scale - 127);
+                byte* q = src[i].Qs;
+                for (int l = 0; l < 16; ++l)
+                {
+                    dst[l] = scale * lut[q[l] & 0x0F];
+                    dst[l + 16] = scale * lut[(q[l] >> 4) & 0x0F];
+                }
+                dst += 32;
+            }
+        }
+    }
+
+    /// <summary>
     /// Computes dot product between a Q4_K quantized row and a float vector x of length k.
     /// Uses vectorized AVX2/FMA nibble extraction and precalculated block sums.
     /// </summary>
@@ -578,6 +700,237 @@ public static unsafe class QuantKernels
     }
 
     /// <summary>
+    /// Computes dot product between a Q5_K quantized row and a float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotQ5_K(BlockQ5_K* row, float* x, int k)
+    {
+        int nb = k / QK_K;
+        float sum = 0f;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d = (float)row[i].Delta;
+            float min = (float)row[i].DeltaMin;
+            byte* scales = row[i].Scales;
+            byte* ql = row[i].Qs;
+            byte* qh = row[i].Qh;
+
+            int is_idx = 0;
+            byte u1 = 1;
+            byte u2 = 2;
+            for (int j = 0; j < QK_K; j += 64)
+            {
+                GetScaleMinK4(is_idx + 0, scales, out byte sc0, out byte m0);
+                float d1 = d * sc0;
+                float m1 = min * m0;
+
+                GetScaleMinK4(is_idx + 1, scales, out byte sc1, out byte m1_val);
+                float d2 = d * sc1;
+                float m2 = min * m1_val;
+
+                float sub0 = 0f;
+                float sub1 = 0f;
+
+                for (int l = 0; l < 32; ++l)
+                {
+                    int q0 = (ql[l] & 0x0F) + ((qh[l] & u1) != 0 ? 16 : 0);
+                    sub0 += (d1 * q0 - m1) * x[l];
+                }
+                for (int l = 0; l < 32; ++l)
+                {
+                    int q1 = (ql[l] >> 4) + ((qh[l] & u2) != 0 ? 16 : 0);
+                    sub1 += (d2 * q1 - m2) * x[l + 32];
+                }
+
+                sum += sub0 + sub1;
+                x += 64;
+                ql += 32;
+                is_idx += 2;
+                u1 = (byte)(u1 << 2);
+                u2 = (byte)(u2 << 2);
+            }
+        }
+
+        return sum;
+    }
+
+    /// <summary>
+    /// Computes dot product between a Q3_K quantized row and a float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotQ3_K(BlockQ3_K* row, float* x, int k)
+    {
+        const uint kmask1 = 0x03030303;
+        const uint kmask2 = 0x0F0F0F0F;
+
+        int nb = k / QK_K;
+        float sum = 0f;
+        uint* aux = stackalloc uint[4];
+        sbyte* scales = (sbyte*)aux;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d_all = (float)row[i].Delta;
+            byte* q = row[i].Qs;
+            byte* hm = row[i].Hmask;
+            byte m = 1;
+
+            Buffer.MemoryCopy(row[i].Scales, aux, 16, 12);
+            uint tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+            int is_idx = 0;
+            for (int n = 0; n < QK_K; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j)
+                {
+                    float dl0 = d_all * (scales[is_idx++] - 32);
+                    float sub0 = 0f;
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int q0 = (sbyte)((q[l + 0] >> shift) & 3) - ((hm[l + 0] & m) != 0 ? 0 : 4);
+                        sub0 += q0 * x[l];
+                    }
+                    sum += dl0 * sub0;
+                    x += 16;
+
+                    float dl1 = d_all * (scales[is_idx++] - 32);
+                    float sub1 = 0f;
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int q1 = (sbyte)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) != 0 ? 0 : 4);
+                        sub1 += q1 * x[l];
+                    }
+                    sum += dl1 * sub1;
+                    x += 16;
+
+                    shift += 2;
+                    m = (byte)(m << 1);
+                }
+                q += 32;
+            }
+        }
+
+        return sum;
+    }
+
+    private static readonly float[] E2M1Table = [
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    ];
+
+    /// <summary>
+    /// Computes dot product between an MXFP4 quantized row and a float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotMXFP4(BlockMXFP4* row, float* x, int k)
+    {
+        int nb = k / 32;
+        float sum = 0f;
+
+        fixed (float* lut = E2M1Table)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float scale = MathF.ScaleB(1.0f, row[i].Scale - 127);
+                byte* q = row[i].Qs;
+                float blockSum = 0f;
+
+                for (int l = 0; l < 16; ++l)
+                {
+                    int v0 = q[l] & 0x0F;
+                    int v1 = (q[l] >> 4) & 0x0F;
+                    blockSum += lut[v0] * x[l] + lut[v1] * x[l + 16];
+                }
+
+                sum += scale * blockSum;
+                x += 32;
+            }
+        }
+
+        return sum;
+    }
+
+    /// <summary>
+    /// Evaluates router gating logits, applies softmax, and selects the top-K active experts.
+    /// Renormalizes top-K weights so their sum equals 1.0.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RouterTopK(
+        float* x,
+        float* gateInpWeight,
+        float* gateInpBias,
+        int dim,
+        int expertCount,
+        int topK,
+        int* selectedIndices,
+        float* selectedWeights)
+    {
+        float* logits = stackalloc float[expertCount];
+
+        // 1. Compute router logits for all experts
+        float maxLogit = float.MinValue;
+        for (int e = 0; e < expertCount; e++)
+        {
+            float* row = gateInpWeight + (long)e * dim;
+            float z = VecDotF32(row, x, dim);
+            if (gateInpBias != null)
+            {
+                z += gateInpBias[e];
+            }
+            logits[e] = z;
+            if (z > maxLogit) maxLogit = z;
+        }
+
+        // 2. Softmax probabilities
+        float* probs = stackalloc float[expertCount];
+        for (int e = 0; e < expertCount; e++)
+        {
+            probs[e] = MathF.Exp(logits[e] - maxLogit);
+        }
+
+        // 3. Select top-K experts with largest probabilities
+        for (int k = 0; k < topK; k++)
+        {
+            float bestVal = -1f;
+            int bestIdx = -1;
+            for (int e = 0; e < expertCount; e++)
+            {
+                if (probs[e] > bestVal)
+                {
+                    bestVal = probs[e];
+                    bestIdx = e;
+                }
+            }
+
+            selectedIndices[k] = bestIdx;
+            selectedWeights[k] = bestVal;
+            if (bestIdx >= 0)
+            {
+                probs[bestIdx] = -2f; // Mark as visited
+            }
+        }
+
+        // 4. Renormalize top-K weights to sum to 1.0
+        float sumWeights = 0f;
+        for (int k = 0; k < topK; k++)
+        {
+            sumWeights += selectedWeights[k];
+        }
+
+        float invSum = sumWeights > 0f ? 1.0f / sumWeights : 1.0f / topK;
+        for (int k = 0; k < topK; k++)
+        {
+            selectedWeights[k] *= invSum;
+        }
+    }
+
+    /// <summary>
     /// Multiplies a quantized matrix W [nRows, nCols] by vector x [nCols] producing y [nRows].
     /// Automatically multithreads row calculations across all available CPU cores.
     /// </summary>
@@ -690,6 +1043,9 @@ public static unsafe class QuantKernels
             GgufType.Q6_K => VecDotQ6_K((BlockQ6_K*)rowPtr, x, nCols),
             GgufType.Q8_0 => VecDotQ8_0((BlockQ8_0*)rowPtr, x, nCols),
             GgufType.Q4_0 => VecDotQ4_0((BlockQ4_0*)rowPtr, x, nCols),
+            GgufType.Q5_K => VecDotQ5_K((BlockQ5_K*)rowPtr, x, nCols),
+            GgufType.Q3_K => VecDotQ3_K((BlockQ3_K*)rowPtr, x, nCols),
+            GgufType.MXFP4 => VecDotMXFP4((BlockMXFP4*)rowPtr, x, nCols),
             GgufType.F16 => VecDotF16((Half*)rowPtr, x, nCols),
             GgufType.F32 => VecDotF32((float*)rowPtr, x, nCols),
             _ => throw new NotSupportedException($"Quantization type {type} is not supported in hardware GEMV kernels.")
@@ -819,10 +1175,10 @@ public static unsafe class QuantKernels
     }
 
     /// <summary>
-    /// In-place numerically stable Softmax over a vector of logits.
+    /// In-place numerically stable Softmax over a vector of logits with optional attention sink logit.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public static void Softmax(float* x, int size)
+    public static void Softmax(float* x, int size, float? sinkLogit = null)
     {
         if (size <= 0) return;
 
@@ -831,8 +1187,12 @@ public static unsafe class QuantKernels
         {
             if (x[i] > maxVal) maxVal = x[i];
         }
+        if (sinkLogit.HasValue && sinkLogit.Value > maxVal)
+        {
+            maxVal = sinkLogit.Value;
+        }
 
-        float sumExp = 0f;
+        float sumExp = sinkLogit.HasValue ? MathF.Exp(sinkLogit.Value - maxVal) : 0f;
         for (int i = 0; i < size; i++)
         {
             float expVal = MathF.Exp(x[i] - maxVal);
@@ -858,11 +1218,20 @@ public static unsafe class QuantKernels
 
         switch (type)
         {
+            case GgufType.Q3_K:
+                DequantizeQ3_K((BlockQ3_K*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q4_K:
                 DequantizeQ4_K((BlockQ4_K*)rowPtr, dst, embeddingDim);
                 break;
+            case GgufType.Q5_K:
+                DequantizeQ5_K((BlockQ5_K*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q6_K:
                 DequantizeQ6_K((BlockQ6_K*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.MXFP4:
+                DequantizeMXFP4((BlockMXFP4*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.Q8_0:
                 for (int i = 0; i < embeddingDim / 32; i++)

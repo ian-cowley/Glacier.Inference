@@ -197,11 +197,13 @@ public static class Program
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier inspect <model.gguf>");
-        Console.WriteLine("  glacier inspect -m <model.gguf>");
+        Console.WriteLine("  glacier inspect <model.gguf> [options]");
+        Console.WriteLine("  glacier inspect -m <model.gguf> [options]");
         Console.WriteLine();
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
+        Console.WriteLine("  -f, --filter <pattern>               Filter displayed tensors by name pattern (e.g. 'exps', 'attn')");
+        Console.WriteLine("  -a, --all                            Display all tensors instead of capping at first 25");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("Description:");
@@ -211,7 +213,8 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine("  glacier inspect models/Qwen2.5-Coder-7B-Enterprise-Q8_0.gguf");
-        Console.WriteLine("  glacier inspect -m models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf");
+        Console.WriteLine("  glacier inspect models/Qwen3-30B-A3B-Q4_K_M.gguf --filter exps");
+        Console.WriteLine("  glacier inspect -m models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf -a");
     }
 
     private static void PrintBenchHelp()
@@ -335,10 +338,17 @@ public static class Program
         }
 
         string? modelPath = null;
+        string? tensorFilter = null;
+        bool showAllTensors = false;
+
         for (int i = 0; i < args.Length; i++)
         {
             if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
                 modelPath = args[++i];
+            else if ((args[i] == "-f" || args[i] == "--filter") && i + 1 < args.Length)
+                tensorFilter = args[++i];
+            else if (args[i] == "-a" || args[i] == "--all")
+                showAllTensors = true;
             else if (!args[i].StartsWith("-") && modelPath == null)
                 modelPath = args[i];
         }
@@ -401,6 +411,35 @@ public static class Program
                     Console.WriteLine($"  {kv.Key}: {s}");
                 }
             }
+        }
+
+        Console.WriteLine("\n--- Tensors Summary ---");
+        var types = new Dictionary<Glacier.Inference.Gguf.GgufType, int>();
+        foreach (var t in gguf.TensorList)
+        {
+            types[t.Type] = types.GetValueOrDefault(t.Type) + 1;
+        }
+        foreach (var kvp in types)
+        {
+            Console.WriteLine($"  {kvp.Key}: {kvp.Value} tensors");
+        }
+
+        var displayTensors = gguf.TensorList;
+        if (!string.IsNullOrEmpty(tensorFilter))
+        {
+            displayTensors = displayTensors.Where(t => t.Name.Contains(tensorFilter, StringComparison.OrdinalIgnoreCase)).ToList();
+            Console.WriteLine($"\n--- Filtered Tensors (matching '{tensorFilter}', {displayTensors.Count} matching) ---");
+        }
+        else
+        {
+            Console.WriteLine(showAllTensors ? $"\n--- All Tensors ({displayTensors.Count}) ---" : "\n--- First 25 Tensors ---");
+        }
+
+        int maxDisplay = showAllTensors || !string.IsNullOrEmpty(tensorFilter) ? displayTensors.Count : Math.Min(25, displayTensors.Count);
+        for (int i = 0; i < maxDisplay; i++)
+        {
+            var t = displayTensors[i];
+            Console.WriteLine($"  [{i,3}] {t.Name,-45} | Type: {t.Type,-10} | Dims: [{string.Join(" x ", t.Dimensions)}]");
         }
 
         return 0;

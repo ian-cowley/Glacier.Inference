@@ -107,7 +107,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         Device = targetDevice;
         Engine = targetEngine;
 
-        if (targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+        if (!_weights.IsMoe && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
         {
             try
             {
@@ -130,7 +130,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
             }
         }
-        else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+        else if (!_weights.IsMoe && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                  targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
         {
             try
@@ -157,7 +157,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
             _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
+            ActiveDevice = _weights.IsMoe
+                ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
+                : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
         }
     }
 

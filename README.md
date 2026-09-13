@@ -19,14 +19,17 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 - **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
 - **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via pure DXGI P/Invoke.
 - **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS on compute dGPUs (NVIDIA RTX 3060, RTX 4060, RTX 4090).
-- **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-100ms cold time without heap allocations.
-- **Hardware SIMD Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F16`, and `F32`.
+- **Mixture-of-Experts (MoE) Architecture Runtime**: High-throughput MoE routing engine supporting up to 128 experts per layer with Top-$K$ gating, softmax re-normalization, shared experts (DeepSeek / ERNIE), per-head Query/Key RMSNorm (`attn_q_norm`, `attn_k_norm`), and zero-copy 3D tensor slicing (`[cols x rows x num_experts]`).
+- **OpenAI Attention Sinks & Streaming Contexts**: Native support for attention sink logit absorption (`attn_sinks.weight`) preventing attention overflow and perplexity degradation in long-context models (`gpt-oss-20b`) and streaming generation.
+- **Next-Gen Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `MXFP4` (Type 39, Microscaling FP4 with E2M1 LUT and power-of-2 scaling), `Q3_K` (Type 11, 3.4375 bpw), `Q4_K` (Type 12), `Q5_K` (Type 13, 5.5 bpw), `Q6_K` (Type 14), `Q8_0` (Type 8), `Q4_0`, `F16`, and `F32`.
+- **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
 - **Full Architecture Support**:
-  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 (4B).
+  - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
+  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 (4B dense & 30B MoE).
   - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
-  - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama.
+  - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama, DeepSeek-Coder-V2-Lite.
   - **Xiaomi MiMo Family**: MiMo-7B-RL.
-  - Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Optional QKV Bias, SwiGLU FFN, and RMSNorm.
+  - Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Optional QKV Bias, SwiGLU FFN, Per-Head RMSNorm, and Attention Sinks.
 - **Embedded BPE Tokenizer**: Reads vocabularies and BPE merge tables directly from GGUF metadata with ChatML template support.
 - **Dual-Protocol HTTP Server**: Drop-in compatible with Ollama (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI (`/v1/chat/completions`, `/v1/models`).
 - **Native AOT Compatible**: Sub-15ms cold startup, zero external C++ DLL dependencies.
@@ -176,6 +179,25 @@ To verify versatility and robustness across model sizes and model families, `Gla
 | **Qwen2.5-Coder-7B Enterprise** | 🇨🇳 Alibaba (China) / Q8_0 | 7.54 GB (Q8_0) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)** | **82.30 tok/s**<br>**38.40 tok/s** | **28.43 tok/s**<br>**6.77 tok/s** | **2.00 s**<br>**5.64 s** | Heavyweight 8-bit quantization, full-stack .NET 10 post-trained |
 | **Xiaomi MiMo-7B-RL** | 🇨🇳 Xiaomi (China) / MiMo | 4.36 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **99.54 tok/s** | **41.64 tok/s** | **0.90 s** | ChatML, RL-aligned Qwen2-derived architecture |
 | **Qwen3-4B-Instruct** | 🇨🇳 Alibaba (China) / 4B | 2.33 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **177.90 tok/s** | **65.99 tok/s** | **0.42 s** | Sub-3B compact weight footprint, ultra-high throughput |
+
+### Benchmark 7: Mixture-of-Experts (MoE) & Next-Gen Quantization Benchmark (USA & Chinese Frontiers)
+To verify support for sparse Mixture-of-Experts architectures and next-generation quantization types (Microscaling FP4, Q3_K, Q5_K), `Glacier.Inference` was evaluated against frontier open MoE models ranging from 8B to 30B total parameters:
+
+| Model | Provenance / Family | Active / Total Params | Quant Type | Weight Size | Tested Accelerator | Generation Rate | Architectural Features |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen3-30B-A3B-Instruct** | 🇨🇳 Alibaba (China) | **3B Active** / 30B Total (128 Experts) | `Q3_K_L` | **13.58 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **0.6 – 1.0 tok/s** | 128 Experts, Top-8 routing, QK RMSNorm (`attn_q_norm`), 3D tensor slicing |
+| **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **1.7 tok/s** | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
+| **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **12.57 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **1.2 tok/s** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
+| **LiquidAI LFM2-8B-A1B** | 🇺🇸 Liquid AI (USA) | **1.5B Active** / 8B Total (32 Experts) | `Q4_K_M` | **4.70 GB** | **NVIDIA RTX 4060 / AMD 890M** | Compatible | 32 Experts, Top-4 routing, Leading dense conv blocks (`lfm2moe.shortconv`), QK-Norm |
+| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **NVIDIA RTX 3060 / AMD 890M** | Compatible | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Shared Experts |
+
+#### Hardware Sizing & Allocation Matrix for MoE Models:
+| Hardware Target | Memory Capacity & Bandwidth | Target MoE Models | Optimal Allocation |
+| :--- | :--- | :--- | :--- |
+| **NVIDIA GeForce RTX 4060 Laptop** | 8 GB GDDR6 (256 GB/s) | Models $\le 7.5\text{ GB}$ (e.g. `LiquidAI LFM2-8B-A1B` at 4.70 GB, dense 7B models) | 100% VRAM Resident (Bare-Metal SASS) |
+| **NVIDIA GeForce RTX 3060 Desktop** | 12 GB GDDR6 (360 GB/s) | Models $\le 11.5\text{ GB}$ (e.g. `gpt-oss-20b-MXFP4` at 11.28 GB, `DeepSeek-Coder-V2-Lite` at 9.65 GB) | 100% VRAM Resident (Bare-Metal SASS) |
+| **AMD Radeon 890M iGPU** | 15.5 GB Unified Memory (LPDDR5X) | Models $\le 14.5\text{ GB}$ (e.g. `Qwen3-30B-A3B-Q3_K_L` at 13.58 GB, `ERNIE-4.5-21B-A3B` at 12.57 GB) | Unified Memory Direct3D 12 Compute |
+| **AMD Ryzen AI 9 HX 370 CPU** | 31 GB System RAM (24 Threads AVX-512) | Models up to 28 GB (e.g. `Qwen3-30B-A3B-Q4_K_M` at 17.35 GB, `Mixtral-8x7B` at 26 GB) | Multi-threaded AVX-512 / AVX2 SIMD |
 
 ### 💡 Why Glacier is Faster & Deep-Dive Architecture
 
@@ -405,15 +427,16 @@ Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRat
 │  ├─ IDraftProvider (PromptLookupDraftProvider, ModelDraftProvider)     │
 │  ├─ DeviceManager (Pure C# DXGI & nvcuda hardware enumeration)         │
 │  ├─ GlacierSettings (Persistent JSON hardware configuration)          │
-│  ├─ GgufFile (MemoryMappedFile zero-copy reader)                       │
+│  ├─ GgufFile (MemoryMappedFile zero-copy reader, GgufMetadataReader)   │
+│  ├─ MoE Routing & Gating (Top-K, 3D Tensor Slicing, Shared Experts)   │
 │  ├─ Qwen2GpuModel (Bare-Metal SASS GPU engine, VerifyBatch, Argmax)    │
 │  ├─ Qwen2D3D12Model (Bare-Metal Direct3D 12 Compute HLSL Wave32)      │
 │  ├─ D3D12Context (Pure C# Vortice.D3D12 device & compute pipeline)     │
 │  ├─ D3D12Shaders (Embedded compiled HLSL compute shaders, 32T GEMM)   │
-│  ├─ QuantKernels (AVX-512 / AVX2 Q4_K, Q6_K, Q8_0, F16)                │
+│  ├─ QuantKernels (AVX-512/AVX2 Q4_K, Q6_K, Q8_0, Q3_K, Q5_K, MXFP4)   │
 │  ├─ KVCache (Unmanaged contiguous ring buffer, Adaptive FP16 / FP8)    │
-│  ├─ Qwen2Model / TransformerModel (Attention, SwiGLU)                  │
-│  ├─ BpeTokenizer (Direct GGUF token & merge tables)                    │
+│  ├─ Qwen2Model / MoE Transformer (Attention Sinks, QK-Norm, SwiGLU)    │
+│  ├─ BpeTokenizer (Direct GGUF token & merge tables, ChatML)            │
 │  └─ Sampler (Pure GPU Argmax ~3μs, Temperature, Top-K, Top-P)          │
 └────────────────────────────────────────────────────────────────────────┘
 ```

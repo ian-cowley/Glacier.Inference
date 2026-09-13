@@ -40,6 +40,13 @@ public sealed unsafe class GgufFile : IDisposable
     public int EosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.eos_token_id", 151645);
     public int BosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.bos_token_id", 151643);
 
+    public int ExpertCount => (int)GetMetadataUInt32($"{Architecture}.expert_count", 0);
+    public int ExpertUsedCount => (int)GetMetadataUInt32($"{Architecture}.expert_used_count", 0);
+    public int ExpertFeedForwardLength => (int)GetMetadataUInt32($"{Architecture}.expert_feed_forward_length", 0);
+    public int ExpertSharedCount => (int)GetMetadataUInt32($"{Architecture}.expert_shared_count", 0);
+    public int LeadingDenseBlockCount => (int)GetMetadataUInt32($"{Architecture}.leading_dense_block_count", 0);
+    public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
+
     public static GgufFile Open(string filePath) => new(filePath);
 
     public GgufFile(string filePath)

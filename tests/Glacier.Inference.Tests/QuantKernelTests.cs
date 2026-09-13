@@ -169,5 +169,155 @@ public unsafe class QuantKernelTests
             Assert.Equal(ySingle[i], yBatch[i], 0.0001f);
         }
     }
+
+    [Fact]
+    public void RouterTopK_SelectsTopK_And_NormalizesToUnitSum()
+    {
+        const int dim = 64;
+        const int expertCount = 8;
+        const int topK = 2;
+
+        float[] x = new float[dim];
+        for (int i = 0; i < dim; i++) x[i] = 1.0f;
+
+        // Create router weights where expert 3 has highest dot product, expert 6 has second highest
+        float[] weights = new float[expertCount * dim];
+        for (int i = 0; i < dim; i++)
+        {
+            weights[3 * dim + i] = 2.0f; // Dot = 128
+            weights[6 * dim + i] = 1.5f; // Dot = 96
+            weights[1 * dim + i] = 0.5f; // Dot = 32
+        }
+
+        int[] selectedIndices = new int[topK];
+        float[] selectedWeights = new float[topK];
+
+        fixed (float* pX = x, pW = weights, pWeightsOut = selectedWeights)
+        fixed (int* pIdxOut = selectedIndices)
+        {
+            QuantKernels.RouterTopK(pX, pW, null, dim, expertCount, topK, pIdxOut, pWeightsOut);
+        }
+
+        // Top-2 should be expert 3 and expert 6
+        Assert.Equal(3, selectedIndices[0]);
+        Assert.Equal(6, selectedIndices[1]);
+
+        // Weights should sum to 1.0
+        float sum = selectedWeights[0] + selectedWeights[1];
+        Assert.InRange(sum, 0.999f, 1.001f);
+        Assert.True(selectedWeights[0] > selectedWeights[1]);
+    }
+
+    [Fact]
+    public void RouterTopK_IncorporatesBias_Correctly()
+    {
+        const int dim = 32;
+        const int expertCount = 4;
+        const int topK = 1;
+
+        float[] x = new float[dim];
+        float[] weights = new float[expertCount * dim]; // all zeros -> dot = 0
+        float[] bias = [1.0f, 5.0f, 2.0f, 0.0f]; // expert 1 has highest bias
+
+        int[] selectedIndices = new int[topK];
+        float[] selectedWeights = new float[topK];
+
+        fixed (float* pX = x, pW = weights, pB = bias, pWeightsOut = selectedWeights)
+        fixed (int* pIdxOut = selectedIndices)
+        {
+            QuantKernels.RouterTopK(pX, pW, pB, dim, expertCount, topK, pIdxOut, pWeightsOut);
+        }
+
+        Assert.Equal(1, selectedIndices[0]);
+        Assert.Equal(1.0f, selectedWeights[0], 0.001f);
+    }
+
+    [Fact]
+    public void VecDotQ5_K_MatchesDequantizedDotProduct()
+    {
+        const int k = 256;
+        BlockQ5_K block = new BlockQ5_K();
+        block.Delta = (Half)1.5f;
+        block.DeltaMin = (Half)0.5f;
+
+        for (int i = 0; i < 12; i++) block.Scales[i] = (byte)(i * 5 + 1);
+        for (int i = 0; i < 32; i++) block.Qh[i] = (byte)(i % 255);
+        for (int i = 0; i < 128; i++) block.Qs[i] = (byte)((i * 17) & 0xFF);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 7) - 3.0f;
+
+        float[] dequant = new float[k];
+        float expectedDot = 0f;
+
+        BlockQ5_K* pBlock = &block;
+        fixed (float* pDst = dequant, pX = x)
+        {
+            QuantKernels.DequantizeQ5_K(pBlock, pDst, k);
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotQ5_K(pBlock, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.01f);
+        }
+    }
+
+    [Fact]
+    public void VecDotQ3_K_MatchesDequantizedDotProduct()
+    {
+        const int k = 256;
+        BlockQ3_K block = new BlockQ3_K();
+        block.Delta = (Half)0.75f;
+
+        for (int i = 0; i < 32; i++) block.Hmask[i] = (byte)(i * 13 + 7);
+        for (int i = 0; i < 64; i++) block.Qs[i] = (byte)(i * 23);
+        for (int i = 0; i < 12; i++) block.Scales[i] = (byte)(i * 11 + 3);
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 9) - 4.0f;
+
+        float[] dequant = new float[k];
+        float expectedDot = 0f;
+
+        BlockQ3_K* pBlock3 = &block;
+        fixed (float* pDst = dequant, pX = x)
+        {
+            QuantKernels.DequantizeQ3_K(pBlock3, pDst, k);
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotQ3_K(pBlock3, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.01f);
+        }
+    }
+
+    [Fact]
+    public void VecDotMXFP4_MatchesDequantizedDotProduct()
+    {
+        const int k = 64; // 2 blocks
+        BlockMXFP4[] blocks = new BlockMXFP4[2];
+        blocks[0].Scale = 129; // 2^(129-127) = 2^2 = 4.0
+        blocks[1].Scale = 125; // 2^(125-127) = 2^(-2) = 0.25
+
+        for (int i = 0; i < 16; i++)
+        {
+            blocks[0].Qs[i] = (byte)(i | ((15 - i) << 4));
+            blocks[1].Qs[i] = (byte)(((i * 3) & 0x0F) | (((i * 7) & 0x0F) << 4));
+        }
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 5) - 2.0f;
+
+        float[] dequant = new float[k];
+        float expectedDot = 0f;
+
+        fixed (BlockMXFP4* pBlocks = blocks)
+        fixed (float* pDst = dequant, pX = x)
+        {
+            QuantKernels.DequantizeMXFP4(pBlocks, pDst, k);
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotMXFP4(pBlocks, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.001f);
+        }
+    }
 }
 
