@@ -55,9 +55,33 @@ jobs:
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
         run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
 
+      - name: Publish Standalone CLI Binaries
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p release-assets
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+
+          # Windows x64
+          dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/win-x64
+          zip -j "release-assets/glacier-${TAG_NAME}-win-x64.zip" publish/win-x64/glacier.exe
+
+          # Windows ARM64 (Snapdragon X Elite)
+          dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r win-arm64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/win-arm64
+          zip -j "release-assets/glacier-${TAG_NAME}-win-arm64.zip" publish/win-arm64/glacier.exe
+
+          # Linux x64
+          dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/linux-x64
+          tar -czf "release-assets/glacier-${TAG_NAME}-linux-x64.tar.gz" -C publish/linux-x64 glacier
+
+          # macOS ARM64 (Apple Silicon)
+          dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/osx-arm64
+          tar -czf "release-assets/glacier-${TAG_NAME}-osx-arm64.tar.gz" -C publish/osx-arm64 glacier
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: packages/*.nupkg
+          files: |
+            packages/*.nupkg
+            release-assets/*
           generate_release_notes: true

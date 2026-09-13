@@ -36,6 +36,41 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 
 ---
 
+## Installation & Standalone Binaries
+
+### Option 1: Download Standalone CLI Binaries (Zero Dependencies)
+Prebuilt, self-contained single-file binaries are available directly on the [GitHub Releases](https://github.com/ian-cowley/Glacier.Inference/releases) page:
+
+| Platform | Architecture | Archive | Features / Capabilities |
+| :--- | :--- | :--- | :--- |
+| **Windows** | `x64` | [**`glacier-v1.1.10-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
+| **Windows** | `ARM64` | [**`glacier-v1.1.10-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
+| **Linux** | `x64` | [**`glacier-v1.1.10-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
+| **macOS** | `ARM64` | [**`glacier-v1.1.10-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD |
+
+Simply extract the archive and run `glacier` from any terminal:
+```bash
+# Windows
+.\glacier.exe devices
+
+# Linux / macOS
+chmod +x glacier
+./glacier devices
+```
+
+### Option 2: Install as a .NET Global Tool
+```bash
+dotnet tool install --global Glacier.Inference.Cli
+glacier --help
+```
+
+### Option 3: Add NuGet Package to Your C# Project
+```bash
+dotnet add package Glacier.Inference
+```
+
+---
+
 ## CLI Usage & Complete Help System
 
 Glacier provides a full hierarchical `--help` system. You can view top-level help or deep contextual help for any individual command:
