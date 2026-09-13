@@ -14,15 +14,15 @@ public sealed unsafe class LayerWeights
 
     public required byte* QWeight { get; init; }
     public required GgufType QType { get; init; }
-    public required float* QBias { get; init; }
+    public float* QBias { get; init; }
 
     public required byte* KWeight { get; init; }
     public required GgufType KType { get; init; }
-    public required float* KBias { get; init; }
+    public float* KBias { get; init; }
 
     public required byte* VWeight { get; init; }
     public required GgufType VType { get; init; }
-    public required float* VBias { get; init; }
+    public float* VBias { get; init; }
 
     public required byte* AttnOutWeight { get; init; }
     public required GgufType AttnOutType { get; init; }
@@ -112,11 +112,11 @@ public sealed unsafe class ModelWeights
         {
             var attnNorm = gguf.Tensors[$"blk.{l}.attn_norm.weight"];
             var q = gguf.Tensors[$"blk.{l}.attn_q.weight"];
-            var qb = gguf.Tensors[$"blk.{l}.attn_q.bias"];
+            gguf.TryGetTensor($"blk.{l}.attn_q.bias", out var qb);
             var k = gguf.Tensors[$"blk.{l}.attn_k.weight"];
-            var kb = gguf.Tensors[$"blk.{l}.attn_k.bias"];
+            gguf.TryGetTensor($"blk.{l}.attn_k.bias", out var kb);
             var v = gguf.Tensors[$"blk.{l}.attn_v.weight"];
-            var vb = gguf.Tensors[$"blk.{l}.attn_v.bias"];
+            gguf.TryGetTensor($"blk.{l}.attn_v.bias", out var vb);
             var attnOut = gguf.Tensors[$"blk.{l}.attn_output.weight"];
 
             var ffnNorm = gguf.Tensors[$"blk.{l}.ffn_norm.weight"];
@@ -130,13 +130,13 @@ public sealed unsafe class ModelWeights
                 AttnNormType = attnNorm.Type,
                 QWeight = gguf.GetTensorPointer(q),
                 QType = q.Type,
-                QBias = (float*)gguf.GetTensorPointer(qb),
+                QBias = qb != null ? (float*)gguf.GetTensorPointer(qb) : null,
                 KWeight = gguf.GetTensorPointer(k),
                 KType = k.Type,
-                KBias = (float*)gguf.GetTensorPointer(kb),
+                KBias = kb != null ? (float*)gguf.GetTensorPointer(kb) : null,
                 VWeight = gguf.GetTensorPointer(v),
                 VType = v.Type,
-                VBias = (float*)gguf.GetTensorPointer(vb),
+                VBias = vb != null ? (float*)gguf.GetTensorPointer(vb) : null,
                 AttnOutWeight = gguf.GetTensorPointer(attnOut),
                 AttnOutType = attnOut.Type,
                 FfnNormWeight = (float*)gguf.GetTensorPointer(ffnNorm),

@@ -16,6 +16,7 @@ public sealed partial class BpeTokenizer
     private readonly string[] _idToToken;
     private readonly Dictionary<string, int> _bpeRanks = new(160000, StringComparer.Ordinal);
     private readonly Dictionary<string, int> _specialTokens = new(StringComparer.Ordinal);
+    private readonly HashSet<int> _stopTokens = new();
 
     // Byte-level BPE character mappings
     private static readonly char[] ByteToChar = new char[256];
@@ -30,6 +31,8 @@ public sealed partial class BpeTokenizer
     public int EosTokenId { get; }
     public int BosTokenId { get; }
     public int PadTokenId { get; }
+
+    public bool IsStopToken(int tokenId) => _stopTokens.Contains(tokenId);
 
     static BpeTokenizer()
     {
@@ -90,10 +93,28 @@ public sealed partial class BpeTokenizer
             }
         }
 
-        // Register special tokens
+        // Register special tokens across architectures (Qwen, LLaMA 3, DeepSeek, Mistral)
         RegisterSpecialToken("<|im_start|>");
         RegisterSpecialToken("<|im_end|>");
         RegisterSpecialToken("<|endoftext|>");
+        RegisterSpecialToken("<|begin_of_text|>");
+        RegisterSpecialToken("<|end_of_text|>");
+        RegisterSpecialToken("<|start_header_id|>");
+        RegisterSpecialToken("<|end_header_id|>");
+        RegisterSpecialToken("<|eot_id|>");
+        RegisterSpecialToken("<s>");
+        RegisterSpecialToken("</s>");
+        RegisterSpecialToken("<unk>");
+        RegisterSpecialToken("<think>");
+        RegisterSpecialToken("</think>");
+
+        // Initialize stop tokens
+        if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
+        RegisterStopToken("<|im_end|>");
+        RegisterStopToken("<|endoftext|>");
+        RegisterStopToken("<|end_of_text|>");
+        RegisterStopToken("<|eot_id|>");
+        RegisterStopToken("</s>");
     }
 
     public BpeTokenizer(IEnumerable<string> vocab, int eosTokenId = 151643, int bosTokenId = 151644)
@@ -109,6 +130,13 @@ public sealed partial class BpeTokenizer
             _tokenToId[tokenList[i]] = i;
             _specialTokens[tokenList[i]] = i;
         }
+
+        if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
+        RegisterStopToken("<|im_end|>");
+        RegisterStopToken("<|endoftext|>");
+        RegisterStopToken("<|end_of_text|>");
+        RegisterStopToken("<|eot_id|>");
+        RegisterStopToken("</s>");
     }
 
     private void RegisterSpecialToken(string token)
@@ -119,23 +147,55 @@ public sealed partial class BpeTokenizer
         }
     }
 
+    private void RegisterStopToken(string token)
+    {
+        if (_specialTokens.TryGetValue(token, out int id))
+        {
+            _stopTokens.Add(id);
+        }
+        else if (_tokenToId.TryGetValue(token, out int id2))
+        {
+            _stopTokens.Add(id2);
+        }
+    }
+
     /// <summary>
-    /// Formats a user prompt and optional system prompt into standard Qwen2 ChatML format.
+    /// Formats a user prompt and optional system prompt into the model's native chat template (ChatML or LLaMA-3).
     /// </summary>
     public string FormatChatML(string prompt, string systemPrompt = "You are a helpful assistant.")
     {
-        var sb = new StringBuilder();
-        if (!string.IsNullOrEmpty(systemPrompt))
+        // 1. Check for LLaMA 3 header format
+        if (_specialTokens.ContainsKey("<|start_header_id|>"))
         {
-            sb.Append("<|im_start|>system\n");
-            sb.Append(systemPrompt);
-            sb.Append("<|im_end|>\n");
+            var sb = new StringBuilder();
+            if (_specialTokens.ContainsKey("<|begin_of_text|>"))
+            {
+                sb.Append("<|begin_of_text|>");
+            }
+            if (!string.IsNullOrEmpty(systemPrompt))
+            {
+                sb.Append($"<|start_header_id|>system<|end_header_id|>\n\n{systemPrompt}<|eot_id|>");
+            }
+            sb.Append($"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>");
+            sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            return sb.ToString();
         }
-        sb.Append("<|im_start|>user\n");
-        sb.Append(prompt);
-        sb.Append("<|im_end|>\n");
-        sb.Append("<|im_start|>assistant\n");
-        return sb.ToString();
+
+        // 2. Standard ChatML format (Qwen2, Qwen3, DeepSeek, MiMo)
+        {
+            var sb = new StringBuilder();
+            if (!string.IsNullOrEmpty(systemPrompt))
+            {
+                sb.Append("<|im_start|>system\n");
+                sb.Append(systemPrompt);
+                sb.Append("<|im_end|>\n");
+            }
+            sb.Append("<|im_start|>user\n");
+            sb.Append(prompt);
+            sb.Append("<|im_end|>\n");
+            sb.Append("<|im_start|>assistant\n");
+            return sb.ToString();
+        }
     }
 
     /// <summary>

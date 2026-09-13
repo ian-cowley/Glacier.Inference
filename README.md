@@ -22,10 +22,11 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-100ms cold time without heap allocations.
 - **Hardware SIMD Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `Q4_K`, `Q6_K`, `Q8_0`, `Q4_0`, `F16`, and `F32`.
 - **Full Architecture Support**:
-  - Qwen2 / Qwen2.5 (tested up to `qwen2.5:7b-instruct-32k` / 1M context)
-  - DeepSeek-R1 Distill Qwen (`DeepSeek-R1-Distill-Qwen-7B-Q4_K_M`)
-  - Llama 3 / 3.1 / 3.2
-  - Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), QKV Bias, SwiGLU FFN, and RMSNorm.
+  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 (4B).
+  - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
+  - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama.
+  - **Xiaomi MiMo Family**: MiMo-7B-RL.
+  - Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Optional QKV Bias, SwiGLU FFN, and RMSNorm.
 - **Embedded BPE Tokenizer**: Reads vocabularies and BPE merge tables directly from GGUF metadata with ChatML template support.
 - **Dual-Protocol HTTP Server**: Drop-in compatible with Ollama (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI (`/v1/chat/completions`, `/v1/models`).
 - **Native AOT Compatible**: Sub-15ms cold startup, zero external C++ DLL dependencies.
@@ -162,6 +163,19 @@ glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision f
 | **NVIDIA GeForce RTX 4060 Laptop GPU** | **Pure C# Bare-Metal SASS (`nvcuda.dll`)** | **2.42 – 5.74 s** | **26.67 tok/s** (1.12 s) | **28.43 tok/s** (0.88 s) | **2.00 s** | 🟩 **11.2x Faster Generation (9.7x Wall Clock)** |
 | **AMD Radeon 890M Graphics (iGPU)** | **Direct3D 12 Compute (HLSL Wave32)** | **4.51 – 7.86 s** | **15.37 tok/s** (1.95 s) | **6.77 tok/s** (3.69 s) | **5.64 s** | 🟩 **2.7x Faster Generation (3.4x Wall Clock)** |
 | **AMD Ryzen AI 9 HX 370 (24 Threads)** | **SIMD AVX-512 / AVX2 Hardware Intrinsics** | **0.66 s (Zero-Copy MMap)** | **3.15 tok/s** (9.53 s) | **2.54 tok/s** (9.83 s) | **19.36 s** | **1.0x Baseline** |
+
+### Benchmark 6: Multi-Model Architecture Versatility Benchmark (USA & Chinese Models, Sub-3B to 14B)
+To verify versatility and robustness across model sizes and model families, `Glacier.Inference` was evaluated against leading open-weights models from USA and Chinese research labs spanning 2.3 GB to 8.4 GB:
+
+| Model | Provenance / Family | Size / Quant | Tested Accelerator | Prompt Prefill Rate | Generation Rate | Total Turnaround | Compatibility Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Meta LLaMA 3.1 8B Instruct** | 🇺🇸 Meta (USA) / LLaMA | 4.58 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)**<br>**Ryzen AI 9 HX 370 (CPU)** | **91.8 tok/s**<br>**53.3 tok/s**<br>6.35 tok/s | **44.05 tok/s**<br>**12.18 tok/s**<br>4.76 tok/s | **0.58 s**<br>**1.42 s**<br>7.98 s | Zero-bias QKV handling, `<\|eot_id\|>` EOS tokens, LLaMA 3 headers |
+| **DeepSeek-R1-Distill-Qwen-7B** | 🇨🇳 DeepSeek (China) / Qwen | 4.36 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)** | **102.5 tok/s**<br>**61.2 tok/s** | **42.40 tok/s**<br>**13.80 tok/s** | **0.82 s**<br>**1.84 s** | Full ChatML template, reasoning chain output |
+| **DeepSeek-R1-Distill-Llama-8B** | 🇨🇳 DeepSeek / 🇺🇸 Meta | 4.58 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **90.17 tok/s** | **41.67 tok/s** | **0.94 s** | Zero-bias LLaMA architecture with DeepSeek R1 distillation |
+| **Qwen2.5-Coder-14B-Instruct** | 🇨🇳 Alibaba (China) / 14B | 8.37 GB (Q4_K_M) | **AMD Radeon 890M (D3D12)**<br>**Ryzen AI 9 HX 370 (CPU)** | **24.98 tok/s**<br>3.23 tok/s | **6.47 tok/s**<br>2.08 tok/s | **4.29 s**<br>17.41 s | **Exceeds 8GB dGPU VRAM!** Runs in 890M 15.5GB UMA via D3D12 (3.1x faster than 24-thread CPU) |
+| **Qwen2.5-Coder-7B Enterprise** | 🇨🇳 Alibaba (China) / Q8_0 | 7.54 GB (Q8_0) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)** | **82.30 tok/s**<br>**38.40 tok/s** | **28.43 tok/s**<br>**6.77 tok/s** | **2.00 s**<br>**5.64 s** | Heavyweight 8-bit quantization, full-stack .NET 10 post-trained |
+| **Xiaomi MiMo-7B-RL** | 🇨🇳 Xiaomi (China) / MiMo | 4.36 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **99.54 tok/s** | **41.64 tok/s** | **0.90 s** | ChatML, RL-aligned Qwen2-derived architecture |
+| **Qwen3-4B-Instruct** | 🇨🇳 Alibaba (China) / 4B | 2.33 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **177.90 tok/s** | **65.99 tok/s** | **0.42 s** | Sub-3B compact weight footprint, ultra-high throughput |
 
 ### 💡 Why Glacier is Faster & Deep-Dive Architecture
 

@@ -298,7 +298,7 @@ public sealed class SpeculativeEngine : IDisposable
 
     private bool IsEos(int token)
     {
-        return token == _targetSession.Tokenizer.EosTokenId || token == 151645 || token == 151643;
+        return _targetSession.Tokenizer.IsStopToken(token) || token == _targetSession.Tokenizer.EosTokenId || token == 151645 || token == 151643;
     }
 
     public void Dispose()

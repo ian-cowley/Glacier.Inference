@@ -381,7 +381,27 @@ public static class Program
         {
             totalParamBytes += t.GetByteSize();
         }
-        Console.WriteLine($"Total Model Size:       {totalParamBytes / (1024.0 * 1024.0 * 1024.0):F2} GB");
+        Console.WriteLine("\n--- Metadata Keys ---");
+        foreach (var kv in gguf.Metadata)
+        {
+            if (kv.Value is System.Collections.IList list)
+            {
+                Console.WriteLine($"  {kv.Key}: [list of {list.Count} items]");
+            }
+            else
+            {
+                string s = kv.Value?.ToString() ?? "";
+                if (kv.Key == "tokenizer.chat_template")
+                {
+                    Console.WriteLine($"\n[Chat Template]:\n{s}\n");
+                }
+                else
+                {
+                    if (s.Length > 80) s = s.Substring(0, 80) + "...";
+                    Console.WriteLine($"  {kv.Key}: {s}");
+                }
+            }
+        }
 
         return 0;
     }
@@ -419,7 +439,7 @@ public static class Program
                 compareOllamaUrl = args[++i];
             else if (args[i] == "--compare-model" && i + 1 < args.Length)
                 compareModel = args[++i];
-            else if (args[i] == "--device" && i + 1 < args.Length)
+            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];
@@ -618,8 +638,10 @@ public static class Program
         {
             if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
                 modelPath = args[++i];
-            else if (args[i] == "--device" && i + 1 < args.Length)
+            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
                 device = args[++i];
+            else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
+                promptParts.Add(args[++i]);
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
@@ -686,7 +708,7 @@ public static class Program
                 formatChat: true,
                 onToken: t => Console.Write(t));
 
-            Console.WriteLine($"\n\n[{result.Metrics.GenerationTokensPerSecond:F1} tokens/sec | {result.Metrics.GeneratedTokens} tokens]");
+            Console.WriteLine($"\n\n[{result.Metrics.GenerationTokensPerSecond:F1} tokens/sec | {result.Metrics.GeneratedTokens} tokens | {result.FinishReason}]");
             return 0;
         }
 
@@ -752,7 +774,7 @@ public static class Program
                 port = p;
             else if (args[i] == "--host" && i + 1 < args.Length)
                 host = args[++i];
-            else if (args[i] == "--device" && i + 1 < args.Length)
+            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];

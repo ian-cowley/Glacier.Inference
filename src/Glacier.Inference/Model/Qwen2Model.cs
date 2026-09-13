@@ -138,10 +138,10 @@ public sealed unsafe class Qwen2Model : IDisposable
             QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
             QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
 
-            // Add Q, K, V biases
-            AddVector(_q, layer.QBias, qDim);
-            AddVector(_k, layer.KBias, kvDim);
-            AddVector(_v, layer.VBias, kvDim);
+            // Add Q, K, V biases if present
+            if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
+            if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
+            if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
 
             // Rotary Position Embedding (RoPE)
             QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
@@ -251,9 +251,9 @@ public sealed unsafe class Qwen2Model : IDisposable
                 float* k = _kBatch + t * kvDim;
                 float* v = _vBatch + t * kvDim;
 
-                AddVector(q, layer.QBias, qDim);
-                AddVector(k, layer.KBias, kvDim);
-                AddVector(v, layer.VBias, kvDim);
+                if (layer.QBias != null) AddVector(q, layer.QBias, qDim);
+                if (layer.KBias != null) AddVector(k, layer.KBias, kvDim);
+                if (layer.VBias != null) AddVector(v, layer.VBias, kvDim);
 
                 QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
                 kvCache.Store(l, pos, k, v);

@@ -303,18 +303,30 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
 
             IntPtr dQ = _gpu.AllocateDevice(qBytes);
             _gpu.CopyToDevice(dQ, (IntPtr)lw.QWeight, qBytes);
-            IntPtr dQBias = _gpu.AllocateDevice(qDim * sizeof(float));
-            _gpu.CopyToDevice(dQBias, (IntPtr)lw.QBias, qDim * sizeof(float));
+            IntPtr dQBias = IntPtr.Zero;
+            if (lw.QBias != null)
+            {
+                dQBias = _gpu.AllocateDevice(qDim * sizeof(float));
+                _gpu.CopyToDevice(dQBias, (IntPtr)lw.QBias, qDim * sizeof(float));
+            }
 
             IntPtr dK = _gpu.AllocateDevice(kBytes);
             _gpu.CopyToDevice(dK, (IntPtr)lw.KWeight, kBytes);
-            IntPtr dKBias = _gpu.AllocateDevice(kvDim * sizeof(float));
-            _gpu.CopyToDevice(dKBias, (IntPtr)lw.KBias, kvDim * sizeof(float));
+            IntPtr dKBias = IntPtr.Zero;
+            if (lw.KBias != null)
+            {
+                dKBias = _gpu.AllocateDevice(kvDim * sizeof(float));
+                _gpu.CopyToDevice(dKBias, (IntPtr)lw.KBias, kvDim * sizeof(float));
+            }
 
             IntPtr dV = _gpu.AllocateDevice(vBytes);
             _gpu.CopyToDevice(dV, (IntPtr)lw.VWeight, vBytes);
-            IntPtr dVBias = _gpu.AllocateDevice(kvDim * sizeof(float));
-            _gpu.CopyToDevice(dVBias, (IntPtr)lw.VBias, kvDim * sizeof(float));
+            IntPtr dVBias = IntPtr.Zero;
+            if (lw.VBias != null)
+            {
+                dVBias = _gpu.AllocateDevice(kvDim * sizeof(float));
+                _gpu.CopyToDevice(dVBias, (IntPtr)lw.VBias, kvDim * sizeof(float));
+            }
 
             IntPtr dAttnOut = _gpu.AllocateDevice(attnOutBytes);
             _gpu.CopyToDevice(dAttnOut, (IntPtr)lw.AttnOutWeight, attnOutBytes);
@@ -1224,11 +1236,11 @@ public sealed unsafe class Qwen2GpuModel : IDisposable
                     {
                         _gpu.FreeDevice(lw.AttnNormWeight);
                         _gpu.FreeDevice(lw.QWeight);
-                        _gpu.FreeDevice(lw.QBias);
+                        if (lw.QBias != IntPtr.Zero) _gpu.FreeDevice(lw.QBias);
                         _gpu.FreeDevice(lw.KWeight);
-                        _gpu.FreeDevice(lw.KBias);
+                        if (lw.KBias != IntPtr.Zero) _gpu.FreeDevice(lw.KBias);
                         _gpu.FreeDevice(lw.VWeight);
-                        _gpu.FreeDevice(lw.VBias);
+                        if (lw.VBias != IntPtr.Zero) _gpu.FreeDevice(lw.VBias);
                         _gpu.FreeDevice(lw.AttnOutWeight);
                         _gpu.FreeDevice(lw.FfnNormWeight);
                         _gpu.FreeDevice(lw.FfnGateWeight);

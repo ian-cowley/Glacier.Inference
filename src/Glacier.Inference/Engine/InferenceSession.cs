@@ -254,9 +254,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             recentTokens.Add(nextToken);
 
             // Check for stop tokens
-            if (nextToken == _tokenizer.EosTokenId || nextToken == 151645 || nextToken == 151643)
+            if (_tokenizer.IsStopToken(nextToken) || nextToken == _tokenizer.EosTokenId || nextToken == 151645 || nextToken == 151643)
             {
-                finishReason = "stop";
+                finishReason = $"stop({nextToken})";
                 break;
             }
 
