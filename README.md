@@ -46,7 +46,7 @@ Prebuilt, self-contained single-file binaries are available directly on the [Git
 | **Windows** | `x64` | [**`glacier-v1.1.10-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
 | **Windows** | `ARM64` | [**`glacier-v1.1.10-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
 | **Linux** | `x64` | [**`glacier-v1.1.10-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
-| **macOS** | `ARM64` | [**`glacier-v1.1.10-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD |
+| **macOS** | `ARM64` | [**`glacier-v1.1.10-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
 
 Simply extract the archive and run `glacier` from any terminal:
 ```bash
@@ -488,6 +488,32 @@ Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRat
 │  └─ Sampler (Pure GPU Argmax ~3μs, Temperature, Top-K, Top-P)          │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🗺️ Roadmap & Community Contributions
+
+Glacier is developed with a strict commitment to **zero external C++ dependencies**, empirical benchmarking on real silicon, and maximum hardware saturation. We warmly welcome community contributions, particularly from developers with access to specialized hardware!
+
+### 1. 🍏 Apple Silicon Metal GPU Engine (M1 / M2 / M3 / M4)
+* **Objective**: Bare-metal GPU acceleration on macOS tapping directly into Apple's high-bandwidth unified memory fabric (100–800 GB/s on M-series Pro/Max/Ultra).
+* **Architecture Design**:
+  - Pure C# zero-dependency runtime binding to `libobjc.dylib` and `Metal.framework` via P/Invoke (`MTLCreateSystemDefaultDevice`, `MTLCommandQueue`, `MTLComputePipelineState`), mirroring Glacier's DXGI / Direct3D 12 design.
+  - Metal Shading Language (MSL) compute shaders utilizing 32-thread SIMDgroups (`simdgroup_matrix` / `simd_shuffle`) for quantized GEMV/GEMM (`Q4_K`, `Q6_K`, `Q8_0`).
+  - `MTLStorageModeShared` zero-copy memory binding to directly compute against memory-mapped GGUF weights without host-to-device transfers.
+* **Call for Contributors**: If you have an Apple Silicon Mac and want to help build, profile, or benchmark the Metal compute pipeline, contributions and PRs are warmly welcomed! *(Automated headless compilation and tests can also run against GitHub Actions `macos-14` M1 runners).*
+
+### 2. 🐧 Cross-Platform Vulkan Compute Backend (Linux / Android)
+* Vendor-neutral compute shaders (SPIR-V) enabling hardware-accelerated inference on Linux without proprietary NVIDIA drivers (AMD ROCm / RADV, Intel Arc ANV, and Qualcomm Adreno GPUs on Snapdragon).
+
+### 3. ⚡ FlashAttention-3 & Chunked Prefill
+* Tiled online softmax with FP8 tensor cores to support 128k+ sequence contexts with bounded KV-cache memory and zero perplexity degradation.
+
+### 4. 🔗 Multi-GPU Tensor Parallelism (TP)
+* Intra-node tensor parallelism over lock-free shared memory ring buffers, splitting large 70B+ and 120B+ MoE models across multiple local GPUs (e.g. dual RTX rigs or discrete GPU + unified iGPU hybrid splits).
+
+### 5. 🚀 Continuous In-Flight Batching Server
+* Dynamic scheduler for the OpenAI/Ollama compatible HTTP endpoint, batching multiple concurrent user generation requests into unified transformer matrix sweeps.
 
 ---
 
