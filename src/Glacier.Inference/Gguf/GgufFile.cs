@@ -35,6 +35,15 @@ public sealed unsafe class GgufFile : IDisposable
     public int FeedForwardLength => (int)GetMetadataUInt32($"{Architecture}.feed_forward_length", 18944);
     public int HeadCount => (int)GetMetadataUInt32($"{Architecture}.attention.head_count", 28);
     public int HeadCountKv => (int)GetMetadataUInt32($"{Architecture}.attention.head_count_kv", 4);
+    public int HeadDim
+    {
+        get
+        {
+            uint keyLen = GetMetadataUInt32($"{Architecture}.attention.key_length", 0);
+            if (keyLen > 0) return (int)keyLen;
+            return HeadCount > 0 ? EmbeddingLength / HeadCount : 128;
+        }
+    }
     public float RopeFreqBase => GetMetadataSingle($"{Architecture}.rope.freq_base", 10000000.0f);
     public float RmsNormEps => GetMetadataSingle($"{Architecture}.attention.layer_norm_rms_epsilon", 1e-5f);
     public int EosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.eos_token_id", 151645);

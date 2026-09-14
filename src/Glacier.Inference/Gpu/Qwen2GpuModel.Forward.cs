@@ -52,6 +52,16 @@ public sealed unsafe partial class Qwen2GpuModel
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
 
+            // Optional QK-Norm (Qwen 3 / Qwen 3.8)
+            if (lw.AttnQNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormHeads(_dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps);
+            }
+            if (lw.AttnKNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormHeads(_dK, lw.AttnKNormWeight, _nHeadsKv, _headDim, _weights.RmsNormEps);
+            }
+
             // Rotary Position Embedding (RoPE) directly in VRAM
             LaunchRope(_dQ, _dK, pos);
 
@@ -62,7 +72,7 @@ public sealed unsafe partial class Qwen2GpuModel
             LaunchAttention(l, pos);
 
             // Attention out projection (fused residual accumulation directly into _dX: _dX += attnProj)
-            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, _dim, _dim, IntPtr.Zero, _dX);
+            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, qDim, _dim, IntPtr.Zero, _dX);
 
             // FFN pre-norm
             LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
@@ -258,12 +268,22 @@ public sealed unsafe partial class Qwen2GpuModel
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
             CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
 
+            // Optional QK-Norm (Qwen 3 / Qwen 3.8)
+            if (lw.AttnQNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormBatchHeads(_dQBatch, lw.AttnQNormWeight, _nHeads, _headDim, batchSize, _weights.RmsNormEps);
+            }
+            if (lw.AttnKNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormBatchHeads(_dKBatch, lw.AttnKNormWeight, _nHeadsKv, _headDim, batchSize, _weights.RmsNormEps);
+            }
+
             LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
             LaunchKvCacheStoreBatch(l, chunkStartPos, batchSize);
 
             LaunchAttentionBatch(l, chunkStartPos, batchSize);
 
-            LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, _dim, _dim, batchSize, IntPtr.Zero, _dXBatch);
+            LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, qDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
 
             LaunchRmsNormBatch(_dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
 

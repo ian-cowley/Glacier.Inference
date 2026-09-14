@@ -25,7 +25,7 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
 - **Full Architecture Support**:
   - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
-  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 (4B dense & 30B MoE).
+  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 & Qwen3.8 (4B Thinking, 8B, 30B MoE) with native decoupled head dimensions (`key_length = 128`), non-square attention projections, and per-head QK-normalization (`rms_norm_heads_kernel`).
   - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
   - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama, DeepSeek-Coder-V2-Lite.
   - **Xiaomi MiMo Family**: MiMo-7B-RL.
@@ -43,10 +43,10 @@ Prebuilt, self-contained single-file binaries are available directly on the [Git
 
 | Platform | Architecture | Archive | Features / Capabilities |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `x64` | [**`glacier-v1.1.10-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
-| **Windows** | `ARM64` | [**`glacier-v1.1.10-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
-| **Linux** | `x64` | [**`glacier-v1.1.10-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
-| **macOS** | `ARM64` | [**`glacier-v1.1.10-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
+| **Windows** | `x64` | [**`glacier-v1.1.11-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
+| **Windows** | `ARM64` | [**`glacier-v1.1.11-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
+| **Linux** | `x64` | [**`glacier-v1.1.11-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
+| **macOS** | `ARM64` | [**`glacier-v1.1.11-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
 
 Simply extract the archive and run `glacier` from any terminal:
 ```bash

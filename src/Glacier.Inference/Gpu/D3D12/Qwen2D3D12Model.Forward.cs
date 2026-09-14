@@ -76,7 +76,7 @@ public sealed unsafe partial class Qwen2D3D12Model
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // Attn Out projection with fused residual addition (_dX += attnOut)
-            DispatchGemv(cmd, lw.AttnOutType, null, _dAttnOut, lw.AttnOutWeight, _dim, _dim, null, residual: _dX);
+            DispatchGemv(cmd, lw.AttnOutType, null, _dAttnOut, lw.AttnOutWeight, qDim, _dim, null, residual: _dX);
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // FFN pre-norm
@@ -305,7 +305,7 @@ public sealed unsafe partial class Qwen2D3D12Model
                 cmd.ResourceBarrierUnorderedAccessView(null!);
 
                 // Batched Attn Out with fused residual addition (_dXBatch += attnOut)
-                DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch, lw.AttnOutWeight, _dim, _dim, chunkSize, null, residual: _dXBatch);
+                DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch, lw.AttnOutWeight, qDim, _dim, chunkSize, null, residual: _dXBatch);
                 cmd.ResourceBarrierUnorderedAccessView(null!);
 
                 // FFN pre-norm across all tokens in parallel

@@ -90,7 +90,7 @@ public sealed unsafe class ModelWeights
     public int FeedForwardLength { get; }
     public int HeadCount { get; }
     public int HeadCountKv { get; }
-    public int HeadDim => EmbeddingLength / HeadCount;
+    public int HeadDim => Gguf.HeadDim;
     public float RopeFreqBase { get; }
     public float RmsNormEps { get; }
 

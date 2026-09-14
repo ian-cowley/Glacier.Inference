@@ -169,13 +169,14 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
     {
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
+        int maxAttnOut = Math.Max(_dim, qDim);
 
         _dX = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
         _dNormX = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
         _dQ = _ctx.CreateDeviceBuffer((ulong)(qDim * sizeof(float)));
         _dK = _ctx.CreateDeviceBuffer((ulong)(kvDim * sizeof(float)));
         _dV = _ctx.CreateDeviceBuffer((ulong)(kvDim * sizeof(float)));
-        _dAttnOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+        _dAttnOut = _ctx.CreateDeviceBuffer((ulong)(maxAttnOut * sizeof(float)));
         _dGate = _ctx.CreateDeviceBuffer((ulong)(_ffnDim * sizeof(float)));
         _dUp = _ctx.CreateDeviceBuffer((ulong)(_ffnDim * sizeof(float)));
         _dFfnAct = _ctx.CreateDeviceBuffer((ulong)(_ffnDim * sizeof(float)));
@@ -189,7 +190,7 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
         _dQBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * qDim * sizeof(float)));
         _dKBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * kvDim * sizeof(float)));
         _dVBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * kvDim * sizeof(float)));
-        _dAttnOutBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * _dim * sizeof(float)));
+        _dAttnOutBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * maxAttnOut * sizeof(float)));
         _dGateBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * _ffnDim * sizeof(float)));
         _dUpBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * _ffnDim * sizeof(float)));
         _dFfnActBatch = _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * _ffnDim * sizeof(float)));
@@ -458,7 +459,7 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
                 _ctx.CopyToDevice(dAttnKNorm, (IntPtr)lw.AttnKNormWeight, (ulong)(_headDim * sizeof(float)));
             }
 
-            var dAttnOut = UploadTensor(lw.AttnOutType, (IntPtr)lw.AttnOutWeight, _dim, _dim);
+            var dAttnOut = UploadTensor(lw.AttnOutType, (IntPtr)lw.AttnOutWeight, _dim, qDim);
 
             var dFfnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
             _ctx.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (ulong)(_dim * sizeof(float)));

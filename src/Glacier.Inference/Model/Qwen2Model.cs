@@ -82,14 +82,18 @@ public sealed unsafe class Qwen2Model : IDisposable
         int maxFfn = Math.Max(_ffnDim, Math.Max(expFfn, expFfn * 2));
         if (maxFfn == 0) maxFfn = _ffnDim;
 
+        int qDim = _nHeads * _headDim;
+        int maxAttnOut = Math.Max(_dim, qDim);
+        int attnOutChunks = (maxAttnOut + 31) / 32;
+
         _x = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _normX = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _normXSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
         _q = (float*)NativeMemory.AllocZeroed((nuint)(_nHeads * _headDim * sizeof(float)));
         _k = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _headDim * sizeof(float)));
         _v = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _headDim * sizeof(float)));
-        _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
+        _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(maxAttnOut * sizeof(float)));
+        _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)(attnOutChunks * sizeof(float)));
         _attnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
         _gate = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
         _up = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
@@ -108,8 +112,8 @@ public sealed unsafe class Qwen2Model : IDisposable
         _qBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
         _kBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
         _vBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
-        _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _attnOutSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * (_dim / 32) * sizeof(float)));
+        _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
+        _attnOutSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * attnOutChunks * sizeof(float)));
         _attnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
         _gateBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
         _upBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
@@ -181,8 +185,8 @@ public sealed unsafe class Qwen2Model : IDisposable
             ComputeAttention(l, pos, kvCache);
 
             // Attention output projection
-            QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, _dim);
-            QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, _dim, _dim, _attnOutSums);
+            QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, qDim);
+            QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
             if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
 
             // Residual connection: x = x + attnProj
@@ -374,15 +378,16 @@ public sealed unsafe class Qwen2Model : IDisposable
                 QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
                 kvCache.Store(l, pos, k, v);
 
-                ComputeAttentionToken(l, pos, q, _attnOutBatch + t * _dim, kvCache);
+                ComputeAttentionToken(l, pos, q, _attnOutBatch + t * qDim, kvCache);
             }
 
             // Attention output projection (weights streamed once!)
+            int attnOutChunks = (qDim + 31) / 32;
             for (int t = 0; t < batchSize; t++)
             {
-                QuantKernels.ComputeBlockSums32(_attnOutBatch + t * _dim, _attnOutSumBatch + t * normXChunks, _dim);
+                QuantKernels.ComputeBlockSums32(_attnOutBatch + t * qDim, _attnOutSumBatch + t * attnOutChunks, qDim);
             }
-            QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, _dim, _dim, batchSize, _attnOutSumBatch);
+            QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, qDim, _dim, batchSize, _attnOutSumBatch);
             if (layer.AttnOutBias != null)
             {
                 for (int t = 0; t < batchSize; t++)

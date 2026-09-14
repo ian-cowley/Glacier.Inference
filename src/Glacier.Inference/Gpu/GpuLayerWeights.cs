@@ -16,6 +16,8 @@ public sealed class GpuLayerWeights
     public IntPtr VWeight { get; init; }
     public IntPtr VBias { get; init; }
     public IntPtr AttnOutWeight { get; init; }
+    public IntPtr AttnQNormWeight { get; init; }
+    public IntPtr AttnKNormWeight { get; init; }
 
     public IntPtr FfnNormWeight { get; init; }
     public IntPtr FfnGateWeight { get; init; }

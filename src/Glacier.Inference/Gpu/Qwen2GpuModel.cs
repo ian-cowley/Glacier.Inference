@@ -42,6 +42,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnAttentionGqa;
     private IntPtr _fnAttentionGqaF16;
     private IntPtr _fnAttentionGqaFp8;
+    private IntPtr _fnRmsNormHeads;
 
     // Batched Prefill Kernels & Buffers (batchSize <= 32)
     public const int MaxBatchSize = 32;
@@ -50,6 +51,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnGemmQ8_0Batch;
     private IntPtr _fnGemmSwigluBatch;
     private IntPtr _fnRmsNormBatch;
+    private IntPtr _fnRmsNormBatchHeads;
     private IntPtr _fnAddBiasBatch;
     private IntPtr _fnVecAddBatch;
     private IntPtr _fnRopeBatch;
@@ -166,6 +168,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormHeads, _module, "rms_norm_heads_kernel"), "ModuleGetFunction(rms_norm_heads_kernel)");
 
         // 2b. Retrieve batched prefill kernels
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
@@ -173,6 +176,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatchHeads, _module, "rms_norm_batch_heads_kernel"), "ModuleGetFunction(rms_norm_batch_heads_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBiasBatch, _module, "add_bias_batch"), "ModuleGetFunction(add_bias_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddBatch, _module, "vec_add_batch"), "ModuleGetFunction(vec_add_batch)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
@@ -193,12 +197,13 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 0), "EventCreate(eventVDone)");
 
         // 3. Allocate GPU VRAM scratch buffers (single token)
+        int maxAttnOut = Math.Max(_dim, _nHeads * _headDim);
         _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dNormX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dQ = _gpu.AllocateDevice((nuint)(_nHeads * _headDim * sizeof(float)));
         _dK = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
         _dV = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
-        _dAttnOut = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+        _dAttnOut = _gpu.AllocateDevice((nuint)(maxAttnOut * sizeof(float)));
         _dAttnProj = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
         _dGate = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
         _dUp = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
@@ -216,7 +221,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         _dQBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
         _dKBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
         _dVBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
-        _dAttnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+        _dAttnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
         _dAttnProjBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
         _dFfnActBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
         _dFfnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
@@ -265,7 +270,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             nuint qBytes = (nuint)GgufTypes.GetRowBytes(lw.QType, _dim) * qDim;
             nuint kBytes = (nuint)GgufTypes.GetRowBytes(lw.KType, _dim) * kvDim;
             nuint vBytes = (nuint)GgufTypes.GetRowBytes(lw.VType, _dim) * kvDim;
-            nuint attnOutBytes = (nuint)GgufTypes.GetRowBytes(lw.AttnOutType, _dim) * (nuint)_dim;
+            nuint attnOutBytes = (nuint)GgufTypes.GetRowBytes(lw.AttnOutType, (int)qDim) * (nuint)_dim;
 
             nuint ffnGateBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnGateType, _dim) * (nuint)_ffnDim;
             nuint ffnUpBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnUpType, _dim) * (nuint)_ffnDim;
@@ -301,6 +306,22 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
                 _gpu.CopyToDevice(dVBias, (IntPtr)lw.VBias, kvDim * sizeof(float));
             }
 
+            IntPtr dAttnQNorm = IntPtr.Zero;
+            if (lw.AttnQNormWeight != null)
+            {
+                nuint qNormBytes = (nuint)(_headDim * sizeof(float));
+                dAttnQNorm = _gpu.AllocateDevice(qNormBytes);
+                _gpu.CopyToDevice(dAttnQNorm, (IntPtr)lw.AttnQNormWeight, qNormBytes);
+            }
+
+            IntPtr dAttnKNorm = IntPtr.Zero;
+            if (lw.AttnKNormWeight != null)
+            {
+                nuint kNormBytes = (nuint)(_headDim * sizeof(float));
+                dAttnKNorm = _gpu.AllocateDevice(kNormBytes);
+                _gpu.CopyToDevice(dAttnKNorm, (IntPtr)lw.AttnKNormWeight, kNormBytes);
+            }
+
             IntPtr dAttnOut = _gpu.AllocateDevice(attnOutBytes);
             _gpu.CopyToDevice(dAttnOut, (IntPtr)lw.AttnOutWeight, attnOutBytes);
 
@@ -326,6 +347,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
                 VWeight = dV,
                 VBias = dVBias,
                 AttnOutWeight = dAttnOut,
+                AttnQNormWeight = dAttnQNorm,
+                AttnKNormWeight = dAttnKNorm,
                 FfnNormWeight = dFfnNorm,
                 FfnGateWeight = dFfnGate,
                 FfnUpWeight = dFfnUp,
@@ -409,6 +432,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
                         _gpu.FreeDevice(lw.VWeight);
                         if (lw.VBias != IntPtr.Zero) _gpu.FreeDevice(lw.VBias);
                         _gpu.FreeDevice(lw.AttnOutWeight);
+                        if (lw.AttnQNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnQNormWeight);
+                        if (lw.AttnKNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnKNormWeight);
                         _gpu.FreeDevice(lw.FfnNormWeight);
                         _gpu.FreeDevice(lw.FfnGateWeight);
                         _gpu.FreeDevice(lw.FfnUpWeight);

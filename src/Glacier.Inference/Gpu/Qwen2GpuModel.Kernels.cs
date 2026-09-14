@@ -523,4 +523,48 @@ public sealed unsafe partial class Qwen2GpuModel
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(kv_cache_store_batch)");
     }
+
+    private void LaunchRmsNormHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, float eps)
+    {
+        uint blockSize = (uint)Math.Min(128, headDim);
+        uint gridSize = (uint)nHeads;
+
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dBuf;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &nHeads;
+        pArgs[3] = &headDim;
+        pArgs[4] = &eps;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNormHeads,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm_heads)");
+    }
+
+    private void LaunchRmsNormBatchHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, int batchSize, float eps)
+    {
+        uint blockSize = (uint)Math.Min(128, headDim);
+        uint gridX = (uint)nHeads;
+        uint gridY = (uint)batchSize;
+
+        void** pArgs = stackalloc void*[6];
+        pArgs[0] = &dBuf;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &nHeads;
+        pArgs[3] = &headDim;
+        pArgs[4] = &batchSize;
+        pArgs[5] = &eps;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNormBatchHeads,
+            gridX, gridY, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm_batch_heads)");
+    }
 }

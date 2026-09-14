@@ -495,4 +495,82 @@ __global__ void apply_repetition_penalty_kernel(
     }
 }
 
+// =========================================================================
+// 20. Per-Head RMSNorm Kernel (Qwen3 / Qwen3.8 QK-Norm)
+// =========================================================================
+__global__ void rms_norm_heads_kernel(
+    float* __restrict__ x,               // [n_heads, head_dim] in-place
+    const float* __restrict__ weight,   // [head_dim]
+    int n_heads,
+    int head_dim,
+    float eps
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    float* head_x = x + h * head_dim;
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = head_x[i];
+        local_sum += val * val;
+    }
+
+    local_sum = warp_reduce_sum(local_sum);
+    __shared__ float s_sum;
+    if (tid == 0) s_sum = 0.0f;
+    __syncthreads();
+
+    if ((tid % WARP_SIZE) == 0) {
+        atomicAdd(&s_sum, local_sum);
+    }
+    __syncthreads();
+
+    float rms = rsqrtf((s_sum / (float)head_dim) + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        head_x[i] = head_x[i] * rms * weight[i];
+    }
+}
+
+// =========================================================================
+// 21. Batched Per-Head RMSNorm Kernel (Qwen3 / Qwen3.8 Prompt Prefill QK-Norm)
+// =========================================================================
+__global__ void rms_norm_batch_heads_kernel(
+    float* __restrict__ x,               // [batch_size, n_heads, head_dim] in-place
+    const float* __restrict__ weight,   // [head_dim]
+    int n_heads,
+    int head_dim,
+    int batch_size,
+    float eps
+) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    if (h >= n_heads || t >= batch_size) return;
+
+    float* head_x = x + (size_t)t * ((size_t)n_heads * head_dim) + h * head_dim;
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = head_x[i];
+        local_sum += val * val;
+    }
+
+    local_sum = warp_reduce_sum(local_sum);
+    __shared__ float s_sum;
+    if (tid == 0) s_sum = 0.0f;
+    __syncthreads();
+
+    if ((tid % WARP_SIZE) == 0) {
+        atomicAdd(&s_sum, local_sum);
+    }
+    __syncthreads();
+
+    float rms = rsqrtf((s_sum / (float)head_dim) + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        head_x[i] = head_x[i] * rms * weight[i];
+    }
+}
+
 } // extern "C"
