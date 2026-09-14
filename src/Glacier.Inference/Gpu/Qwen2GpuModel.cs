@@ -242,8 +242,9 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         _hX = new float[_dim];
 
         // 4. Upload model weights into GPU VRAM
+        double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($">> Uploading 4.68 GB model weights into {gpu.DeviceName} VRAM...");
+        Console.WriteLine($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM...");
         var sw = Stopwatch.StartNew();
 
         _dOutNormWeight = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
