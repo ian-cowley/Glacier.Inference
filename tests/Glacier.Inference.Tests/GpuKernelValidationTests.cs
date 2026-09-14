@@ -1103,7 +1103,7 @@ public unsafe class GpuKernelValidationTests
     {
         if (!File.Exists(ModelPath) || !GpuContext.IsSupported) return;
 
-        using var session = new InferenceSession(ModelPath, maxSeqLen: 512, device: "nvidia-rtx-4060");
+        using var session = new InferenceSession(ModelPath, maxSeqLen: 512);
         _output.WriteLine($"Session active device: {session.ActiveDevice}");
 
         var options = new SamplingOptions { MaxTokens = 30, Temperature = 0.0f }; // Greedy
