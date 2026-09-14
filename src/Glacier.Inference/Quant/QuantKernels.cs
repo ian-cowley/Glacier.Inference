@@ -18,6 +18,7 @@ public static unsafe partial class QuantKernels
     private const int QK_K = 256;
     private const int QK8_0 = 32;
     private const int QK4_0 = 32;
+    private const int QK5_0 = 32;
 
 
     /// <summary>
@@ -36,6 +37,9 @@ public static unsafe partial class QuantKernels
                 break;
             case GgufType.Q4_K:
                 DequantizeQ4_K((BlockQ4_K*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.Q5_0:
+                DequantizeQ5_0((BlockQ5_0*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.Q5_K:
                 DequantizeQ5_K((BlockQ5_K*)rowPtr, dst, embeddingDim);

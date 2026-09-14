@@ -3,6 +3,7 @@
 [Oo]bj/
 [Rr]elease/
 publish/
+publish_single/
 
 # IDE and editor folders
 .vs/

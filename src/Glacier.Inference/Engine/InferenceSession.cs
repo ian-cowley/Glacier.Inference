@@ -132,7 +132,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             Device = targetDevice;
             Engine = targetEngine;
 
-            if (!_weights.IsMoe && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+            if (!_weights.IsMoe && !_weights.IsMla && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
                 {
@@ -150,12 +150,12 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpu?.Dispose();
                     _gpu = null;
                     _gpuModel = null;
-                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = new Qwen2Model(_weights, maxSeqLen);
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
                 }
             }
-            else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+            else if (!_weights.IsMla && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
             {
                 try
@@ -173,18 +173,20 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
                     _d3d12Model?.Dispose();
                     _d3d12Model = null;
-                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = new Qwen2Model(_weights, maxSeqLen);
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12]";
                 }
             }
             else
             {
-                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                ActiveDevice = _weights.IsMoe
-                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
-                    : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
+                ActiveDevice = _weights.IsMla
+                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (Multi-Head Latent Attention)]"
+                    : _weights.IsMoe
+                        ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
+                        : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
             }
         }
     }

@@ -58,55 +58,62 @@ public sealed unsafe partial class Qwen2Model
             QuantKernels.RMSNorm(_x, layer.AttnNormWeight, _normX, _dim, _weights.RmsNormEps);
             QuantKernels.ComputeBlockSums32(_normX, _normXSums, _dim);
 
-            // Q, K, V projections (reusing _normXSums across all 3)
-            int qDim = _nHeads * _headDim;
-            int kvDim = _nHeadsKv * _headDim;
-            QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
-            QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
-            QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
-
-            // Add Q, K, V biases if present
-            if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
-            if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
-            if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
-
-            // Optional QK-Norm (e.g. Qwen3)
-            if (layer.AttnQNormWeight != null)
+            if (layer.IsMla)
             {
-                for (int h = 0; h < _nHeads; h++)
+                ForwardMlaLayer(l, modelLayer, pos, kvCache);
+            }
+            else
+            {
+                // Q, K, V projections (reusing _normXSums across all 3)
+                int qDim = _nHeads * _headDim;
+                int kvDim = _nHeadsKv * _headDim;
+                QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
+                QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
+                QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
+
+                // Add Q, K, V biases if present
+                if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
+                if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
+                if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
+
+                // Optional QK-Norm (e.g. Qwen3)
+                if (layer.AttnQNormWeight != null)
                 {
-                    float* qHead = _q + h * _headDim;
-                    QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
+                    for (int h = 0; h < _nHeads; h++)
+                    {
+                        float* qHead = _q + h * _headDim;
+                        QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
+                    }
                 }
-            }
-            if (layer.AttnKNormWeight != null)
-            {
-                for (int h = 0; h < _nHeadsKv; h++)
+                if (layer.AttnKNormWeight != null)
                 {
-                    float* kHead = _k + h * _headDim;
-                    QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                    for (int h = 0; h < _nHeadsKv; h++)
+                    {
+                        float* kHead = _k + h * _headDim;
+                        QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                    }
                 }
+
+                // Rotary Position Embedding (RoPE)
+                QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
+
+                // Store in KV cache (stage-relative layer l)
+                kvCache?.Store(l, pos, _k, _v);
+
+                // Multi-Head / Grouped Query Attention (GQA)
+                if (kvCache != null)
+                {
+                    ComputeAttention(l, modelLayer, pos, kvCache);
+                }
+
+                // Attention output projection
+                QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, qDim);
+                QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
+                if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
+
+                // Residual connection: x = x + attnProj
+                AddVector(_x, _attnProj, _dim);
             }
-
-            // Rotary Position Embedding (RoPE)
-            QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
-
-            // Store in KV cache (stage-relative layer l)
-            kvCache?.Store(l, pos, _k, _v);
-
-            // Multi-Head / Grouped Query Attention (GQA)
-            if (kvCache != null)
-            {
-                ComputeAttention(l, modelLayer, pos, kvCache);
-            }
-
-            // Attention output projection
-            QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, qDim);
-            QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
-            if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
-
-            // Residual connection: x = x + attnProj
-            AddVector(_x, _attnProj, _dim);
 
             // FFN pre-norm
             QuantKernels.RMSNorm(_x, layer.FfnNormWeight, _normX, _dim, _weights.RmsNormEps);
@@ -118,7 +125,7 @@ public sealed unsafe partial class Qwen2Model
                 int numExperts = _weights.ExpertCount;
                 int topK = _weights.ExpertUsedCount;
 
-                QuantKernels.RouterTopK(_normX, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights);
+                QuantKernels.RouterTopK(_normX, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
 
                 new Span<float>(_ffnOut, _dim).Clear();
 
@@ -312,76 +319,83 @@ public sealed unsafe partial class Qwen2Model
                 QuantKernels.ComputeBlockSums32(normXt, _normXSumBatch + t * normXChunks, _dim);
             }
 
-            // Batched Q, K, V projections (weights streamed once!)
-            QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
-            QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumBatch);
-            QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumBatch);
-
-            // Add Q, K, V biases if present
-            if (layer.QBias != null || layer.KBias != null || layer.VBias != null)
+            if (layer.IsMla)
             {
-                for (int t = 0; t < batchSize; t++)
-                {
-                    if (layer.QBias != null) AddVector(_qBatch + t * qDim, layer.QBias, qDim);
-                    if (layer.KBias != null) AddVector(_kBatch + t * kvDim, layer.KBias, kvDim);
-                    if (layer.VBias != null) AddVector(_vBatch + t * kvDim, layer.VBias, kvDim);
-                }
+                ForwardMlaBatchChunkLayer(l, modelLayer, chunkStartPos, batchSize, kvCache);
             }
-
-            // Per-token RoPE, KV cache store, and Attention
-            for (int t = 0; t < batchSize; t++)
+            else
             {
-                int pos = chunkStartPos + t;
-                float* q = _qBatch + t * qDim;
-                float* k = _kBatch + t * kvDim;
-                float* v = _vBatch + t * kvDim;
+                // Batched Q, K, V projections (weights streamed once!)
+                QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
+                QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumBatch);
+                QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumBatch);
 
-                // Optional QK-Norm
-                if (layer.AttnQNormWeight != null)
+                // Add Q, K, V biases if present
+                if (layer.QBias != null || layer.KBias != null || layer.VBias != null)
                 {
-                    for (int h = 0; h < _nHeads; h++)
+                    for (int t = 0; t < batchSize; t++)
                     {
-                        float* qHead = q + h * _headDim;
-                        QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
-                    }
-                }
-                if (layer.AttnKNormWeight != null)
-                {
-                    for (int h = 0; h < _nHeadsKv; h++)
-                    {
-                        float* kHead = k + h * _headDim;
-                        QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                        if (layer.QBias != null) AddVector(_qBatch + t * qDim, layer.QBias, qDim);
+                        if (layer.KBias != null) AddVector(_kBatch + t * kvDim, layer.KBias, kvDim);
+                        if (layer.VBias != null) AddVector(_vBatch + t * kvDim, layer.VBias, kvDim);
                     }
                 }
 
-                QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
-                kvCache?.Store(l, pos, k, v);
-
-                if (kvCache != null)
-                {
-                    ComputeAttentionToken(l, modelLayer, pos, q, _attnOutBatch + t * qDim, kvCache);
-                }
-            }
-
-            // Attention output projection (weights streamed once!)
-            int attnOutChunks = (qDim + 31) / 32;
-            for (int t = 0; t < batchSize; t++)
-            {
-                QuantKernels.ComputeBlockSums32(_attnOutBatch + t * qDim, _attnOutSumBatch + t * attnOutChunks, qDim);
-            }
-            QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, qDim, _dim, batchSize, _attnOutSumBatch);
-            if (layer.AttnOutBias != null)
-            {
+                // Per-token RoPE, KV cache store, and Attention
                 for (int t = 0; t < batchSize; t++)
                 {
-                    AddVector(_attnProjBatch + t * _dim, layer.AttnOutBias, _dim);
-                }
-            }
+                    int pos = chunkStartPos + t;
+                    float* q = _qBatch + t * qDim;
+                    float* k = _kBatch + t * kvDim;
+                    float* v = _vBatch + t * kvDim;
 
-            // Residual connection
-            for (int t = 0; t < batchSize; t++)
-            {
-                AddVector(_xBatch + t * _dim, _attnProjBatch + t * _dim, _dim);
+                    // Optional QK-Norm
+                    if (layer.AttnQNormWeight != null)
+                    {
+                        for (int h = 0; h < _nHeads; h++)
+                        {
+                            float* qHead = q + h * _headDim;
+                            QuantKernels.RMSNorm(qHead, layer.AttnQNormWeight, qHead, _headDim, _weights.RmsNormEps);
+                        }
+                    }
+                    if (layer.AttnKNormWeight != null)
+                    {
+                        for (int h = 0; h < _nHeadsKv; h++)
+                        {
+                            float* kHead = k + h * _headDim;
+                            QuantKernels.RMSNorm(kHead, layer.AttnKNormWeight, kHead, _headDim, _weights.RmsNormEps);
+                        }
+                    }
+
+                    QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
+                    kvCache?.Store(l, pos, k, v);
+
+                    if (kvCache != null)
+                    {
+                        ComputeAttentionToken(l, modelLayer, pos, q, _attnOutBatch + t * qDim, kvCache);
+                    }
+                }
+
+                // Attention output projection (weights streamed once!)
+                int attnOutChunks = (qDim + 31) / 32;
+                for (int t = 0; t < batchSize; t++)
+                {
+                    QuantKernels.ComputeBlockSums32(_attnOutBatch + t * qDim, _attnOutSumBatch + t * attnOutChunks, qDim);
+                }
+                QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, qDim, _dim, batchSize, _attnOutSumBatch);
+                if (layer.AttnOutBias != null)
+                {
+                    for (int t = 0; t < batchSize; t++)
+                    {
+                        AddVector(_attnProjBatch + t * _dim, layer.AttnOutBias, _dim);
+                    }
+                }
+
+                // Residual connection
+                for (int t = 0; t < batchSize; t++)
+                {
+                    AddVector(_xBatch + t * _dim, _attnProjBatch + t * _dim, _dim);
+                }
             }
 
             // FFN pre-norm for all tokens in chunk
@@ -409,7 +423,7 @@ public sealed unsafe partial class Qwen2Model
                     float* normXSumst = _normXSumBatch + t * normXChunks;
                     float* ffnOutt = _ffnOutBatch + t * _dim;
 
-                    QuantKernels.RouterTopK(normXt, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights);
+                    QuantKernels.RouterTopK(normXt, layer.FfnGateInpWeight, layer.FfnGateInpBias, _dim, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
 
                     for (int d = 0; d < _dim; d++) ffnOutt[d] = 0f;
 

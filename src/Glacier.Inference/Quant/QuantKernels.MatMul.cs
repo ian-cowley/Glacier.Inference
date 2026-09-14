@@ -124,6 +124,7 @@ public static unsafe partial class QuantKernels
             GgufType.Q6_K => VecDotQ6_K((BlockQ6_K*)rowPtr, x, nCols),
             GgufType.Q8_0 => VecDotQ8_0((BlockQ8_0*)rowPtr, x, nCols),
             GgufType.Q4_0 => VecDotQ4_0((BlockQ4_0*)rowPtr, x, nCols),
+            GgufType.Q5_0 => VecDotQ5_0((BlockQ5_0*)rowPtr, x, nCols),
             GgufType.Q5_K => VecDotQ5_K((BlockQ5_K*)rowPtr, x, nCols),
             GgufType.Q3_K => VecDotQ3_K((BlockQ3_K*)rowPtr, x, nCols),
             GgufType.MXFP4 => VecDotMXFP4((BlockMXFP4*)rowPtr, x, nCols),

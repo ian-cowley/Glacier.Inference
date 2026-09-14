@@ -67,6 +67,8 @@ public static class GgufTypes
         GgufType.F16 or GgufType.BF16 => (long)count * 2,
         GgufType.Q8_0 => ((long)count / 32) * 34,
         GgufType.Q4_0 => ((long)count / 32) * 18,
+        GgufType.Q5_0 => ((long)count / 32) * 22,
+        GgufType.Q5_1 => ((long)count / 32) * 24,
         GgufType.Q4_K => ((long)count / 256) * 144,
         GgufType.Q6_K => ((long)count / 256) * 210,
         GgufType.Q3_K => ((long)count / 256) * 110,

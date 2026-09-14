@@ -20,6 +20,7 @@ Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped
 - **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via pure DXGI P/Invoke.
 - **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS on compute dGPUs (NVIDIA RTX 3060, RTX 4060, RTX 4090).
 - **Mixture-of-Experts (MoE) Architecture Runtime**: High-throughput MoE routing engine supporting up to 128 experts per layer with Top-$K$ gating, softmax re-normalization, shared experts (DeepSeek / ERNIE), per-head Query/Key RMSNorm (`attn_q_norm`, `attn_k_norm`), and zero-copy 3D tensor slicing (`[cols x rows x num_experts]`).
+- **DeepSeek Multi-Head Latent Attention (MLA) & Decoupled YaRN RoPE**: Low-rank latent KV compression ($d_c = 512$), decoupled 192-dim QK projections, 128-dim Value projections, adjacent $(2i, 2i+1)$ RoPE pairing, and dual YaRN scaling ($mscaleBase$ and $mscaleAllDim$), delivering coherent, high-speed inference for DeepSeek-Coder-V2 and DeepSeek-V4 MoE architectures.
 - **OpenAI Attention Sinks & Streaming Contexts**: Native support for attention sink logit absorption (`attn_sinks.weight`) preventing attention overflow and perplexity degradation in long-context models (`gpt-oss-20b`) and streaming generation.
 - **Next-Gen Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `MXFP4` (Type 39, Microscaling FP4 with E2M1 LUT and power-of-2 scaling), `Q3_K` (Type 11, 3.4375 bpw), `Q4_K` (Type 12), `Q5_K` (Type 13, 5.5 bpw), `Q6_K` (Type 14), `Q8_0` (Type 8), `Q4_0`, `F16`, and `F32`.
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
@@ -43,10 +44,10 @@ Prebuilt, self-contained single-file binaries are available directly on the [Git
 
 | Platform | Architecture | Archive | Features / Capabilities |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `x64` | [**`glacier-v1.1.11-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
-| **Windows** | `ARM64` | [**`glacier-v1.1.11-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
-| **Linux** | `x64` | [**`glacier-v1.1.11-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
-| **macOS** | `ARM64` | [**`glacier-v1.1.11-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
+| **Windows** | `x64` | [**`glacier-v1.1.12-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
+| **Windows** | `ARM64` | [**`glacier-v1.1.12-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
+| **Linux** | `x64` | [**`glacier-v1.1.12-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
+| **macOS** | `ARM64` | [**`glacier-v1.1.12-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
 
 Simply extract the archive and run `glacier` from any terminal:
 ```bash
@@ -224,7 +225,7 @@ To verify support for sparse Mixture-of-Experts architectures and next-generatio
 | **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **14.20 GB** | **AMD Radeon 890M (D3D12 UMA)** | 🟩 **19.23 tok/s (D3D12)** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
 | **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **3.08 tok/s** (CPU AVX-512) | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
 | **LiquidAI LFM2-8B-A1B** | 🇺🇸 Liquid AI (USA) | **1.5B Active** / 8B Total (32 Experts) | `Q4_K_M` | **4.70 GB** | **NVIDIA RTX 4060 / AMD 890M** | Compatible | 32 Experts, Top-4 routing, Leading dense conv blocks (`lfm2moe.shortconv`), QK-Norm |
-| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **NVIDIA RTX 3060 / AMD 890M** | Compatible | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Shared Experts |
+| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **AMD Ryzen 9 6900HX (DDR5)**<br>**Ryzen AI 9 HX 370 (LPDDR5X)**<br>**AMD Ryzen 5 5500 (DDR4)** | 🟩 **5.60 tok/s (Minisforum64)**<br>🟩 **2.00–4.50 tok/s (Zenbook)**<br>0.50 tok/s (Beast) | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Decoupled YaRN RoPE, Shared Experts |
 
 #### Hardware Sizing & Allocation Matrix for MoE Models:
 | Hardware Target | Memory Capacity & Bandwidth | Target MoE Models | Optimal Allocation |

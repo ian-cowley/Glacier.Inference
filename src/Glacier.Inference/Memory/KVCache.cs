@@ -13,9 +13,12 @@ public sealed unsafe class KVCache : IDisposable
     private readonly int _layers;
     private readonly int _nHeadsKv;
     private readonly int _headDim;
+    private readonly int _vHeadDim;
     private readonly int _maxSeqLen;
-    private readonly long _layerStride;
-    private readonly long _headStride;
+    private readonly long _layerStrideK;
+    private readonly long _layerStrideV;
+    private readonly long _headStrideK;
+    private readonly long _headStrideV;
 
     private float* _kBuffer;
     private float* _vBuffer;
@@ -25,34 +28,41 @@ public sealed unsafe class KVCache : IDisposable
     public int Layers => _layers;
     public int HeadsKv => _nHeadsKv;
     public int HeadDim => _headDim;
+    public int ValueHeadDim => _vHeadDim;
 
-    public KVCache(int layers, int nHeadsKv, int headDim, int maxSeqLen = 4096)
+    public KVCache(int layers, int nHeadsKv, int headDim, int maxSeqLen = 4096, int vHeadDim = -1)
     {
         _layers = layers;
         _nHeadsKv = nHeadsKv;
         _headDim = headDim;
+        _vHeadDim = vHeadDim > 0 ? vHeadDim : headDim;
         _maxSeqLen = maxSeqLen;
 
-        _headStride = (long)_maxSeqLen * _headDim;
-        _layerStride = (long)_nHeadsKv * _headStride;
-        long totalElements = (long)_layers * _layerStride;
-        long totalBytes = totalElements * sizeof(float);
+        _headStrideK = (long)_maxSeqLen * _headDim;
+        _layerStrideK = (long)_nHeadsKv * _headStrideK;
+        long totalElementsK = (long)_layers * _layerStrideK;
+        long totalBytesK = totalElementsK * sizeof(float);
 
-        _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
-        _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
+        _headStrideV = (long)_maxSeqLen * _vHeadDim;
+        _layerStrideV = (long)_nHeadsKv * _headStrideV;
+        long totalElementsV = (long)_layers * _layerStrideV;
+        long totalBytesV = totalElementsV * sizeof(float);
+
+        _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesK);
+        _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesV);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
-        long offset = (long)layer * _layerStride + (long)headKv * _headStride + (long)pos * _headDim;
+        long offset = (long)layer * _layerStrideK + (long)headKv * _headStrideK + (long)pos * _headDim;
         return _kBuffer + offset;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetValuePtr(int layer, int headKv, int pos)
     {
-        long offset = (long)layer * _layerStride + (long)headKv * _headStride + (long)pos * _headDim;
+        long offset = (long)layer * _layerStrideV + (long)headKv * _headStrideV + (long)pos * _vHeadDim;
         return _vBuffer + offset;
     }
 
@@ -68,7 +78,7 @@ public sealed unsafe class KVCache : IDisposable
             float* vDst = GetValuePtr(layer, h, pos);
 
             Buffer.MemoryCopy(kSrc + h * _headDim, kDst, _headDim * sizeof(float), _headDim * sizeof(float));
-            Buffer.MemoryCopy(vSrc + h * _headDim, vDst, _headDim * sizeof(float), _headDim * sizeof(float));
+            Buffer.MemoryCopy(vSrc + h * _vHeadDim, vDst, _vHeadDim * sizeof(float), _vHeadDim * sizeof(float));
         }
     }
 
@@ -77,10 +87,10 @@ public sealed unsafe class KVCache : IDisposable
     /// </summary>
     public void Reset()
     {
-        long totalElements = (long)_layers * _layerStride;
-        long totalBytes = totalElements * sizeof(float);
-        NativeMemory.Clear(_kBuffer, (nuint)totalBytes);
-        NativeMemory.Clear(_vBuffer, (nuint)totalBytes);
+        long totalBytesK = (long)_layers * _layerStrideK * sizeof(float);
+        long totalBytesV = (long)_layers * _layerStrideV * sizeof(float);
+        NativeMemory.Clear(_kBuffer, (nuint)totalBytesK);
+        NativeMemory.Clear(_vBuffer, (nuint)totalBytesV);
     }
 
     public void Dispose()

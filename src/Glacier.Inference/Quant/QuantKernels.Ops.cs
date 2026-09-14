@@ -24,7 +24,8 @@ public static unsafe partial class QuantKernels
         int expertCount,
         int topK,
         int* selectedIndices,
-        float* selectedWeights)
+        float* selectedWeights,
+        bool normTopK = true)
     {
         float* logits = stackalloc float[expertCount];
 
@@ -40,18 +41,19 @@ public static unsafe partial class QuantKernels
             logits[e] = z;
         }
 
-        SoftmaxTopK(logits, expertCount, topK, selectedIndices, selectedWeights);
+        SoftmaxTopK(logits, expertCount, topK, selectedIndices, selectedWeights, normTopK);
     }
 
     /// <summary>
-    /// Computes Softmax across router logits, selects the top-K experts, and renormalizes weights to sum to 1.0.
+    /// Computes Softmax across router logits, selects the top-K experts, and optionally renormalizes weights to sum to 1.0.
     /// </summary>
     public static void SoftmaxTopK(
         float* logits,
         int expertCount,
         int topK,
         int* selectedIndices,
-        float* selectedWeights)
+        float* selectedWeights,
+        bool normTopK = true)
     {
         float maxLogit = float.MinValue;
         for (int e = 0; e < expertCount; e++)
@@ -59,11 +61,20 @@ public static unsafe partial class QuantKernels
             if (logits[e] > maxLogit) maxLogit = logits[e];
         }
 
-        // 2. Softmax probabilities
+        // 2. Softmax probabilities over all experts
         float* probs = stackalloc float[expertCount];
+        float sumExp = 0f;
         for (int e = 0; e < expertCount; e++)
         {
-            probs[e] = MathF.Exp(logits[e] - maxLogit);
+            float ep = MathF.Exp(logits[e] - maxLogit);
+            probs[e] = ep;
+            sumExp += ep;
+        }
+
+        float invSumExp = sumExp > 0f ? 1.0f / sumExp : 1.0f;
+        for (int e = 0; e < expertCount; e++)
+        {
+            probs[e] *= invSumExp;
         }
 
         // 3. Select top-K experts with largest probabilities
@@ -88,17 +99,20 @@ public static unsafe partial class QuantKernels
             }
         }
 
-        // 4. Renormalize top-K weights to sum to 1.0
-        float sumWeights = 0f;
-        for (int k = 0; k < topK; k++)
+        // 4. Renormalize top-K weights if requested (e.g. Qwen2-MoE, Mixtral)
+        if (normTopK)
         {
-            sumWeights += selectedWeights[k];
-        }
+            float sumWeights = 0f;
+            for (int k = 0; k < topK; k++)
+            {
+                sumWeights += selectedWeights[k];
+            }
 
-        float invSum = sumWeights > 0f ? 1.0f / sumWeights : 1.0f / topK;
-        for (int k = 0; k < topK; k++)
-        {
-            selectedWeights[k] *= invSum;
+            float invSum = sumWeights > 0f ? 1.0f / sumWeights : 1.0f / topK;
+            for (int k = 0; k < topK; k++)
+            {
+                selectedWeights[k] *= invSum;
+            }
         }
     }
 
@@ -208,6 +222,112 @@ public static unsafe partial class QuantKernels
                     head[i + halfDim] = v0 * s + v1 * c;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Applies Rotary Position Embedding (RoPE NeOX style with YaRN support) to Multi-Head Latent Attention (MLA) vectors.
+    /// In MLA:
+    /// - Q has nHeads of dimension (qkNopeDim + qkRopeDim). RoPE is applied ONLY to the trailing qkRopeDim slice.
+    /// - kRope has dimension qkRopeDim (shared positional key vector). RoPE is applied to this vector.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RoPEMla(
+        float* q, float* kRope,
+        int nHeads,
+        int qHeadDim,
+        int qkNopeDim,
+        int qkRopeDim,
+        int pos,
+        float freqBase,
+        float* invFreqTable = null,
+        float mscale = 1.0f)
+    {
+        int halfDim = qkRopeDim / 2;
+
+        Span<float> cosTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
+        Span<float> sinTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
+
+        for (int i = 0; i < halfDim; i++)
+        {
+            float freq = invFreqTable != null ? invFreqTable[i] : 1.0f / MathF.Pow(freqBase, (float)(2 * i) / qkRopeDim);
+            float theta = pos * freq;
+            cosTable[i] = MathF.Cos(theta) * mscale;
+            sinTable[i] = MathF.Sin(theta) * mscale;
+        }
+
+        fixed (float* pCos = cosTable, pSin = sinTable)
+        {
+            Span<float> temp = qkRopeDim <= 128 ? stackalloc float[qkRopeDim] : new float[qkRopeDim];
+
+            // Apply to Q heads (trailing qkRopeDim slice)
+            for (int h = 0; h < nHeads; h++)
+            {
+                float* qPe = q + h * qHeadDim + qkNopeDim;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float c = pCos[i];
+                    float s = pSin[i];
+                    float q0 = qPe[2 * i];
+                    float q1 = qPe[2 * i + 1];
+
+                    temp[i] = q0 * c - q1 * s;
+                    temp[i + halfDim] = q1 * c + q0 * s;
+                }
+                for (int d = 0; d < qkRopeDim; d++)
+                {
+                    qPe[d] = temp[d];
+                }
+            }
+
+            // Apply to single shared K positional vector
+            if (kRope != null)
+            {
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float c = pCos[i];
+                    float s = pSin[i];
+                    float k0 = kRope[2 * i];
+                    float k1 = kRope[2 * i + 1];
+
+                    temp[i] = k0 * c - k1 * s;
+                    temp[i + halfDim] = k1 * c + k0 * s;
+                }
+                for (int d = 0; d < qkRopeDim; d++)
+                {
+                    kRope[d] = temp[d];
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Precomputes YaRN (Yet another RoPE extensioN) inverse frequencies for a given dimension.
+    /// </summary>
+    public static void PrecomputeYarnFrequencies(
+        Span<float> invFreq,
+        int dim,
+        float freqBase,
+        float scalingFactor,
+        int originalCtx,
+        float betaFast = 32.0f,
+        float betaSlow = 1.0f)
+    {
+        int halfDim = dim / 2;
+        float logBase = MathF.Log(freqBase);
+        float lowDim = (dim * MathF.Log(originalCtx / (betaFast * 2.0f * MathF.PI))) / (2.0f * logBase);
+        float highDim = (dim * MathF.Log(originalCtx / (betaSlow * 2.0f * MathF.PI))) / (2.0f * logBase);
+
+        float low = Math.Max(MathF.Floor(lowDim), 0.0f);
+        float high = Math.Min(MathF.Ceiling(highDim), (float)(dim - 1));
+        float invRange = (high > low) ? 1.0f / (high - low) : 1.0f;
+
+        for (int i = 0; i < halfDim; i++)
+        {
+            float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / dim);
+            float ramp = Math.Clamp((i - low) * invRange, 0.0f, 1.0f);
+            float yarnFreq = (freq / scalingFactor) * ramp + freq * (1.0f - ramp);
+            invFreq[i] = yarnFreq;
         }
     }
 

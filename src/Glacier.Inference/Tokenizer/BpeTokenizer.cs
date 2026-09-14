@@ -17,6 +17,8 @@ public sealed partial class BpeTokenizer
     private readonly Dictionary<string, int> _bpeRanks = new(160000, StringComparer.Ordinal);
     private readonly Dictionary<string, int> _specialTokens = new(StringComparer.Ordinal);
     private readonly HashSet<int> _stopTokens = new();
+    private readonly string _architecture = "";
+    private readonly string _chatTemplate = "";
 
     // Byte-level BPE character mappings
     private static readonly char[] ByteToChar = new char[256];
@@ -31,6 +33,8 @@ public sealed partial class BpeTokenizer
     public int EosTokenId { get; }
     public int BosTokenId { get; }
     public int PadTokenId { get; }
+    public bool AddBosToken { get; }
+    public bool AddEosToken { get; }
 
     public bool IsStopToken(int tokenId) => _stopTokens.Contains(tokenId);
 
@@ -68,6 +72,10 @@ public sealed partial class BpeTokenizer
         EosTokenId = gguf.EosTokenId;
         BosTokenId = gguf.BosTokenId;
         PadTokenId = (int)gguf.GetMetadataUInt32("tokenizer.ggml.padding_token_id", (uint)BosTokenId);
+        AddBosToken = gguf.AddBosToken;
+        AddEosToken = gguf.AddEosToken;
+        _architecture = gguf.Architecture;
+        _chatTemplate = gguf.Metadata.TryGetValue("tokenizer.chat_template", out var ct) ? ct?.ToString() ?? "" : "";
 
         // Load tokens
         if (!gguf.Metadata.TryGetValue("tokenizer.ggml.tokens", out var tokensObj) || tokensObj is not List<object> tokenList)
@@ -107,6 +115,19 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<unk>");
         RegisterSpecialToken("<think>");
         RegisterSpecialToken("</think>");
+        RegisterSpecialToken("<｜begin of sentence｜>");
+        RegisterSpecialToken("<｜end of sentence｜>");
+
+        // Dynamically register model's configured BOS/EOS
+        if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+        {
+            RegisterSpecialToken(_idToToken[BosTokenId]);
+        }
+        if (EosTokenId >= 0 && EosTokenId < _idToToken.Length)
+        {
+            RegisterSpecialToken(_idToToken[EosTokenId]);
+            RegisterStopToken(_idToToken[EosTokenId]);
+        }
 
         // Initialize stop tokens
         if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
@@ -115,6 +136,7 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("<|end_of_text|>");
         RegisterStopToken("<|eot_id|>");
         RegisterStopToken("</s>");
+        RegisterStopToken("<｜end of sentence｜>");
     }
 
     public BpeTokenizer(IEnumerable<string> vocab, int eosTokenId = 151643, int bosTokenId = 151644)
@@ -181,7 +203,26 @@ public sealed partial class BpeTokenizer
             return sb.ToString();
         }
 
-        // 2. Standard ChatML format (Qwen2, Qwen3, DeepSeek, MiMo)
+        // 2. DeepSeek format ({{ bos_token }}User: ... \n\nAssistant:)
+        if (_architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) || _chatTemplate.Contains("User: "))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
+            {
+                sb.Append(systemPrompt);
+                sb.Append("\n\n");
+            }
+            sb.Append("User: ");
+            sb.Append(prompt);
+            sb.Append("\n\nAssistant:");
+            return sb.ToString();
+        }
+
+        // 3. Standard ChatML format (Qwen2, Qwen3, MiMo)
         {
             var sb = new StringBuilder();
             if (!string.IsNullOrEmpty(systemPrompt))
@@ -293,6 +334,14 @@ public sealed partial class BpeTokenizer
                         result.Add(id);
                     }
                 }
+            }
+        }
+
+        if (AddBosToken && BosTokenId >= 0)
+        {
+            if (result.Count == 0 || result[0] != BosTokenId)
+            {
+                result.Insert(0, BosTokenId);
             }
         }
 

@@ -48,12 +48,33 @@ public sealed unsafe class GgufFile : IDisposable
     public float RmsNormEps => GetMetadataSingle($"{Architecture}.attention.layer_norm_rms_epsilon", 1e-5f);
     public int EosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.eos_token_id", 151645);
     public int BosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.bos_token_id", 151643);
+    public bool AddBosToken => GetMetadataBool("tokenizer.ggml.add_bos_token", false);
+    public bool AddEosToken => GetMetadataBool("tokenizer.ggml.add_eos_token", false);
+
+    public int ValueDim
+    {
+        get
+        {
+            uint valLen = GetMetadataUInt32($"{Architecture}.attention.value_length", 0);
+            if (valLen > 0) return (int)valLen;
+            return HeadDim;
+        }
+    }
+    public int KvLoraRank => (int)GetMetadataUInt32($"{Architecture}.attention.kv_lora_rank", 512);
+    public int RopeDimensionCount => (int)GetMetadataUInt32($"{Architecture}.rope.dimension_count", (uint)HeadDim);
+    public int QkNopeHeadDim => HeadDim > RopeDimensionCount ? HeadDim - RopeDimensionCount : 128;
+    public string RopeScalingType => GetMetadataString($"{Architecture}.rope.scaling.type", "");
+    public float RopeScalingFactor => GetMetadataSingle($"{Architecture}.rope.scaling.factor", 1.0f);
+    public int RopeScalingOriginalContextLength => (int)GetMetadataUInt32($"{Architecture}.rope.scaling.original_context_length", 4096);
+    public float RopeScalingYarnLogMultiplier => GetMetadataSingle($"{Architecture}.rope.scaling.yarn_log_multiplier", 0.0707f);
+    public bool IsMla => Architecture == "deepseek2" || Tensors.ContainsKey("blk.0.attn_kv_a_mqa.weight") || Tensors.ContainsKey("blk.1.attn_kv_a_mqa.weight");
 
     public int ExpertCount => (int)GetMetadataUInt32($"{Architecture}.expert_count", 0);
     public int ExpertUsedCount => (int)GetMetadataUInt32($"{Architecture}.expert_used_count", 0);
     public int ExpertFeedForwardLength => (int)GetMetadataUInt32($"{Architecture}.expert_feed_forward_length", 0);
     public int ExpertSharedCount => (int)GetMetadataUInt32($"{Architecture}.expert_shared_count", 0);
     public int LeadingDenseBlockCount => (int)GetMetadataUInt32($"{Architecture}.leading_dense_block_count", 0);
+    public bool NormTopK => Architecture != "deepseek2" && GetMetadataBool($"{Architecture}.expert_weights_norm", Architecture != "deepseek2");
     public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
 
     public static GgufFile Open(string filePath) => new(filePath);
@@ -178,6 +199,17 @@ public sealed unsafe class GgufFile : IDisposable
         {
             if (val is float f) return f;
             if (val is double d) return (float)d;
+        }
+        return fallback;
+    }
+
+    public bool GetMetadataBool(string key, bool fallback = false)
+    {
+        if (Metadata.TryGetValue(key, out var val))
+        {
+            if (val is bool b) return b;
+            if (val is uint u) return u != 0;
+            if (val is int i) return i != 0;
         }
         return fallback;
     }

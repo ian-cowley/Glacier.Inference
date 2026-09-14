@@ -19,6 +19,12 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private readonly int _dim;
     private readonly int _ffnDim;
     private readonly int _headDim;
+    private readonly int _vHeadDim;
+    private readonly int _qkNopeDim;
+    private readonly int _qkRopeDim;
+    private readonly int _kvLoraRank;
+    private float* _yarnInvFreq;
+    private readonly float _yarnMscale;
     private readonly int _nHeads;
     private readonly int _nHeadsKv;
     private readonly int _groupSize;
@@ -45,6 +51,12 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _expertDownOut;
     private float* _headScores;
 
+    // Preallocated MLA scratch buffers (single token)
+    private float* _compressedKv;
+    private float* _cKvNorm;
+    private float* _cKvSums;
+    private float* _decompressedKv;
+
     // Preallocated unmanaged scratch buffers (batched chunk prefill <= MaxBatchSize)
     private float* _xBatch;
     private float* _normXBatch;
@@ -60,6 +72,10 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _ffnActBatch;
     private float* _ffnActSumBatch;
     private float* _ffnOutBatch;
+
+    // Preallocated MLA scratch buffers (batched)
+    private float* _compressedKvBatch;
+    private float* _decompressedKvBatch;
 
     private bool _disposed;
 
@@ -83,10 +99,13 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         _dim = weights.EmbeddingLength;
         _ffnDim = weights.FeedForwardLength;
         _headDim = weights.HeadDim;
+        _vHeadDim = weights.ValueDim;
+        _qkNopeDim = weights.QkNopeHeadDim;
+        _qkRopeDim = weights.RopeDimensionCount;
+        _kvLoraRank = weights.KvLoraRank;
         _nHeads = weights.HeadCount;
         _nHeadsKv = weights.HeadCountKv;
         _groupSize = _nHeads / _nHeadsKv;
-        _attnScale = 1.0f / MathF.Sqrt(_headDim);
         _maxSeqLen = maxSeqLen;
 
         int expFfn = weights.ExpertFeedForwardLength;
@@ -94,7 +113,7 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         if (maxFfn == 0) maxFfn = _ffnDim;
 
         int qDim = _nHeads * _headDim;
-        int maxAttnOut = Math.Max(_dim, qDim);
+        int maxAttnOut = Math.Max(_dim, Math.Max(qDim, _nHeads * _vHeadDim));
         int attnOutChunks = (maxAttnOut + 31) / 32;
 
         _x = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
@@ -102,7 +121,7 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         _normXSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
         _q = (float*)NativeMemory.AllocZeroed((nuint)(_nHeads * _headDim * sizeof(float)));
         _k = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _headDim * sizeof(float)));
-        _v = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _headDim * sizeof(float)));
+        _v = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(maxAttnOut * sizeof(float)));
         _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)(attnOutChunks * sizeof(float)));
         _attnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
@@ -116,13 +135,56 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         long scoreBufferSize = (long)_nHeads * _maxSeqLen * sizeof(float);
         _headScores = (float*)NativeMemory.AllocZeroed((nuint)scoreBufferSize);
 
+        // MLA buffers
+        int kvMqaDim = _kvLoraRank + _qkRopeDim;
+        int decompKvDim = _nHeads * (_qkNopeDim + _vHeadDim);
+        int halfRope = _qkRopeDim / 2;
+        if (_weights.IsMla)
+        {
+            _compressedKv = (float*)NativeMemory.AllocZeroed((nuint)(kvMqaDim * sizeof(float)));
+            _cKvNorm = (float*)NativeMemory.AllocZeroed((nuint)(_kvLoraRank * sizeof(float)));
+            _cKvSums = (float*)NativeMemory.AllocZeroed((nuint)(((_kvLoraRank + 31) / 32) * sizeof(float)));
+            _decompressedKv = (float*)NativeMemory.AllocZeroed((nuint)(decompKvDim * sizeof(float)));
+
+            _compressedKvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * kvMqaDim * sizeof(float)));
+            _decompressedKvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * decompKvDim * sizeof(float)));
+
+            _yarnInvFreq = (float*)NativeMemory.AllocZeroed((nuint)(halfRope * sizeof(float)));
+            if (weights.Gguf.RopeScalingType.Equals("yarn", StringComparison.OrdinalIgnoreCase))
+            {
+                QuantKernels.PrecomputeYarnFrequencies(
+                    new Span<float>(_yarnInvFreq, halfRope),
+                    _qkRopeDim,
+                    weights.RopeFreqBase,
+                    weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f,
+                    weights.Gguf.RopeScalingOriginalContextLength > 0 ? weights.Gguf.RopeScalingOriginalContextLength : 4096);
+
+                float logMul = weights.Gguf.RopeScalingYarnLogMultiplier > 0 ? weights.Gguf.RopeScalingYarnLogMultiplier : 0.0707f;
+                float factor = weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f;
+                float mscaleAllDim = factor > 1.0f ? (logMul * MathF.Log(factor) + 1.0f) : 1.0f;
+                float mscaleBase = factor > 1.0f ? (0.1f * MathF.Log(factor) + 1.0f) : 1.0f;
+                _yarnMscale = mscaleBase / mscaleAllDim;
+                _attnScale = (1.0f / MathF.Sqrt(_headDim)) * mscaleAllDim * mscaleAllDim;
+            }
+            else
+            {
+                _yarnMscale = 1.0f;
+                _attnScale = 1.0f / MathF.Sqrt(_headDim);
+            }
+        }
+        else
+        {
+            _yarnMscale = 1.0f;
+            _attnScale = 1.0f / MathF.Sqrt(_headDim);
+        }
+
         // Batch scratch buffers
         _xBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
         _normXBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
         _normXSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * (_dim / 32) * sizeof(float)));
         _qBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
         _kBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
-        _vBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+        _vBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
         _attnOutSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * attnOutChunks * sizeof(float)));
         _attnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
@@ -156,8 +218,8 @@ public sealed unsafe partial class Qwen2Model : IDisposable
             QuantKernels.Softmax(scores, pos + 1, sinkLogit);
 
             // Value aggregation
-            float* outHead = outHeadBase + h * _headDim;
-            for (int d = 0; d < _headDim; d++) outHead[d] = 0f;
+            float* outHead = outHeadBase + h * _vHeadDim;
+            for (int d = 0; d < _vHeadDim; d++) outHead[d] = 0f;
 
             for (int t = 0; t <= pos; t++)
             {
@@ -167,7 +229,7 @@ public sealed unsafe partial class Qwen2Model : IDisposable
                 if (Vector256.IsHardwareAccelerated)
                 {
                     var vw = Vector256.Create(w);
-                    for (int d = 0; d < _headDim; d += 8)
+                    for (int d = 0; d < _vHeadDim; d += 8)
                     {
                         var vo = Vector256.Load(outHead + d);
                         var vv = Vector256.Load(vPast + d);
@@ -177,7 +239,7 @@ public sealed unsafe partial class Qwen2Model : IDisposable
                 }
                 else
                 {
-                    for (int d = 0; d < _headDim; d++)
+                    for (int d = 0; d < _vHeadDim; d++)
                     {
                         outHead[d] += w * vPast[d];
                     }
@@ -247,6 +309,14 @@ public sealed unsafe partial class Qwen2Model : IDisposable
             FreeIfAllocated(ref _ffnActBatch);
             FreeIfAllocated(ref _ffnActSumBatch);
             FreeIfAllocated(ref _ffnOutBatch);
+
+            FreeIfAllocated(ref _compressedKv);
+            FreeIfAllocated(ref _cKvNorm);
+            FreeIfAllocated(ref _cKvSums);
+            FreeIfAllocated(ref _decompressedKv);
+            FreeIfAllocated(ref _yarnInvFreq);
+            FreeIfAllocated(ref _compressedKvBatch);
+            FreeIfAllocated(ref _decompressedKvBatch);
 
             _disposed = true;
         }

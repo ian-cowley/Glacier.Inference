@@ -24,6 +24,17 @@ public unsafe struct BlockQ4_0
 }
 
 /// <summary>
+/// Q5_0 quantization block: 32 elements in 22 bytes (2-byte FP16 scale + 4-byte high bits + 16 bytes 4-bit nibbles).
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ5_0
+{
+    public Half Delta;
+    public uint Qh;
+    public fixed byte Qs[16];
+}
+
+/// <summary>
 /// Q4_K quantization super-block: 256 elements in 144 bytes.
 /// Contains scales, offsets, and 4-bit weights for 8 sub-blocks of 32.
 /// </summary>

@@ -319,5 +319,108 @@ public unsafe class QuantKernelTests
             Assert.Equal(expectedDot, actualDot, 0.001f);
         }
     }
+
+    [Fact]
+    public void RoPEMla_RotatesOnlyPeSliceAndPreservesNopeSlice()
+    {
+        const int nHeads = 2;
+        const int qHeadDim = 192;
+        const int qkNopeDim = 128;
+        const int qkRopeDim = 64;
+
+        float[] q = new float[nHeads * qHeadDim];
+        float[] kRope = new float[qkRopeDim];
+
+        // Fill with distinct values
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(i + 1) * 0.01f;
+        for (int i = 0; i < kRope.Length; i++) kRope[i] = (float)(i + 10) * 0.01f;
+
+        float[] qBefore = (float[])q.Clone();
+        float[] kBefore = (float[])kRope.Clone();
+
+        fixed (float* pQ = q, pK = kRope)
+        {
+            QuantKernels.RoPEMla(pQ, pK, nHeads, qHeadDim, qkNopeDim, qkRopeDim, pos: 5, freqBase: 10000.0f);
+        }
+
+        // 1. Verify q_nope (0..127) for both heads is completely untouched
+        for (int h = 0; h < nHeads; h++)
+        {
+            for (int i = 0; i < qkNopeDim; i++)
+            {
+                Assert.Equal(qBefore[h * qHeadDim + i], q[h * qHeadDim + i]);
+            }
+        }
+
+        // 2. Verify q_pe (128..191) has rotated (values changed) but L2 norm preserved
+        for (int h = 0; h < nHeads; h++)
+        {
+            float normBefore = 0f, normAfter = 0f;
+            for (int i = 0; i < qkRopeDim; i++)
+            {
+                float b = qBefore[h * qHeadDim + qkNopeDim + i];
+                float a = q[h * qHeadDim + qkNopeDim + i];
+                normBefore += b * b;
+                normAfter += a * a;
+            }
+            Assert.NotEqual(qBefore[h * qHeadDim + qkNopeDim], q[h * qHeadDim + qkNopeDim]);
+            Assert.True(Math.Abs(normBefore - normAfter) / normBefore < 1e-4f, $"Norm mismatch: before={normBefore}, after={normAfter}");
+        }
+
+        // 3. Verify kRope has rotated and L2 norm preserved
+        float kNormBefore = 0f, kNormAfter = 0f;
+        for (int i = 0; i < qkRopeDim; i++)
+        {
+            kNormBefore += kBefore[i] * kBefore[i];
+            kNormAfter += kRope[i] * kRope[i];
+        }
+        Assert.NotEqual(kBefore[0], kRope[0]);
+        Assert.True(Math.Abs(kNormBefore - kNormAfter) / kNormBefore < 1e-4f, $"KNorm mismatch: before={kNormBefore}, after={kNormAfter}");
+    }
+
+    [Fact]
+    public void PrecomputeYarnFrequencies_InterpolatesSmoothly()
+    {
+        float[] freqs = new float[32];
+        QuantKernels.PrecomputeYarnFrequencies(freqs, dim: 64, freqBase: 10000f, scalingFactor: 40f, originalCtx: 4096);
+
+        // Frequencies should be strictly positive and decreasing with index
+        for (int i = 0; i < 32; i++)
+        {
+            Assert.True(freqs[i] > 0f);
+            if (i > 0)
+            {
+                Assert.True(freqs[i] <= freqs[i - 1]);
+            }
+        }
+    }
+
+    [Fact]
+    public void Q5_0_DequantizeAndVecDot_MatchesExpected()
+    {
+        BlockQ5_0 block = new BlockQ5_0();
+        block.Delta = (Half)2.0f;
+        // bit 0 set (element 0) and bit 16 set (element 16)
+        block.Qh = (1u << 0) | (1u << 16);
+        // element 0: lower nibble 5 | 16 = 21 -> 21 - 16 = 5. Value = 5 * 2 = 10.
+        // element 16: upper nibble 9 | 16 = 25 -> 25 - 16 = 9. Value = 9 * 2 = 18.
+        block.Qs[0] = (byte)(5 | (9 << 4));
+
+        float[] dequant = new float[32];
+        float[] x = new float[32];
+        x[0] = 1.0f;
+        x[16] = 2.0f;
+
+        BlockQ5_0* pBlock = &block;
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeQ5_0(pBlock, pDequant, 32);
+            float dot = QuantKernels.VecDotQ5_0(pBlock, pX, 32);
+
+            Assert.Equal(10.0f, dequant[0], 1e-4f);
+            Assert.Equal(18.0f, dequant[16], 1e-4f);
+            Assert.Equal(46.0f, dot, 1e-4f);
+        }
+    }
 }
 

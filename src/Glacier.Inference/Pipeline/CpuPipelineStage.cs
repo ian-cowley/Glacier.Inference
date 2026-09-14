@@ -41,7 +41,7 @@ public sealed class CpuPipelineStage : IPipelineStage
         _isFirstStage = isFirstStage;
         _isLastStage = isLastStage;
         int resolvedLayers = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
-        _kvCache = new KVCache(resolvedLayers, weights.HeadCountKv, weights.HeadDim, maxSeqLen);
+        _kvCache = new KVCache(resolvedLayers, weights.HeadCountKv, weights.HeadDim, maxSeqLen, weights.ValueDim);
         _model = new Qwen2Model(
             weights,
             maxSeqLen: maxSeqLen,
