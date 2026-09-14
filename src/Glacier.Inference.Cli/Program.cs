@@ -105,6 +105,7 @@ public static class Program
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto safe selection)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto adaptive)");
         Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
+        Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU pipeline split (e.g. 'auto', 'nvidia-rtx-4060:14,amd-890m:14')");
         Console.WriteLine();
         Console.WriteLine("Subcommand Help:");
         Console.WriteLine("  glacier <command> --help             Detailed help, options, and examples for any command");
@@ -235,6 +236,7 @@ public static class Program
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  --compare-ollama <url>               Ollama base URL for side-by-side comparison");
         Console.WriteLine("                                       (e.g. http://127.0.0.1:11434 or http://remote-host:11434)");
         Console.WriteLine("  --compare-model <name>               Ollama model tag to query (default: qwen2.5:7b-instruct-32k)");
@@ -248,6 +250,7 @@ public static class Program
         Console.WriteLine("Examples:");
         Console.WriteLine("  glacier bench model.gguf -n 50");
         Console.WriteLine("  glacier bench model.gguf -c 4096 --device nvidia-rtx-4060 --engine baremetal");
+        Console.WriteLine("  glacier bench model.gguf --split auto");
         Console.WriteLine("  glacier bench model.gguf --compare-ollama http://127.0.0.1:11434 --compare-model qwen2.5:7b");
     }
 
@@ -271,6 +274,7 @@ public static class Program
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("Interactive REPL Commands:");
@@ -280,6 +284,7 @@ public static class Program
         Console.WriteLine("  glacier run model.gguf                                # Launch interactive chat REPL");
         Console.WriteLine("  glacier run model.gguf \"Explain quicksort in C#\"       # Single-shot streaming answer");
         Console.WriteLine("  glacier run model.gguf -c 4096 --temp 0.2              # Low-temperature coding mode");
+        Console.WriteLine("  glacier run model.gguf --split auto                   # Dual-GPU pipeline parallelism");
         Console.WriteLine("  glacier run model.gguf --device amd-890m --engine directml");
     }
 
@@ -301,6 +306,7 @@ public static class Program
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("HTTP API Endpoints:");
@@ -464,6 +470,7 @@ public static class Program
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
+        string? split = null;
         int maxSeqLen = 2048;
 
         for (int i = 0; i < args.Length; i++)
@@ -484,6 +491,8 @@ public static class Program
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
                 kvPrecisionStr = args[++i];
+            else if (args[i] == "--split" && i + 1 < args.Length)
+                split = args[++i];
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
             else if (!args[i].StartsWith("-") && modelPath == null)
@@ -522,13 +531,15 @@ public static class Program
         Console.WriteLine($"Prompt:       \"{prompt}\"");
         Console.WriteLine($"Context Len:  {maxSeqLen}");
         Console.WriteLine($"KV Precision: {kvPrecision}");
+        if (!string.IsNullOrEmpty(split))
+            Console.WriteLine($"Pipeline Split: {split}");
         if (!string.IsNullOrEmpty(compareOllamaUrl))
             Console.WriteLine($"Comparative:  Ollama at {compareOllamaUrl}");
         Console.WriteLine();
 
         Console.WriteLine(">> Loading model into zero-copy virtual address space...");
         var loadSw = Stopwatch.StartNew();
-        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
         loadSw.Stop();
         Console.WriteLine($"   Cold load completed in: {loadSw.ElapsedMilliseconds} ms ({loadSw.Elapsed.TotalSeconds:F2} s)");
         Console.WriteLine($"   Execution Device: {session.ActiveDevice}");
@@ -667,6 +678,7 @@ public static class Program
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
+        string? split = null;
         int maxSeqLen = 2048;
         int maxTokens = 512;
         float temperature = 0.7f;
@@ -685,6 +697,8 @@ public static class Program
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
                 kvPrecisionStr = args[++i];
+            else if (args[i] == "--split" && i + 1 < args.Length)
+                split = args[++i];
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
             else if ((args[i] == "-n" || args[i] == "--tokens" || args[i] == "--max-tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int tok))
@@ -729,7 +743,7 @@ public static class Program
         Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference...");
         Console.ResetColor();
 
-        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
         var options = new SamplingOptions { MaxTokens = maxTokens, Temperature = temperature, TopP = topP };
@@ -803,6 +817,7 @@ public static class Program
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
+        string? split = null;
         int maxSeqLen = 2048;
 
         for (int i = 0; i < args.Length; i++)
@@ -819,6 +834,8 @@ public static class Program
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
                 kvPrecisionStr = args[++i];
+            else if (args[i] == "--split" && i + 1 < args.Length)
+                split = args[++i];
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
             else if (!args[i].StartsWith("-") && modelPath == null)
@@ -857,10 +874,12 @@ public static class Program
         Console.WriteLine($"Endpoint:     http://{host}:{port}");
         Console.WriteLine($"Context Len:  {maxSeqLen}");
         Console.WriteLine($"KV Precision: {kvPrecision}");
+        if (!string.IsNullOrEmpty(split))
+            Console.WriteLine($"Pipeline Split: {split}");
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
-        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision);
+        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         var appBuilder = WebApplication.CreateBuilder();

@@ -17,8 +17,32 @@ public sealed unsafe partial class Qwen2D3D12Model
     /// </summary>
     public void Forward(int token, int pos, Span<float> logits, bool computeLogits = true)
     {
-        // 1. Extract embedding directly into persistently mapped upload buffer
-        QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
+        ForwardStage(token, pos, default, default, logits, computeLogits);
+    }
+
+    /// <summary>
+    /// Executes layers assigned to this stage for a single token forward step.
+    /// </summary>
+    public void ForwardStage(
+        int token,
+        int pos,
+        ReadOnlySpan<float> inputX,
+        Span<float> outputX,
+        Span<float> logits,
+        bool computeLogits)
+    {
+        // 1. Input activation: either extract embedding or copy incoming hidden vector
+        if (StartLayer == 0)
+        {
+            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
+        }
+        else
+        {
+            fixed (float* pInput = inputX)
+            {
+                Buffer.MemoryCopy(pInput, _pUploadEmbedding, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+            }
+        }
 
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
@@ -28,7 +52,7 @@ public sealed unsafe partial class Qwen2D3D12Model
         _ctx.BeginCommands();
         var cmd = _ctx.CommandList;
 
-        // Copy embedding from upload buffer into _dX inside the same command list
+        // Copy embedding / input activation from upload buffer into _dX inside the same command list
         cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
         cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
         cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
@@ -37,7 +61,7 @@ public sealed unsafe partial class Qwen2D3D12Model
         int* selectedIndices = stackalloc int[maxTopK];
         float* selectedWeights = stackalloc float[maxTopK];
 
-        for (int l = 0; l < _weights.BlockCount; l++)
+        for (int l = 0; l < LayerCount; l++)
         {
             var lw = _layerWeights[l];
 
@@ -145,8 +169,9 @@ public sealed unsafe partial class Qwen2D3D12Model
                 // Shared Expert if present
                 if (lw.FfnGateShexpWeight != null)
                 {
+                    int modelLayer = StartLayer + l;
                     int shexpFfnDim = expertFfnDim * 2;
-                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
                         shexpFfnDim = (int)tShexp.Dimensions[1];
 
                     DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight, _dim, shexpFfnDim);
@@ -184,21 +209,34 @@ public sealed unsafe partial class Qwen2D3D12Model
             }
         }
 
-        if (computeLogits)
+        if (IsLastStage)
         {
-            // Final RMSNorm
-            DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // Output projection (LM Head)
-            DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            if (!logits.IsEmpty)
+            if (computeLogits)
             {
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                // Final RMSNorm
+                DispatchRmsNorm(cmd, _dX, _dOutNormWeight!, _dNormX, _dim, _weights.RmsNormEps);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                // Output projection (LM Head)
+                DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight!, _dim, _weights.VocabSize);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                if (!logits.IsEmpty)
+                {
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                }
+            }
+        }
+        else
+        {
+            // Intermediate stage: copy _dX to _readbackActivation
+            if (!outputX.IsEmpty && _readbackActivation != null)
+            {
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopySource);
+                cmd.CopyBufferRegion(_readbackActivation, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
             }
         }
         swRec.Stop();
@@ -210,12 +248,25 @@ public sealed unsafe partial class Qwen2D3D12Model
 
         LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
 
-        // 3. Read back logits if requested
-        if (computeLogits && !logits.IsEmpty)
+        // 3. Read back logits if last stage, or activation if intermediate stage
+        if (IsLastStage)
         {
-            fixed (float* pLogits = logits)
+            if (computeLogits && !logits.IsEmpty)
             {
-                Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
+                fixed (float* pLogits = logits)
+                {
+                    Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
+                }
+            }
+        }
+        else
+        {
+            if (!outputX.IsEmpty && _pReadbackActivation != null)
+            {
+                fixed (float* pOut = outputX)
+                {
+                    Buffer.MemoryCopy(_pReadbackActivation, pOut, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+                }
             }
         }
     }
@@ -226,20 +277,49 @@ public sealed unsafe partial class Qwen2D3D12Model
     /// </summary>
     public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
     {
-        if (tokens.IsEmpty) return;
+        ForwardBatchStage(tokens, startPos, default, default, logits, computeLogits);
+    }
 
-        if (tokens.Length == 1)
+    /// <summary>
+    /// Executes batched prefill for the layers assigned to this stage.
+    /// </summary>
+    public void ForwardBatchStage(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        ReadOnlySpan<float> inputXBatch,
+        Span<float> outputXBatch,
+        Span<float> logits,
+        bool computeLogits)
+    {
+        int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
+        if (totalTokens == 0) return;
+
+        if (totalTokens == 1)
         {
-            Forward(tokens[0], startPos, logits, computeLogits);
+            ForwardStage(
+                !tokens.IsEmpty ? tokens[0] : 0,
+                startPos,
+                inputXBatch,
+                outputXBatch,
+                logits,
+                computeLogits);
             return;
         }
 
         if (_weights.IsMoe)
         {
-            for (int t = 0; t < tokens.Length; t++)
+            for (int t = 0; t < totalTokens; t++)
             {
-                bool isLast = (t == tokens.Length - 1);
-                Forward(tokens[t], startPos + t, isLast ? logits : Span<float>.Empty, isLast && computeLogits);
+                bool isLast = (t == totalTokens - 1);
+                var inSlice = !inputXBatch.IsEmpty ? inputXBatch.Slice(t * _dim, _dim) : default;
+                var outSlice = !outputXBatch.IsEmpty ? outputXBatch.Slice(t * _dim, _dim) : default;
+                ForwardStage(
+                    !tokens.IsEmpty ? tokens[t] : 0,
+                    startPos + t,
+                    inSlice,
+                    outSlice,
+                    isLast ? logits : Span<float>.Empty,
+                    isLast && computeLogits);
             }
             return;
         }
@@ -247,23 +327,37 @@ public sealed unsafe partial class Qwen2D3D12Model
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        for (int offset = 0; offset < tokens.Length; offset += MaxBatchChunk)
+        for (int offset = 0; offset < totalTokens; offset += MaxBatchChunk)
         {
-            int chunkSize = Math.Min(MaxBatchChunk, tokens.Length - offset);
-            bool isLastChunk = (offset + chunkSize == tokens.Length);
+            int chunkSize = Math.Min(MaxBatchChunk, totalTokens - offset);
+            bool isLastChunk = (offset + chunkSize == totalTokens);
             int chunkStartPos = startPos + offset;
 
-            // 1. Vectorized host embedding extraction for the chunk
-            fixed (int* pTokens = tokens)
+            // 1. Vectorized host embedding extraction or intermediate activation copy for the chunk
+            if (StartLayer == 0)
             {
-                for (int t = 0; t < chunkSize; t++)
+                fixed (int* pTokens = tokens)
                 {
-                    QuantKernels.ExtractEmbedding(
-                        _weights.EmbdType,
-                        _weights.EmbdWeight,
-                        pTokens[offset + t],
-                        _pUploadEmbeddingBatch + t * _dim,
-                        _dim);
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        QuantKernels.ExtractEmbedding(
+                            _weights.EmbdType,
+                            _weights.EmbdWeight,
+                            pTokens[offset + t],
+                            _pUploadEmbeddingBatch + t * _dim,
+                            _dim);
+                    }
+                }
+            }
+            else
+            {
+                fixed (float* pInput = inputXBatch)
+                {
+                    Buffer.MemoryCopy(
+                        pInput + (long)offset * _dim,
+                        _pUploadEmbeddingBatch,
+                        (ulong)(chunkSize * _dim * sizeof(float)),
+                        (ulong)(chunkSize * _dim * sizeof(float)));
                 }
             }
 
@@ -271,14 +365,13 @@ public sealed unsafe partial class Qwen2D3D12Model
             _ctx.BeginCommands();
             var cmd = _ctx.CommandList;
 
-            // Copy entire chunk of embeddings into _dXBatch
+            // Copy entire chunk of embeddings/activations into _dXBatch
             cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopyDest);
             cmd.CopyBufferRegion(_dXBatch, 0, _uploadEmbeddingBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
             cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.Common);
 
-            // Execute all layers across all tokens in the chunk simultaneously!
-            // Weights for each layer are read from VRAM ONCE per chunk!
-            for (int l = 0; l < _weights.BlockCount; l++)
+            // Execute assigned layers across all tokens in the chunk simultaneously
+            for (int l = 0; l < LayerCount; l++)
             {
                 var lw = _layerWeights[l];
 
@@ -325,29 +418,42 @@ public sealed unsafe partial class Qwen2D3D12Model
                 DispatchGemmBatch(cmd, lw.FfnDownType, null, _dFfnActBatch, lw.FfnDownWeight!, _ffnDim, _dim, chunkSize, null, residual: _dXBatch);
             }
 
-            if (isLastChunk && computeLogits)
+            if (IsLastStage)
             {
-                // Copy the final token's hidden state into _dX for LM Head evaluation
-                ulong lastTokenOffset = (ulong)((chunkSize - 1) * _dim * sizeof(float));
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-                cmd.CopyBufferRegion(_dX, 0, _dXBatch, lastTokenOffset, (ulong)(_dim * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
-
-                // Final RMSNorm on final token
-                DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Output projection (LM Head)
-                DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                if (!logits.IsEmpty)
+                if (isLastChunk && computeLogits)
                 {
-                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                    cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                    // Copy the final token's hidden state into _dX for LM Head evaluation
+                    ulong lastTokenOffset = (ulong)((chunkSize - 1) * _dim * sizeof(float));
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dX, 0, _dXBatch, lastTokenOffset, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+
+                    // Final RMSNorm on final token
+                    DispatchRmsNorm(cmd, _dX, _dOutNormWeight!, _dNormX, _dim, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    // Output projection (LM Head)
+                    DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight!, _dim, _weights.VocabSize);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    if (!logits.IsEmpty)
+                    {
+                        cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
+                        cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                    }
                 }
             }
+            else
+            {
+                if (!outputXBatch.IsEmpty && _readbackActivationBatch != null)
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackActivationBatch, 0, _dXBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
+                }
+            }
+
             swRec.Stop();
             var swGpu = Stopwatch.StartNew();
             _ctx.EndCommandsAndExecute();
@@ -355,12 +461,28 @@ public sealed unsafe partial class Qwen2D3D12Model
             swGpu.Stop();
             LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
 
-
-            if (isLastChunk && computeLogits && !logits.IsEmpty)
+            if (IsLastStage)
             {
-                fixed (float* pLogits = logits)
+                if (isLastChunk && computeLogits && !logits.IsEmpty)
                 {
-                    Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
+                    fixed (float* pLogits = logits)
+                    {
+                        Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
+                    }
+                }
+            }
+            else
+            {
+                if (!outputXBatch.IsEmpty && _pReadbackActivationBatch != null)
+                {
+                    fixed (float* pOut = outputXBatch)
+                    {
+                        Buffer.MemoryCopy(
+                            _pReadbackActivationBatch,
+                            pOut + (long)offset * _dim,
+                            (ulong)(chunkSize * _dim * sizeof(float)),
+                            (ulong)(chunkSize * _dim * sizeof(float)));
+                    }
                 }
             }
         }

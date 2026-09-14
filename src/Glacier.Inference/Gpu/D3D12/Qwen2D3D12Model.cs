@@ -124,8 +124,8 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
     private readonly ID3D12Resource[] _dValCache;
 
     // Model Weights in GPU VRAM
-    private ID3D12Resource _dOutNormWeight = null!;
-    private ID3D12Resource _dOutWeight = null!;
+    private ID3D12Resource? _dOutNormWeight;
+    private ID3D12Resource? _dOutWeight;
     private readonly D3D12LayerWeights[] _layerWeights;
 
     private readonly float[] _hX;
@@ -134,18 +134,36 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
     private const int MaxBatchChunk = 64;
     private ID3D12Resource _uploadEmbeddingBatch = null!;
     private float* _pUploadEmbeddingBatch;
+    private ID3D12Resource? _readbackActivation;
+    private float* _pReadbackActivation;
+    private ID3D12Resource? _readbackActivationBatch;
+    private float* _pReadbackActivationBatch;
     private ID3D12Resource _readbackLogits = null!;
     private float* _pReadbackLogits;
+    private float[]? _hostLogits;
+    private readonly Sampling.Sampler _sampler = new();
     private bool _disposed;
 
     public D3D12Context Context => _ctx;
     public ModelWeights Weights => _weights;
+    public int StartLayer { get; }
+    public int LayerCount { get; }
+    public bool IsLastStage { get; }
     public (double RecordMs, double GpuMs) LastTimings { get; private set; }
 
-    public Qwen2D3D12Model(D3D12Context ctx, ModelWeights weights, int maxSeqLen = 4096)
+    public Qwen2D3D12Model(
+        D3D12Context ctx,
+        ModelWeights weights,
+        int maxSeqLen = 4096,
+        int startLayer = 0,
+        int layerCount = -1,
+        bool isLastStage = true)
     {
         _ctx = ctx;
         _weights = weights;
+        StartLayer = startLayer;
+        LayerCount = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
+        IsLastStage = isLastStage;
         _dim = weights.EmbeddingLength;
         _ffnDim = weights.FeedForwardLength;
         _headDim = weights.HeadDim;
@@ -156,9 +174,9 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
         _maxSeqLen = maxSeqLen;
 
         _hX = new float[_dim];
-        _dKeyCache = new ID3D12Resource[weights.BlockCount];
-        _dValCache = new ID3D12Resource[weights.BlockCount];
-        _layerWeights = new D3D12LayerWeights[weights.BlockCount];
+        _dKeyCache = new ID3D12Resource[LayerCount];
+        _dValCache = new ID3D12Resource[LayerCount];
+        _layerWeights = new D3D12LayerWeights[LayerCount];
 
         InitPipelines();
         InitScratchBuffers();
@@ -211,9 +229,22 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
         _readbackLogits.Map(0, null, &pReadback);
         _pReadbackLogits = (float*)pReadback;
 
+        if (!IsLastStage)
+        {
+            _readbackActivation = _ctx.CreateReadbackBuffer((ulong)(_dim * sizeof(float)));
+            void* pRbAct = null;
+            _readbackActivation.Map(0, null, &pRbAct);
+            _pReadbackActivation = (float*)pRbAct;
+
+            _readbackActivationBatch = _ctx.CreateReadbackBuffer((ulong)(MaxBatchChunk * _dim * sizeof(float)));
+            void* pRbBatch = null;
+            _readbackActivationBatch.Map(0, null, &pRbBatch);
+            _pReadbackActivationBatch = (float*)pRbBatch;
+        }
+
         // KV Cache per layer
         ulong kvBytes = (ulong)((long)_nHeadsKv * _maxSeqLen * _headDim * sizeof(float));
-        for (int l = 0; l < _weights.BlockCount; l++)
+        for (int l = 0; l < LayerCount; l++)
         {
             _dKeyCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
             _dValCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
@@ -238,12 +269,13 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
 
             int maxShexpFfnDim = expertFfnDim * 2;
             bool hasShexp = false;
-            for (int l = 0; l < _weights.BlockCount; l++)
+            for (int l = 0; l < LayerCount; l++)
             {
-                if (_weights.Layers[l].FfnGateShexpWeight != null)
+                int modelLayer = StartLayer + l;
+                if (_weights.Layers[modelLayer].FfnGateShexpWeight != null)
                 {
                     hasShexp = true;
-                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
                     {
                         if ((int)tShexp.Dimensions[1] > maxShexpFfnDim)
                             maxShexpFfnDim = (int)tShexp.Dimensions[1];
@@ -403,17 +435,21 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
     private void UploadWeights()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($">> Uploading model weights to {_ctx.DeviceName} via Direct3D 12 Compute...");
+        Console.WriteLine($">> Uploading model weights to {_ctx.DeviceName} via Direct3D 12 Compute (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
         var sw = Stopwatch.StartNew();
 
-        _dOutNormWeight = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
-        _ctx.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (ulong)(_dim * sizeof(float)));
-
-        _dOutWeight = UploadTensor(_weights.OutType, (IntPtr)_weights.OutWeight, _weights.VocabSize, _dim);
-
-        for (int l = 0; l < _weights.BlockCount; l++)
+        if (IsLastStage)
         {
-            var lw = _weights.Layers[l];
+            _dOutNormWeight = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+            _ctx.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (ulong)(_dim * sizeof(float)));
+
+            _dOutWeight = UploadTensor(_weights.OutType, (IntPtr)_weights.OutWeight, _weights.VocabSize, _dim);
+        }
+
+        for (int l = 0; l < LayerCount; l++)
+        {
+            int modelLayer = StartLayer + l;
+            var lw = _weights.Layers[modelLayer];
             int qDim = _nHeads * _headDim;
             int kvDim = _nHeadsKv * _headDim;
 
@@ -495,7 +531,7 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
                 if (lw.FfnGateShexpWeight != null)
                 {
                     int shexpFfnDim = expertFfnDim * 2;
-                    if (_weights.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
                         shexpFfnDim = (int)tShexp.Dimensions[1];
 
                     dFfnGateShexp = UploadTensor(lw.FfnGateShexpType, (IntPtr)lw.FfnGateShexpWeight, shexpFfnDim, _dim);
@@ -595,13 +631,23 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
                 _uploadEmbeddingBatch.Unmap(0);
                 _uploadEmbeddingBatch.Dispose();
             }
+            if (_readbackActivation != null)
+            {
+                _readbackActivation.Unmap(0);
+                _readbackActivation.Dispose();
+            }
+            if (_readbackActivationBatch != null)
+            {
+                _readbackActivationBatch.Unmap(0);
+                _readbackActivationBatch.Dispose();
+            }
             if (_readbackLogits != null)
             {
                 _readbackLogits.Unmap(0);
                 _readbackLogits.Dispose();
             }
 
-            for (int l = 0; l < _weights.BlockCount; l++)
+            for (int l = 0; l < LayerCount; l++)
             {
                 _dKeyCache[l]?.Dispose();
                 _dValCache[l]?.Dispose();
@@ -681,5 +727,27 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
 
             _ctx?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Samples next token with support for greedy / temperature / top-P sampling from readback logits.
+    /// </summary>
+    public int SampleToken(Sampling.SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
+    {
+        if (_pReadbackLogits == null) return -1;
+        _hostLogits ??= new float[_weights.VocabSize];
+        fixed (float* pLogits = _hostLogits)
+        {
+            Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_weights.VocabSize * sizeof(float)), (ulong)(_weights.VocabSize * sizeof(float)));
+        }
+        return _sampler.Sample(_hostLogits.AsSpan(), options, recentTokens);
+    }
+
+    /// <summary>
+    /// Resets layer-local KV caches on this stage.
+    /// </summary>
+    public void ResetKvCache()
+    {
+        // Direct3D 12 KV cache writes directly overwrite entries by token position.
     }
 }

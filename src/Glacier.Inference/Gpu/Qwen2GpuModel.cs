@@ -122,11 +122,29 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
     public GpuContext Context => _gpu;
     public ModelWeights Weights => _weights;
+    public int StartLayer { get; }
+    public int LayerCount { get; }
+    public bool IsLastStage { get; }
 
-    public Qwen2GpuModel(GpuContext gpu, ModelWeights weights, int maxSeqLen = 4096, KvCachePrecision kvPrecision = KvCachePrecision.Auto)
+    public void ResetKvCache()
+    {
+        // On GPU, KV cache stores write directly at token position.
+    }
+
+    public Qwen2GpuModel(
+        GpuContext gpu,
+        ModelWeights weights,
+        int maxSeqLen = 4096,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        int startLayer = 0,
+        int layerCount = -1,
+        bool isLastStage = true)
     {
         _gpu = gpu;
         _weights = weights;
+        StartLayer = startLayer;
+        LayerCount = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
+        IsLastStage = isLastStage;
         _dim = weights.EmbeddingLength;
         _ffnDim = weights.FeedForwardLength;
         _headDim = weights.HeadDim;
@@ -229,8 +247,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         _hXBatch = new float[MaxBatchSize * _dim];
 
         // 4. Allocate GPU VRAM KV Cache per layer with precision-specific byte footprint
-        _dKeyCache = new IntPtr[_weights.BlockCount];
-        _dValCache = new IntPtr[_weights.BlockCount];
+        _dKeyCache = new IntPtr[LayerCount];
+        _dValCache = new IntPtr[LayerCount];
         int elementBytes = KvPrecision switch
         {
             KvCachePrecision.Fp8 => 1,
@@ -238,7 +256,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             _ => 4
         };
         nuint kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes);
-        for (int l = 0; l < _weights.BlockCount; l++)
+        for (int l = 0; l < LayerCount; l++)
         {
             _dKeyCache[l] = _gpu.AllocateDevice(kvBytes);
             _dValCache[l] = _gpu.AllocateDevice(kvBytes);
@@ -249,20 +267,24 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         // 4. Upload model weights into GPU VRAM
         double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM...");
+        Console.WriteLine($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
         var sw = Stopwatch.StartNew();
 
-        _dOutNormWeight = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-        _gpu.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (nuint)(_dim * sizeof(float)));
-
-        nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, _dim) * (nuint)_weights.VocabSize;
-        _dOutWeight = _gpu.AllocateDevice(outBytes);
-        _gpu.CopyToDevice(_dOutWeight, (IntPtr)_weights.OutWeight, outBytes);
-
-        _layerWeights = new GpuLayerWeights[_weights.BlockCount];
-        for (int l = 0; l < _weights.BlockCount; l++)
+        if (IsLastStage)
         {
-            var lw = _weights.Layers[l];
+            _dOutNormWeight = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+            _gpu.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (nuint)(_dim * sizeof(float)));
+
+            nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, _dim) * (nuint)_weights.VocabSize;
+            _dOutWeight = _gpu.AllocateDevice(outBytes);
+            _gpu.CopyToDevice(_dOutWeight, (IntPtr)_weights.OutWeight, outBytes);
+        }
+
+        _layerWeights = new GpuLayerWeights[LayerCount];
+        for (int l = 0; l < LayerCount; l++)
+        {
+            int modelLayer = StartLayer + l;
+            var lw = _weights.Layers[modelLayer];
 
             nuint qDim = (nuint)(_nHeads * _headDim);
             nuint kvDim = (nuint)(_nHeadsKv * _headDim);

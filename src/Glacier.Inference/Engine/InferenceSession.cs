@@ -15,6 +15,7 @@ using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
+using Glacier.Inference.Pipeline;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Tokenizer;
 
@@ -69,6 +70,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     private readonly Qwen2D3D12Model? _d3d12Model;
     private readonly Qwen2Model? _cpuModel;
     private readonly KVCache? _kvCache;
+    private readonly PipelineSession? _pipelineSession;
     private readonly int _maxSeqLen;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
@@ -82,7 +84,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public DeviceInfo Device { get; }
     public InferenceEngineType Engine { get; }
     public string ActiveDevice { get; }
-    public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null;
+    public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null || _pipelineSession != null;
+    public bool IsPipelineAccelerated => _pipelineSession != null;
+    public PipelineSession? PipelineSession => _pipelineSession;
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
     public Qwen2D3D12Model? D3D12Model => _d3d12Model;
@@ -94,7 +98,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         int maxSeqLen = 4096,
         string? device = null,
         InferenceEngineType engine = InferenceEngineType.Auto,
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        string? split = null)
     {
         _gguf = GgufFile.Open(modelPath);
         _weights = new ModelWeights(_gguf);
@@ -103,67 +108,88 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         _sampler = new Sampler();
         _logits = new float[_weights.VocabSize];
 
-        var (targetDevice, targetEngine) = GlacierSettings.ResolveTarget(device, engine != InferenceEngineType.Auto ? engine.ToString() : null);
-        Device = targetDevice;
-        Engine = targetEngine;
-
-        if (!_weights.IsMoe && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+        string? effectiveSplit = split;
+        if (effectiveSplit == null && device != null && (device.Contains(',') || device.Contains(':') || device.Equals("auto", StringComparison.OrdinalIgnoreCase)))
         {
-            try
-            {
-                _gpu = new GpuContext(targetDevice.Index);
-                _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen, kvPrecision);
-                _kvCache = null; // GPU maintains all KV states in device VRAM
-                ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision}]";
-            }
-            catch (Exception ex)
-            {
-                var settings = GlacierSettings.Load();
-                if (!settings.FallbackToCpu)
-                    throw new InvalidOperationException($"Failed to initialize Bare-Metal SASS inference on {targetDevice.Name}: {ex.Message}", ex);
-
-                _gpu?.Dispose();
-                _gpu = null;
-                _gpuModel = null;
-                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
-                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
-            }
+            effectiveSplit = device;
         }
-        else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
-                 targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
-        {
-            try
-            {
-                var d3dCtx = new D3D12Context(targetDevice.Index);
-                _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
-                _kvCache = null; // GPU maintains all KV states in device VRAM
-                ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32]";
-            }
-            catch (Exception ex)
-            {
-                var settings = GlacierSettings.Load();
-                if (!settings.FallbackToCpu)
-                    throw new InvalidOperationException($"Failed to initialize Direct3D 12 Compute inference on {targetDevice.Name}: {ex.Message}", ex);
 
-                _d3d12Model?.Dispose();
-                _d3d12Model = null;
-                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
-                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12]";
-            }
+        var stageSpecs = !string.IsNullOrEmpty(effectiveSplit)
+            ? PipelineSplitConfig.ResolveStages(effectiveSplit, _weights)
+            : null;
+
+        if (stageSpecs != null && stageSpecs.Count > 1)
+        {
+            _pipelineSession = PipelineSession.Create(_weights, stageSpecs, maxSeqLen, kvPrecision);
+            _kvCache = null;
+            ActiveDevice = _pipelineSession.TopologyDescription;
+            Device = stageSpecs[0].Device;
+            Engine = stageSpecs[0].Engine;
         }
         else
         {
-            _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
-            _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-            ActiveDevice = _weights.IsMoe
-                ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
-                : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
+            var (targetDevice, targetEngine) = GlacierSettings.ResolveTarget(device, engine != InferenceEngineType.Auto ? engine.ToString() : null);
+            Device = targetDevice;
+            Engine = targetEngine;
+
+            if (!_weights.IsMoe && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+            {
+                try
+                {
+                    _gpu = new GpuContext(targetDevice.Index);
+                    _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen, kvPrecision);
+                    _kvCache = null; // GPU maintains all KV states in device VRAM
+                    ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision}]";
+                }
+                catch (Exception ex)
+                {
+                    var settings = GlacierSettings.Load();
+                    if (!settings.FallbackToCpu)
+                        throw new InvalidOperationException($"Failed to initialize Bare-Metal SASS inference on {targetDevice.Name}: {ex.Message}", ex);
+
+                    _gpu?.Dispose();
+                    _gpu = null;
+                    _gpuModel = null;
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                    _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
+                }
+            }
+            else if ((targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+                     targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    var d3dCtx = new D3D12Context(targetDevice.Index);
+                    _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                    _kvCache = null; // GPU maintains all KV states in device VRAM
+                    ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32]";
+                }
+                catch (Exception ex)
+                {
+                    var settings = GlacierSettings.Load();
+                    if (!settings.FallbackToCpu)
+                        throw new InvalidOperationException($"Failed to initialize Direct3D 12 Compute inference on {targetDevice.Name}: {ex.Message}", ex);
+
+                    _d3d12Model?.Dispose();
+                    _d3d12Model = null;
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                    _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12]";
+                }
+            }
+            else
+            {
+                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen);
+                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                ActiveDevice = _weights.IsMoe
+                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
+                    : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
+            }
         }
     }
 
-    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device, KvCachePrecision kvPrecision = KvCachePrecision.Auto)
+    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device, KvCachePrecision kvPrecision = KvCachePrecision.Auto, string? split = null)
         : this(modelPath, maxSeqLen, device switch
         {
             InferenceDevice.Gpu => "gpu",
@@ -174,7 +200,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             InferenceDevice.Gpu => InferenceEngineType.BareMetal,
             InferenceDevice.Cpu => InferenceEngineType.Cpu,
             _ => InferenceEngineType.Auto
-        }, kvPrecision: kvPrecision)
+        }, kvPrecision: kvPrecision, split: split)
     {
     }
 
@@ -205,13 +231,20 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
 
         // Reset KV cache if active
-        _kvCache?.Reset();
+        if (_pipelineSession != null)
+            _pipelineSession.ResetKvCache();
+        else
+            _kvCache?.Reset();
 
         var totalStopwatch = Stopwatch.StartNew();
         var promptStopwatch = Stopwatch.StartNew();
 
         // 2. Prefill prompt tokens
-        if (_gpuModel != null)
+        if (_pipelineSession != null)
+        {
+            _pipelineSession.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
+        }
+        else if (_gpuModel != null)
         {
             _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
         }
@@ -249,10 +282,20 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             ct.ThrowIfCancellationRequested();
 
-            // Sample next token (pure GPU reduction in ~3 us for GPU model; CPU sampler for CPU model)
-            int nextToken = (_gpuModel != null && step > 0)
-                ? _gpuModel.SampleToken(options, CollectionsMarshal.AsSpan(recentTokens))
-                : _sampler.Sample(_logits.AsSpan(), options, CollectionsMarshal.AsSpan(recentTokens));
+            // Sample next token
+            int nextToken;
+            if (_pipelineSession != null)
+            {
+                nextToken = _pipelineSession.SampleToken(options, CollectionsMarshal.AsSpan(recentTokens), _logits.AsSpan(), _sampler);
+            }
+            else if (_gpuModel != null && step > 0)
+            {
+                nextToken = _gpuModel.SampleToken(options, CollectionsMarshal.AsSpan(recentTokens));
+            }
+            else
+            {
+                nextToken = _sampler.Sample(_logits.AsSpan(), options, CollectionsMarshal.AsSpan(recentTokens));
+            }
             recentTokens.Add(nextToken);
 
             // Check for stop tokens
@@ -301,7 +344,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     /// </summary>
     public void ResetKvCache()
     {
-        _kvCache?.Reset();
+        if (_pipelineSession != null)
+            _pipelineSession.ResetKvCache();
+        else
+            _kvCache?.Reset();
     }
 
     /// <summary>
@@ -312,7 +358,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         if (promptTokens.IsEmpty) return;
         ResetKvCache();
 
-        if (_gpuModel != null)
+        if (_pipelineSession != null)
+        {
+            _pipelineSession.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
+        }
+        else if (_gpuModel != null)
         {
             _gpuModel.ForwardBatch(promptTokens, 0, _logits.AsSpan(), computeLogits: true);
         }
@@ -339,6 +389,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     /// </summary>
     public int SampleNextToken(SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
     {
+        if (_pipelineSession != null)
+            return _pipelineSession.SampleToken(options, recentTokens, _logits.AsSpan(), _sampler);
+
         return _gpuModel != null
             ? _gpuModel.SampleToken(options, recentTokens)
             : _sampler.Sample(_logits.AsSpan(), options, recentTokens);
@@ -353,7 +406,15 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     {
         if (tokens.IsEmpty) return;
 
-        if (_gpuModel != null)
+        if (_pipelineSession != null)
+        {
+            for (int t = 0; t < tokens.Length; t++)
+            {
+                ForwardToken(tokens[t], startPos + t, computeLogits: true);
+                predictedTokens[t] = _pipelineSession.SampleToken(SamplingOptions.Greedy, default, _logits.AsSpan(), _sampler);
+            }
+        }
+        else if (_gpuModel != null)
         {
             _gpuModel.VerifyBatch(tokens, startPos, predictedTokens);
         }
@@ -370,7 +431,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ForwardToken(int token, int pos, bool computeLogits)
     {
-        if (_gpuModel != null)
+        if (_pipelineSession != null)
+        {
+            _pipelineSession.Forward(token, pos, computeLogits ? _logits.AsSpan() : Span<float>.Empty, computeLogits);
+        }
+        else if (_gpuModel != null)
         {
             _gpuModel.Forward(token, pos, null, Span<float>.Empty, computeLogits);
         }
@@ -388,6 +453,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     {
         if (!_disposed)
         {
+            _pipelineSession?.Dispose();
             _gpuModel?.Dispose();
             _gpu?.Dispose();
             _d3d12Model?.Dispose();

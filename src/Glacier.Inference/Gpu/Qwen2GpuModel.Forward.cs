@@ -18,18 +18,42 @@ public sealed unsafe partial class Qwen2GpuModel
     /// </summary>
     public void Forward(int token, int pos, KVCache? kvCache = null, Span<float> logits = default, bool computeLogits = true)
     {
-        // 1. Extract embedding into host buffer and copy to GPU
-        fixed (float* pX = _hX)
+        ForwardStage(token, pos, default, default, logits, computeLogits);
+    }
+
+    /// <summary>
+    /// Executes layers assigned to this stage for a single token forward step.
+    /// </summary>
+    public void ForwardStage(
+        int token,
+        int pos,
+        ReadOnlySpan<float> inputX,
+        Span<float> outputX,
+        Span<float> logits,
+        bool computeLogits)
+    {
+        // 1. Input activation: either extract embedding or copy incoming hidden vector
+        if (StartLayer == 0)
         {
-            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
-            _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+            fixed (float* pX = _hX)
+            {
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
+                _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+            }
+        }
+        else
+        {
+            fixed (float* pX = inputX)
+            {
+                _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+            }
         }
 
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        // 2. Transformer layers (100% inside GPU VRAM)
-        for (int l = 0; l < _weights.BlockCount; l++)
+        // 2. Transformer layers assigned to this stage
+        for (int l = 0; l < LayerCount; l++)
         {
             var lw = _layerWeights[l];
 
@@ -93,20 +117,34 @@ public sealed unsafe partial class Qwen2GpuModel
             LaunchGemv(lw.FfnDownType, IntPtr.Zero, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, IntPtr.Zero, _dX);
         }
 
-        if (computeLogits)
+        if (IsLastStage)
         {
-            // Final RMSNorm
-            LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-
-            // Output projection (LM Head) on GPU
-            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-
-            // Copy logits from GPU to CPU (skipped when logits buffer is empty for pure GPU sampling)
-            if (!logits.IsEmpty)
+            if (computeLogits)
             {
-                fixed (float* pLogits = logits)
+                // Final RMSNorm
+                LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+
+                // Output projection (LM Head) on GPU
+                LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+
+                // Copy logits from GPU to CPU (skipped when logits buffer is empty for pure GPU sampling)
+                if (!logits.IsEmpty)
                 {
-                    _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                    fixed (float* pLogits = logits)
+                    {
+                        _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Intermediate stage: copy _dX back to host buffer outputX
+            if (!outputX.IsEmpty)
+            {
+                fixed (float* pOut = outputX)
+                {
+                    _gpu.CopyToHost((IntPtr)pOut, _dX, (nuint)(_dim * sizeof(float)));
                 }
             }
         }
@@ -118,14 +156,35 @@ public sealed unsafe partial class Qwen2GpuModel
     /// </summary>
     public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
     {
+        ForwardBatchStage(tokens, startPos, default, default, logits, computeLogits);
+    }
+
+    /// <summary>
+    /// Executes batched prefill for the layers assigned to this stage.
+    /// </summary>
+    public void ForwardBatchStage(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        ReadOnlySpan<float> inputXBatch,
+        Span<float> outputXBatch,
+        Span<float> logits,
+        bool computeLogits)
+    {
+        int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
         int offset = 0;
-        while (offset < tokens.Length)
+        while (offset < totalTokens)
         {
-            int batchSize = Math.Min(tokens.Length - offset, MaxBatchSize);
-            bool isLastChunk = (offset + batchSize == tokens.Length);
+            int batchSize = Math.Min(totalTokens - offset, MaxBatchSize);
+            bool isLastChunk = (offset + batchSize == totalTokens);
+            var inSlice = !inputXBatch.IsEmpty ? inputXBatch.Slice(offset * _dim, batchSize * _dim) : default;
+            var outSlice = !outputXBatch.IsEmpty ? outputXBatch.Slice(offset * _dim, batchSize * _dim) : default;
+            var tokSlice = !tokens.IsEmpty ? tokens.Slice(offset, batchSize) : default;
+
             ForwardBatchChunk(
-                tokens.Slice(offset, batchSize),
+                tokSlice,
                 startPos + offset,
+                inSlice,
+                outSlice,
                 isLastChunk && computeLogits ? logits : Span<float>.Empty,
                 isLastChunk && computeLogits);
             offset += batchSize;
@@ -146,7 +205,7 @@ public sealed unsafe partial class Qwen2GpuModel
             throw new ArgumentException($"Batch size {batchSize} exceeds MaxBatchSize {MaxBatchSize}");
 
         // Forward through all transformer layers in batch
-        ForwardBatchChunk(tokens, startPos, Span<float>.Empty, computeLogits: false);
+        ForwardBatchChunk(tokens, startPos, default, default, Span<float>.Empty, computeLogits: false);
 
         // For each token position in the batch, compute RMSNorm + LM Head + GPU argmax
         for (int t = 0; t < batchSize; t++)
@@ -234,24 +293,40 @@ public sealed unsafe partial class Qwen2GpuModel
         return _sampler.Sample(_hostLogits.AsSpan(), options, recentTokens);
     }
 
-    private void ForwardBatchChunk(ReadOnlySpan<int> chunkTokens, int chunkStartPos, Span<float> logits, bool computeLogits)
+    private void ForwardBatchChunk(
+        ReadOnlySpan<int> chunkTokens,
+        int chunkStartPos,
+        ReadOnlySpan<float> inputXBatch,
+        Span<float> outputXBatch,
+        Span<float> logits,
+        bool computeLogits)
     {
-        int batchSize = chunkTokens.Length;
+        int batchSize = !chunkTokens.IsEmpty ? chunkTokens.Length : (inputXBatch.Length / _dim);
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        // 1. Extract embeddings into host batch buffer and copy to GPU
-        fixed (float* pXBatch = _hXBatch)
+        // 1. Extract embeddings into host batch buffer or copy from input activations
+        if (StartLayer == 0)
         {
-            for (int t = 0; t < batchSize; t++)
+            fixed (float* pXBatch = _hXBatch)
             {
-                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, chunkTokens[t], pXBatch + t * _dim, _dim);
+                for (int t = 0; t < batchSize; t++)
+                {
+                    QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, chunkTokens[t], pXBatch + t * _dim, _dim);
+                }
+                _gpu.CopyToDevice(_dXBatch, (IntPtr)pXBatch, (nuint)(batchSize * _dim * sizeof(float)));
             }
-            _gpu.CopyToDevice(_dXBatch, (IntPtr)pXBatch, (nuint)(batchSize * _dim * sizeof(float)));
+        }
+        else
+        {
+            fixed (float* pInput = inputXBatch)
+            {
+                _gpu.CopyToDevice(_dXBatch, (IntPtr)pInput, (nuint)(batchSize * _dim * sizeof(float)));
+            }
         }
 
         // 2. Transformer layers in batch
-        for (int l = 0; l < _weights.BlockCount; l++)
+        for (int l = 0; l < LayerCount; l++)
         {
             var lw = _layerWeights[l];
 
@@ -306,22 +381,38 @@ public sealed unsafe partial class Qwen2GpuModel
             LaunchGemmBatch(lw.FfnDownType, IntPtr.Zero, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
         }
 
-        if (computeLogits)
+        if (IsLastStage)
         {
-            // We only need logits for the last token in the batch
-            int lastTokenIdx = batchSize - 1;
-            IntPtr dXLast = _dXBatch + lastTokenIdx * _dim * sizeof(float);
-
-            // Final RMSNorm
-            LaunchRmsNorm(dXLast, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-
-            // Output projection (LM Head) on GPU
-            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-
-            // Copy logits from GPU to CPU
-            fixed (float* pLogits = logits)
+            if (computeLogits)
             {
-                _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                // We only need logits for the last token in the batch
+                int lastTokenIdx = batchSize - 1;
+                IntPtr dXLast = _dXBatch + lastTokenIdx * _dim * sizeof(float);
+
+                // Final RMSNorm
+                LaunchRmsNorm(dXLast, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+
+                // Output projection (LM Head) on GPU
+                LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+
+                // Copy logits from GPU to CPU
+                if (!logits.IsEmpty)
+                {
+                    fixed (float* pLogits = logits)
+                    {
+                        _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                    }
+                }
+            }
+        }
+        else
+        {
+            if (!outputXBatch.IsEmpty)
+            {
+                fixed (float* pOut = outputXBatch)
+                {
+                    _gpu.CopyToHost((IntPtr)pOut, _dXBatch, (nuint)(batchSize * _dim * sizeof(float)));
+                }
             }
         }
     }

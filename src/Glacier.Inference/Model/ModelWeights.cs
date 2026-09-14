@@ -82,6 +82,7 @@ public sealed unsafe class LayerWeights
 public sealed unsafe class ModelWeights
 {
     public GgufFile Gguf { get; }
+    public long FileSizeBytes => new FileInfo(Gguf.FilePath).Length;
 
     public int VocabSize { get; }
     public int BlockCount { get; }
