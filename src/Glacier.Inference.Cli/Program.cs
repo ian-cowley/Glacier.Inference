@@ -1254,8 +1254,8 @@ public static class Program
 
     private static string FormatEngineName(InferenceEngineType engine) => engine switch
     {
-        InferenceEngineType.BareMetal => "BareMetal (SASS/HIP)",
-        InferenceEngineType.Vulkan => "Vulkan (CoopMat)",
+        InferenceEngineType.BareMetal => "Native Driver (SASS/HIP)",
+        InferenceEngineType.Vulkan => "Vulkan (CoopMat / WMMA)",
         InferenceEngineType.DirectML => "DirectML",
         InferenceEngineType.Cpu => "Cpu",
         _ => engine.ToString()

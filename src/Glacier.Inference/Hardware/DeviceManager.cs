@@ -196,7 +196,7 @@ public static class DeviceManager
                                 IsDisplayDevice = false,
                                 SupportedEngines = engines,
                                 RecommendedEngine = InferenceEngineType.BareMetal,
-                                SafetyNotes = "AMD ROCm / HIP Bare-Metal engine. Direct HSA / KFD kernel execution via AQL queues & hardware doorbells."
+                                SafetyNotes = "AMD ROCm / HIP driver engine. Direct HSA / KFD kernel execution via AQL queues & hardware doorbells."
                             });
                         }
                     }
@@ -313,7 +313,7 @@ public static class DeviceManager
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 supportedEngines.Add(InferenceEngineType.Cpu);
                                 recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : (VulkanDriver.IsAvailable() ? InferenceEngineType.Vulkan : InferenceEngineType.DirectML);
-                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime. Vulkan & DirectML also supported.";
+                                safetyNotes = "Pure C# Native SASS driver engine. Bypasses CUDA Toolkit & cudart64.dll runtime. Vulkan & DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {
@@ -330,12 +330,12 @@ public static class DeviceManager
                                 if (hipAvail)
                                 {
                                     recommendedEngine = InferenceEngineType.BareMetal;
-                                    safetyNotes = "AMD ROCm / HIP Bare-Metal engine (amdhip64.dll). Vulkan (cooperative matrix) and DirectML also supported.";
+                                    safetyNotes = "AMD ROCm / HIP driver engine (amdhip64.dll). Vulkan Hardware Tensor and DirectML also supported.";
                                 }
                                 else if (vkAvail)
                                 {
                                     recommendedEngine = InferenceEngineType.Vulkan;
-                                    safetyNotes = "Universal Vulkan Cooperative Matrix engine (VK_KHR_cooperative_matrix). DirectML also supported.";
+                                    safetyNotes = "Vulkan Hardware Tensor engine (VK_KHR_cooperative_matrix). DirectML also supported.";
                                 }
                                 else
                                 {
