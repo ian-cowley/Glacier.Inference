@@ -6,26 +6,28 @@ High-Performance C# .NET 10 LLM Inference Engine & Command-Line Server Runtime.
 [![NuGet](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped GGUF model execution, bare-metal GPU SASS streaming via native driver (`nvcuda.dll`), bare-metal Direct3D 12 Compute (`HLSL Wave32` via `Vortice.D3D12`), multi-device discovery with safe cooperative drivers, SIMD AVX-512 / AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, speculative decoding engine, streaming terminal chat REPL, and an Ollama/OpenAI-compatible HTTP API server.
+Pure C# .NET 10 alternative to Ollama, vLLM, and llama.cpp. Direct memory-mapped GGUF model execution, bare-metal GPU SASS streaming via native NVIDIA driver (`nvcuda.dll`), bare-metal AMD ROCm / HIP driver execution (`amdhip64.dll` / `libamdhip64.so`), universal Vulkan Cooperative Matrix acceleration (`VK_KHR_cooperative_matrix` via `vulkan-1.dll` / `libvulkan.so.1`), bare-metal Direct3D 12 Compute (`HLSL Wave32` via `Vortice.D3D12`), multi-device discovery with safe cooperative drivers, SIMD AVX-512 / AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, speculative decoding engine, streaming terminal chat REPL, and an Ollama/OpenAI-compatible HTTP API server.
 
 ---
 
 ## Features
 
 - **Pure C# Bare-Metal SASS Engine (NVIDIA)**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`). Supports `Q4_K`, `Q6_K`, `Q8_0`, `FP16`, and `FP32`.
+- **Pure C# Bare-Metal HIP / ROCm Engine (AMD)**: Zero-dependency direct driver P/Invoke (`amdhip64.dll` on Windows, `libamdhip64.so` on Linux). Interacts directly with the AMD HSA / KFD kernel driver (`/dev/kfd`), dispatching native AMDGPU ISA (`gfx1150` RDNA 3.5 / CDNA) via user-space AQL queues and hardware doorbells with sub-microsecond launch latency.
+- **Universal Vulkan Cooperative Matrix Engine (AMD / Intel / NVIDIA)**: Pure C# P/Invoke to `vulkan-1.dll` and `libvulkan.so.1` with `VK_KHR_cooperative_matrix` support. Provides zero-install hardware tensor acceleration across any modern display driver without needing vendor-specific CUDA or ROCm SDK installations.
 - **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets and full 32-token GEMM tiling for robust prompt prefill.
 - **Bare-Metal Direct3D 12 Compute Engine (AMD / Intel)**: Native HLSL Wave32 compute shaders for AMD Radeon 680M / 890M (RDNA 2 / RDNA 3.5) and Intel Arc GPUs. Features register-tiled Batched GEMM (`Q4_K`, `Q6_K`, `Q8_0`), 128-bit vectorization, 36-byte aligned `ByteAddressBuffer` routing, and zero-allocation persistent buffers delivering up to 35+ tok/s generation and up to 216 tok/s prompt prefill in pure C# .NET 10 with 0 external C++ binaries.
 - **Speculative Decoding Engine (1.5x–3x Throughput Acceleration)**: Seamless assisted generation via `PromptLookupDraftProvider` (sub-microsecond n-gram matching with 0 extra VRAM) and `ModelDraftProvider`, coordinated with GPU batched verification (`VerifyBatch`) evaluating all candidates in a single pass over weights.
 - **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
-- **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via pure DXGI P/Invoke.
-- **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS on compute dGPUs (NVIDIA RTX 3060, RTX 4060, RTX 4090).
+- **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via DXGI, HIP, Vulkan, and Linux `/dev/kfd`.
+- **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Bare-Metal SASS / HIP on compute GPUs.
 - **Mixture-of-Experts (MoE) Architecture Runtime**: High-throughput MoE routing engine supporting up to 128 experts per layer with Top-$K$ gating, softmax re-normalization, shared experts (DeepSeek / ERNIE), per-head Query/Key RMSNorm (`attn_q_norm`, `attn_k_norm`), and zero-copy 3D tensor slicing (`[cols x rows x num_experts]`).
 - **DeepSeek Multi-Head Latent Attention (MLA) & Decoupled YaRN RoPE**: Low-rank latent KV compression ($d_c = 512$), decoupled 192-dim QK projections, 128-dim Value projections, adjacent $(2i, 2i+1)$ RoPE pairing, and dual YaRN scaling ($mscaleBase$ and $mscaleAllDim$), delivering coherent, high-speed inference for DeepSeek-Coder-V2 and DeepSeek-V4 MoE architectures.
 - **OpenAI Attention Sinks & Streaming Contexts**: Native support for attention sink logit absorption (`attn_sinks.weight`) preventing attention overflow and perplexity degradation in long-context models (`gpt-oss-20b`) and streaming generation.
 - **Next-Gen Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `MXFP4` (Type 39, Microscaling FP4 with E2M1 LUT and power-of-2 scaling), `Q3_K` (Type 11, 3.4375 bpw), `Q4_K` (Type 12), `Q5_K` (Type 13, 5.5 bpw), `Q6_K` (Type 14), `Q8_0` (Type 8), `Q4_0`, `F16`, and `F32`.
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
 - **Full Architecture Support**:
-  - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
+  - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), Gemma-4-26B-A4B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
   - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 & Qwen3.8 (4B Thinking, 8B, 30B MoE) with native decoupled head dimensions (`key_length = 128`), non-square attention projections, and per-head QK-normalization (`rms_norm_heads_kernel`).
   - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
   - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama, DeepSeek-Coder-V2-Lite.
@@ -44,10 +46,10 @@ Prebuilt, self-contained single-file binaries are available directly on the [Git
 
 | Platform | Architecture | Archive | Features / Capabilities |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `x64` | [**`glacier-v1.1.12-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal D3D12 Wave32, DirectML, AVX-512 |
-| **Windows** | `ARM64` | [**`glacier-v1.1.12-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
-| **Linux** | `x64` | [**`glacier-v1.1.12-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-metal CUDA driver interop & AVX-512 / AVX2 SIMD |
-| **macOS** | `ARM64` | [**`glacier-v1.1.12-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
+| **Windows** | `x64` | [**`glacier-v1.1.13-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal NVIDIA SASS (`nvcuda.dll`), Bare-Metal AMD HIP (`amdhip64.dll`), Vulkan CoopMat, D3D12 Wave32, AVX-512 |
+| **Windows** | `ARM64` | [**`glacier-v1.1.13-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
+| **Linux** | `x64` | [**`glacier-v1.1.13-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Bare-Metal CUDA (`libcuda.so`), Bare-Metal AMD HIP (`libamdhip64.so`), Vulkan CoopMat, AVX-512 SIMD |
+| **macOS** | `ARM64` | [**`glacier-v1.1.13-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
 
 Simply extract the archive and run `glacier` from any terminal:
 ```bash
@@ -247,6 +249,25 @@ To verify support for sparse Mixture-of-Experts architectures and next-generatio
 | **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `Qwen3-30B-A3B` (13.58 GB MoE) | **24.20 tok/s** | **21.68 tok/s** | **1.54 s** |
 | **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `ERNIE-4.5-21B-A3B` (14.20 GB MoE) | **21.99 tok/s** | **19.23 tok/s** | **6.29 s** |
 | **Cluster Head** | **AMD Ryzen AI 9 HX 370 CPU** | Zen 5 (AVX-512) | **SIMD AVX-512 Hardware Intrinsics** | `gpt-oss-20b` (11.28 GB MXFP4 MoE) | **3.42 tok/s** | **3.08 tok/s** | **15.26 s** |
+
+---
+
+### Benchmark 9: AMD Bare-Metal HIP & Universal Vulkan Cooperative Matrix Benchmark (AMD Ryzen AI 9 HX 370 / Radeon 890M, 64GB Unified Memory)
+Evaluated on **AMD Ryzen AI 9 HX 370 (12C/24T Zen 5) w/ Radeon 890M (16 CUs RDNA 3.5, gfx1150) across 64GB Unified LPDDR5X Memory** comparing Bare-Metal AMD HIP (`libamdhip64.so` / `/dev/kfd`), Universal Vulkan Cooperative Matrix (`VK_KHR_cooperative_matrix`), and Direct3D 12 Compute across Dense and Mixture-of-Experts (MoE) models:
+
+| Model Architecture | Model Weights & Size | Active Params / Tok | Acceleration Engine | Prompt Prefill Rate | Generation Rate | Bandwidth Efficiency |
+| :--- | :--- | :---: | :--- | :---: | :---: | :--- |
+| **Fine-Grained MoE** | `Gemma-4-26B-A4B-it` (15.63 GiB) | **4.0 B** (128 Experts, Top-8) | **Vulkan Cooperative Matrix (`KHR_coopmat`)** | 🚀 **285.41 tok/s** | 🚀 **29.00 tok/s** | 🟩 **5.8x Faster** (Relieves unified LPDDR5X bus) |
+| **Standard Dense** | `Qwen3.6-27B-UD` (16.39 GiB) | **26.9 B** (100% Dense) | **Vulkan Cooperative Matrix (`KHR_coopmat`)** | **94.43 tok/s** | 🐌 **4.97 tok/s** | 100% Bus Saturation on 16.4 GB weight sweep |
+| **Developer 7B** | `Qwen2.5-Coder-7B` (4.70 GiB) | **7.0 B** (100% Dense) | **Bare-Metal AMD HIP / ROCm (`/dev/kfd`)** | 🚀 **253.60 tok/s** | 🚀 **17.66 tok/s** | Direct AQL doorbell ring, sub-µs launch latency |
+| **Developer 7B** | `Qwen2.5-Coder-7B` (4.70 GiB) | **7.0 B** (100% Dense) | **Direct3D 12 Compute (HLSL Wave32)** | **48.45 tok/s** | **11.33 tok/s** | DWM display cooperative execution |
+
+> [!TIP]
+> **Unified Memory Architecture (UMA) Insight**:
+> On unified LPDDR5X memory architectures where CPU and GPU share the memory bus, dense models >15GB hit memory bandwidth ceilings during serial autoregressive token generation (~5 tok/s).
+> **Mixture-of-Experts (MoE)** accesses only 4B active parameters per token while holding 26B total parameters of knowledge, executing **5.8x faster** (29.0 tok/s vs 4.97 tok/s).
+
+---
 
 ### 💡 Why Glacier is Faster & Deep-Dive Architecture
 

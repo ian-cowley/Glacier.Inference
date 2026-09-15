@@ -98,13 +98,17 @@ public sealed class GlacierSettings
         if (!string.IsNullOrWhiteSpace(cliEngine))
         {
             string clean = cliEngine.Trim().ToLowerInvariant();
-            if (clean is "baremetal" or "bare-metal" or "sass" or "cuda")
+            if (clean is "baremetal" or "bare-metal" or "sass" or "cuda" or "hip" or "rocm")
             {
                 engine = InferenceEngineType.BareMetal;
             }
             else if (clean is "directml" or "dml" or "dx12" or "d3d12" or "direct3d12")
             {
                 engine = InferenceEngineType.DirectML;
+            }
+            else if (clean is "vulkan" or "vk" or "coopmat" or "cooperative-matrix")
+            {
+                engine = InferenceEngineType.Vulkan;
             }
             else if (clean is "cpu" or "simd")
             {
@@ -120,7 +124,7 @@ public sealed class GlacierSettings
             }
             else
             {
-                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, baremetal, directml, cpu");
+                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, baremetal, vulkan, directml, cpu");
             }
         }
         else if (string.IsNullOrWhiteSpace(cliDevice) && settings.Engine != InferenceEngineType.Auto)

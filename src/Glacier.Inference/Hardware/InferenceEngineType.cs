@@ -27,6 +27,12 @@ public enum InferenceEngineType
     DirectML,
 
     /// <summary>
+    /// Universal Vulkan 1.3+ compute engine using VK_KHR_cooperative_matrix.
+    /// Zero-dependency hardware tensor execution for AMD, Intel, and NVIDIA across Windows and Linux.
+    /// </summary>
+    Vulkan,
+
+    /// <summary>
     /// SIMD-vectorized CPU execution engine (AVX-512 / AVX2 / ARM Neon).
     /// </summary>
     Cpu,

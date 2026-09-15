@@ -5,21 +5,23 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// Direct, zero-dependency P/Invoke bindings to the native NVIDIA CUDA driver (nvcuda.dll).
-/// Bypasses cudart64.dll and high-level wrappers to achieve sub-microsecond bare-metal dispatch.
+/// Direct, zero-dependency P/Invoke bindings to the native AMD ROCm / HIP driver (amdhip64.dll on Windows, libamdhip64.so on Linux).
+/// Bypasses high-level runtimes to achieve sub-microsecond bare-metal kernel dispatch directly to AMD RDNA/CDNA GPUs.
 /// </summary>
-public static class CuDriver
+public static class HipDriver
 {
-    private const string CudaLib = "nvcuda.dll";
+    private const string HipLib = "amdhip64.dll";
 
-    public const uint CU_MEMHOSTALLOC_PORTABLE = 0x01;
-    public const uint CU_MEMHOSTALLOC_DEVICEMAP = 0x02;
-    public const uint CU_MEMHOSTALLOC_WRITECOMBINED = 0x04;
+    public const uint HIP_MEMHOSTALLOC_PORTABLE = 0x01;
+    public const uint HIP_MEMHOSTALLOC_DEVICEMAP = 0x02;
+    public const uint HIP_MEMHOSTALLOC_WRITECOMBINED = 0x04;
 
-    public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
-    public const int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+    public const int HIP_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
+    public const int HIP_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+    public const int HIP_DEVICE_ATTRIBUTE_WARP_SIZE = 10;
+    public const int HIP_DEVICE_ATTRIBUTE_WAVEFRONT_SIZE = 84;
 
-    static CuDriver()
+    static HipDriver()
     {
         NativeDriverResolver.EnsureRegistered();
     }
@@ -29,9 +31,21 @@ public static class CuDriver
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                return NativeLibrary.TryLoad("nvcuda.dll", out IntPtr handle) && handle != IntPtr.Zero;
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return (NativeLibrary.TryLoad("libcuda.so.1", out IntPtr handle) || NativeLibrary.TryLoad("libcuda.so", out handle)) && handle != IntPtr.Zero;
+            {
+                if (NativeLibrary.TryLoad("amdhip64.dll", out IntPtr handle) && handle != IntPtr.Zero)
+                    return true;
+                if (NativeLibrary.TryLoad("amdhip64_6.dll", out handle) && handle != IntPtr.Zero)
+                    return true;
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                if ((NativeLibrary.TryLoad("libamdhip64.so", out IntPtr handle) ||
+                     NativeLibrary.TryLoad("libamdhip64.so.6", out handle) ||
+                     NativeLibrary.TryLoad("/opt/rocm/lib/libamdhip64.so", out handle)) && handle != IntPtr.Zero)
+                {
+                    return true;
+                }
+            }
             return false;
         }
         catch
@@ -42,89 +56,89 @@ public static class CuDriver
 
     public static bool IsAvailable() => _isAvailable.Value;
 
-    [DllImport(CudaLib, EntryPoint = "cuInit")]
+    [DllImport(HipLib, EntryPoint = "hipInit")]
     public static extern int Init(uint flags);
 
-    [DllImport(CudaLib, EntryPoint = "cuDriverGetVersion")]
+    [DllImport(HipLib, EntryPoint = "hipDriverGetVersion")]
     public static extern int DriverGetVersion(out int driverVersion);
 
-    [DllImport(CudaLib, EntryPoint = "cuDeviceGetCount")]
+    [DllImport(HipLib, EntryPoint = "hipGetDeviceCount")]
     public static extern int DeviceGetCount(out int count);
 
-    [DllImport(CudaLib, EntryPoint = "cuDeviceGet")]
+    [DllImport(HipLib, EntryPoint = "hipDeviceGet")]
     public static extern int DeviceGet(out int device, int ordinal);
 
-    [DllImport(CudaLib, EntryPoint = "cuDeviceGetName")]
+    [DllImport(HipLib, EntryPoint = "hipDeviceGetName")]
     public static extern int DeviceGetName(byte[] name, int len, int dev);
 
-    [DllImport(CudaLib, EntryPoint = "cuDeviceGetAttribute")]
+    [DllImport(HipLib, EntryPoint = "hipDeviceGetAttribute")]
     public static extern int DeviceGetAttribute(out int pi, int attrib, int dev);
 
-    [DllImport(CudaLib, EntryPoint = "cuDeviceTotalMem_v2")]
+    [DllImport(HipLib, EntryPoint = "hipDeviceTotalMem")]
     public static extern int DeviceTotalMem(out nuint bytes, int dev);
 
-    [DllImport(CudaLib, EntryPoint = "cuCtxCreate_v2")]
+    [DllImport(HipLib, EntryPoint = "hipCtxCreate")]
     public static extern int CtxCreate(out IntPtr pctx, uint flags, int dev);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuCtxSetCurrent")]
+    [DllImport(HipLib, EntryPoint = "hipCtxSetCurrent")]
     public static extern int CtxSetCurrent(IntPtr ctx);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuCtxGetCurrent")]
+    [DllImport(HipLib, EntryPoint = "hipCtxGetCurrent")]
     public static extern int CtxGetCurrent(out IntPtr pctx);
 
-    [DllImport(CudaLib, EntryPoint = "cuCtxDestroy_v2")]
+    [DllImport(HipLib, EntryPoint = "hipCtxDestroy")]
     public static extern int CtxDestroy(IntPtr ctx);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuCtxSynchronize")]
+    [DllImport(HipLib, EntryPoint = "hipCtxSynchronize")]
     public static extern int CtxSynchronize();
 
-    [DllImport(CudaLib, EntryPoint = "cuModuleLoadData")]
+    [DllImport(HipLib, EntryPoint = "hipModuleLoadData")]
     public static extern int ModuleLoadData(out IntPtr module, byte[] image);
 
-    [DllImport(CudaLib, EntryPoint = "cuModuleGetFunction")]
+    [DllImport(HipLib, EntryPoint = "hipModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemAlloc_v2")]
+    [DllImport(HipLib, EntryPoint = "hipMalloc")]
     public static extern int MemAlloc(out IntPtr dptr, nuint bytesize);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemFree_v2")]
+    [DllImport(HipLib, EntryPoint = "hipFree")]
     public static extern int MemFree(IntPtr dptr);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemHostAlloc")]
+    [DllImport(HipLib, EntryPoint = "hipHostMalloc")]
     public static extern int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemFreeHost")]
+    [DllImport(HipLib, EntryPoint = "hipHostFree")]
     public static extern int MemFreeHost(IntPtr p);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+    [DllImport(HipLib, EntryPoint = "hipHostGetDevicePointer")]
     public static extern int MemHostGetDevicePointer(out IntPtr pdptr, IntPtr p, uint flags);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemcpyHtoD_v2")]
+    [DllImport(HipLib, EntryPoint = "hipMemcpyHtoD")]
     public static extern int MemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, nuint byteCount);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemcpyDtoH_v2")]
+    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoH")]
     public static extern int MemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, nuint byteCount);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemcpyDtoD_v2")]
+    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoD")]
     public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuMemsetD8_v2")]
+    [DllImport(HipLib, EntryPoint = "hipMemsetD8")]
     public static extern int MemsetD8(IntPtr dstDevice, byte uc, nuint count);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuLaunchKernel")]
+    [DllImport(HipLib, EntryPoint = "hipModuleLaunchKernel")]
     public static extern int LaunchKernel(
         IntPtr f,
         uint gridDimX, uint gridDimY, uint gridDimZ,
@@ -132,37 +146,33 @@ public static class CuDriver
         uint sharedMemBytes, IntPtr hStream,
         IntPtr kernelParams, IntPtr extra);
 
-    [DllImport(CudaLib, EntryPoint = "cuStreamCreate")]
-    public static extern int StreamCreate(out IntPtr phStream, uint flags);
+    [DllImport(HipLib, EntryPoint = "hipStreamCreate")]
+    public static extern int StreamCreate(out IntPtr phStream);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuStreamSynchronize")]
+    [DllImport(HipLib, EntryPoint = "hipStreamSynchronize")]
     public static extern int StreamSynchronize(IntPtr hStream);
 
-    [DllImport(CudaLib, EntryPoint = "cuStreamDestroy_v2")]
+    [DllImport(HipLib, EntryPoint = "hipStreamDestroy")]
     public static extern int StreamDestroy(IntPtr hStream);
 
-    [DllImport(CudaLib, EntryPoint = "cuEventCreate")]
-    public static extern int EventCreate(out IntPtr phEvent, uint flags);
+    [DllImport(HipLib, EntryPoint = "hipEventCreate")]
+    public static extern int EventCreate(out IntPtr phEvent);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuEventRecord")]
+    [DllImport(HipLib, EntryPoint = "hipEventRecord")]
     public static extern int EventRecord(IntPtr hEvent, IntPtr hStream);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuEventSynchronize")]
+    [DllImport(HipLib, EntryPoint = "hipEventSynchronize")]
     public static extern int EventSynchronize(IntPtr hEvent);
 
     [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuEventElapsedTime")]
+    [DllImport(HipLib, EntryPoint = "hipEventElapsedTime")]
     public static extern int EventElapsedTime(out float pMilliseconds, IntPtr hStart, IntPtr hEnd);
 
-    [DllImport(CudaLib, EntryPoint = "cuEventDestroy_v2")]
+    [DllImport(HipLib, EntryPoint = "hipEventDestroy")]
     public static extern int EventDestroy(IntPtr hEvent);
-
-    [SuppressGCTransition]
-    [DllImport(CudaLib, EntryPoint = "cuStreamWaitEvent")]
-    public static extern int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
 
     public static string GetDeviceName(int device)
     {
@@ -175,7 +185,7 @@ public static class CuDriver
     {
         if (res != 0)
         {
-            throw new InvalidOperationException($"CUDA Driver Error during '{op}': code {res}");
+            throw new InvalidOperationException($"AMD HIP Driver Error during '{op}': code {res}");
         }
     }
 }

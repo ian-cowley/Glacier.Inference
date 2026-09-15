@@ -86,21 +86,30 @@ public class DeviceManagerTests
     }
 
     [Fact]
-    public void SafeEngineMatrix_AmdRejectsBareMetal()
+    public void SafeEngineMatrix_AmdAllowsSupportedEngines()
     {
         var devices = DeviceManager.GetDevices();
         var amd = devices.FirstOrDefault(d => d.Vendor == GpuVendor.Amd);
 
         if (amd != null)
         {
-            Assert.Contains(InferenceEngineType.DirectML, amd.SupportedEngines);
-            Assert.DoesNotContain(InferenceEngineType.BareMetal, amd.SupportedEngines);
-            Assert.DoesNotContain(InferenceEngineType.Cpu, amd.SupportedEngines);
+            if (OperatingSystem.IsWindows())
+                Assert.Contains(InferenceEngineType.DirectML, amd.SupportedEngines);
 
-            bool safe = GlacierSettings.ValidateSafety(amd, InferenceEngineType.BareMetal, out string? error);
-            Assert.False(safe);
-            Assert.NotNull(error);
-            Assert.Contains("Safe engines for this device", error);
+            if (HipDriver.IsAvailable())
+            {
+                Assert.Contains(InferenceEngineType.BareMetal, amd.SupportedEngines);
+                bool safe = GlacierSettings.ValidateSafety(amd, InferenceEngineType.BareMetal, out string? error);
+                Assert.True(safe);
+                Assert.Null(error);
+            }
+            if (VulkanDriver.IsAvailable())
+            {
+                Assert.Contains(InferenceEngineType.Vulkan, amd.SupportedEngines);
+                bool safe = GlacierSettings.ValidateSafety(amd, InferenceEngineType.Vulkan, out string? error);
+                Assert.True(safe);
+                Assert.Null(error);
+            }
         }
     }
 
@@ -113,16 +122,12 @@ public class DeviceManagerTests
         if (nvidia != null)
         {
             Assert.Contains(InferenceEngineType.BareMetal, nvidia.SupportedEngines);
-            Assert.Contains(InferenceEngineType.DirectML, nvidia.SupportedEngines);
-            Assert.DoesNotContain(InferenceEngineType.Cpu, nvidia.SupportedEngines);
+            if (OperatingSystem.IsWindows())
+                Assert.Contains(InferenceEngineType.DirectML, nvidia.SupportedEngines);
 
             bool safeBm = GlacierSettings.ValidateSafety(nvidia, InferenceEngineType.BareMetal, out string? errBm);
             Assert.True(safeBm);
             Assert.Null(errBm);
-
-            bool safeDml = GlacierSettings.ValidateSafety(nvidia, InferenceEngineType.DirectML, out string? errDml);
-            Assert.True(safeDml);
-            Assert.Null(errDml);
         }
     }
 
@@ -155,9 +160,11 @@ public class DeviceManagerTests
     public void ResolveTarget_UnsafeTarget_ThrowsInvalidOperationException()
     {
         var devices = DeviceManager.GetDevices();
-        if (devices.Any(d => d.Vendor == GpuVendor.Amd))
+        var cpu = devices.FirstOrDefault(d => d.Vendor == GpuVendor.Cpu);
+        if (cpu != null)
         {
-            Assert.Throws<InvalidOperationException>(() => GlacierSettings.ResolveTarget("amd", "baremetal"));
+            // DirectML is not supported on CPU
+            Assert.Throws<InvalidOperationException>(() => GlacierSettings.ResolveTarget("cpu", "directml"));
         }
     }
 
@@ -195,5 +202,67 @@ public class DeviceManagerTests
         Assert.False(string.IsNullOrWhiteSpace(optimal.Name));
         Assert.False(string.IsNullOrWhiteSpace(optimal.Id));
         Assert.NotEmpty(optimal.SupportedEngines);
+    }
+
+    [Fact]
+    public unsafe void HipContext_InitializationAndAllocation_SucceedsIfSupported()
+    {
+        if (!HipContext.IsSupported) return;
+        using var hip = new HipContext();
+        Assert.NotNull(hip.DeviceName);
+        Assert.True(hip.TotalVramBytes > 0);
+
+        nuint bytes = 1024;
+        IntPtr dptr = hip.AllocateDevice(bytes);
+        Assert.NotEqual(IntPtr.Zero, dptr);
+
+        byte[] src = new byte[bytes];
+        for (int i = 0; i < src.Length; i++) src[i] = (byte)(i & 0xFF);
+        fixed (byte* pSrc = src)
+        {
+            hip.CopyToDevice(dptr, (IntPtr)pSrc, bytes);
+        }
+
+        byte[] dst = new byte[bytes];
+        fixed (byte* pDst = dst)
+        {
+            hip.CopyToHost((IntPtr)pDst, dptr, bytes);
+        }
+
+        hip.FreeDevice(dptr);
+        Assert.Equal(src, dst);
+    }
+
+    [Fact]
+    public unsafe void VulkanContext_InitializationAndBufferMapping_SucceedsIfSupported()
+    {
+        if (!VulkanContext.IsSupported) return;
+        using var vk = new VulkanContext();
+        Assert.NotNull(vk.DeviceName);
+        Assert.True(vk.TotalVramBytes > 0);
+
+        ulong bytes = 1024;
+        vk.CreateBuffer(bytes, VulkanDriver.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VulkanDriver.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            out IntPtr buffer, out IntPtr memory);
+
+        Assert.NotEqual(IntPtr.Zero, buffer);
+        Assert.NotEqual(IntPtr.Zero, memory);
+
+        byte[] src = new byte[bytes];
+        for (int i = 0; i < src.Length; i++) src[i] = (byte)(i & 0xFF);
+        fixed (byte* pSrc = src)
+        {
+            vk.CopyToBuffer(memory, (IntPtr)pSrc, bytes);
+        }
+
+        byte[] dst = new byte[bytes];
+        fixed (byte* pDst = dst)
+        {
+            vk.CopyFromBuffer((IntPtr)pDst, memory, bytes);
+        }
+
+        vk.DestroyBuffer(buffer, memory);
+        Assert.Equal(src, dst);
     }
 }

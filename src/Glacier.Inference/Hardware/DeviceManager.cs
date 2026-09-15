@@ -141,9 +141,119 @@ public static class DeviceManager
             }
         }
 
+        // If DXGI found no discrete GPUs or if on Linux, run native direct driver enumeration
+        if (results.Count == 0)
+        {
+            try
+            {
+                EnumerateNativeGpuDrivers(results);
+            }
+            catch
+            {
+                // Fallback if native driver discovery fails
+            }
+        }
+
         // Always add Host CPU
         results.Add(GetHostCpuDevice(results.Count));
         return results;
+    }
+
+    private static void EnumerateNativeGpuDrivers(List<DeviceInfo> results)
+    {
+        // 1. AMD ROCm / HIP devices
+        if (HipDriver.IsAvailable())
+        {
+            try
+            {
+                if (HipDriver.Init(0) == 0 && HipDriver.DeviceGetCount(out int hipCount) == 0)
+                {
+                    for (int i = 0; i < hipCount; i++)
+                    {
+                        if (HipDriver.DeviceGet(out int dev, i) == 0)
+                        {
+                            string name = HipDriver.GetDeviceName(dev);
+                            ulong mem = 0;
+                            if (HipDriver.DeviceTotalMem(out nuint bytes, dev) == 0)
+                                mem = (ulong)bytes;
+
+                            string slug = GenerateSlug(name, GpuVendor.Amd, results.Count);
+                            var engines = new List<InferenceEngineType> { InferenceEngineType.BareMetal };
+                            if (VulkanDriver.IsAvailable())
+                                engines.Add(InferenceEngineType.Vulkan);
+                            if (OperatingSystem.IsWindows())
+                                engines.Add(InferenceEngineType.DirectML);
+                            engines.Add(InferenceEngineType.Cpu);
+
+                            results.Add(new DeviceInfo
+                            {
+                                Id = slug,
+                                Index = results.Count,
+                                Name = name,
+                                Vendor = GpuVendor.Amd,
+                                DedicatedVramBytes = mem,
+                                SharedVramBytes = 0,
+                                IsDisplayDevice = false,
+                                SupportedEngines = engines,
+                                RecommendedEngine = InferenceEngineType.BareMetal,
+                                SafetyNotes = "AMD ROCm / HIP Bare-Metal engine. Direct HSA / KFD kernel execution via AQL queues & hardware doorbells."
+                            });
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore HIP failure
+            }
+        }
+
+        // 2. NVIDIA CUDA devices
+        if (CuDriver.IsAvailable())
+        {
+            try
+            {
+                if (CuDriver.Init(0) == 0 && CuDriver.DeviceGetCount(out int cuCount) == 0)
+                {
+                    for (int i = 0; i < cuCount; i++)
+                    {
+                        if (CuDriver.DeviceGet(out int dev, i) == 0)
+                        {
+                            string name = CuDriver.GetDeviceName(dev);
+                            ulong mem = 0;
+                            if (CuDriver.DeviceTotalMem(out nuint bytes, dev) == 0)
+                                mem = (ulong)bytes;
+
+                            string slug = GenerateSlug(name, GpuVendor.Nvidia, results.Count);
+                            var engines = new List<InferenceEngineType> { InferenceEngineType.BareMetal };
+                            if (VulkanDriver.IsAvailable())
+                                engines.Add(InferenceEngineType.Vulkan);
+                            if (OperatingSystem.IsWindows())
+                                engines.Add(InferenceEngineType.DirectML);
+                            engines.Add(InferenceEngineType.Cpu);
+
+                            results.Add(new DeviceInfo
+                            {
+                                Id = slug,
+                                Index = results.Count,
+                                Name = name,
+                                Vendor = GpuVendor.Nvidia,
+                                DedicatedVramBytes = mem,
+                                SharedVramBytes = 0,
+                                IsDisplayDevice = false,
+                                SupportedEngines = engines,
+                                RecommendedEngine = InferenceEngineType.BareMetal,
+                                SafetyNotes = "NVIDIA CUDA Bare-Metal SASS engine via libcuda.so."
+                            });
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore CUDA failure on Linux
+            }
+        }
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
@@ -198,27 +308,58 @@ public static class DeviceManager
                                 bool bareMetalAvail = GpuContext.IsSupported;
                                 if (bareMetalAvail)
                                     supportedEngines.Add(InferenceEngineType.BareMetal);
+                                if (VulkanDriver.IsAvailable())
+                                    supportedEngines.Add(InferenceEngineType.Vulkan);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : InferenceEngineType.DirectML;
-                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime. DirectML also supported.";
+                                supportedEngines.Add(InferenceEngineType.Cpu);
+                                recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : (VulkanDriver.IsAvailable() ? InferenceEngineType.Vulkan : InferenceEngineType.DirectML);
+                                safetyNotes = "Pure C# Bare-Metal SASS engine. Bypasses CUDA Toolkit & cudart64.dll runtime. Vulkan & DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {
+                                bool hipAvail = HipDriver.IsAvailable();
+                                bool vkAvail = VulkanDriver.IsAvailable();
+
+                                if (hipAvail)
+                                    supportedEngines.Add(InferenceEngineType.BareMetal);
+                                if (vkAvail)
+                                    supportedEngines.Add(InferenceEngineType.Vulkan);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = "AMD Radeon / Ryzen APU: Pure C# Direct3D 12 Compute engine (HLSL Wave32) across unified system memory.";
+                                supportedEngines.Add(InferenceEngineType.Cpu);
+
+                                if (hipAvail)
+                                {
+                                    recommendedEngine = InferenceEngineType.BareMetal;
+                                    safetyNotes = "AMD ROCm / HIP Bare-Metal engine (amdhip64.dll). Vulkan (cooperative matrix) and DirectML also supported.";
+                                }
+                                else if (vkAvail)
+                                {
+                                    recommendedEngine = InferenceEngineType.Vulkan;
+                                    safetyNotes = "Universal Vulkan Cooperative Matrix engine (VK_KHR_cooperative_matrix). DirectML also supported.";
+                                }
+                                else
+                                {
+                                    recommendedEngine = InferenceEngineType.DirectML;
+                                    safetyNotes = "AMD Radeon / Ryzen APU: Pure C# Direct3D 12 Compute engine (HLSL Wave32) across unified system memory.";
+                                }
                             }
                             else if (vendor == GpuVendor.Intel)
                             {
+                                if (VulkanDriver.IsAvailable())
+                                    supportedEngines.Add(InferenceEngineType.Vulkan);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = "Intel Arc / Core Ultra Xe GPU: DirectML / DX12 Compute engine supported.";
+                                supportedEngines.Add(InferenceEngineType.Cpu);
+                                recommendedEngine = VulkanDriver.IsAvailable() ? InferenceEngineType.Vulkan : InferenceEngineType.DirectML;
+                                safetyNotes = "Intel Arc / Core Ultra Xe GPU: Vulkan Cooperative Matrix & DirectML / DX12 Compute engine supported.";
                             }
                             else
                             {
+                                if (VulkanDriver.IsAvailable())
+                                    supportedEngines.Add(InferenceEngineType.Vulkan);
                                 supportedEngines.Add(InferenceEngineType.DirectML);
-                                recommendedEngine = InferenceEngineType.DirectML;
-                                safetyNotes = "DirectML / DX12 Compute engine supported.";
+                                supportedEngines.Add(InferenceEngineType.Cpu);
+                                recommendedEngine = VulkanDriver.IsAvailable() ? InferenceEngineType.Vulkan : InferenceEngineType.DirectML;
+                                safetyNotes = "Vulkan Cooperative Matrix & DirectML / DX12 Compute engine supported.";
                             }
 
                             results.Add(new DeviceInfo
