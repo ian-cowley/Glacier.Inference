@@ -132,8 +132,12 @@ glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision f
 
 ## 🚀 Like-for-Like Benchmarks: Glacier.Inference vs. Local Ollama
 
+> [!TIP]
+> **Detailed Fleet & Multi-Architecture Matrix**:
+> For comprehensive side-by-side tables grouped by physical machine (RTX 3060 desktop, RTX 4060 laptop, Radeon 890M 64GB, Radeon 680M, CPU), model architecture (Dense vs. MoE frontier), and driver engine (SASS vs. HIP vs. Vulkan CoopMat vs. D3D12), see [**`BENCHMARKS.md`**](BENCHMARKS.md).
+
 ### Benchmark 1: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, 8 GB GDDR6)
-> **Hardware**: ASUS Zenbook S 16 / AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (128-bit GDDR6, 256 GB/s physical memory bandwidth). Model: `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` (4.68 GB).
+> **Hardware**: Mobile Workstation / AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (128-bit GDDR6, 256 GB/s physical memory bandwidth). Model: `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` (4.68 GB).
 
 | Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ CUDA) | Head-to-Head Comparison |
 | :--- | :--- | :--- | :--- |
@@ -168,7 +172,7 @@ glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision f
 | **VRAM Footprint** | **4.68 GB Model + 235 MB KV (FP16)** | ~5.2 GB Total Process | 🟩 **Zero memory bloat** |
 
 ### Benchmark 3: AMD Radeon 680M Integrated GPU (RDNA 2, Unified DDR5)
-> **Hardware**: ASUS ROG / AMD Ryzen 9 6900HX (8C/16T, AVX2) + AMD Radeon 680M (12 CUs, RDNA 2, gfx1035). Model: `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` (986 MB). Prompt: 30 tokens, Output: 46 tokens.
+> **Hardware**: Compact Node / AMD Ryzen 9 6900HX (8C/16T, AVX2) + AMD Radeon 680M (12 CUs, RDNA 2, gfx1035). Model: `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` (986 MB). Prompt: 30 tokens, Output: 46 tokens.
 
 | Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ daemon) | Head-to-Head Comparison |
 | :--- | :--- | :--- | :--- |
@@ -182,7 +186,7 @@ glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision f
 | **Memory Architecture** | 🟩 **Unified DDR5 Zero-Copy** | Traditional VRAM staging | 🟩 **Zero Host-Device PCIe bottlenecks** |
 
 ### Benchmark 4: AMD Radeon 890M Integrated GPU (RDNA 3.5, 16 CUs, Unified LPDDR5X)
-> **Hardware**: ASUS Zenbook S 16 / AMD Ryzen AI 9 HX 370 + AMD Radeon 890M (16 CUs, RDNA 3.5, gfx1150) across 15.5 GB Unified Memory. Model: `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.68 GB). Prompt: 20 tokens, Output: 20 tokens.
+> **Hardware**: Mobile Workstation / AMD Ryzen AI 9 HX 370 + AMD Radeon 890M (16 CUs, RDNA 3.5, gfx1150) across 15.5 GB Unified Memory. Model: `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.68 GB). Prompt: 20 tokens, Output: 20 tokens.
 
 | Metric | Glacier.Inference (Pure C#) | Native C++ Baseline | Head-to-Head Comparison |
 | :--- | :--- | :--- | :--- |
@@ -227,7 +231,7 @@ To verify support for sparse Mixture-of-Experts architectures and next-generatio
 | **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **14.20 GB** | **AMD Radeon 890M (D3D12 UMA)** | 🟩 **19.23 tok/s (D3D12)** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
 | **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **3.08 tok/s** (CPU AVX-512) | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
 | **LiquidAI LFM2-8B-A1B** | 🇺🇸 Liquid AI (USA) | **1.5B Active** / 8B Total (32 Experts) | `Q4_K_M` | **4.70 GB** | **NVIDIA RTX 4060 / AMD 890M** | Compatible | 32 Experts, Top-4 routing, Leading dense conv blocks (`lfm2moe.shortconv`), QK-Norm |
-| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **AMD Ryzen 9 6900HX (DDR5)**<br>**Ryzen AI 9 HX 370 (LPDDR5X)**<br>**AMD Ryzen 5 5500 (DDR4)** | 🟩 **5.60 tok/s (Minisforum64)**<br>🟩 **2.00–4.50 tok/s (Zenbook)**<br>0.50 tok/s (Beast) | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Decoupled YaRN RoPE, Shared Experts |
+| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **AMD Ryzen 9 6900HX (DDR5)**<br>**Ryzen AI 9 HX 370 (LPDDR5X)**<br>**AMD Ryzen 5 5500 (DDR4)** | 🟩 **5.60 tok/s (Machine D)**<br>🟩 **2.00–4.50 tok/s (Machine B)**<br>0.50 tok/s (Machine A) | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Decoupled YaRN RoPE, Shared Experts |
 
 #### Hardware Sizing & Allocation Matrix for MoE Models:
 | Hardware Target | Memory Capacity & Bandwidth | Target MoE Models | Optimal Allocation |
