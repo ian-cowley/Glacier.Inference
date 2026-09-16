@@ -22,6 +22,8 @@ public sealed unsafe class GgufFile : IDisposable
     public ulong TensorCount { get; }
     public ulong MetadataKvCount { get; }
     public ulong TensorDataOffset { get; }
+    public ulong MetadataEndOffset { get; }
+    public byte* BasePointer => _basePointer;
     public uint Alignment { get; } = 32;
 
     public Dictionary<string, object> Metadata { get; } = new(StringComparer.Ordinal);
@@ -123,6 +125,8 @@ public sealed unsafe class GgufFile : IDisposable
                 Alignment = alignVal;
             }
         }
+
+        MetadataEndOffset = (ulong)(ptr - _basePointer);
 
         // 3. Parse Tensor Directory
         TensorList.Capacity = (int)Math.Min((ulong)int.MaxValue, TensorCount);

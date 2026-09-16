@@ -58,6 +58,7 @@ public sealed unsafe class LoraAdapterWeights
     public int Rank => _rank;
     public float Alpha => _alpha;
     public float Scaling => _scaling;
+    public LoraLayerProjections GetProjections(int layer) => _layers[layer];
 
     public LoraAdapterWeights(int layerCount, int rank, float alpha)
     {
