@@ -543,6 +543,16 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 
 ---
 
+## Ecosystem Cross-References
+
+`Glacier.Inference` powers model execution across the **Glacier .NET 10 High-Performance Ecosystem**:
+- **[Glacier.Tune](https://github.com/ian-cowley/Glacier.Tune)**: Zero-copy LLM fine-tuning and LoRA backpropagation using `Glacier.Inference` weights and tokenizers.
+- **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Foundational strided tensor engine with Autograd, hardware GEMM dispatch, and PEFT layers.
+- **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Columnar memory backend for zero-copy feature feeds.
+- **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT deep learning inference microservices.
+
+---
+
 ## Credits
 
 Developed by Ian Cowley and Antigravity (Google DeepMind).
