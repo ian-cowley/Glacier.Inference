@@ -64,17 +64,31 @@ public sealed unsafe partial class Qwen2Model
             }
             else
             {
-                // Q, K, V projections (reusing _normXSums across all 3)
                 int qDim = _nHeads * _headDim;
                 int kvDim = _nHeadsKv * _headDim;
-                QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
-                QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
-                QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
 
-                // Add Q, K, V biases if present
-                if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
-                if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
-                if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
+                if (layer.HasFusedQkv)
+                {
+                    int qkvDim = qDim + 2 * kvDim;
+                    QuantKernels.MatVecMul(layer.QkvType, layer.QkvWeight, _normX, _qkvFused, _dim, qkvDim, _normXSums);
+                    if (layer.QkvBias != null) AddVector(_qkvFused, layer.QkvBias, qkvDim);
+
+                    Buffer.MemoryCopy(_qkvFused, _q, (long)qDim * sizeof(float), (long)qDim * sizeof(float));
+                    Buffer.MemoryCopy(_qkvFused + qDim, _k, (long)kvDim * sizeof(float), (long)kvDim * sizeof(float));
+                    Buffer.MemoryCopy(_qkvFused + qDim + kvDim, _v, (long)kvDim * sizeof(float), (long)kvDim * sizeof(float));
+                }
+                else
+                {
+                    // Q, K, V projections (reusing _normXSums across all 3)
+                    QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
+                    QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
+                    QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
+
+                    // Add Q, K, V biases if present
+                    if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
+                    if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
+                    if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
+                }
 
                 // Add LoRA deltas if present
                 if (LoraWeights != null)
@@ -103,7 +117,7 @@ public sealed unsafe partial class Qwen2Model
                 }
 
                 // Rotary Position Embedding (RoPE)
-                QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
+                QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight);
 
                 // Store in KV cache (stage-relative layer l)
                 kvCache?.Store(l, pos, _k, _v);
@@ -195,15 +209,27 @@ public sealed unsafe partial class Qwen2Model
             }
             else
             {
-                // SwiGLU FFN projections (reusing _normXSums for Gate and Up)
-                QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
-                QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
-                if (LoraWeights != null)
+                // Dense FFN
+                if (layer.HasFusedGateUp)
                 {
-                    LoraWeights.Apply(modelLayer, LoraProjection.Gate, _normX, _gate, _dim, _ffnDim);
-                    LoraWeights.Apply(modelLayer, LoraProjection.Up, _normX, _up, _dim, _ffnDim);
+                    int gateUpDim = 2 * _ffnDim;
+                    QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _gateUpFused, _dim, gateUpDim, _normXSums);
+                    if (layer.FfnUpBias != null) AddVector(_gateUpFused, layer.FfnUpBias, gateUpDim);
+
+                    QuantKernels.SwiGLU(_gateUpFused, _gateUpFused + _ffnDim, _ffnAct, _ffnDim);
                 }
-                QuantKernels.SwiGLU(_gate, _up, _ffnAct, _ffnDim);
+                else
+                {
+                    // SwiGLU FFN projections (reusing _normXSums for Gate and Up)
+                    QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
+                    QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
+                    if (LoraWeights != null)
+                    {
+                        LoraWeights.Apply(modelLayer, LoraProjection.Gate, _normX, _gate, _dim, _ffnDim);
+                        LoraWeights.Apply(modelLayer, LoraProjection.Up, _normX, _up, _dim, _ffnDim);
+                    }
+                    QuantKernels.SwiGLU(_gate, _up, _ffnAct, _ffnDim);
+                }
                 QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, _ffnDim);
                 QuantKernels.MatVecMul(layer.FfnDownType, layer.FfnDownWeight, _ffnAct, _ffnOut, _ffnDim, _dim, _ffnActSums);
                 if (LoraWeights != null)
@@ -346,19 +372,36 @@ public sealed unsafe partial class Qwen2Model
             }
             else
             {
-                // Batched Q, K, V projections (weights streamed once!)
-                QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
-                QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumBatch);
-                QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumBatch);
-
-                // Add Q, K, V biases if present
-                if (layer.QBias != null || layer.KBias != null || layer.VBias != null)
+                if (layer.HasFusedQkv)
                 {
+                    int qkvDim = qDim + 2 * kvDim;
+                    QuantKernels.MatMulBatch(layer.QkvType, layer.QkvWeight, _normXBatch, _qkvBatch, _dim, qkvDim, batchSize, _normXSumBatch);
                     for (int t = 0; t < batchSize; t++)
                     {
-                        if (layer.QBias != null) AddVector(_qBatch + t * qDim, layer.QBias, qDim);
-                        if (layer.KBias != null) AddVector(_kBatch + t * kvDim, layer.KBias, kvDim);
-                        if (layer.VBias != null) AddVector(_vBatch + t * kvDim, layer.VBias, kvDim);
+                        float* src = _qkvBatch + t * qkvDim;
+                        if (layer.QkvBias != null) AddVector(src, layer.QkvBias, qkvDim);
+
+                        Buffer.MemoryCopy(src, _qBatch + t * qDim, (long)qDim * sizeof(float), (long)qDim * sizeof(float));
+                        Buffer.MemoryCopy(src + qDim, _kBatch + t * kvDim, (long)kvDim * sizeof(float), (long)kvDim * sizeof(float));
+                        Buffer.MemoryCopy(src + qDim + kvDim, _vBatch + t * kvDim, (long)kvDim * sizeof(float), (long)kvDim * sizeof(float));
+                    }
+                }
+                else
+                {
+                    // Batched Q, K, V projections (weights streamed once!)
+                    QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
+                    QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumBatch);
+                    QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumBatch);
+
+                    // Add Q, K, V biases if present
+                    if (layer.QBias != null || layer.KBias != null || layer.VBias != null)
+                    {
+                        for (int t = 0; t < batchSize; t++)
+                        {
+                            if (layer.QBias != null) AddVector(_qBatch + t * qDim, layer.QBias, qDim);
+                            if (layer.KBias != null) AddVector(_kBatch + t * kvDim, layer.KBias, kvDim);
+                            if (layer.VBias != null) AddVector(_vBatch + t * kvDim, layer.VBias, kvDim);
+                        }
                     }
                 }
 
@@ -388,7 +431,7 @@ public sealed unsafe partial class Qwen2Model
                         }
                     }
 
-                    QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase);
+                    QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight);
                     kvCache?.Store(l, pos, k, v);
 
                     if (kvCache != null)
@@ -498,16 +541,35 @@ public sealed unsafe partial class Qwen2Model
             }
             else
             {
-                // Batched Gate and Up projections (weights streamed once!)
-                QuantKernels.MatMulBatch(layer.FfnGateType, layer.FfnGateWeight, _normXBatch, _gateBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
-                QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _upBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
-
-                // SwiGLU activation
-                for (int t = 0; t < batchSize; t++)
+                if (layer.HasFusedGateUp)
                 {
-                    float* act = _ffnActBatch + t * _ffnDim;
-                    QuantKernels.SwiGLU(_gateBatch + t * _ffnDim, _upBatch + t * _ffnDim, act, _ffnDim);
-                    QuantKernels.ComputeBlockSums32(act, _ffnActSumBatch + t * ffnChunks, _ffnDim);
+                    int gateUpDim = 2 * _ffnDim;
+                    QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _gateUpBatch, _dim, gateUpDim, batchSize, _normXSumBatch);
+
+                    // SwiGLU activation
+                    for (int t = 0; t < batchSize; t++)
+                    {
+                        float* src = _gateUpBatch + t * gateUpDim;
+                        if (layer.FfnUpBias != null) AddVector(src, layer.FfnUpBias, gateUpDim);
+
+                        float* act = _ffnActBatch + t * _ffnDim;
+                        QuantKernels.SwiGLU(src, src + _ffnDim, act, _ffnDim);
+                        QuantKernels.ComputeBlockSums32(act, _ffnActSumBatch + t * ffnChunks, _ffnDim);
+                    }
+                }
+                else
+                {
+                    // Batched Gate and Up projections (weights streamed once!)
+                    QuantKernels.MatMulBatch(layer.FfnGateType, layer.FfnGateWeight, _normXBatch, _gateBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
+                    QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _upBatch, _dim, _ffnDim, batchSize, _normXSumBatch);
+
+                    // SwiGLU activation
+                    for (int t = 0; t < batchSize; t++)
+                    {
+                        float* act = _ffnActBatch + t * _ffnDim;
+                        QuantKernels.SwiGLU(_gateBatch + t * _ffnDim, _upBatch + t * _ffnDim, act, _ffnDim);
+                        QuantKernels.ComputeBlockSums32(act, _ffnActSumBatch + t * ffnChunks, _ffnDim);
+                    }
                 }
 
                 // Batched FFN Down projection (weights streamed once!)

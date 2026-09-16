@@ -28,6 +28,12 @@ public sealed unsafe class LayerWeights
     public required GgufType AttnOutType { get; init; }
     public float* AttnOutBias { get; init; }
 
+    // Fused QKV (Phi-3, Phi-4)
+    public bool HasFusedQkv => QkvWeight != null;
+    public byte* QkvWeight { get; init; }
+    public GgufType QkvType { get; init; }
+    public float* QkvBias { get; init; }
+
     // Multi-Head Latent Attention (MLA)
     public bool IsMla { get; init; }
     public byte* AttnKvAMqaWeight { get; init; }
@@ -59,9 +65,13 @@ public sealed unsafe class LayerWeights
 
     public byte* FfnUpWeight { get; init; }
     public GgufType FfnUpType { get; init; }
+    public float* FfnUpBias { get; init; }
 
     public byte* FfnDownWeight { get; init; }
     public GgufType FfnDownType { get; init; }
+
+    // Fused Gate/Up SwiGLU (Phi-3, Phi-4: ffn_up combines gate and up projection)
+    public bool HasFusedGateUp => FfnGateWeight == null && FfnUpWeight != null;
 
     // MoE Router & Experts
     public bool IsMoe { get; init; }
@@ -97,6 +107,7 @@ public sealed unsafe class LayerWeights
 public sealed unsafe class ModelWeights
 {
     public GgufFile Gguf { get; }
+    public UniversalArchitecture ArchitectureFamily => ModelArchitectureDetector.Detect(Gguf.Architecture, Gguf);
     public long FileSizeBytes => new FileInfo(Gguf.FilePath).Length;
 
     public int VocabSize { get; }
@@ -115,6 +126,8 @@ public sealed unsafe class ModelWeights
     public int LeadingDenseBlockCount => Gguf.LeadingDenseBlockCount;
     public float RopeFreqBase { get; }
     public float RmsNormEps { get; }
+    public float* RopeFreqsWeight { get; }
+    public bool HasRopeFreqs => RopeFreqsWeight != null;
 
     public bool IsMoe => Gguf.IsMoe;
     public bool NormTopK => Gguf.NormTopK;
@@ -146,6 +159,12 @@ public sealed unsafe class ModelWeights
         HeadCountKv = gguf.HeadCountKv;
         RopeFreqBase = gguf.RopeFreqBase;
         RmsNormEps = gguf.RmsNormEps;
+
+        // Precomputed RoPE frequencies (Meta LLaMA 3.1)
+        if (gguf.TryGetTensor("rope_freqs.weight", out var ropeFreqs) && ropeFreqs != null)
+        {
+            RopeFreqsWeight = (float*)gguf.GetTensorPointer(ropeFreqs);
+        }
 
         // Embedding
         var embdInfo = gguf.Tensors["token_embd.weight"];
@@ -191,6 +210,10 @@ public sealed unsafe class ModelWeights
             byte* qBWeight = null;
             GgufType qBType = GgufType.F32;
 
+            byte* qkvWeight = null;
+            GgufType qkvType = GgufType.F32;
+            float* qkvBias = null;
+
             if (gguf.TryGetTensor($"blk.{l}.attn_q.weight", out var q) && q != null)
             {
                 qWeight = gguf.GetTensorPointer(q);
@@ -212,6 +235,15 @@ public sealed unsafe class ModelWeights
                 {
                     qBWeight = gguf.GetTensorPointer(qB);
                     qBType = qB.Type;
+                }
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.attn_qkv.weight", out var qkv) && qkv != null)
+            {
+                qkvWeight = gguf.GetTensorPointer(qkv);
+                qkvType = qkv.Type;
+                if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
+                {
+                    qkvBias = (float*)gguf.GetTensorPointer(qkvB);
                 }
             }
 
@@ -266,7 +298,10 @@ public sealed unsafe class ModelWeights
                 }
             }
 
-            var attnOut = gguf.Tensors[$"blk.{l}.attn_output.weight"];
+            if (!gguf.TryGetTensor($"blk.{l}.attn_output.weight", out var attnOut) || attnOut == null)
+            {
+                gguf.TryGetTensor($"blk.{l}.attn_wo.weight", out attnOut);
+            }
             gguf.TryGetTensor($"blk.{l}.attn_output.bias", out var attnOutB);
 
             gguf.TryGetTensor($"blk.{l}.attn_q_norm.weight", out var qNorm);
@@ -288,6 +323,7 @@ public sealed unsafe class ModelWeights
             GgufType ffnGateType = GgufType.F32;
             byte* ffnUpWeight = null;
             GgufType ffnUpType = GgufType.F32;
+            float* ffnUpBias = null;
             byte* ffnDownWeight = null;
             GgufType ffnDownType = GgufType.F32;
 
@@ -382,6 +418,10 @@ public sealed unsafe class ModelWeights
                 {
                     ffnUpWeight = gguf.GetTensorPointer(ffnUp);
                     ffnUpType = ffnUp.Type;
+                    if (gguf.TryGetTensor($"blk.{l}.ffn_up.bias", out var ffnUpB) && ffnUpB != null)
+                    {
+                        ffnUpBias = (float*)gguf.GetTensorPointer(ffnUpB);
+                    }
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ffn_down.weight", out var ffnDown) && ffnDown != null)
                 {
@@ -394,6 +434,9 @@ public sealed unsafe class ModelWeights
             {
                 AttnNormWeight = (float*)gguf.GetTensorPointer(attnNorm!),
                 AttnNormType = attnNorm!.Type,
+                QkvWeight = qkvWeight,
+                QkvType = qkvType,
+                QkvBias = qkvBias,
                 QWeight = qWeight,
                 QType = qType,
                 QBias = qb,
@@ -414,8 +457,8 @@ public sealed unsafe class ModelWeights
                 AttnQANormWeight = qANormWeight,
                 AttnQBWeight = qBWeight,
                 AttnQBType = qBType,
-                AttnOutWeight = gguf.GetTensorPointer(attnOut),
-                AttnOutType = attnOut.Type,
+                AttnOutWeight = gguf.GetTensorPointer(attnOut!),
+                AttnOutType = attnOut!.Type,
                 AttnOutBias = attnOutB != null ? (float*)gguf.GetTensorPointer(attnOutB) : null,
                 AttnQNormWeight = qNorm != null ? (float*)gguf.GetTensorPointer(qNorm) : null,
                 AttnKNormWeight = kNorm != null ? (float*)gguf.GetTensorPointer(kNorm) : null,
@@ -427,6 +470,7 @@ public sealed unsafe class ModelWeights
                 FfnGateType = ffnGateType,
                 FfnUpWeight = ffnUpWeight,
                 FfnUpType = ffnUpType,
+                FfnUpBias = ffnUpBias,
                 FfnDownWeight = ffnDownWeight,
                 FfnDownType = ffnDownType,
                 FfnGateInpWeight = gateInpWeight,

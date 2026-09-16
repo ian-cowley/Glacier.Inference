@@ -203,7 +203,20 @@ public sealed partial class BpeTokenizer
             return sb.ToString();
         }
 
-        // 2. DeepSeek format ({{ bos_token }}User: ... \n\nAssistant:)
+        // 2. Microsoft Phi-3 / Phi-4 format with <|im_sep|>
+        if (_specialTokens.ContainsKey("<|im_sep|>"))
+        {
+            var sb = new StringBuilder();
+            if (!string.IsNullOrEmpty(systemPrompt))
+            {
+                sb.Append($"<|im_start|>system<|im_sep|>{systemPrompt}<|im_end|>");
+            }
+            sb.Append($"<|im_start|>user<|im_sep|>{prompt}<|im_end|>");
+            sb.Append("<|im_start|>assistant<|im_sep|>");
+            return sb.ToString();
+        }
+
+        // 3. DeepSeek format ({{ bos_token }}User: ... \n\nAssistant:)
         if (_architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) || _chatTemplate.Contains("User: "))
         {
             var sb = new StringBuilder();
@@ -219,6 +232,24 @@ public sealed partial class BpeTokenizer
             sb.Append("User: ");
             sb.Append(prompt);
             sb.Append("\n\nAssistant:");
+            return sb.ToString();
+        }
+
+        // 4. Mistral / Devstral format ([INST] ... [/INST])
+        if (_specialTokens.ContainsKey("[INST]"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            sb.Append("[INST] ");
+            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
+            {
+                sb.Append(systemPrompt).Append("\n\n");
+            }
+            sb.Append(prompt);
+            sb.Append(" [/INST]");
             return sb.ToString();
         }
 

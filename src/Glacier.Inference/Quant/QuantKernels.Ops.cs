@@ -174,7 +174,8 @@ public static unsafe partial class QuantKernels
         float* q, float* k,
         int nHeadsQ, int nHeadsKv,
         int headDim, int pos,
-        float freqBase, float freqScale = 1.0f)
+        float freqBase, float freqScale = 1.0f,
+        float* ropeFreqs = null)
     {
         int halfDim = headDim / 2;
 
@@ -183,7 +184,8 @@ public static unsafe partial class QuantKernels
 
         for (int i = 0; i < halfDim; i++)
         {
-            float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
+            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
+            float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
             float theta = pos * freq * freqScale;
             cosTable[i] = MathF.Cos(theta);
             sinTable[i] = MathF.Sin(theta);

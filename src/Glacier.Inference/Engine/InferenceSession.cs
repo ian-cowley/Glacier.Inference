@@ -91,6 +91,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public Qwen2GpuModel? GpuModel => _gpuModel;
     public Qwen2D3D12Model? D3D12Model => _d3d12Model;
     public Qwen2Model? CpuModel => _cpuModel;
+    public UniversalArchitecture Architecture => _weights.ArchitectureFamily;
     public int MaxSeqLen => _maxSeqLen;
 
     public InferenceSession(
@@ -132,14 +133,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             Device = targetDevice;
             Engine = targetEngine;
 
-            if (!_weights.IsMoe && !_weights.IsMla && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+            if (!_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
                 {
                     _gpu = new GpuContext(targetDevice.Index);
                     _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen, kvPrecision);
                     _kvCache = null; // GPU maintains all KV states in device VRAM
-                    ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision}]";
+                    ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision} | Arch: {_weights.ArchitectureFamily}]";
                 }
                 catch (Exception ex)
                 {
@@ -152,10 +153,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpuModel = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal]";
+                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
-            else if (!_weights.IsMla && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+            else if (!_weights.IsMla && !_weights.Layers[0].HasFusedQkv && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
             {
                 try
@@ -163,7 +164,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     var d3dCtx = new D3D12Context(targetDevice.Index);
                     _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
                     _kvCache = null; // GPU maintains all KV states in device VRAM
-                    ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32]";
+                    ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
                 }
                 catch (Exception ex)
                 {
@@ -175,7 +176,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _d3d12Model = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = new Qwen2Model(_weights, maxSeqLen);
-                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12]";
+                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
             else
@@ -183,10 +184,12 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
                 ActiveDevice = _weights.IsMla
-                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (Multi-Head Latent Attention)]"
-                    : _weights.IsMoe
-                        ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
-                        : $"{targetDevice.Name} [Engine: SIMD AVX2 Optimized (Batched GEMM)]";
+                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (DeepSeek MLA)]"
+                    : _weights.Layers[0].HasFusedQkv
+                        ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (Microsoft Phi Fused QKV/SwiGLU)]"
+                        : _weights.IsMoe
+                            ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
+                            : $"{targetDevice.Name} [Engine: SIMD AVX2/AVX-512 Optimized ({_weights.ArchitectureFamily})]";
             }
         }
     }

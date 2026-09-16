@@ -51,6 +51,10 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _expertDownOut;
     private float* _headScores;
 
+    // Preallocated fused QKV & Gate/Up scratch buffers (single token)
+    private float* _qkvFused;
+    private float* _gateUpFused;
+
     // Preallocated MLA scratch buffers (single token)
     private float* _compressedKv;
     private float* _cKvNorm;
@@ -72,6 +76,10 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _ffnActBatch;
     private float* _ffnActSumBatch;
     private float* _ffnOutBatch;
+
+    // Preallocated fused QKV & Gate/Up scratch buffers (batched)
+    private float* _qkvBatch;
+    private float* _gateUpBatch;
 
     // Preallocated MLA scratch buffers (batched)
     private float* _compressedKvBatch;
@@ -194,6 +202,13 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         _ffnActBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
         _ffnActSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * ((maxFfn + 31) / 32) * sizeof(float)));
         _ffnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
+
+        int qkvDim = (_nHeads * _headDim) + (_nHeadsKv * _headDim) + (_nHeadsKv * _vHeadDim);
+        int gateUpDim = 2 * maxFfn;
+        _qkvFused = (float*)NativeMemory.AllocZeroed((nuint)(qkvDim * sizeof(float)));
+        _gateUpFused = (float*)NativeMemory.AllocZeroed((nuint)(gateUpDim * sizeof(float)));
+        _qkvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qkvDim * sizeof(float)));
+        _gateUpBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * gateUpDim * sizeof(float)));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -310,6 +325,11 @@ public sealed unsafe partial class Qwen2Model : IDisposable
             FreeIfAllocated(ref _ffnActBatch);
             FreeIfAllocated(ref _ffnActSumBatch);
             FreeIfAllocated(ref _ffnOutBatch);
+
+            FreeIfAllocated(ref _qkvFused);
+            FreeIfAllocated(ref _gateUpFused);
+            FreeIfAllocated(ref _qkvBatch);
+            FreeIfAllocated(ref _gateUpBatch);
 
             FreeIfAllocated(ref _compressedKv);
             FreeIfAllocated(ref _cKvNorm);

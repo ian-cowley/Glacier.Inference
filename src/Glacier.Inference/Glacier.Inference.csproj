@@ -12,15 +12,15 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.1.14</Version>
+    <Version>1.2.0</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>High-performance pure C# .NET 10 LLM inference engine. Native AOT compatible, zero-copy memory-mapped GGUF models, SIMD AVX-512 and AVX2 quantized GEMV kernels (Q4_K, Q6_K, Q8_0, Q4_0, FP16), unmanaged KV-cache ring buffers, and embedded BPE tokenizers. Pure C# alternative to Ollama and vLLM.</Description>
+    <Description>Universal pure C# .NET 10 LLM inference engine supporting Meta Llama 3, DeepSeek V2/V3/R1 (MLA + MoE), Microsoft Phi-3/Phi-4 (fused QKV/SwiGLU), Mistral/Devstral, and Alibaba Qwen 2/2.5. Native AOT compatible, zero-copy GGUF memory-mapped files, AVX-512/AVX2 quantized SIMD kernels, bare-metal GPU acceleration, and universal ChatML tokenizers. Zero Python, zero C++ runtime dependencies.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Inference</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Inference.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>llm;inference;ollama;vllm;gguf;qwen;llama;simd;avx512;quantization;net10;aot;nativeaot;glacier</PackageTags>
+    <PackageTags>llm;inference;llama;deepseek;phi4;mistral;qwen;gguf;simd;avx512;quantization;net10;aot;nativeaot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
