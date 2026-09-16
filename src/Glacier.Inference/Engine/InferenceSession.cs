@@ -451,6 +451,15 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
     }
 
+    public void AttachLora(string loraPath)
+    {
+        var lora = LoraAdapterWeights.Load(loraPath);
+        if (_cpuModel != null)
+        {
+            _cpuModel.LoraWeights = lora;
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)

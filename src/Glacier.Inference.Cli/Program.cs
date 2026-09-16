@@ -679,6 +679,7 @@ public static class Program
         string? engineStr = null;
         string? kvPrecisionStr = null;
         string? split = null;
+        string? loraPath = null;
         int maxSeqLen = 2048;
         int maxTokens = 512;
         float temperature = 0.7f;
@@ -693,6 +694,8 @@ public static class Program
                 device = args[++i];
             else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
                 promptParts.Add(args[++i]);
+            else if (args[i] == "--lora" && i + 1 < args.Length)
+                loraPath = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
                 engineStr = args[++i];
             else if (args[i] == "--kv-precision" && i + 1 < args.Length)
@@ -727,6 +730,11 @@ public static class Program
 
         string? initialPrompt = promptParts.Count > 0 ? string.Join(" ", promptParts) : null;
 
+        if (!string.IsNullOrEmpty(loraPath) && device == null)
+        {
+            device = "cpu"; // LoRA dynamic inference runs on SIMD AVX2/AVX-512 CPU path
+        }
+
         InferenceEngineType engine = InferenceEngineType.Auto;
         if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
         {
@@ -744,6 +752,13 @@ public static class Program
         Console.ResetColor();
 
         using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
+        if (!string.IsNullOrEmpty(loraPath))
+        {
+            session.AttachLora(loraPath);
+            Console.ForegroundColor = ConsoleColor.Magenta;
+            Console.WriteLine($">> Attached Pure C# LoRA Adapter: {Path.GetFileName(loraPath)} (Rank={session.CpuModel?.LoraWeights?.Rank}, Alpha={session.CpuModel?.LoraWeights?.Alpha})");
+            Console.ResetColor();
+        }
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
         var options = new SamplingOptions { MaxTokens = maxTokens, Temperature = temperature, TopP = topP };

@@ -84,6 +84,7 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     public int StartLayer { get; }
     public int LayerCount { get; }
     public bool IsLastStage { get; }
+    public LoraAdapterWeights? LoraWeights { get; set; }
 
     public Qwen2Model(
         ModelWeights weights,

@@ -76,6 +76,14 @@ public sealed unsafe partial class Qwen2Model
                 if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
                 if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
 
+                // Add LoRA deltas if present
+                if (LoraWeights != null)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.Q, _normX, _q, _dim, qDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.K, _normX, _k, _dim, kvDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.V, _normX, _v, _dim, kvDim);
+                }
+
                 // Optional QK-Norm (e.g. Qwen3)
                 if (layer.AttnQNormWeight != null)
                 {
@@ -109,6 +117,10 @@ public sealed unsafe partial class Qwen2Model
                 // Attention output projection
                 QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, qDim);
                 QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
+                if (LoraWeights != null)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.AttnOut, _attnOut, _attnProj, qDim, _dim);
+                }
                 if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
 
                 // Residual connection: x = x + attnProj
@@ -186,9 +198,18 @@ public sealed unsafe partial class Qwen2Model
                 // SwiGLU FFN projections (reusing _normXSums for Gate and Up)
                 QuantKernels.MatVecMul(layer.FfnGateType, layer.FfnGateWeight, _normX, _gate, _dim, _ffnDim, _normXSums);
                 QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _up, _dim, _ffnDim, _normXSums);
+                if (LoraWeights != null)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.Gate, _normX, _gate, _dim, _ffnDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.Up, _normX, _up, _dim, _ffnDim);
+                }
                 QuantKernels.SwiGLU(_gate, _up, _ffnAct, _ffnDim);
                 QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, _ffnDim);
                 QuantKernels.MatVecMul(layer.FfnDownType, layer.FfnDownWeight, _ffnAct, _ffnOut, _ffnDim, _dim, _ffnActSums);
+                if (LoraWeights != null)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.Down, _ffnAct, _ffnOut, _ffnDim, _dim);
+                }
 
                 // Residual connection: x = x + ffnOut
                 AddVector(_x, _ffnOut, _dim);
