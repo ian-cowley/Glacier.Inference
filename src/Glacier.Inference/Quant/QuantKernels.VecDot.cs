@@ -455,17 +455,30 @@ public static unsafe partial class QuantKernels
     {
         float sum = 0f;
         int i = 0;
-        if (Vector256.IsHardwareAccelerated)
+        if (Vector512.IsHardwareAccelerated && k >= 16)
         {
-            int vecLimit = k - 8;
-            var acc = Vector256<float>.Zero;
-            for (; i <= vecLimit; i += 8)
+            var acc0 = Vector512<float>.Zero;
+            var acc1 = Vector512<float>.Zero;
+            for (; i <= k - 32; i += 32)
             {
-                var vx = Vector256.Load(x + i);
-                var vr = Vector256.Load(row + i);
-                acc += vx * vr;
+                acc0 = Vector512.FusedMultiplyAdd(Vector512.Load(x + i), Vector512.Load(row + i), acc0);
+                acc1 = Vector512.FusedMultiplyAdd(Vector512.Load(x + i + 16), Vector512.Load(row + i + 16), acc1);
             }
-            sum = Vector256.Sum(acc);
+            if (i <= k - 16)
+            {
+                acc0 = Vector512.FusedMultiplyAdd(Vector512.Load(x + i), Vector512.Load(row + i), acc0);
+                i += 16;
+            }
+            sum = Vector512.Sum(acc0 + acc1);
+        }
+        if (Vector256.IsHardwareAccelerated && (k - i) >= 8)
+        {
+            var acc = Vector256<float>.Zero;
+            for (; i <= k - 8; i += 8)
+            {
+                acc = Vector256.FusedMultiplyAdd(Vector256.Load(x + i), Vector256.Load(row + i), acc);
+            }
+            sum += Vector256.Sum(acc);
         }
         for (; i < k; i++)
         {

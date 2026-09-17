@@ -120,6 +120,14 @@ public static class CuDriver
     public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
 
     [SuppressGCTransition]
+    [DllImport(CudaLib, EntryPoint = "cuMemcpyDtoDAsync_v2")]
+    public static extern int MemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount, IntPtr hStream);
+
+    [SuppressGCTransition]
+    [DllImport(CudaLib, EntryPoint = "cuMemcpyHtoDAsync_v2")]
+    public static extern int MemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, nuint byteCount, IntPtr hStream);
+
+    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemsetD8_v2")]
     public static extern int MemsetD8(IntPtr dstDevice, byte uc, nuint count);
 

@@ -32,9 +32,38 @@ public sealed unsafe partial class Qwen2D3D12Model
         bool computeLogits)
     {
         // 1. Input activation: either extract embedding or copy incoming hidden vector
+        bool isCacheHit = false;
+        int cachedSlot = -1;
+        int missSlot = -1;
+
         if (StartLayer == 0)
         {
-            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
+            if (_dEmbdCache != null && _embdTokenToSlot != null && _embdTokenToSlot.TryGetValue(token, out cachedSlot))
+            {
+                // In-VRAM token embedding lookup: 0 B PCIe copy!
+                isCacheHit = true;
+                EmbdCacheHitCount++;
+            }
+            else
+            {
+                EmbdCacheMissCount++;
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
+
+                if (_dEmbdCache != null && _embdTokenToSlot != null && _embdCacheTokens != null)
+                {
+                    missSlot = _embdCacheHead;
+                    _embdCacheHead = (_embdCacheHead + 1) % EmbdCacheCapacity;
+
+                    int evictedToken = _embdCacheTokens[missSlot];
+                    if (evictedToken >= 0)
+                    {
+                        _embdTokenToSlot.Remove(evictedToken);
+                    }
+
+                    _embdCacheTokens[missSlot] = token;
+                    _embdTokenToSlot[token] = missSlot;
+                }
+            }
         }
         else
         {
@@ -52,9 +81,27 @@ public sealed unsafe partial class Qwen2D3D12Model
         _ctx.BeginCommands();
         var cmd = _ctx.CommandList;
 
-        // Copy embedding / input activation from upload buffer into _dX inside the same command list
+        // Copy embedding / input activation into _dX inside the same command list
         cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-        cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
+        if (isCacheHit)
+        {
+            // Zero-PCIe In-VRAM copy via CopyBufferRegion from default heap cache to default heap _dX
+            cmd.ResourceBarrierTransition(_dEmbdCache!, ResourceStates.Common, ResourceStates.CopySource);
+            cmd.CopyBufferRegion(_dX, 0, _dEmbdCache!, (ulong)((long)cachedSlot * _dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+            cmd.ResourceBarrierTransition(_dEmbdCache!, ResourceStates.CopySource, ResourceStates.Common);
+        }
+        else
+        {
+            cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
+
+            if (missSlot >= 0 && _dEmbdCache != null)
+            {
+                // Populate default heap in-VRAM embedding cache directly from upload buffer
+                cmd.ResourceBarrierTransition(_dEmbdCache, ResourceStates.Common, ResourceStates.CopyDest);
+                cmd.CopyBufferRegion(_dEmbdCache, (ulong)((long)missSlot * _dim * sizeof(float)), _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dEmbdCache, ResourceStates.CopyDest, ResourceStates.Common);
+            }
+        }
         cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
 
         int maxTopK = _weights.ExpertUsedCount > 0 ? _weights.ExpertUsedCount : 1;
@@ -369,6 +416,35 @@ public sealed unsafe partial class Qwen2D3D12Model
             cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopyDest);
             cmd.CopyBufferRegion(_dXBatch, 0, _uploadEmbeddingBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
             cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.Common);
+
+            if (StartLayer == 0 && _dEmbdCache != null && _embdTokenToSlot != null && _embdCacheTokens != null)
+            {
+                fixed (int* pTokens = tokens)
+                {
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        int tok = pTokens[offset + t];
+                        if (!_embdTokenToSlot.ContainsKey(tok))
+                        {
+                            int slot = _embdCacheHead;
+                            _embdCacheHead = (_embdCacheHead + 1) % EmbdCacheCapacity;
+                            int evicted = _embdCacheTokens[slot];
+                            if (evicted >= 0) _embdTokenToSlot.Remove(evicted);
+                            _embdCacheTokens[slot] = tok;
+                            _embdTokenToSlot[tok] = slot;
+
+                            cmd.ResourceBarrierTransition(_dEmbdCache, ResourceStates.Common, ResourceStates.CopyDest);
+                            cmd.CopyBufferRegion(
+                                _dEmbdCache,
+                                (ulong)((long)slot * _dim * sizeof(float)),
+                                _uploadEmbeddingBatch,
+                                (ulong)((long)t * _dim * sizeof(float)),
+                                (ulong)(_dim * sizeof(float)));
+                            cmd.ResourceBarrierTransition(_dEmbdCache, ResourceStates.CopyDest, ResourceStates.Common);
+                        }
+                    }
+                }
+            }
 
             // Execute assigned layers across all tokens in the chunk simultaneously
             for (int l = 0; l < LayerCount; l++)

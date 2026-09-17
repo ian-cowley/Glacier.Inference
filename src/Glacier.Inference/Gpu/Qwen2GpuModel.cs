@@ -118,6 +118,14 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     // Host buffer for input embedding
     private float[] _hX;
 
+    // VRAM Token Embedding Cache (eliminates host-to-device PCIe copy per token)
+    private const int EmbdCacheCapacity = 4096;
+    private IntPtr _dEmbdCache = IntPtr.Zero;
+    private int[]? _embdCacheTokens;
+    private int _embdCacheHead = 0;
+    private System.Collections.Generic.Dictionary<int, int>? _embdTokenToSlot;
+    private IntPtr _hXPinned = IntPtr.Zero;
+
     private bool _disposed;
 
     public GpuContext Context => _gpu;
@@ -263,6 +271,19 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         }
 
         _hX = new float[_dim];
+
+        // Allocate VRAM token embedding cache (4096 tokens * dim * 4 bytes)
+        if (StartLayer == 0)
+        {
+            nuint cacheBytes = (nuint)(EmbdCacheCapacity * _dim * sizeof(float));
+            if (CuDriver.MemAlloc(out _dEmbdCache, cacheBytes) == 0)
+            {
+                _embdCacheTokens = new int[EmbdCacheCapacity];
+                Array.Fill(_embdCacheTokens, -1);
+                _embdTokenToSlot = new System.Collections.Generic.Dictionary<int, int>(EmbdCacheCapacity);
+            }
+            CuDriver.MemHostAlloc(out _hXPinned, (nuint)(_dim * sizeof(float)), 0);
+        }
 
         // 4. Upload model weights into GPU VRAM
         double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
@@ -429,6 +450,17 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             _gpu.FreeDevice(_dFfnActBatch);
             _gpu.FreeDevice(_dFfnOutBatch);
             _gpu.FreeDevice(_dScoresBufBatch);
+
+            if (_dEmbdCache != IntPtr.Zero)
+            {
+                _gpu.FreeDevice(_dEmbdCache);
+                _dEmbdCache = IntPtr.Zero;
+            }
+            if (_hXPinned != IntPtr.Zero)
+            {
+                CuDriver.MemFreeHost(_hXPinned);
+                _hXPinned = IntPtr.Zero;
+            }
 
             if (_dKeyCache != null)
             {

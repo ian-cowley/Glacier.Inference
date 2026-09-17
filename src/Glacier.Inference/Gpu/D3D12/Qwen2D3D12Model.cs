@@ -134,6 +134,16 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
     private const int MaxBatchChunk = 64;
     private ID3D12Resource _uploadEmbeddingBatch = null!;
     private float* _pUploadEmbeddingBatch;
+
+    // Device-resident In-VRAM Token Embedding Cache (Default Heap, zero-PCIe CopyBufferRegion)
+    public const int EmbdCacheCapacity = 4096;
+    private ID3D12Resource? _dEmbdCache;
+    private int[]? _embdCacheTokens;
+    private int _embdCacheHead;
+    private Dictionary<int, int>? _embdTokenToSlot;
+    public int EmbdCacheHitCount { get; internal set; }
+    public int EmbdCacheMissCount { get; internal set; }
+
     private ID3D12Resource? _readbackActivation;
     private float* _pReadbackActivation;
     private ID3D12Resource? _readbackActivationBatch;
@@ -218,6 +228,15 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
         void* pUpload = null;
         _uploadEmbedding.Map(0, null, &pUpload);
         _pUploadEmbedding = (float*)pUpload;
+
+        if (StartLayer == 0)
+        {
+            ulong cacheBytes = (ulong)(EmbdCacheCapacity * _dim * sizeof(float));
+            _dEmbdCache = _ctx.CreateDeviceBuffer(cacheBytes);
+            _embdCacheTokens = new int[EmbdCacheCapacity];
+            Array.Fill(_embdCacheTokens, -1);
+            _embdTokenToSlot = new Dictionary<int, int>(EmbdCacheCapacity);
+        }
 
         _uploadEmbeddingBatch = _ctx.CreateUploadBuffer((ulong)(MaxBatchChunk * _dim * sizeof(float)));
         void* pUploadBatch = null;
@@ -620,6 +639,13 @@ public sealed unsafe partial class Qwen2D3D12Model : IDisposable
             _dGateBatch?.Dispose();
             _dUpBatch?.Dispose();
             _dFfnActBatch?.Dispose();
+
+            if (_dEmbdCache != null)
+            {
+                _dEmbdCache.Dispose();
+                _dEmbdCache = null;
+            }
+            _embdTokenToSlot?.Clear();
 
             if (_uploadEmbedding != null)
             {

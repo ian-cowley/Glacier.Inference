@@ -35,10 +35,37 @@ public sealed unsafe partial class Qwen2GpuModel
         // 1. Input activation: either extract embedding or copy incoming hidden vector
         if (StartLayer == 0)
         {
-            fixed (float* pX = _hX)
+            if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdTokenToSlot.TryGetValue(token, out int cachedSlot))
             {
-                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
-                _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+                // In-VRAM token embedding lookup: 0 B PCIe copy!
+                IntPtr srcCache = _dEmbdCache + (nint)((long)cachedSlot * _dim * sizeof(float));
+                CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), IntPtr.Zero);
+            }
+            else
+            {
+                fixed (float* pX = _hX)
+                {
+                    QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
+                    _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+                }
+
+                if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdCacheTokens != null)
+                {
+                    int slot = _embdCacheHead;
+                    _embdCacheHead = (_embdCacheHead + 1) % EmbdCacheCapacity;
+
+                    int evictedToken = _embdCacheTokens[slot];
+                    if (evictedToken >= 0)
+                    {
+                        _embdTokenToSlot.Remove(evictedToken);
+                    }
+
+                    _embdCacheTokens[slot] = token;
+                    _embdTokenToSlot[token] = slot;
+
+                    IntPtr dstCache = _dEmbdCache + (nint)((long)slot * _dim * sizeof(float));
+                    CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), IntPtr.Zero);
+                }
             }
         }
         else

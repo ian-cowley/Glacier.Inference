@@ -829,4 +829,44 @@ public class D3D12ShaderTests
             Console.WriteLine($"[RUN {run + 1}] 30 tokens evaluated in {sw.ElapsedMilliseconds} ms ({30.0 / sw.Elapsed.TotalSeconds:F1} tok/s)");
         }
     }
+
+    [Fact]
+    public void D3D12_InVram_EmbeddingCache_OperatesWithZeroPcieCopies()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        string modelPath = @"C:\Users\spuri\.ollama\models\blobs\sha256-183715c435899236895da3869489cc30ac241476b4971a20285b1a462818a5b4";
+        if (!File.Exists(modelPath)) return;
+
+        using var gguf = GgufFile.Open(modelPath);
+        var weights = new ModelWeights(gguf);
+
+        using var ctx = new D3D12Context();
+        using var model = new Qwen2D3D12Model(ctx, weights, 128);
+        float[] logits = new float[weights.VocabSize];
+
+        // First forward pass with token 9707: should be a cache miss
+        model.Forward(token: 9707, pos: 0, logits.AsSpan(), computeLogits: false);
+        Assert.Equal(1, model.EmbdCacheMissCount);
+        Assert.Equal(0, model.EmbdCacheHitCount);
+
+        // Second forward pass with the same token 9707: MUST be an in-VRAM cache hit!
+        model.Forward(token: 9707, pos: 1, logits.AsSpan(), computeLogits: false);
+        Assert.Equal(1, model.EmbdCacheMissCount);
+        Assert.Equal(1, model.EmbdCacheHitCount);
+
+        // Third pass with different token 9708: miss
+        model.Forward(token: 9708, pos: 2, logits.AsSpan(), computeLogits: false);
+        Assert.Equal(2, model.EmbdCacheMissCount);
+        Assert.Equal(1, model.EmbdCacheHitCount);
+
+        // Fourth pass with 9708: hit!
+        model.Forward(token: 9708, pos: 3, logits.AsSpan(), computeLogits: false);
+        Assert.Equal(2, model.EmbdCacheMissCount);
+        Assert.Equal(2, model.EmbdCacheHitCount);
+
+        // Fifth pass with 9707 again: hit!
+        model.Forward(token: 9707, pos: 4, logits.AsSpan(), computeLogits: false);
+        Assert.Equal(2, model.EmbdCacheMissCount);
+        Assert.Equal(3, model.EmbdCacheHitCount);
+    }
 }
