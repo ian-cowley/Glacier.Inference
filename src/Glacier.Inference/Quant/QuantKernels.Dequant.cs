@@ -211,10 +211,10 @@ public static unsafe partial class QuantKernels
                 for (int l = 0; l < 32; ++l)
                 {
                     int is_idx = l / 16;
-                    sbyte q1 = (sbyte)((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4) - 32);
-                    sbyte q2 = (sbyte)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4) - 32);
-                    sbyte q3 = (sbyte)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4) - 32);
-                    sbyte q4 = (sbyte)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4) - 32);
+                    sbyte q1 = (sbyte)(((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32);
+                    sbyte q2 = (sbyte)(((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                    sbyte q3 = (sbyte)(((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+                    sbyte q4 = (sbyte)(((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
 
                     dst[l + 0] = d * sc[is_idx + 0] * q1;
                     dst[l + 32] = d * sc[is_idx + 2] * q2;

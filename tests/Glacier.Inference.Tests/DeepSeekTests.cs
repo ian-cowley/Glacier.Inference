@@ -12,6 +12,7 @@ using Xunit;
 
 namespace Glacier.Inference.Tests;
 
+[Collection("SequentialGpu")]
 public class DeepSeekTests
 {
     private const string ModelPath = @"D:\lmstudio\models\lmstudio-community\DeepSeek-Coder-V2-Lite-Instruct-GGUF\DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf";

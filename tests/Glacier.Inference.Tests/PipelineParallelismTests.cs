@@ -15,6 +15,7 @@ using Glacier.Inference.Sampling;
 using Xunit;
 using Xunit.Abstractions;
 
+[Collection("SequentialGpu")]
 public class PipelineParallelismTests
 {
     private readonly ITestOutputHelper _output;

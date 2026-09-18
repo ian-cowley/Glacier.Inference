@@ -24,10 +24,11 @@ public sealed partial class BpeTokenizer
     private static readonly char[] ByteToChar = new char[256];
     private static readonly Dictionary<char, byte> CharToByte = new(256);
 
-    // Qwen2 / GPT-2 regex pattern for pre-tokenization
-    private static readonly Regex TokenSplitterRegex = new(
-        @"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-        RegexOptions.Compiled);
+    private static readonly string[] CharToStringLut = new string[256];
+
+    // Qwen2 / GPT-2 source-generated regex pattern for Native AOT pre-tokenization
+    [GeneratedRegex(@"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")]
+    private static partial Regex GetTokenSplitterRegex();
 
     public int VocabSize => _idToToken.Length;
     public int EosTokenId { get; }
@@ -64,6 +65,7 @@ public sealed partial class BpeTokenizer
             char c = (char)cs[i];
             ByteToChar[b] = c;
             CharToByte[c] = b;
+            CharToStringLut[b] = c.ToString();
         }
     }
 
@@ -278,6 +280,8 @@ public sealed partial class BpeTokenizer
     {
         var result = new List<int>();
         int index = 0;
+        Span<byte> utf8StackBuffer = stackalloc byte[256];
+        List<string> word = new(64);
 
         while (index < text.Length)
         {
@@ -309,60 +313,64 @@ public sealed partial class BpeTokenizer
                 }
             }
 
-            // Slice substring before the next special token
-            string segment = text.Substring(index, nextSpecialIndex - index);
+            // Slice span before the next special token
+            ReadOnlySpan<char> segment = text.AsSpan(index, nextSpecialIndex - index);
             index = nextSpecialIndex;
 
-            // Pre-tokenize segment using regex
-            var matches = TokenSplitterRegex.Matches(segment);
-            foreach (Match match in matches)
+            // Pre-tokenize segment using source-generated regex with zero-allocation span enumeration
+            foreach (var match in GetTokenSplitterRegex().EnumerateMatches(segment))
             {
-                string matchText = match.Value;
-                byte[] utf8Bytes = Encoding.UTF8.GetBytes(matchText);
+                ReadOnlySpan<char> matchSpan = segment.Slice(match.Index, match.Length);
+                int maxBytes = Encoding.UTF8.GetMaxByteCount(matchSpan.Length);
+                byte[]? rentedBytes = null;
+                Span<byte> byteSpan = maxBytes <= 256 ? utf8StackBuffer : (rentedBytes = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes));
 
-                // Convert bytes to unicode BPE chars
-                var chars = new char[utf8Bytes.Length];
-                for (int i = 0; i < utf8Bytes.Length; i++)
+                try
                 {
-                    chars[i] = ByteToChar[utf8Bytes[i]];
-                }
-
-                // Initial word pieces
-                var word = new List<string>(chars.Length);
-                for (int i = 0; i < chars.Length; i++)
-                {
-                    word.Add(chars[i].ToString());
-                }
-
-                // Apply BPE merges
-                while (word.Count > 1)
-                {
-                    int bestRank = int.MaxValue;
-                    int bestIndex = -1;
-
-                    for (int i = 0; i < word.Count - 1; i++)
+                    int bytesWritten = Encoding.UTF8.GetBytes(matchSpan, byteSpan);
+                    word.Clear();
+                    for (int i = 0; i < bytesWritten; i++)
                     {
-                        string pair = $"{word[i]} {word[i + 1]}";
-                        if (_bpeRanks.TryGetValue(pair, out int rank) && rank < bestRank)
-                        {
-                            bestRank = rank;
-                            bestIndex = i;
-                        }
+                        word.Add(CharToStringLut[byteSpan[i]]);
                     }
 
-                    if (bestIndex == -1) break; // No more merges possible
-
-                    string merged = word[bestIndex] + word[bestIndex + 1];
-                    word[bestIndex] = merged;
-                    word.RemoveAt(bestIndex + 1);
-                }
-
-                // Map merged tokens to IDs
-                foreach (string piece in word)
-                {
-                    if (_tokenToId.TryGetValue(piece, out int id))
+                    // Apply BPE merges
+                    while (word.Count > 1)
                     {
-                        result.Add(id);
+                        int bestRank = int.MaxValue;
+                        int bestIndex = -1;
+
+                        for (int i = 0; i < word.Count - 1; i++)
+                        {
+                            string pair = $"{word[i]} {word[i + 1]}";
+                            if (_bpeRanks.TryGetValue(pair, out int rank) && rank < bestRank)
+                            {
+                                bestRank = rank;
+                                bestIndex = i;
+                            }
+                        }
+
+                        if (bestIndex == -1) break; // No more merges possible
+
+                        string merged = word[bestIndex] + word[bestIndex + 1];
+                        word[bestIndex] = merged;
+                        word.RemoveAt(bestIndex + 1);
+                    }
+
+                    // Map merged tokens to IDs
+                    foreach (string piece in word)
+                    {
+                        if (_tokenToId.TryGetValue(piece, out int id))
+                        {
+                            result.Add(id);
+                        }
+                    }
+                }
+                finally
+                {
+                    if (rentedBytes != null)
+                    {
+                        System.Buffers.ArrayPool<byte>.Shared.Return(rentedBytes);
                     }
                 }
             }

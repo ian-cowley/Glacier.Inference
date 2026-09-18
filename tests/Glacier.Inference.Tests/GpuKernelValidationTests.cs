@@ -13,6 +13,7 @@ using Glacier.Inference.Tokenizer;
 using Xunit;
 using Xunit.Abstractions;
 
+[Collection("SequentialGpu")]
 public unsafe class GpuKernelValidationTests
 {
     private readonly ITestOutputHelper _output;

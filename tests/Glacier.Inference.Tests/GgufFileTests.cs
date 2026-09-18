@@ -5,6 +5,7 @@ using System.IO;
 using Glacier.Inference.Gguf;
 using Xunit;
 
+[Collection("SequentialGpu")]
 public class GgufFileTests
 {
     private static readonly string LocalQwenPath = CudaFactAttribute.ModelPath;

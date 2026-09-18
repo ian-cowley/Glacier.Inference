@@ -10,6 +10,7 @@ using Glacier.Inference.Quant;
 using Vortice.D3DCompiler;
 using Xunit;
 
+[Collection("SequentialGpu")]
 public class D3D12ShaderTests
 {
     [Fact]

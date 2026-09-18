@@ -211,57 +211,105 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         _gateUpBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * gateUpDim * sizeof(float)));
     }
 
+    private const int ParallelAttentionSeqThreshold = 256;
+
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void ComputeAttentionToken(int stageLayer, int modelLayer, int pos, float* qHeadBase, float* outHeadBase, KVCache kvCache)
     {
-        Parallel.For(0, _nHeads, h =>
+        if (pos < ParallelAttentionSeqThreshold)
         {
-            int hKv = h / _groupSize;
-            float* qHead = qHeadBase + h * _headDim;
-            float* scores = _headScores + (long)h * _maxSeqLen;
-
-            // Score calculation Q * K^T
-            for (int t = 0; t <= pos; t++)
+            for (int h = 0; h < _nHeads; h++)
             {
-                float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
-                float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
-                scores[t] = dot * _attnScale;
+                EvaluateSingleHeadAttention(stageLayer, modelLayer, pos, qHeadBase, outHeadBase, kvCache, h);
             }
+            return;
+        }
 
-            // Softmax over 0..pos with optional attention sink logit
-            var layerWeights = _weights.Layers[modelLayer];
-            float? sinkLogit = layerWeights.AttnSinksWeight != null ? (float?)layerWeights.AttnSinksWeight[h] : null;
-            QuantKernels.Softmax(scores, pos + 1, sinkLogit);
+        int numChunks = Math.Min(Environment.ProcessorCount, 4);
+        int chunkSize = (_nHeads + numChunks - 1) / numChunks;
 
-            // Value aggregation
-            float* outHead = outHeadBase + h * _vHeadDim;
-            for (int d = 0; d < _vHeadDim; d++) outHead[d] = 0f;
+        Parallel.For(0, numChunks, chunkIdx =>
+        {
+            int startHead = chunkIdx * chunkSize;
+            int endHead = Math.Min(startHead + chunkSize, _nHeads);
 
-            for (int t = 0; t <= pos; t++)
+            for (int h = startHead; h < endHead; h++)
             {
-                float* vPast = kvCache.GetValuePtr(stageLayer, hKv, t);
-                float w = scores[t];
-
-                if (Vector256.IsHardwareAccelerated)
-                {
-                    var vw = Vector256.Create(w);
-                    for (int d = 0; d < _vHeadDim; d += 8)
-                    {
-                        var vo = Vector256.Load(outHead + d);
-                        var vv = Vector256.Load(vPast + d);
-                        vo += vw * vv;
-                        vo.Store(outHead + d);
-                    }
-                }
-                else
-                {
-                    for (int d = 0; d < _vHeadDim; d++)
-                    {
-                        outHead[d] += w * vPast[d];
-                    }
-                }
+                EvaluateSingleHeadAttention(stageLayer, modelLayer, pos, qHeadBase, outHeadBase, kvCache, h);
             }
         });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    private void EvaluateSingleHeadAttention(
+        int stageLayer,
+        int modelLayer,
+        int pos,
+        float* qHeadBase,
+        float* outHeadBase,
+        KVCache kvCache,
+        int h)
+    {
+        int hKv = h / _groupSize;
+        float* qHead = qHeadBase + h * _headDim;
+        float* scores = _headScores + (long)h * _maxSeqLen;
+
+        // Score calculation Q * K^T
+        for (int t = 0; t <= pos; t++)
+        {
+            float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
+            float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
+            scores[t] = dot * _attnScale;
+        }
+
+        // Softmax over 0..pos with optional attention sink logit
+        var layerWeights = _weights.Layers[modelLayer];
+        float? sinkLogit = layerWeights.AttnSinksWeight != null ? (float?)layerWeights.AttnSinksWeight[h] : null;
+        QuantKernels.Softmax(scores, pos + 1, sinkLogit);
+
+        // Value aggregation
+        float* outHead = outHeadBase + h * _vHeadDim;
+        for (int d = 0; d < _vHeadDim; d++) outHead[d] = 0f;
+
+        for (int t = 0; t <= pos; t++)
+        {
+            float* vPast = kvCache.GetValuePtr(stageLayer, hKv, t);
+            float w = scores[t];
+
+            if (Vector512.IsHardwareAccelerated && _vHeadDim >= 16)
+            {
+                var vw = Vector512.Create(w);
+                int d = 0;
+                for (; d <= _vHeadDim - 16; d += 16)
+                {
+                    var vo = Vector512.Load(outHead + d);
+                    var vv = Vector512.Load(vPast + d);
+                    vo = Vector512.FusedMultiplyAdd(vw, vv, vo);
+                    vo.Store(outHead + d);
+                }
+                for (; d < _vHeadDim; d++) outHead[d] += w * vPast[d];
+            }
+            else if (Vector256.IsHardwareAccelerated)
+            {
+                var vw = Vector256.Create(w);
+                int d = 0;
+                for (; d <= _vHeadDim - 8; d += 8)
+                {
+                    var vo = Vector256.Load(outHead + d);
+                    var vv = Vector256.Load(vPast + d);
+                    vo += vw * vv;
+                    vo.Store(outHead + d);
+                }
+                for (; d < _vHeadDim; d++) outHead[d] += w * vPast[d];
+            }
+            else
+            {
+                for (int d = 0; d < _vHeadDim; d++)
+                {
+                    outHead[d] += w * vPast[d];
+                }
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]

@@ -9,14 +9,35 @@ using Xunit;
 
 namespace Glacier.Inference.Tests;
 
+public sealed class Llama3FactAttribute : FactAttribute
+{
+    public Llama3FactAttribute()
+    {
+        try
+        {
+            if (!File.Exists(Llama3DiscoveryTests.Llama3Path))
+            {
+                Skip = $"Llama 3 model file not found at '{Llama3DiscoveryTests.Llama3Path}'.";
+            }
+        }
+        catch
+        {
+            Skip = $"Llama 3 model file not found or inaccessible at '{Llama3DiscoveryTests.Llama3Path}'.";
+        }
+    }
+}
+
+[Collection("SequentialGpu")]
 public class Llama3DiscoveryTests
 {
-    private const string Llama3Path = @"D:\lmstudio\models\lmstudio-community\Meta-Llama-3.1-8B-Instruct-GGUF\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
+    public const string Llama3Path = @"D:\lmstudio\models\lmstudio-community\Meta-Llama-3.1-8B-Instruct-GGUF\Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
 
-    [Fact]
+    [Llama3Fact]
     public void Llama3_Tokenizer_CanEncodeAndDecode()
     {
-        if (!File.Exists(Llama3Path)) return;
+        bool exists = false;
+        try { exists = File.Exists(Llama3Path); } catch { exists = false; }
+        if (!exists) return;
 
         using var gguf = GgufFile.Open(Llama3Path);
         var tokenizer = new BpeTokenizer(gguf);
@@ -29,10 +50,12 @@ public class Llama3DiscoveryTests
         Assert.Equal(sample, decoded);
     }
 
-    [Fact]
+    [Llama3Fact]
     public void Llama3_GeneratesCoherentLogits()
     {
-        if (!File.Exists(Llama3Path)) return;
+        bool exists = false;
+        try { exists = File.Exists(Llama3Path); } catch { exists = false; }
+        if (!exists) return;
 
         using var gguf = GgufFile.Open(Llama3Path);
         var weights = new ModelWeights(gguf);

@@ -463,6 +463,55 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
     }
 
+    /// <summary>
+    /// Extracts a normalized vector embedding for the given input text.
+    /// Runs directly through the in-process hardware engine with zero IPC serialization.
+    /// </summary>
+    public void ExtractEmbedding(
+        ReadOnlySpan<char> text,
+        Span<float> destination,
+        PoolingStrategy strategy = PoolingStrategy.LastToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (text.IsEmpty)
+        {
+            destination.Slice(0, Math.Min(destination.Length, _weights.EmbeddingLength)).Clear();
+            return;
+        }
+
+        int[] tokens = _tokenizer.Encode(text.ToString());
+        ExtractEmbedding(tokens, destination, strategy);
+    }
+
+    /// <summary>
+    /// Extracts a normalized vector embedding for pre-tokenized inputs.
+    /// </summary>
+    public void ExtractEmbedding(
+        ReadOnlySpan<int> tokens,
+        Span<float> destination,
+        PoolingStrategy strategy = PoolingStrategy.LastToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (_pipelineSession != null)
+            _pipelineSession.ResetKvCache();
+        else
+            _kvCache?.Reset();
+
+        if (_gpuModel != null)
+        {
+            _gpuModel.ExtractEmbedding(tokens, destination, strategy);
+        }
+        else if (_cpuModel != null && _kvCache != null)
+        {
+            _cpuModel.ExtractEmbedding(tokens, destination, _kvCache, strategy);
+        }
+        else
+        {
+            throw new NotSupportedException("Embedding extraction is not supported on the active engine configuration.");
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)

@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
@@ -440,6 +441,62 @@ public sealed unsafe partial class Qwen2GpuModel
                 {
                     _gpu.CopyToHost((IntPtr)pOut, _dXBatch, (nuint)(batchSize * _dim * sizeof(float)));
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Extracts a normalized embedding vector on the GPU using the specified pooling strategy.
+    /// </summary>
+    public void ExtractEmbedding(
+        ReadOnlySpan<int> tokens,
+        Span<float> destination,
+        PoolingStrategy strategy = PoolingStrategy.LastToken)
+    {
+        if (destination.Length < _dim)
+            throw new ArgumentException($"Destination span too small. Expected {_dim}, got {destination.Length}", nameof(destination));
+
+        destination.Slice(0, _dim).Clear();
+        if (tokens.IsEmpty) return;
+
+        // Forward batch without logits
+        ForwardBatch(tokens, 0, Span<float>.Empty, computeLogits: false);
+
+        int totalTokens = tokens.Length;
+        int lastBatchSize = totalTokens % MaxBatchSize;
+        if (lastBatchSize == 0 && totalTokens > 0) lastBatchSize = MaxBatchSize;
+
+        // Last token hidden state on GPU
+        int lastTokenIdx = lastBatchSize - 1;
+        IntPtr dXLast = _dXBatch + lastTokenIdx * _dim * sizeof(float);
+
+        // Final RMSNorm in VRAM
+        LaunchRmsNorm(dXLast, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+
+        // Copy normalized embedding from GPU VRAM to CPU destination
+        fixed (float* pDst = destination)
+        {
+            _gpu.CopyToHost((IntPtr)pDst, _dNormX, (nuint)(_dim * sizeof(float)));
+        }
+
+        // L2 Normalize
+        NormalizeL2Vector(destination.Slice(0, _dim));
+    }
+
+    private static void NormalizeL2Vector(Span<float> vec)
+    {
+        float sumSq = 0f;
+        for (int i = 0; i < vec.Length; i++)
+        {
+            sumSq += vec[i] * vec[i];
+        }
+
+        if (sumSq > 0f)
+        {
+            float invNorm = 1.0f / MathF.Sqrt(sumSq);
+            for (int i = 0; i < vec.Length; i++)
+            {
+                vec[i] *= invNorm;
             }
         }
     }

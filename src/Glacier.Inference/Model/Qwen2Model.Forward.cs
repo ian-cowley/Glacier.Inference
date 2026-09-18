@@ -2,6 +2,7 @@ namespace Glacier.Inference.Model;
 
 using System;
 using System.Runtime.CompilerServices;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Quant;
@@ -610,6 +611,88 @@ public sealed unsafe partial class Qwen2Model
                 {
                     Buffer.MemoryCopy(_xBatch, pOut, (ulong)(batchSize * _dim * sizeof(float)), (ulong)(batchSize * _dim * sizeof(float)));
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Extracts a normalized embedding vector for the given token sequence using the specified pooling strategy.
+    /// Bypasses the LM Head projection for maximum throughput.
+    /// </summary>
+    public void ExtractEmbedding(
+        ReadOnlySpan<int> tokens,
+        Span<float> destination,
+        KVCache kvCache,
+        PoolingStrategy strategy = PoolingStrategy.LastToken)
+    {
+        if (destination.Length < _dim)
+            throw new ArgumentException($"Destination span too small. Expected {_dim}, got {destination.Length}", nameof(destination));
+
+        destination.Slice(0, _dim).Clear();
+        if (tokens.IsEmpty) return;
+
+        // Forward tokens through transformer layers
+        ForwardBatch(tokens, 0, Span<float>.Empty, kvCache, computeLogits: false);
+
+        int totalTokens = tokens.Length;
+        int lastBatchSize = totalTokens % MaxBatchSize;
+        if (lastBatchSize == 0 && totalTokens > 0) lastBatchSize = MaxBatchSize;
+
+        if (strategy == PoolingStrategy.LastToken)
+        {
+            // The last token in the sequence is at (lastBatchSize - 1) in _xBatch
+            float* xLast = _xBatch + (lastBatchSize - 1) * _dim;
+            fixed (float* pDst = destination)
+            {
+                QuantKernels.RMSNorm(xLast, _weights.OutNormWeight, pDst, _dim, _weights.RmsNormEps);
+            }
+        }
+        else // MeanPooling
+        {
+            int count = Math.Min(totalTokens, MaxBatchSize);
+            Span<float> tempNorm = stackalloc float[Math.Min(_dim, 4096)];
+            bool useHeap = _dim > 4096;
+            float[]? heapArr = useHeap ? new float[_dim] : null;
+            Span<float> normBuffer = useHeap ? heapArr.AsSpan() : tempNorm;
+
+            fixed (float* pNorm = normBuffer)
+            {
+                for (int t = 0; t < count; t++)
+                {
+                    float* xt = _xBatch + t * _dim;
+                    QuantKernels.RMSNorm(xt, _weights.OutNormWeight, pNorm, _dim, _weights.RmsNormEps);
+                    for (int d = 0; d < _dim; d++)
+                    {
+                        destination[d] += normBuffer[d];
+                    }
+                }
+            }
+
+            float invCount = 1.0f / count;
+            for (int d = 0; d < _dim; d++)
+            {
+                destination[d] *= invCount;
+            }
+        }
+
+        // L2 Normalize to unit vector
+        NormalizeL2Vector(destination.Slice(0, _dim));
+    }
+
+    private static void NormalizeL2Vector(Span<float> vec)
+    {
+        float sumSq = 0f;
+        for (int i = 0; i < vec.Length; i++)
+        {
+            sumSq += vec[i] * vec[i];
+        }
+
+        if (sumSq > 0f)
+        {
+            float invNorm = 1.0f / MathF.Sqrt(sumSq);
+            for (int i = 0; i < vec.Length; i++)
+            {
+                vec[i] *= invNorm;
             }
         }
     }

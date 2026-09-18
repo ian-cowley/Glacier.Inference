@@ -7,6 +7,7 @@ using Glacier.Inference.Gpu;
 using Glacier.Inference.Hardware;
 using Xunit;
 
+[Collection("SequentialGpu")]
 public class DeviceManagerTests
 {
     [Fact]

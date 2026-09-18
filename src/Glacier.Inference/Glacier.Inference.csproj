@@ -12,7 +12,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.2</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Universal pure C# .NET 10 LLM inference engine supporting Meta Llama 3, DeepSeek V2/V3/R1 (MLA + MoE), Microsoft Phi-3/Phi-4 (fused QKV/SwiGLU), Mistral/Devstral, and Alibaba Qwen 2/2.5. Native AOT compatible, zero-copy GGUF memory-mapped files, AVX-512/AVX2 quantized SIMD kernels, bare-metal GPU acceleration, and universal ChatML tokenizers. Zero Python, zero C++ runtime dependencies.</Description>
