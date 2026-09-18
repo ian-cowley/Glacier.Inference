@@ -6,9 +6,12 @@
 
 ### Universal Pure C# .NET 10 LLM Engine & Server Runtime
 
-[![CI](https://github.com/ian-cowley/Glacier.Inference/actions/workflows/publish-nuget.yml/badge.svg)](https://github.com/ian-cowley/Glacier.Inference/actions)
-[![NuGet](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
+[![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
+[![NuGet Version](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference/)
+[![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
+[![CI](https://github.com/ian-cowley/Glacier.Inference/actions/workflows/publish-nuget.yml/badge.svg)](https://github.com/ian-cowley/Glacier.Inference/actions)
 
 ```text
 ========================================================================================================
