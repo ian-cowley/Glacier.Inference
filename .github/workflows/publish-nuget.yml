@@ -29,8 +29,24 @@ jobs:
 
       - name: Setup NuGet sources
         run: |
-          mkdir -p ../nuget-local || true
+          mkdir -p ../nuget-local
           dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
+
+      - name: Wait for upstream NuGet packages to be available
+        run: |
+          wait_for_nuget() {
+            local pkg=$1 ver=$2 timeout=1200 elapsed=0
+            echo "Waiting for $pkg $ver on nuget.org..."
+            until curl -sf "https://api.nuget.org/v3-flatcontainer/${pkg,,}/${ver}/${pkg,,}.${ver}.nupkg" -o /dev/null; do
+              if [ $elapsed -ge $timeout ]; then echo "TIMEOUT waiting for $pkg $ver" && exit 1; fi
+              echo "  $pkg $ver not yet available, retrying in 30s (${elapsed}s elapsed)..."
+              sleep 30; elapsed=$((elapsed+30))
+            done
+            echo "  $pkg $ver is available."
+          }
+          wait_for_nuget Glacier.Polaris 1.0.17
+          wait_for_nuget Glacier.Gpu 1.0.7
+          wait_for_nuget Glacier.Tensor 1.0.7
 
       - name: Restore dependencies
         run: dotnet restore
@@ -55,29 +71,22 @@ jobs:
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
         run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
 
+
       - name: Publish Standalone CLI Binaries
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           mkdir -p release-assets
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-
-          # Windows x64
           dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/win-x64
           zip -j "release-assets/glacier-${TAG_NAME}-win-x64.zip" publish/win-x64/glacier.exe
-
-          # Windows ARM64 (Snapdragon X Elite)
           dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r win-arm64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/win-arm64
           zip -j "release-assets/glacier-${TAG_NAME}-win-arm64.zip" publish/win-arm64/glacier.exe
-
-          # Linux x64
           dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/linux-x64
           tar -czf "release-assets/glacier-${TAG_NAME}-linux-x64.tar.gz" -C publish/linux-x64 glacier
-
-          # macOS ARM64 (Apple Silicon)
           dotnet publish src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj -c Release -r osx-arm64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish/osx-arm64
           tar -czf "release-assets/glacier-${TAG_NAME}-osx-arm64.tar.gz" -C publish/osx-arm64 glacier
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (Inference with CLI binaries)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
