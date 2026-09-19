@@ -596,6 +596,15 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 
 ---
 
+## 🆕 What's New in v1.2.2
+
+- **`Vector512<float>` and `AdvSimd` Q4_K / Q5_K / Q6_K quantised dot-product kernels** — saturates AVX-512 FMA throughput on Zen 5 and Apple Silicon for all major K-quant levels.
+- **Operator precedence bug fix in quantisation decode path** — correctness fix in the dequantisation formula that produced subtly incorrect logits on Q5_K models.
+- **`[GeneratedRegex]` source-generated BPE tokeniser** — zero-allocation, AOT-safe tokenisation replacing the previous runtime-compiled regex.
+- **4 new adversarial tests** — total test count grows to **105 tests** (100 %).
+
+---
+
 ## Credits
 
 Developed by Ian Cowley and Antigravity (Google DeepMind).
