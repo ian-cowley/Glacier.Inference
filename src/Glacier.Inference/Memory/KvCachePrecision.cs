@@ -8,7 +8,7 @@ public enum KvCachePrecision
     /// <summary>
     /// Automatically selects optimal precision based on context length and GPU VRAM capacity:
     /// - For maxSeqLen &lt;= 4096: FP16 (lossless, 2x VRAM reduction vs FP32)
-    /// - For maxSeqLen &gt; 4096: FP8 (4x VRAM reduction, native Ada Lovelace sm_89 silicon)
+    /// - For maxSeqLen &gt; 4096: FP8 (4x VRAM reduction, native Ada Lovelace sm_89 and AMD RDNA 4 / RDNA 3 WMMA silicon)
     /// </summary>
     Auto = 0,
 
@@ -23,7 +23,7 @@ public enum KvCachePrecision
     Fp16 = 2,
 
     /// <summary>
-    /// 8-bit floating point e4m3 (1 byte per element, 4x compression, native Ada Lovelace instructions).
+    /// 8-bit floating point e4m3 (1 byte per element, 4x compression, native Ada Lovelace sm_89 and AMD RDNA 4.0 gfx1200 WMMA instructions).
     /// </summary>
     Fp8 = 3
 }
