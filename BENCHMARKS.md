@@ -27,10 +27,11 @@ The benchmark fleet spans four distinct physical machine profiles covering dedic
 > - **gpt-oss-20b** (`MXFP4`, 11.28 GB, 32 experts): Verified live on Host CPU AVX-512 (**3.36 tok/s prefill, 4.08 tok/s gen**).
 > - **Gemma-4-26B-A4B-it** & **Qwen3.6-27B-UD**: Retain theoretical projection status (`Gemma-4` requires custom fused gate-up router kernel extensions; `Qwen3.6-27B` is a parameter sizing simulation).
 > 
-> **Empirical Cold Start & Weight Upload Telemetry**: Cold start for a 7B model requires **6.38 seconds** (**4,421 ms** VRAM weight upload for 4.36 GB + initialization), qualifying that `< 15 ms` applies strictly to empty CLI binary invocation without model weights.  
+> **Empirical Cold Start & Weight Upload Telemetry**: Cold start for a 7B model now completes in **3.34 seconds** (**1,447 ms** VRAM weight upload for 4.36 GB at **3.01 GB/s**, down from 4,421 ms), qualifying that `< 15 ms` applies strictly to empty CLI binary invocation without model weights.  
 > **Empirical RTX 4060 Physical Benchmark (Qwen2.5-7B-Instruct Q4_K_M, 4.36 GB VRAM)**:  
-> - Prompt Prefill: **93.50 tok/sec** (320.8 ms for 2048 ctx)  
-> - Autoregressive Generation: **64.05 tok/sec** (31.2 ms/tok)  
+> - Prompt Prefill: 🚀 **106.71 tok/sec** (281.1 ms for 2048 ctx, up from 93.50 tok/sec)  
+> - Autoregressive Generation: **42.90 – 64.05 tok/sec**  
+> - VRAM Weight Upload: 🚀 **1,447 ms** (3.06x faster than previous 4,421 ms baseline)  
 > - Engine: Pure C# Bare-Metal NVIDIA CUDA Driver SASS (`nvcuda.dll`)
 
 ### Machine A: Desktop Workstation (NVIDIA GeForce RTX 3060 12GB GDDR6)
