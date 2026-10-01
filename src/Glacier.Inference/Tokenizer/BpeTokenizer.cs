@@ -255,24 +255,7 @@ public sealed partial class BpeTokenizer
             return sb.ToString();
         }
 
-        // 5. Qwen 3.5 / 3.6 Hybrid models with native thinking
-        if (_architecture.Equals("qwen35", StringComparison.OrdinalIgnoreCase))
-        {
-            var sb = new StringBuilder();
-            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
-            {
-                sb.Append("<|im_start|>system\n");
-                sb.Append(systemPrompt);
-                sb.Append("<|im_end|>\n");
-            }
-            sb.Append("<|im_start|>user\n");
-            sb.Append(prompt);
-            sb.Append("<|im_end|>\n");
-            sb.Append("<|im_start|>assistant\n<think>\n");
-            return sb.ToString();
-        }
-
-        // 6. Standard ChatML format (Qwen2, Qwen3, MiMo)
+        // 5. Standard ChatML format (Qwen2, Qwen3, MiMo)
         {
             var sb = new StringBuilder();
             if (!string.IsNullOrEmpty(systemPrompt))
