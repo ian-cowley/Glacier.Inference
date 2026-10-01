@@ -98,3 +98,16 @@ public unsafe struct BlockMXFP4
     public fixed byte Qs[16];
 }
 
+/// <summary>
+/// IQ4_XS (Type 23) quantization super-block: 256 elements in 136 bytes.
+/// Non-linear 4-bit quantization with 8 sub-blocks of 32 using kvalues_iq4nl lookup table.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ4_XS
+{
+    public Half Delta;            // 2 bytes
+    public ushort ScalesH;        // 2 bytes (high 2 bits of the 8 6-bit scales)
+    public fixed byte ScalesL[4]; // 4 bytes (low 4 bits of the 8 6-bit scales, 2 per byte)
+    public fixed byte Qs[128];    // 128 bytes (4-bit table indices for 256 elements)
+}
+

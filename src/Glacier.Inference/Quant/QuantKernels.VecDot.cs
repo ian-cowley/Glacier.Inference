@@ -1131,4 +1131,53 @@ public static unsafe partial class QuantKernels
         return sum;
     }
 
+    /// <summary>
+    /// Non-linear 16-entry codebook for IQ4_NL and IQ4_XS (kvalues_iq4nl).
+    /// </summary>
+    public static readonly float[] KValuesIq4Nl =
+    [
+        -127f, -104f, -83f, -65f, -49f, -35f, -22f, -10f,
+           1f,   13f,  25f,  38f,  53f,  69f,  89f, 113f
+    ];
+
+    /// <summary>
+    /// Computes dot product between an IQ4_XS quantized row and a float vector x of length k.
+    /// Super-block size is 256 elements in 136 bytes (8 sub-blocks of 32).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotIQ4_XS(BlockIQ4_XS* row, float* x, int k)
+    {
+        int nb = k / QK_K;
+        float totalSum = 0f;
+
+        fixed (float* kValues = KValuesIq4Nl)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                ushort scalesH = row[i].ScalesH;
+                byte* scalesL = row[i].ScalesL;
+                byte* qs = row[i].Qs;
+
+                for (int ib = 0; ib < 8; ib++)
+                {
+                    int ls = ((scalesL[ib / 2] >> (4 * (ib % 2))) & 0x0F) | (((scalesH >> (2 * ib)) & 3) << 4);
+                    float dl = d * (ls - 32);
+
+                    float subSum = 0f;
+                    for (int j = 0; j < 16; j++)
+                    {
+                        byte q = qs[j];
+                        subSum += x[j] * kValues[q & 0x0F] + x[j + 16] * kValues[q >> 4];
+                    }
+
+                    totalSum += dl * subSum;
+                    x += 32;
+                    qs += 16;
+                }
+            }
+        }
+
+        return totalSum;
+    }
 }

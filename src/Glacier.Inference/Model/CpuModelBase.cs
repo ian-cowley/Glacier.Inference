@@ -257,6 +257,17 @@ public abstract unsafe class CpuModelBase : ICpuModel
                 QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, shexpFfnDim);
                 QuantKernels.MatVecMul(layer.FfnDownShexpType, layer.FfnDownShexpWeight, _ffnAct, _expertDownOut, shexpFfnDim, _dim, _ffnActSums);
 
+                // Modulate by shared expert gate if present (Qwen 3.5 MoE)
+                if (layer.FfnGateInpShexpWeight != null)
+                {
+                    float gateVal = QuantKernels.VecDotF32(_normX, layer.FfnGateInpShexpWeight, _dim);
+                    float shexpGate = 1.0f / (1.0f + MathF.Exp(-gateVal));
+                    for (int d = 0; d < _dim; d++)
+                    {
+                        _expertDownOut[d] *= shexpGate;
+                    }
+                }
+
                 AddVector(_ffnOut, _expertDownOut, _dim);
             }
 
@@ -496,6 +507,17 @@ public abstract unsafe class CpuModelBase : ICpuModel
                     QuantKernels.SwiGLU(_gate, _up, _ffnAct, shexpFfnDim);
                     QuantKernels.ComputeBlockSums32(_ffnAct, _ffnActSums, shexpFfnDim);
                     QuantKernels.MatVecMul(layer.FfnDownShexpType, layer.FfnDownShexpWeight, _ffnAct, _expertDownOut, shexpFfnDim, _dim, _ffnActSums);
+
+                    // Modulate by shared expert gate if present (Qwen 3.5 MoE)
+                    if (layer.FfnGateInpShexpWeight != null)
+                    {
+                        float gateVal = QuantKernels.VecDotF32(normXt, layer.FfnGateInpShexpWeight, _dim);
+                        float shexpGate = 1.0f / (1.0f + MathF.Exp(-gateVal));
+                        for (int d = 0; d < _dim; d++)
+                        {
+                            _expertDownOut[d] *= shexpGate;
+                        }
+                    }
 
                     AddVector(ffnOutt, _expertDownOut, _dim);
                 }

@@ -37,6 +37,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
 
     // Preallocated standard attention scratch buffers for interleaved full-attention layers
     private float* _q;
+    private float* _qFull;
+    private float* _qGate;
     private float* _k;
     private float* _v;
     private float* _attnOut;
@@ -46,6 +48,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
 
     // Batched standard attention scratch buffers
     private float* _qBatch;
+    private float* _qFullBatch;
+    private float* _qGateBatch;
     private float* _kBatch;
     private float* _vBatch;
     private float* _attnOutBatch;
@@ -97,6 +101,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         int attnOutChunks = (_dim + 31) / 32;
 
         _q = (float*)NativeMemory.AllocZeroed((nuint)(qDim * sizeof(float)));
+        _qFull = (float*)NativeMemory.AllocZeroed((nuint)(2 * qDim * sizeof(float)));
+        _qGate = (float*)NativeMemory.AllocZeroed((nuint)(qDim * sizeof(float)));
         _k = (float*)NativeMemory.AllocZeroed((nuint)(kvDim * sizeof(float)));
         _v = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(maxAttnOut * sizeof(float)));
@@ -107,6 +113,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         _headScores = (float*)NativeMemory.AllocZeroed((nuint)scoreBufferSize);
 
         _qBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qDim * sizeof(float)));
+        _qFullBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * 2 * qDim * sizeof(float)));
+        _qGateBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qDim * sizeof(float)));
         _kBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * kvDim * sizeof(float)));
         _vBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
@@ -286,11 +294,28 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
 
-        QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
+        if (layer.HasQGate)
+        {
+            QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _qFull, _dim, 2 * qDim, _normXSums);
+            if (layer.QBias != null) AddVector(_qFull, layer.QBias, 2 * qDim);
+
+            // Split interleaved heads: for each head h, first headDim is Q, second headDim is Q-Gate
+            for (int h = 0; h < _nHeads; h++)
+            {
+                float* srcHead = _qFull + h * (2 * _headDim);
+                Buffer.MemoryCopy(srcHead, _q + h * _headDim, (ulong)(_headDim * sizeof(float)), (ulong)(_headDim * sizeof(float)));
+                Buffer.MemoryCopy(srcHead + _headDim, _qGate + h * _headDim, (ulong)(_headDim * sizeof(float)), (ulong)(_headDim * sizeof(float)));
+            }
+        }
+        else
+        {
+            QuantKernels.MatVecMul(layer.QType, layer.QWeight, _normX, _q, _dim, qDim, _normXSums);
+            if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
+        }
+
         QuantKernels.MatVecMul(layer.KType, layer.KWeight, _normX, _k, _dim, kvDim, _normXSums);
         QuantKernels.MatVecMul(layer.VType, layer.VWeight, _normX, _v, _dim, kvDim, _normXSums);
 
-        if (layer.QBias != null) AddVector(_q, layer.QBias, qDim);
         if (layer.KBias != null) AddVector(_k, layer.KBias, kvDim);
         if (layer.VBias != null) AddVector(_v, layer.VBias, kvDim);
 
@@ -317,6 +342,15 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         if (kvCache != null)
         {
             ComputeStandardAttentionToken(stageLayer, modelLayer, pos, _q, _attnOut, kvCache);
+        }
+
+        if (layer.HasQGate)
+        {
+            for (int j = 0; j < qDim; j++)
+            {
+                float sig = 1.0f / (1.0f + MathF.Exp(-_qGate[j]));
+                _attnOut[j] *= sig;
+            }
         }
 
         QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
@@ -381,15 +415,43 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             int qDim = _nHeads * _headDim;
             int kvDim = _nHeadsKv * _headDim;
 
-            QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
+            if (layer.HasQGate)
+            {
+                QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qFullBatch, _dim, 2 * qDim, batchSize, _normXSumBatch);
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* qFull = _qFullBatch + t * (2 * qDim);
+                    if (layer.QBias != null) AddVector(qFull, layer.QBias, 2 * qDim);
+
+                    float* q = _qBatch + t * qDim;
+                    float* qGate = _qGateBatch + t * qDim;
+                    for (int h = 0; h < _nHeads; h++)
+                    {
+                        float* srcHead = qFull + h * (2 * _headDim);
+                        Buffer.MemoryCopy(srcHead, q + h * _headDim, (ulong)(_headDim * sizeof(float)), (ulong)(_headDim * sizeof(float)));
+                        Buffer.MemoryCopy(srcHead + _headDim, qGate + h * _headDim, (ulong)(_headDim * sizeof(float)), (ulong)(_headDim * sizeof(float)));
+                    }
+                }
+            }
+            else
+            {
+                QuantKernels.MatMulBatch(layer.QType, layer.QWeight, _normXBatch, _qBatch, _dim, qDim, batchSize, _normXSumBatch);
+                if (layer.QBias != null)
+                {
+                    for (int t = 0; t < batchSize; t++)
+                    {
+                        AddVector(_qBatch + t * qDim, layer.QBias, qDim);
+                    }
+                }
+            }
+
             QuantKernels.MatMulBatch(layer.KType, layer.KWeight, _normXBatch, _kBatch, _dim, kvDim, batchSize, _normXSumBatch);
             QuantKernels.MatMulBatch(layer.VType, layer.VWeight, _normXBatch, _vBatch, _dim, kvDim, batchSize, _normXSumBatch);
 
-            if (layer.QBias != null || layer.KBias != null || layer.VBias != null)
+            if (layer.KBias != null || layer.VBias != null)
             {
                 for (int t = 0; t < batchSize; t++)
                 {
-                    if (layer.QBias != null) AddVector(_qBatch + t * qDim, layer.QBias, qDim);
                     if (layer.KBias != null) AddVector(_kBatch + t * kvDim, layer.KBias, kvDim);
                     if (layer.VBias != null) AddVector(_vBatch + t * kvDim, layer.VBias, kvDim);
                 }
@@ -425,6 +487,20 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
                 if (kvCache != null)
                 {
                     ComputeStandardAttentionToken(stageLayer, modelLayer, pos, q, _attnOutBatch + t * qDim, kvCache);
+                }
+            }
+
+            if (layer.HasQGate)
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* attnOut = _attnOutBatch + t * qDim;
+                    float* qGate = _qGateBatch + t * qDim;
+                    for (int j = 0; j < qDim; j++)
+                    {
+                        float sig = 1.0f / (1.0f + MathF.Exp(-qGate[j]));
+                        attnOut[j] *= sig;
+                    }
                 }
             }
 
@@ -464,6 +540,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             FreeIfAllocated(ref _gdnYSums);
 
             FreeIfAllocated(ref _q);
+            FreeIfAllocated(ref _qFull);
+            FreeIfAllocated(ref _qGate);
             FreeIfAllocated(ref _k);
             FreeIfAllocated(ref _v);
             FreeIfAllocated(ref _attnOut);
@@ -472,6 +550,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             FreeIfAllocated(ref _headScores);
 
             FreeIfAllocated(ref _qBatch);
+            FreeIfAllocated(ref _qFullBatch);
+            FreeIfAllocated(ref _qGateBatch);
             FreeIfAllocated(ref _kBatch);
             FreeIfAllocated(ref _vBatch);
             FreeIfAllocated(ref _attnOutBatch);

@@ -112,6 +112,12 @@ public sealed unsafe class LayerWeights
 
     public byte* FfnDownShexpWeight { get; init; }
     public GgufType FfnDownShexpType { get; init; }
+
+    // Qwen 3.5 / 3.6 Q-Gate (attn_q outputs query + gate)
+    public bool HasQGate { get; init; }
+
+    // Shared Expert Gate (Qwen 3.5 MoE: ffn_gate_inp_shexp)
+    public float* FfnGateInpShexpWeight { get; init; }
 }
 
 /// <summary>
@@ -294,6 +300,7 @@ public sealed unsafe class ModelWeights
             float* kvANormWeight = null;
             byte* kvBWeight = null;
             GgufType kvBType = GgufType.F32;
+            bool hasQGate = false;
 
             if (isGdn)
             {
@@ -344,6 +351,10 @@ public sealed unsafe class ModelWeights
                 {
                     qWeight = gguf.GetTensorPointer(q);
                     qType = q.Type;
+                    if (q.Dimensions.Length > 1 && q.Dimensions[1] == 2 * (ulong)(HeadCount * HeadDim))
+                    {
+                        hasQGate = true;
+                    }
                     if (gguf.TryGetTensor($"blk.{l}.attn_q.bias", out var qBias) && qBias != null)
                     {
                         qb = (float*)gguf.GetTensorPointer(qBias);
@@ -480,6 +491,7 @@ public sealed unsafe class ModelWeights
             GgufType shexpUpType = GgufType.F32;
             byte* shexpDownWeight = null;
             GgufType shexpDownType = GgufType.F32;
+            float* shexpGateInpWeight = null;
 
             if (hasMoE)
             {
@@ -525,7 +537,10 @@ public sealed unsafe class ModelWeights
                     gateInpBias = (float*)gguf.GetTensorPointer(expProbsB);
                 }
 
-                // Check for shared expert
+                if (gguf.TryGetTensor($"blk.{l}.ffn_gate_inp_shexp.weight", out var ffnGateInpShexp) && ffnGateInpShexp != null)
+                {
+                    shexpGateInpWeight = (float*)gguf.GetTensorPointer(ffnGateInpShexp);
+                }
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var ffnGateShexp) && ffnGateShexp != null)
                 {
                     shexpGateWeight = gguf.GetTensorPointer(ffnGateShexp);
@@ -599,6 +614,7 @@ public sealed unsafe class ModelWeights
                 AttnKNormWeight = kNorm != null ? (float*)gguf.GetTensorPointer(kNorm) : null,
                 AttnSinksWeight = attnSinks != null ? (float*)gguf.GetTensorPointer(attnSinks) : null,
                 IsGdn = isGdn,
+                HasQGate = hasQGate,
                 AttnGateWeight = attnGateWeight,
                 AttnGateType = attnGateType,
                 SsmConv1dWeight = ssmConv1dWeight,
@@ -630,6 +646,7 @@ public sealed unsafe class ModelWeights
                 FfnDownExpsWeight = downExpsWeight,
                 FfnDownExpsType = downExpsType,
                 FfnDownExpsBias = downExpsBias,
+                FfnGateInpShexpWeight = shexpGateInpWeight,
                 FfnGateShexpWeight = shexpGateWeight,
                 FfnGateShexpType = shexpGateType,
                 FfnUpShexpWeight = shexpUpWeight,

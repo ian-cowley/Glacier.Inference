@@ -128,6 +128,7 @@ public static unsafe partial class QuantKernels
             GgufType.Q5_K => VecDotQ5_K((BlockQ5_K*)rowPtr, x, nCols),
             GgufType.Q3_K => VecDotQ3_K((BlockQ3_K*)rowPtr, x, nCols),
             GgufType.MXFP4 => VecDotMXFP4((BlockMXFP4*)rowPtr, x, nCols),
+            GgufType.IQ4_XS => VecDotIQ4_XS((BlockIQ4_XS*)rowPtr, x, nCols),
             GgufType.F16 => VecDotF16((Half*)rowPtr, x, nCols),
             GgufType.F32 => VecDotF32((float*)rowPtr, x, nCols),
             _ => throw new NotSupportedException($"Quantization type {type} is not supported in hardware GEMV kernels.")

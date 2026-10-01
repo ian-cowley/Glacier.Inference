@@ -422,5 +422,38 @@ public unsafe class QuantKernelTests
             Assert.Equal(46.0f, dot, 1e-4f);
         }
     }
+
+    [Fact]
+    public void IQ4_XS_DequantizeAndVecDot_MatchesExpected()
+    {
+        BlockIQ4_XS block = new BlockIQ4_XS();
+        block.Delta = (Half)1.0f;
+        // For ib = 0: scalesL[0] low nibble = 1, scalesH low 2 bits = 2 -> (2 << 4) | 1 = 33.
+        // ls = 33, so (ls - 32) = 1.0f.
+        block.ScalesL[0] = 1;
+        block.ScalesH = 2;
+        // qs[0] = 8 | (9 << 4) -> low nibble index 8 (val = 1.0f), high nibble index 9 (val = 13.0f)
+        block.Qs[0] = (byte)(8 | (9 << 4));
+
+        float[] dequant = new float[256];
+        float[] x = new float[256];
+        x[0] = 2.0f;
+        x[16] = 3.0f;
+
+        BlockIQ4_XS* pBlock = &block;
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeIQ4_XS(pBlock, pDequant, 256);
+            float dot = QuantKernels.VecDotIQ4_XS(pBlock, pX, 256);
+
+            // dequant[0] = 1.0 * 1.0 = 1.0
+            // dequant[16] = 1.0 * 13.0 = 13.0
+            Assert.Equal(1.0f, dequant[0], 1e-4f);
+            Assert.Equal(13.0f, dequant[16], 1e-4f);
+
+            // dot = 2.0 * 1.0 + 3.0 * 13.0 = 41.0
+            Assert.Equal(41.0f, dot, 1e-4f);
+        }
+    }
 }
 

@@ -230,4 +230,37 @@ public static unsafe partial class QuantKernels
         }
     }
 
+    /// <summary>
+    /// Dequantizes a row of IQ4_XS blocks into 32-bit floating point array.
+    /// </summary>
+    public static void DequantizeIQ4_XS(BlockIQ4_XS* src, float* dst, int k)
+    {
+        int nb = k / QK_K;
+        fixed (float* kValues = KValuesIq4Nl)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)src[i].Delta;
+                ushort scalesH = src[i].ScalesH;
+                byte* scalesL = src[i].ScalesL;
+                byte* qs = src[i].Qs;
+
+                for (int ib = 0; ib < 8; ib++)
+                {
+                    int ls = ((scalesL[ib / 2] >> (4 * (ib % 2))) & 0x0F) | (((scalesH >> (2 * ib)) & 3) << 4);
+                    float dl = d * (ls - 32);
+
+                    for (int j = 0; j < 16; j++)
+                    {
+                        byte q = qs[j];
+                        dst[j] = dl * kValues[q & 0x0F];
+                        dst[j + 16] = dl * kValues[q >> 4];
+                    }
+
+                    dst += 32;
+                    qs += 16;
+                }
+            }
+        }
+    }
 }
