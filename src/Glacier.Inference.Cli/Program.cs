@@ -712,6 +712,7 @@ public static class Program
         int maxTokens = 512;
         float temperature = 0.7f;
         float topP = 0.9f;
+        bool rawPrompt = false;
         var promptParts = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
@@ -722,6 +723,8 @@ public static class Program
                 device = args[++i];
             else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
                 promptParts.Add(args[++i]);
+            else if (args[i] == "--raw")
+                rawPrompt = true;
             else if (args[i] == "--lora" && i + 1 < args.Length)
                 loraPath = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
@@ -801,7 +804,7 @@ public static class Program
             var result = await session.GenerateAsync(
                 initialPrompt,
                 options,
-                formatChat: true,
+                formatChat: !rawPrompt,
                 onToken: t => Console.Write(t));
 
             Console.WriteLine($"\n\n[{result.Metrics.GenerationTokensPerSecond:F1} tokens/sec | {result.Metrics.GeneratedTokens} tokens | {result.FinishReason}]");
