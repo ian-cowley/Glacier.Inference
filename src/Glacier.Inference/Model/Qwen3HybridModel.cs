@@ -150,8 +150,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         // 1. Compute linear projections from normalized x
         QuantKernels.MatVecMul(layer.QkvType, layer.QkvWeight, normX, _gdnQkv, _dim, _gdnConvChannels, normXSums);
         QuantKernels.MatVecMul(layer.AttnGateType, layer.AttnGateWeight, normX, _gdnZ, _dim, _ssmInnerSize, normXSums);
-        QuantKernels.MatVecMul(GgufType.F32, (byte*)layer.SsmAlphaWeight, normX, _gdnA, _dim, _ssmHeads, normXSums);
-        QuantKernels.MatVecMul(GgufType.F32, (byte*)layer.SsmBetaWeight, normX, _gdnB, _dim, _ssmHeads, normXSums);
+        QuantKernels.MatVecMul(layer.SsmAlphaType, layer.SsmAlphaWeight, normX, _gdnA, _dim, _ssmHeads, normXSums);
+        QuantKernels.MatVecMul(layer.SsmBetaType, layer.SsmBetaWeight, normX, _gdnB, _dim, _ssmHeads, normXSums);
 
         // 2. Depthwise 1D Causal Convolution with SiLU activation
         float* convState = _ssmCache.GetConvState(modelLayer);
@@ -195,8 +195,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
                 sumSqK += kg[d] * kg[d];
             }
 
-            float invNormQ = sumSqQ > 1e-12f ? (1.0f / MathF.Sqrt(sumSqQ)) * qkScale : 0f;
-            float invNormK = sumSqK > 1e-12f ? (1.0f / MathF.Sqrt(sumSqK)) : 0f;
+            float invNormQ = sumSqQ > 1e-12f ? (1.0f / MathF.Sqrt(sumSqQ + 1e-6f)) * qkScale : 0f;
+            float invNormK = sumSqK > 1e-12f ? 1.0f / MathF.Sqrt(sumSqK + 1e-6f) : 0f;
 
             for (int d = 0; d < _ssmStateDim; d++)
             {
@@ -206,8 +206,8 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         }
 
         // 5. Recurrent DeltaNet associative state update across all heads
-        int headsPerGroup = _ssmHeads / _ssmGroupCount; // 3
-        int dState = _ssmStateDim; // 128
+        int headsPerGroup = _ssmHeads / _ssmGroupCount;
+        int dState = _ssmStateDim;
 
         Parallel.For(0, _ssmHeads, h =>
         {
@@ -218,15 +218,15 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             float* sMat = _ssmCache.GetRecurrentState(modelLayer, h);
 
             float aVal = _gdnA[h] + (layer.SsmDtBias != null ? layer.SsmDtBias[h] : 0f);
-            float dt = MathF.Log(1.0f + MathF.Exp(aVal));
+            float dt = aVal > 20.0f ? aVal : MathF.Log(1.0f + MathF.Exp(aVal));
             float aLog = layer.SsmAWeight != null ? layer.SsmAWeight[h] : 0f;
-            float gVal = -MathF.Exp(aLog) * dt;
+            float gVal = aLog * dt; // In GGUF, ssm_a is already stored as -exp(A_log)
             float decay = MathF.Exp(gVal);
 
             float bVal = _gdnB[h];
             float beta = 1.0f / (1.0f + MathF.Exp(-bVal));
 
-            // State update: delta = (v - S_{t-1} k) * beta
+            // Step 1 & 2: Decay recurrent state and retrieve memory: kvMem = (decay * S_{t-1}) * k
             float* delta = stackalloc float[dState];
             for (int i = 0; i < dState; i++)
             {
@@ -234,36 +234,30 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
                 float* sRow = sMat + i * dState;
                 for (int j = 0; j < dState; j++)
                 {
-                    kvMem += sRow[j] * kHead[j];
+                    float decayed = sRow[j] * decay;
+                    sRow[j] = decayed;
+                    kvMem += decayed * kHead[j];
                 }
                 delta[i] = (vHead[i] - kvMem) * beta;
             }
 
-            // S_t = decay * S_{t-1} + delta * k^T
-            for (int i = 0; i < dState; i++)
-            {
-                float* sRow = sMat + i * dState;
-                float dVal = delta[i];
-                for (int j = 0; j < dState; j++)
-                {
-                    sRow[j] = decay * sRow[j] + dVal * kHead[j];
-                }
-            }
-
-            // y_h = S_t * q
+            // Step 3 & 4: S_t = S' + delta * k^T and compute output y_h = S_t * q
             float* yHead = _gdnY + h * dState;
             for (int i = 0; i < dState; i++)
             {
                 float* sRow = sMat + i * dState;
+                float dVal = delta[i];
                 float dot = 0f;
                 for (int j = 0; j < dState; j++)
                 {
-                    dot += sRow[j] * qHead[j];
+                    float updated = sRow[j] + dVal * kHead[j];
+                    sRow[j] = updated;
+                    dot += updated * qHead[j];
                 }
                 yHead[i] = dot;
             }
 
-            // Head RMSNorm
+            // Step 5: Head RMSNorm
             if (layer.SsmNormWeight != null)
             {
                 QuantKernels.RMSNorm(yHead, layer.SsmNormWeight, yHead, dState, _weights.RmsNormEps);
@@ -281,10 +275,10 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         // 7. Output projection back to residual stream
         int yChunks = (_ssmInnerSize + 31) / 32;
         QuantKernels.ComputeBlockSums32(_gdnY, _gdnYSums, _ssmInnerSize);
-        QuantKernels.MatVecMul(layer.SsmOutType, layer.SsmOutWeight, _gdnY, _normX, _ssmInnerSize, _dim, _gdnYSums);
+        QuantKernels.MatVecMul(layer.SsmOutType, layer.SsmOutWeight, _gdnY, _attnProj, _ssmInnerSize, _dim, _gdnYSums);
 
-        // Residual connection: x = x + normX (projected out)
-        AddVector(x, _normX, _dim);
+        // Residual connection: x = x + attnProj (projected out)
+        AddVector(x, _attnProj, _dim);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -336,7 +330,7 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             }
         }
 
-        QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight);
+        QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount);
         kvCache?.Store(stageLayer, pos, _k, _v);
 
         if (kvCache != null)
@@ -353,6 +347,7 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             }
         }
 
+        QuantKernels.ComputeBlockSums32(_attnOut, _attnOutSums, qDim);
         QuantKernels.MatVecMul(layer.AttnOutType, layer.AttnOutWeight, _attnOut, _attnProj, qDim, _dim, _attnOutSums);
         if (layer.AttnOutBias != null) AddVector(_attnProj, layer.AttnOutBias, _dim);
 
@@ -481,7 +476,7 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
                     }
                 }
 
-                QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight);
+                QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount);
                 kvCache?.Store(stageLayer, pos, k, v);
 
                 if (kvCache != null)

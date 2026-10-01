@@ -298,6 +298,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
         promptStopwatch.Stop();
 
+
+
         // 3. Autoregressive token generation loop
         var genStopwatch = Stopwatch.StartNew();
         var recentTokens = new List<int>(options.MaxTokens + 16);
@@ -341,6 +343,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             // Forward next token
             ForwardToken(nextToken, currentPos, computeLogits: true);
             currentPos++;
+
+
 
             // Yield control briefly
             if ((step & 15) == 0)

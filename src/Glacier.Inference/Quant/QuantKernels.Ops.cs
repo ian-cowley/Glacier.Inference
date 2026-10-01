@@ -168,6 +168,7 @@ public static unsafe partial class QuantKernels
 
     /// <summary>
     /// Applies Rotary Position Embedding (RoPE NeOX style) in-place to Q and K tensors.
+    /// Supports partial RoPE when ropeDim is less than headDim (e.g. Qwen 3.5 / 3.6 where ropeDim=64 and headDim=256).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void RoPE(
@@ -175,16 +176,18 @@ public static unsafe partial class QuantKernels
         int nHeadsQ, int nHeadsKv,
         int headDim, int pos,
         float freqBase, float freqScale = 1.0f,
-        float* ropeFreqs = null)
+        float* ropeFreqs = null,
+        int ropeDim = -1)
     {
-        int halfDim = headDim / 2;
+        if (ropeDim <= 0 || ropeDim > headDim) ropeDim = headDim;
+        int halfDim = ropeDim / 2;
 
         Span<float> cosTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
         Span<float> sinTable = halfDim <= 128 ? stackalloc float[halfDim] : new float[halfDim];
 
         for (int i = 0; i < halfDim; i++)
         {
-            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / headDim);
+            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / ropeDim);
             float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
             float theta = pos * freq * freqScale;
             cosTable[i] = MathF.Cos(theta);

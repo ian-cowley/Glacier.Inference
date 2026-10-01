@@ -40,8 +40,10 @@ public sealed unsafe class LayerWeights
     public GgufType AttnGateType { get; init; }
     public float* SsmConv1dWeight { get; init; }
     public float* SsmAWeight { get; init; }
-    public float* SsmAlphaWeight { get; init; }
-    public float* SsmBetaWeight { get; init; }
+    public byte* SsmAlphaWeight { get; init; }
+    public GgufType SsmAlphaType { get; init; }
+    public byte* SsmBetaWeight { get; init; }
+    public GgufType SsmBetaType { get; init; }
     public float* SsmDtBias { get; init; }
     public float* SsmNormWeight { get; init; }
     public byte* SsmOutWeight { get; init; }
@@ -273,8 +275,10 @@ public sealed unsafe class ModelWeights
             GgufType attnGateType = GgufType.F32;
             float* ssmConv1dWeight = null;
             float* ssmAWeight = null;
-            float* ssmAlphaWeight = null;
-            float* ssmBetaWeight = null;
+            byte* ssmAlphaWeight = null;
+            GgufType ssmAlphaType = GgufType.F32;
+            byte* ssmBetaWeight = null;
+            GgufType ssmBetaType = GgufType.F32;
             float* ssmDtBias = null;
             float* ssmNormWeight = null;
             byte* ssmOutWeight = null;
@@ -325,11 +329,13 @@ public sealed unsafe class ModelWeights
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_alpha.weight", out var gdnAlpha) && gdnAlpha != null)
                 {
-                    ssmAlphaWeight = (float*)gguf.GetTensorPointer(gdnAlpha);
+                    ssmAlphaWeight = (byte*)gguf.GetTensorPointer(gdnAlpha);
+                    ssmAlphaType = gdnAlpha.Type;
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_beta.weight", out var gdnBeta) && gdnBeta != null)
                 {
-                    ssmBetaWeight = (float*)gguf.GetTensorPointer(gdnBeta);
+                    ssmBetaWeight = (byte*)gguf.GetTensorPointer(gdnBeta);
+                    ssmBetaType = gdnBeta.Type;
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_dt.bias", out var gdnDt) && gdnDt != null)
                 {
@@ -620,7 +626,9 @@ public sealed unsafe class ModelWeights
                 SsmConv1dWeight = ssmConv1dWeight,
                 SsmAWeight = ssmAWeight,
                 SsmAlphaWeight = ssmAlphaWeight,
+                SsmAlphaType = ssmAlphaType,
                 SsmBetaWeight = ssmBetaWeight,
+                SsmBetaType = ssmBetaType,
                 SsmDtBias = ssmDtBias,
                 SsmNormWeight = ssmNormWeight,
                 SsmOutWeight = ssmOutWeight,

@@ -345,6 +345,7 @@ public static class Program
 
         string? modelPath = null;
         string? tensorFilter = null;
+        string? printTensor = null;
         bool showAllTensors = false;
 
         for (int i = 0; i < args.Length; i++)
@@ -353,6 +354,8 @@ public static class Program
                 modelPath = args[++i];
             else if ((args[i] == "-f" || args[i] == "--filter") && i + 1 < args.Length)
                 tensorFilter = args[++i];
+            else if (args[i] == "--print-tensor" && i + 1 < args.Length)
+                printTensor = args[++i];
             else if (args[i] == "-a" || args[i] == "--all")
                 showAllTensors = true;
             else if (!args[i].StartsWith("-") && modelPath == null)
@@ -446,6 +449,31 @@ public static class Program
         {
             var t = displayTensors[i];
             Console.WriteLine($"  [{i,3}] {t.Name,-45} | Type: {t.Type,-10} | Dims: [{string.Join(" x ", t.Dimensions)}]");
+        }
+
+        if (!string.IsNullOrEmpty(printTensor))
+        {
+            if (gguf.TryGetTensor(printTensor, out var targetTensor) && targetTensor != null)
+            {
+                Console.WriteLine($"\n--- Tensor Data Preview: {targetTensor.Name} ({targetTensor.Type}, Dims: [{string.Join(" x ", targetTensor.Dimensions)}]) ---");
+                unsafe
+                {
+                    void* ptr = gguf.GetTensorPointer(targetTensor);
+                    if (targetTensor.Type == Glacier.Inference.Gguf.GgufType.F32)
+                    {
+                        float* fptr = (float*)ptr;
+                        int count = Math.Min(32, (int)targetTensor.Dimensions[0]);
+                        for (int i = 0; i < count; i++)
+                        {
+                            Console.WriteLine($"  [{i,2}] = {fptr[i]:F6}");
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine($"\n[Warning] Tensor '{printTensor}' not found.");
+            }
         }
 
         return 0;
