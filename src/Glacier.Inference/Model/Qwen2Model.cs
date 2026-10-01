@@ -69,7 +69,7 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
         int maxAttnOut = Math.Max(qDim, _nHeads * _vHeadDim);
-        int attnOutChunks = (_dim + 31) / 32;
+        int attnOutChunks = (Math.Max(maxAttnOut, _dim) + 31) / 32;
 
         _q = (float*)NativeMemory.AllocZeroed((nuint)(qDim * sizeof(float)));
         _k = (float*)NativeMemory.AllocZeroed((nuint)(kvDim * sizeof(float)));
