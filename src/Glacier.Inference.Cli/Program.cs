@@ -405,7 +405,10 @@ public static class Program
         {
             if (kv.Value is System.Collections.IList list)
             {
-                Console.WriteLine($"  {kv.Key}: [list of {list.Count} items]");
+                if (list.Count <= 16)
+                    Console.WriteLine($"  {kv.Key}: [{string.Join(", ", list.Cast<object>())}]");
+                else
+                    Console.WriteLine($"  {kv.Key}: [list of {list.Count} items]");
             }
             else
             {
