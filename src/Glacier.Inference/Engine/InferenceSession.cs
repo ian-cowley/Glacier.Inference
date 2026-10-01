@@ -68,7 +68,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     private readonly GpuContext? _gpu;
     private readonly Qwen2GpuModel? _gpuModel;
     private readonly Qwen2D3D12Model? _d3d12Model;
-    private readonly Qwen2Model? _cpuModel;
+    private readonly ICpuModel? _cpuModel;
     private readonly KVCache? _kvCache;
     private readonly PipelineSession? _pipelineSession;
     private readonly int _maxSeqLen;
@@ -90,7 +90,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
     public Qwen2D3D12Model? D3D12Model => _d3d12Model;
-    public Qwen2Model? CpuModel => _cpuModel;
+    public ICpuModel? CpuModel => _cpuModel;
     public UniversalArchitecture Architecture => _weights.ArchitectureFamily;
     public int MaxSeqLen => _maxSeqLen;
 
@@ -152,7 +152,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpu = null;
                     _gpuModel = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                    _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
@@ -175,7 +175,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _d3d12Model?.Dispose();
                     _d3d12Model = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                    _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
@@ -199,7 +199,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
 
                 _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
                 string cpuDeviceName = DeviceManager.ResolveDevice("cpu").Name;
                 string prefix = targetDevice.Vendor != GpuVendor.Cpu
                     ? $"{cpuDeviceName} [Fallback from {targetDevice.Name} | "

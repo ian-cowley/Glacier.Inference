@@ -11,7 +11,7 @@ using Glacier.Inference.Sampling;
 /// </summary>
 public sealed class CpuPipelineStage : IPipelineStage
 {
-    private readonly Qwen2Model _model;
+    private readonly ICpuModel _model;
     private readonly KVCache _kvCache;
     private readonly DeviceInfo _device;
     private readonly InferenceEngineType _engine;
@@ -25,7 +25,7 @@ public sealed class CpuPipelineStage : IPipelineStage
     public InferenceEngineType Engine => _engine;
     public bool IsFirstStage => _isFirstStage;
     public bool IsLastStage => _isLastStage;
-    public Qwen2Model Model => _model;
+    public ICpuModel Model => _model;
 
     public CpuPipelineStage(
         DeviceInfo device,
@@ -42,7 +42,7 @@ public sealed class CpuPipelineStage : IPipelineStage
         _isLastStage = isLastStage;
         int resolvedLayers = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
         _kvCache = new KVCache(resolvedLayers, weights.HeadCountKv, weights.HeadDim, maxSeqLen, weights.ValueDim);
-        _model = new Qwen2Model(
+        _model = CpuModelFactory.Create(
             weights,
             maxSeqLen: maxSeqLen,
             startLayer: startLayer,

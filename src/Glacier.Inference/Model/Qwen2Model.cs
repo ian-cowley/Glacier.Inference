@@ -12,48 +12,27 @@ using Glacier.Inference.Quant;
 /// <summary>
 /// High-performance Qwen2 / Qwen2.5 Transformer inference runtime.
 /// Executes hardware SIMD quantized GEMV decoding with zero heap allocations.
+/// Also supports Llama 3, Mistral, Phi-4 (fused QKV), and DeepSeek (MLA) architectures.
 /// </summary>
-public sealed unsafe partial class Qwen2Model : IDisposable
+public sealed unsafe partial class Qwen2Model : CpuModelBase
 {
-    private readonly ModelWeights _weights;
-    private readonly int _dim;
-    private readonly int _ffnDim;
-    private readonly int _headDim;
-    private readonly int _vHeadDim;
     private readonly int _qkNopeDim;
     private readonly int _qkRopeDim;
     private readonly int _kvLoraRank;
     private float* _yarnInvFreq;
     private readonly float _yarnMscale;
-    private readonly int _nHeads;
-    private readonly int _nHeadsKv;
     private readonly int _groupSize;
     private readonly float _attnScale;
-    private readonly int _maxSeqLen;
 
-    public const int MaxBatchSize = 64;
-
-    // Preallocated unmanaged scratch buffers (single token)
-    private float* _x;
-    private float* _normX;
-    private float* _normXSums;
+    // Preallocated unmanaged attention scratch buffers (single token)
     private float* _q;
     private float* _k;
     private float* _v;
     private float* _attnOut;
     private float* _attnOutSums;
     private float* _attnProj;
-    private float* _gate;
-    private float* _up;
-    private float* _ffnAct;
-    private float* _ffnActSums;
-    private float* _ffnOut;
-    private float* _expertDownOut;
     private float* _headScores;
-
-    // Preallocated fused QKV & Gate/Up scratch buffers (single token)
     private float* _qkvFused;
-    private float* _gateUpFused;
 
     // Preallocated MLA scratch buffers (single token)
     private float* _compressedKv;
@@ -61,56 +40,18 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _cKvSums;
     private float* _decompressedKv;
 
-    // Preallocated unmanaged scratch buffers (batched chunk prefill <= MaxBatchSize)
-    private float* _xBatch;
-    private float* _normXBatch;
-    private float* _normXSumBatch;
+    // Preallocated unmanaged attention scratch buffers (batched chunk prefill <= MaxBatchSize)
     private float* _qBatch;
     private float* _kBatch;
     private float* _vBatch;
     private float* _attnOutBatch;
     private float* _attnOutSumBatch;
     private float* _attnProjBatch;
-    private float* _gateBatch;
-    private float* _upBatch;
-    private float* _ffnActBatch;
-    private float* _ffnActSumBatch;
-    private float* _ffnOutBatch;
-
-    // Preallocated fused QKV & Gate/Up scratch buffers (batched)
     private float* _qkvBatch;
-    private float* _gateUpBatch;
 
     // Preallocated MLA scratch buffers (batched)
     private float* _compressedKvBatch;
     private float* _decompressedKvBatch;
-
-    // Preallocated Gated DeltaNet (GDN) / Hybrid SSM scratch buffers & cache
-    private SsmStateCache? _ssmCache;
-    private float* _gdnQkv;
-    private float* _gdnConvOut;
-    private float* _gdnZ;
-    private float* _gdnA;
-    private float* _gdnB;
-    private float* _gdnY;
-    private float* _gdnYSums;
-    private readonly int _ssmConvKernel;
-    private readonly int _ssmStateDim;
-    private readonly int _ssmGroupCount;
-    private readonly int _ssmHeads;
-    private readonly int _ssmInnerSize;
-    private readonly int _gdnConvChannels;
-    private readonly bool _hasGdn;
-
-    private bool _disposed;
-
-    public ModelWeights Weights => _weights;
-    public SsmStateCache? SsmCache => _ssmCache;
-    public int MaxSeqLen => _maxSeqLen;
-    public int StartLayer { get; }
-    public int LayerCount { get; }
-    public bool IsLastStage { get; }
-    public LoraAdapterWeights? LoraWeights { get; set; }
 
     public Qwen2Model(
         ModelWeights weights,
@@ -118,46 +59,24 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         int startLayer = 0,
         int layerCount = -1,
         bool isLastStage = true)
+        : base(weights, maxSeqLen, startLayer, layerCount, isLastStage)
     {
-        _weights = weights;
-        StartLayer = startLayer;
-        LayerCount = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
-        IsLastStage = isLastStage;
-        _dim = weights.EmbeddingLength;
-        _ffnDim = weights.FeedForwardLength;
-        _headDim = weights.HeadDim;
-        _vHeadDim = weights.ValueDim;
         _qkNopeDim = weights.QkNopeHeadDim;
         _qkRopeDim = weights.RopeDimensionCount;
         _kvLoraRank = weights.KvLoraRank;
-        _nHeads = weights.HeadCount;
-        _nHeadsKv = weights.HeadCountKv;
-        _groupSize = _nHeads / _nHeadsKv;
-        _maxSeqLen = maxSeqLen;
-
-        int expFfn = weights.ExpertFeedForwardLength;
-        int maxFfn = Math.Max(_ffnDim, Math.Max(expFfn, expFfn * 2));
-        if (maxFfn == 0) maxFfn = _ffnDim;
+        _groupSize = _nHeadsKv > 0 ? _nHeads / _nHeadsKv : 1;
 
         int qDim = _nHeads * _headDim;
-        int maxAttnOut = Math.Max(_dim, Math.Max(qDim, _nHeads * _vHeadDim));
-        int attnOutChunks = (maxAttnOut + 31) / 32;
+        int kvDim = _nHeadsKv * _headDim;
+        int maxAttnOut = Math.Max(qDim, _nHeads * _vHeadDim);
+        int attnOutChunks = (_dim + 31) / 32;
 
-        _x = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _normX = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _normXSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
-        _q = (float*)NativeMemory.AllocZeroed((nuint)(_nHeads * _headDim * sizeof(float)));
-        _k = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _headDim * sizeof(float)));
+        _q = (float*)NativeMemory.AllocZeroed((nuint)(qDim * sizeof(float)));
+        _k = (float*)NativeMemory.AllocZeroed((nuint)(kvDim * sizeof(float)));
         _v = (float*)NativeMemory.AllocZeroed((nuint)(_nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOut = (float*)NativeMemory.AllocZeroed((nuint)(maxAttnOut * sizeof(float)));
         _attnOutSums = (float*)NativeMemory.AllocZeroed((nuint)(attnOutChunks * sizeof(float)));
         _attnProj = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _gate = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
-        _up = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
-        _ffnAct = (float*)NativeMemory.AllocZeroed((nuint)(maxFfn * sizeof(float)));
-        _ffnActSums = (float*)NativeMemory.AllocZeroed((nuint)(((maxFfn + 31) / 32) * sizeof(float)));
-        _ffnOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
-        _expertDownOut = (float*)NativeMemory.AllocZeroed((nuint)(_dim * sizeof(float)));
 
         long scoreBufferSize = (long)_nHeads * _maxSeqLen * sizeof(float);
         _headScores = (float*)NativeMemory.AllocZeroed((nuint)scoreBufferSize);
@@ -205,50 +124,17 @@ public sealed unsafe partial class Qwen2Model : IDisposable
             _attnScale = 1.0f / MathF.Sqrt(_headDim);
         }
 
-        // Batch scratch buffers
-        _xBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _normXBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _normXSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * (_dim / 32) * sizeof(float)));
-        _qBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
-        _kBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+        // Batch attention scratch buffers
+        _qBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qDim * sizeof(float)));
+        _kBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * kvDim * sizeof(float)));
         _vBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _nHeadsKv * _vHeadDim * sizeof(float)));
         _attnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
         _attnOutSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * attnOutChunks * sizeof(float)));
         _attnProjBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _gateBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
-        _upBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
-        _ffnActBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * maxFfn * sizeof(float)));
-        _ffnActSumBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * ((maxFfn + 31) / 32) * sizeof(float)));
-        _ffnOutBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * _dim * sizeof(float)));
 
-        int qkvDim = (_nHeads * _headDim) + (_nHeadsKv * _headDim) + (_nHeadsKv * _vHeadDim);
-        int gateUpDim = 2 * maxFfn;
+        int qkvDim = qDim + 2 * kvDim;
         _qkvFused = (float*)NativeMemory.AllocZeroed((nuint)(qkvDim * sizeof(float)));
-        _gateUpFused = (float*)NativeMemory.AllocZeroed((nuint)(gateUpDim * sizeof(float)));
         _qkvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qkvDim * sizeof(float)));
-        _gateUpBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * gateUpDim * sizeof(float)));
-
-        bool hasGdn = _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm;
-        if (!hasGdn)
-        {
-            for (int i = 0; i < _weights.Layers.Length; i++)
-            {
-                if (_weights.Layers[i].IsGdn)
-                {
-                    hasGdn = true;
-                    break;
-                }
-            }
-        }
-        _hasGdn = hasGdn;
-        _ssmConvKernel = _weights.Gguf.SsmConvKernel;
-        _ssmStateDim = _weights.Gguf.SsmStateSize;
-        _ssmGroupCount = _weights.Gguf.SsmGroupCount;
-        _ssmHeads = _weights.Gguf.SsmTimeStepRank;
-        _ssmInnerSize = _weights.Gguf.SsmInnerSize;
-        _gdnConvChannels = (_ssmGroupCount * 2 + _ssmHeads) * _ssmStateDim;
-
-        InitializeGdnBuffers();
     }
 
     private const int ParallelAttentionSeqThreshold = 256;
@@ -358,101 +244,37 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         ComputeAttentionToken(stageLayer, modelLayer, pos, _q, _attnOut, kvCache);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void AddVector(float* a, float* b, int count)
-    {
-        int i = 0;
-        if (Vector256.IsHardwareAccelerated)
-        {
-            int limit = count - 8;
-            for (; i <= limit; i += 8)
-            {
-                var va = Vector256.Load(a + i);
-                var vb = Vector256.Load(b + i);
-                (va + vb).Store(a + i);
-            }
-        }
-        for (; i < count; i++)
-        {
-            a[i] += b[i];
-        }
-    }
-
-    public void Dispose()
+    protected override void Dispose(bool disposing)
     {
         if (!_disposed)
         {
-            FreeIfAllocated(ref _x);
-            FreeIfAllocated(ref _normX);
-            FreeIfAllocated(ref _normXSums);
             FreeIfAllocated(ref _q);
             FreeIfAllocated(ref _k);
             FreeIfAllocated(ref _v);
             FreeIfAllocated(ref _attnOut);
             FreeIfAllocated(ref _attnOutSums);
             FreeIfAllocated(ref _attnProj);
-            FreeIfAllocated(ref _gate);
-            FreeIfAllocated(ref _up);
-            FreeIfAllocated(ref _ffnAct);
-            FreeIfAllocated(ref _ffnActSums);
-            FreeIfAllocated(ref _ffnOut);
-            FreeIfAllocated(ref _expertDownOut);
             FreeIfAllocated(ref _headScores);
-
-            FreeIfAllocated(ref _xBatch);
-            FreeIfAllocated(ref _normXBatch);
-            FreeIfAllocated(ref _normXSumBatch);
-            FreeIfAllocated(ref _qBatch);
-            FreeIfAllocated(ref _kBatch);
-            FreeIfAllocated(ref _vBatch);
-            FreeIfAllocated(ref _attnOutBatch);
-            FreeIfAllocated(ref _attnOutSumBatch);
-            FreeIfAllocated(ref _attnProjBatch);
-            FreeIfAllocated(ref _gateBatch);
-            FreeIfAllocated(ref _upBatch);
-            FreeIfAllocated(ref _ffnActBatch);
-            FreeIfAllocated(ref _ffnActSumBatch);
-            FreeIfAllocated(ref _ffnOutBatch);
-
             FreeIfAllocated(ref _qkvFused);
-            FreeIfAllocated(ref _gateUpFused);
-            FreeIfAllocated(ref _qkvBatch);
-            FreeIfAllocated(ref _gateUpBatch);
 
             FreeIfAllocated(ref _compressedKv);
             FreeIfAllocated(ref _cKvNorm);
             FreeIfAllocated(ref _cKvSums);
             FreeIfAllocated(ref _decompressedKv);
             FreeIfAllocated(ref _yarnInvFreq);
+
+            FreeIfAllocated(ref _qBatch);
+            FreeIfAllocated(ref _kBatch);
+            FreeIfAllocated(ref _vBatch);
+            FreeIfAllocated(ref _attnOutBatch);
+            FreeIfAllocated(ref _attnOutSumBatch);
+            FreeIfAllocated(ref _attnProjBatch);
+            FreeIfAllocated(ref _qkvBatch);
+
             FreeIfAllocated(ref _compressedKvBatch);
             FreeIfAllocated(ref _decompressedKvBatch);
 
-            _ssmCache?.Dispose();
-            FreeIfAllocated(ref _gdnQkv);
-            FreeIfAllocated(ref _gdnConvOut);
-            FreeIfAllocated(ref _gdnZ);
-            FreeIfAllocated(ref _gdnA);
-            FreeIfAllocated(ref _gdnB);
-            FreeIfAllocated(ref _gdnY);
-            FreeIfAllocated(ref _gdnYSums);
-
-            _disposed = true;
+            base.Dispose(disposing);
         }
-        GC.SuppressFinalize(this);
-    }
-
-    private static void FreeIfAllocated(ref float* ptr)
-    {
-        if (ptr != null)
-        {
-            NativeMemory.Free(ptr);
-            ptr = null;
-        }
-    }
-
-    ~Qwen2Model()
-    {
-        Dispose();
     }
 }
-

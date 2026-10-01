@@ -212,4 +212,17 @@ public class UniversalArchitectureTests
         Assert.Equal(0.0f, conv0[0]);
         Assert.Equal(0.0f, rec0_0[0]);
     }
+
+    [Fact]
+    public void CpuModelFactory_ReturnsQwen2Model_ForStandardTransformer()
+    {
+        if (!File.Exists(Llama3Path)) return;
+
+        using var gguf = GgufFile.Open(Llama3Path);
+        var weights = new ModelWeights(gguf);
+        using var model = CpuModelFactory.Create(weights, maxSeqLen: 128);
+
+        Assert.IsType<Qwen2Model>(model);
+        Assert.Equal(weights.BlockCount, model.LayerCount);
+    }
 }
