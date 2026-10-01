@@ -62,6 +62,27 @@ __global__ void swiglu_kernel(
     }
 }
 
+__global__ void swiglu_bwd_kernel(
+    const float* __restrict__ d_hidden,
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ d_gate,
+    float* __restrict__ d_up,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float dh = d_hidden[idx];
+        float g = gate[idx];
+        float u = up[idx];
+        float sig = 1.0f / (1.0f + __expf(-g));
+        float siluG = g * sig;
+        d_up[idx] = dh * siluG;
+        float dSilu = sig * (1.0f + g * (1.0f - sig));
+        d_gate[idx] = dh * u * dSilu;
+    }
+}
+
 // =========================================================================
 // 5. Add Bias Vector: y[i] += bias[i]
 // =========================================================================
