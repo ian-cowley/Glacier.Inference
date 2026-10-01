@@ -562,27 +562,25 @@ Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRat
 
 ## 🗺️ Roadmap & Community Contributions
 
-Glacier is developed with a strict commitment to **zero external C++ dependencies**, empirical benchmarking on real silicon, and maximum hardware saturation. We warmly welcome community contributions, particularly from developers with access to specialized hardware!
+Glacier is developed with a strict commitment to **zero external C++ dependencies**, empirical benchmarking on real silicon, and maximum hardware saturation.
 
-### 1. 🍏 Apple Silicon Metal GPU Engine (M1 / M2 / M3 / M4)
-* **Objective**: Bare-metal GPU acceleration on macOS tapping directly into Apple's high-bandwidth unified memory fabric (100–800 GB/s on M-series Pro/Max/Ultra).
-* **Architecture Design**:
-  - Pure C# zero-dependency runtime binding to `libobjc.dylib` and `Metal.framework` via P/Invoke (`MTLCreateSystemDefaultDevice`, `MTLCommandQueue`, `MTLComputePipelineState`), mirroring Glacier's DXGI / Direct3D 12 design.
-  - Metal Shading Language (MSL) compute shaders utilizing 32-thread SIMDgroups (`simdgroup_matrix` / `simd_shuffle`) for quantized GEMV/GEMM (`Q4_K`, `Q6_K`, `Q8_0`).
-  - `MTLStorageModeShared` zero-copy memory binding to directly compute against memory-mapped GGUF weights without host-to-device transfers.
-* **Call for Contributors**: If you have an Apple Silicon Mac and want to help build, profile, or benchmark the Metal compute pipeline, contributions and PRs are warmly welcomed! *(Automated headless compilation and tests can also run against GitHub Actions `macos-14` M1 runners).*
+> [!NOTE]
+> **Foundational GPU Primitives Delivered**: Core in-memory shader assembly (PTX 8.0, SPIR-V 1.6, DXIL), 3-tier VRAM slab allocation, and multi-GPU distributed Ring AllReduce collectives have been fully implemented in [`Glacier.Compute`](../Glacier.Compute). Native macOS Cocoa/Metal runtime dispatch is implemented in [`Glacier.Windowing`](../Glacier.Windowing).
+
+### 1. 🍏 Apple Silicon Metal GPU Engine (macOS Integration)
+* **Objective**: Bare-metal GPU acceleration on macOS tapping directly into Apple's high-bandwidth unified memory fabric (100–800 GB/s on M-series Pro/Max/Ultra) via `Glacier.Windowing` Cocoa/Metal bindings and MSL compute kernels (`simdgroup_matrix`).
 
 ### 2. 🐧 Cross-Platform Vulkan Compute Backend (Linux / Android)
-* Vendor-neutral compute shaders (SPIR-V) enabling hardware-accelerated inference on Linux without proprietary NVIDIA drivers (AMD ROCm / RADV, Intel Arc ANV, and Qualcomm Adreno GPUs on Snapdragon).
+* Leveraging `Glacier.Compute`'s in-memory SPIR-V 1.6 binary emitter to execute hardware-accelerated compute shaders across vendor-neutral GPUs on Linux and mobile without proprietary drivers.
 
 ### 3. ⚡ FlashAttention-3 & Chunked Prefill
 * Tiled online softmax with FP8 tensor cores to support 128k+ sequence contexts with bounded KV-cache memory and zero perplexity degradation.
 
 ### 4. 🔗 Multi-GPU Tensor Parallelism (TP)
-* Intra-node tensor parallelism over lock-free shared memory ring buffers, splitting large 70B+ and 120B+ MoE models across multiple local GPUs (e.g. dual RTX rigs or discrete GPU + unified iGPU hybrid splits).
+* Leveraging `Glacier.Compute.Distrib` Ring AllReduce and lock-free shared memory ring buffers to split large 70B+ and 120B+ MoE models across multi-GPU rigs.
 
 ### 5. 🚀 Continuous In-Flight Batching Server
-* Dynamic scheduler for the OpenAI/Ollama compatible HTTP endpoint, batching multiple concurrent user generation requests into unified transformer matrix sweeps.
+* Dynamic scheduler integrated with `Glacier.Serve`'s PagedAttention KV pool, batching multiple concurrent generation requests into unified transformer matrix sweeps.
 
 ---
 
