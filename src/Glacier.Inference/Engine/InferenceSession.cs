@@ -298,7 +298,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
         promptStopwatch.Stop();
 
-
+        var top5 = _logits.Select((val, idx) => (val, idx)).OrderByDescending(x => x.val).Take(5).ToList();
+        Console.WriteLine($"[Debug] Top 5 prefill logits: {string.Join(", ", top5.Select(x => $"{x.idx} ('{_tokenizer.DecodeToken(x.idx)}')={x.val:F2}"))}");
 
         // 3. Autoregressive token generation loop
         var genStopwatch = Stopwatch.StartNew();
@@ -343,6 +344,12 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             // Forward next token
             ForwardToken(nextToken, currentPos, computeLogits: true);
             currentPos++;
+
+            if (step < 5)
+            {
+                var top5step = _logits.Select((val, idx) => (val, idx)).OrderByDescending(x => x.val).Take(5).ToList();
+                Console.WriteLine($"\n[Debug] Step {step + 1} logits: {string.Join(", ", top5step.Select(x => $"{x.idx} ('{_tokenizer.DecodeToken(x.idx)}')={x.val:F2}"))}");
+            }
 
 
 
