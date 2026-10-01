@@ -120,6 +120,21 @@ public sealed unsafe class LayerWeights
 
     // Shared Expert Gate (Qwen 3.5 MoE: ffn_gate_inp_shexp)
     public float* FfnGateInpShexpWeight { get; init; }
+
+    // Gemma 4 specific fields
+    public bool IsSwa { get; init; }
+    public int HeadDim { get; init; }
+    public int HeadsKv { get; init; }
+    public float* AttnPostNormWeight { get; init; }
+    public float* FfnPostNormWeight { get; init; }
+    public float* FfnPostNorm1Weight { get; init; }
+    public float* FfnPreNorm2Weight { get; init; }
+    public float* FfnPostNorm2Weight { get; init; }
+    public float* FfnGateInpScaleWeight { get; init; }
+    public byte* FfnGateUpExpsWeight { get; init; }
+    public GgufType FfnGateUpExpsType { get; init; }
+    public float* FfnDownExpsScaleWeight { get; init; }
+    public float* LayerOutputScaleWeight { get; init; }
 }
 
 /// <summary>
@@ -164,6 +179,16 @@ public sealed unsafe class ModelWeights
     public int ExpertUsedCount => Gguf.ExpertUsedCount;
     public int ExpertFeedForwardLength => Gguf.ExpertFeedForwardLength > 0 ? Gguf.ExpertFeedForwardLength : FeedForwardLength;
     public int ExpertSharedCount => Gguf.ExpertSharedCount;
+
+    // Gemma 4 metadata
+    public float FinalLogitSoftcapping => Gguf.FinalLogitSoftcapping;
+    public int SlidingWindow => Gguf.SlidingWindow;
+    public float RopeFreqBaseSwa => Gguf.RopeFreqBaseSwa;
+    public int KeyLengthSwa => Gguf.KeyLengthSwa;
+    public int ValueLengthSwa => Gguf.ValueLengthSwa;
+    public int RopeDimensionCountSwa => Gguf.RopeDimensionCountSwa;
+    public bool[]? SlidingWindowPattern => Gguf.SlidingWindowPattern;
+    public int[]? HeadCountKvPattern => Gguf.HeadCountKvPattern;
 
     public byte* EmbdWeight { get; }
     public GgufType EmbdType { get; }
@@ -469,7 +494,9 @@ public sealed unsafe class ModelWeights
             }
 
             // Check if this layer has MoE experts
-            bool hasMoE = gguf.TryGetTensor($"blk.{l}.ffn_gate_exps.weight", out var ffnGateExps) && ffnGateExps != null;
+            GgufTensorInfo? ffnGateUpExps = null;
+            bool hasMoE = (gguf.TryGetTensor($"blk.{l}.ffn_gate_exps.weight", out var ffnGateExps) && ffnGateExps != null) ||
+                          (gguf.TryGetTensor($"blk.{l}.ffn_gate_up_exps.weight", out ffnGateUpExps) && ffnGateUpExps != null);
 
             byte* ffnGateWeight = null;
             GgufType ffnGateType = GgufType.F32;
@@ -491,6 +518,17 @@ public sealed unsafe class ModelWeights
             GgufType downExpsType = GgufType.F32;
             float* downExpsBias = null;
 
+            byte* gateUpExpsWeight = null;
+            GgufType gateUpExpsType = GgufType.F32;
+            float* gateInpScale = null;
+            float* downExpsScale = null;
+            float* layerOutScale = null;
+            float* attnPostNormWeight = null;
+            float* ffnPostNormWeight = null;
+            float* ffnPostNorm1Weight = null;
+            float* ffnPreNorm2Weight = null;
+            float* ffnPostNorm2Weight = null;
+
             byte* shexpGateWeight = null;
             GgufType shexpGateType = GgufType.F32;
             byte* shexpUpWeight = null;
@@ -501,8 +539,16 @@ public sealed unsafe class ModelWeights
 
             if (hasMoE)
             {
-                gateExpsWeight = gguf.GetTensorPointer(ffnGateExps!);
-                gateExpsType = ffnGateExps!.Type;
+                if (ffnGateExps != null)
+                {
+                    gateExpsWeight = gguf.GetTensorPointer(ffnGateExps);
+                    gateExpsType = ffnGateExps.Type;
+                }
+                if (ffnGateUpExps != null)
+                {
+                    gateUpExpsWeight = gguf.GetTensorPointer(ffnGateUpExps);
+                    gateUpExpsType = ffnGateUpExps.Type;
+                }
 
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_exps.bias", out var ffnGateExpsB) && ffnGateExpsB != null)
                 {
@@ -563,27 +609,110 @@ public sealed unsafe class ModelWeights
                     shexpDownType = ffnDownShexp.Type;
                 }
             }
-            else
+
+            // Always check for dense FFN projections (e.g. Gemma 4 shared MLP alongside MoE)
+            if (gguf.TryGetTensor($"blk.{l}.ffn_gate.weight", out var ffnGate) && ffnGate != null)
             {
-                if (gguf.TryGetTensor($"blk.{l}.ffn_gate.weight", out var ffnGate) && ffnGate != null)
+                ffnGateWeight = gguf.GetTensorPointer(ffnGate);
+                ffnGateType = ffnGate.Type;
+            }
+            if (gguf.TryGetTensor($"blk.{l}.ffn_up.weight", out var ffnUp) && ffnUp != null)
+            {
+                ffnUpWeight = gguf.GetTensorPointer(ffnUp);
+                ffnUpType = ffnUp.Type;
+                if (gguf.TryGetTensor($"blk.{l}.ffn_up.bias", out var ffnUpB) && ffnUpB != null)
                 {
-                    ffnGateWeight = gguf.GetTensorPointer(ffnGate);
-                    ffnGateType = ffnGate.Type;
+                    ffnUpBias = (float*)gguf.GetTensorPointer(ffnUpB);
                 }
-                if (gguf.TryGetTensor($"blk.{l}.ffn_up.weight", out var ffnUp) && ffnUp != null)
-                {
-                    ffnUpWeight = gguf.GetTensorPointer(ffnUp);
-                    ffnUpType = ffnUp.Type;
-                    if (gguf.TryGetTensor($"blk.{l}.ffn_up.bias", out var ffnUpB) && ffnUpB != null)
-                    {
-                        ffnUpBias = (float*)gguf.GetTensorPointer(ffnUpB);
-                    }
-                }
-                if (gguf.TryGetTensor($"blk.{l}.ffn_down.weight", out var ffnDown) && ffnDown != null)
-                {
-                    ffnDownWeight = gguf.GetTensorPointer(ffnDown);
-                    ffnDownType = ffnDown.Type;
-                }
+            }
+            if (gguf.TryGetTensor($"blk.{l}.ffn_down.weight", out var ffnDown) && ffnDown != null)
+            {
+                ffnDownWeight = gguf.GetTensorPointer(ffnDown);
+                ffnDownType = ffnDown.Type;
+            }
+
+            // Gemma 4 specific norms and scales
+            if (gguf.TryGetTensor($"blk.{l}.ffn_gate_inp.scale", out var ffnGateInpScale) && ffnGateInpScale != null)
+            {
+                gateInpScale = (float*)gguf.GetTensorPointer(ffnGateInpScale);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.ffn_down_exps.scale", out var ffnDownExpsScale) && ffnDownExpsScale != null)
+            {
+                downExpsScale = (float*)gguf.GetTensorPointer(ffnDownExpsScale);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.layer_output_scale.weight", out var lOutScale) && lOutScale != null)
+            {
+                layerOutScale = (float*)gguf.GetTensorPointer(lOutScale);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.post_attention_norm.weight", out var apn) && apn != null)
+            {
+                attnPostNormWeight = (float*)gguf.GetTensorPointer(apn);
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.attn_post_norm.weight", out apn) && apn != null)
+            {
+                attnPostNormWeight = (float*)gguf.GetTensorPointer(apn);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.post_ffw_norm.weight", out var fpn) && fpn != null)
+            {
+                ffnPostNormWeight = (float*)gguf.GetTensorPointer(fpn);
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.ffn_post_norm.weight", out fpn) && fpn != null)
+            {
+                ffnPostNormWeight = (float*)gguf.GetTensorPointer(fpn);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.post_ffw_norm_1.weight", out var fpn1) && fpn1 != null)
+            {
+                ffnPostNorm1Weight = (float*)gguf.GetTensorPointer(fpn1);
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.ffn_post_norm_1.weight", out fpn1) && fpn1 != null)
+            {
+                ffnPostNorm1Weight = (float*)gguf.GetTensorPointer(fpn1);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.pre_ffw_norm_2.weight", out var fpn2pre) && fpn2pre != null)
+            {
+                ffnPreNorm2Weight = (float*)gguf.GetTensorPointer(fpn2pre);
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.ffn_pre_norm_2.weight", out fpn2pre) && fpn2pre != null)
+            {
+                ffnPreNorm2Weight = (float*)gguf.GetTensorPointer(fpn2pre);
+            }
+            if (gguf.TryGetTensor($"blk.{l}.post_ffw_norm_2.weight", out var fpn2post) && fpn2post != null)
+            {
+                ffnPostNorm2Weight = (float*)gguf.GetTensorPointer(fpn2post);
+            }
+            else if (gguf.TryGetTensor($"blk.{l}.ffn_post_norm_2.weight", out fpn2post) && fpn2post != null)
+            {
+                ffnPostNorm2Weight = (float*)gguf.GetTensorPointer(fpn2post);
+            }
+
+            bool isSwa = true;
+            if (gguf.SlidingWindowPattern != null && l < gguf.SlidingWindowPattern.Length)
+            {
+                isSwa = gguf.SlidingWindowPattern[l];
+            }
+            else if (gguf.Architecture == "gemma4")
+            {
+                isSwa = (l + 1) % 6 != 0;
+            }
+
+            int headsKv = HeadCountKv;
+            if (gguf.HeadCountKvPattern != null && l < gguf.HeadCountKvPattern.Length)
+            {
+                headsKv = gguf.HeadCountKvPattern[l];
+            }
+            else if (gguf.Architecture == "gemma4")
+            {
+                headsKv = isSwa ? 8 : 2;
+            }
+
+            int layerHeadDim = HeadDim;
+            if (qNorm != null && qNorm.Dimensions.Length > 0)
+            {
+                layerHeadDim = (int)qNorm.Dimensions[0];
+            }
+            else if (gguf.Architecture == "gemma4")
+            {
+                layerHeadDim = isSwa ? 256 : 512;
             }
 
             Layers[l] = new LayerWeights
@@ -660,7 +789,20 @@ public sealed unsafe class ModelWeights
                 FfnUpShexpWeight = shexpUpWeight,
                 FfnUpShexpType = shexpUpType,
                 FfnDownShexpWeight = shexpDownWeight,
-                FfnDownShexpType = shexpDownType
+                FfnDownShexpType = shexpDownType,
+                IsSwa = isSwa,
+                HeadDim = layerHeadDim,
+                HeadsKv = headsKv,
+                AttnPostNormWeight = attnPostNormWeight,
+                FfnPostNormWeight = ffnPostNormWeight,
+                FfnPostNorm1Weight = ffnPostNorm1Weight,
+                FfnPreNorm2Weight = ffnPreNorm2Weight,
+                FfnPostNorm2Weight = ffnPostNorm2Weight,
+                FfnGateInpScaleWeight = gateInpScale,
+                FfnGateUpExpsWeight = gateUpExpsWeight,
+                FfnGateUpExpsType = gateUpExpsType,
+                FfnDownExpsScaleWeight = downExpsScale,
+                LayerOutputScaleWeight = layerOutScale
             };
         }
     }

@@ -118,7 +118,7 @@ public static unsafe partial class QuantKernels
 
 
     /// <summary>
-    /// Root Mean Square Normalization: dst[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i]
+    /// Root Mean Square Normalization: dst[i] = (x[i] / sqrt(mean(x^2) + eps)) * (weight != null ? weight[i] : 1.0)
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void RMSNorm(float* x, float* weight, float* dst, int size, float eps)
@@ -147,22 +147,44 @@ public static unsafe partial class QuantKernels
         float rms = 1.0f / MathF.Sqrt((sumSq / size) + eps);
 
         i = 0;
-        if (Vector256.IsHardwareAccelerated)
+        if (weight != null)
         {
-            var vRms = Vector256.Create(rms);
-            int vecLimit = size - 8;
-            for (; i <= vecLimit; i += 8)
+            if (Vector256.IsHardwareAccelerated)
             {
-                var vx = Vector256.Load(x + i);
-                var vw = Vector256.Load(weight + i);
-                var vout = vx * vRms * vw;
-                vout.Store(dst + i);
+                var vRms = Vector256.Create(rms);
+                int vecLimit = size - 8;
+                for (; i <= vecLimit; i += 8)
+                {
+                    var vx = Vector256.Load(x + i);
+                    var vw = Vector256.Load(weight + i);
+                    var vout = vx * vRms * vw;
+                    vout.Store(dst + i);
+                }
+            }
+
+            for (; i < size; i++)
+            {
+                dst[i] = x[i] * rms * weight[i];
             }
         }
-
-        for (; i < size; i++)
+        else
         {
-            dst[i] = x[i] * rms * weight[i];
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var vRms = Vector256.Create(rms);
+                int vecLimit = size - 8;
+                for (; i <= vecLimit; i += 8)
+                {
+                    var vx = Vector256.Load(x + i);
+                    var vout = vx * vRms;
+                    vout.Store(dst + i);
+                }
+            }
+
+            for (; i < size; i++)
+            {
+                dst[i] = x[i] * rms;
+            }
         }
     }
 
@@ -347,6 +369,67 @@ public static unsafe partial class QuantKernels
             float g = gate[i];
             float silu = g / (1.0f + MathF.Exp(-g));
             dst[i] = silu * up[i];
+        }
+    }
+
+    /// <summary>
+    /// Computes GeLU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float Gelu(float x)
+    {
+        return 0.5f * x * (1.0f + MathF.Tanh(0.7978845608f * x * (1.0f + 0.044715f * x * x)));
+    }
+
+    /// <summary>
+    /// GeLU-GLU activation function used by Gemma: dst[i] = GeLU(gate[i]) * up[i]
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void GeluGLU(float* gate, float* up, float* dst, int size)
+    {
+        for (int i = 0; i < size; i++)
+        {
+            float g = gate[i];
+            float gelu = 0.5f * g * (1.0f + MathF.Tanh(0.7978845608f * g * (1.0f + 0.044715f * g * g)));
+            dst[i] = gelu * up[i];
+        }
+    }
+
+    /// <summary>
+    /// Scales vector x by a scalar and elementwise multiplies by an optional scale vector: dst[i] = x[i] * scalar * (scaleVec != null ? scaleVec[i] : 1.0f)
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void ScaleAndMul(float* x, float* scaleVec, float scalar, float* dst, int size)
+    {
+        int i = 0;
+        if (Vector256.IsHardwareAccelerated)
+        {
+            var vScalar = Vector256.Create(scalar);
+            int vecLimit = size - 8;
+            for (; i <= vecLimit; i += 8)
+            {
+                var vx = Vector256.Load(x + i);
+                var vs = scaleVec != null ? Vector256.Load(scaleVec + i) : Vector256<float>.One;
+                (vx * vScalar * vs).Store(dst + i);
+            }
+        }
+        for (; i < size; i++)
+        {
+            dst[i] = x[i] * scalar * (scaleVec != null ? scaleVec[i] : 1.0f);
+        }
+    }
+
+    /// <summary>
+    /// Applies tanh softcapping to logits: logits[i] = cap * tanh(logits[i] / cap)
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void SoftcapLogits(float* logits, int size, float cap)
+    {
+        if (cap <= 0f) return;
+        float invCap = 1.0f / cap;
+        for (int i = 0; i < size; i++)
+        {
+            logits[i] = cap * MathF.Tanh(logits[i] * invCap);
         }
     }
 

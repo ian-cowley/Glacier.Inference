@@ -87,6 +87,47 @@ public sealed unsafe class GgufFile : IDisposable
     public int SsmTimeStepRank => (int)GetMetadataUInt32($"{Architecture}.ssm.time_step_rank", 48);
     public int SsmInnerSize => (int)GetMetadataUInt32($"{Architecture}.ssm.inner_size", 6144);
 
+    public float FinalLogitSoftcapping => GetMetadataSingle($"{Architecture}.final_logit_softcapping", 0f);
+    public int SlidingWindow => (int)GetMetadataUInt32($"{Architecture}.attention.sliding_window", 0);
+    public float RopeFreqBaseSwa => GetMetadataSingle($"{Architecture}.rope.freq_base_swa", 10000.0f);
+    public int KeyLengthSwa => (int)GetMetadataUInt32($"{Architecture}.attention.key_length_swa", 256);
+    public int ValueLengthSwa => (int)GetMetadataUInt32($"{Architecture}.attention.value_length_swa", 256);
+    public int RopeDimensionCountSwa => (int)GetMetadataUInt32($"{Architecture}.rope.dimension_count_swa", 256);
+
+    public bool[]? SlidingWindowPattern
+    {
+        get
+        {
+            var list = GetMetadataList($"{Architecture}.attention.sliding_window_pattern");
+            if (list == null) return null;
+            var pattern = new bool[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] is bool b) pattern[i] = b;
+                else if (list[i] is uint u) pattern[i] = u != 0;
+                else if (list[i] is int iv) pattern[i] = iv != 0;
+            }
+            return pattern;
+        }
+    }
+
+    public int[]? HeadCountKvPattern
+    {
+        get
+        {
+            var list = GetMetadataList($"{Architecture}.attention.head_count_kv");
+            if (list == null) return null;
+            var arr = new int[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] is uint u) arr[i] = (int)u;
+                else if (list[i] is int iv) arr[i] = iv;
+                else if (list[i] is ulong ul) arr[i] = (int)ul;
+            }
+            return arr;
+        }
+    }
+
     public static GgufFile Open(string filePath) => new(filePath);
 
     public GgufFile(string filePath)
@@ -225,6 +266,13 @@ public sealed unsafe class GgufFile : IDisposable
             if (val is int i) return i != 0;
         }
         return fallback;
+    }
+
+    public List<object>? GetMetadataList(string key)
+    {
+        if (Metadata.TryGetValue(key, out var val) && val is List<object> list)
+            return list;
+        return null;
     }
 
     private static string ReadString(ref byte* ptr)

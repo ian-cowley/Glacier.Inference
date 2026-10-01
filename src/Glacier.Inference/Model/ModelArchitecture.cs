@@ -39,6 +39,11 @@ public enum UniversalArchitecture
     HybridSsm,
 
     /// <summary>
+    /// Google Gemma 4 family with interleaved Sliding Window Attention (ISWA), dual shared+MoE MLP, and GeLU-GLU.
+    /// </summary>
+    Gemma4,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -61,6 +66,12 @@ public static class ModelArchitectureDetector
 
     public static UniversalArchitecture Detect(string arch, GgufFile gguf)
     {
+        if (string.Equals(arch, "gemma4", StringComparison.OrdinalIgnoreCase) ||
+            arch.StartsWith("gemma4", StringComparison.OrdinalIgnoreCase))
+        {
+            return UniversalArchitecture.Gemma4;
+        }
+
         if (HasSsmTensors(gguf))
         {
             return UniversalArchitecture.HybridSsm;

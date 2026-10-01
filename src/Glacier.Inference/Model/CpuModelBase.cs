@@ -112,7 +112,7 @@ public abstract unsafe class CpuModelBase : ICpuModel
     /// Executes forward pass for a single token at position pos.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void Forward(int token, int pos, KVCache kvCache, Span<float> logits, bool computeLogits = true)
+    public virtual void Forward(int token, int pos, KVCache kvCache, Span<float> logits, bool computeLogits = true)
     {
         ForwardStage(token, pos, default, default, logits, computeLogits, kvCache);
     }
@@ -121,7 +121,7 @@ public abstract unsafe class CpuModelBase : ICpuModel
     /// Executes layers assigned to this stage for a single token forward step.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void ForwardStage(
+    public virtual void ForwardStage(
         int token,
         int pos,
         ReadOnlySpan<float> inputX,
@@ -308,7 +308,7 @@ public abstract unsafe class CpuModelBase : ICpuModel
     /// <summary>
     /// Evaluates a sequence of prompt tokens in batched chunks.
     /// </summary>
-    public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, KVCache kvCache, bool computeLogits = true)
+    public virtual void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, KVCache kvCache, bool computeLogits = true)
     {
         ForwardBatchStage(tokens, startPos, default, default, logits, computeLogits, kvCache);
     }
@@ -316,7 +316,7 @@ public abstract unsafe class CpuModelBase : ICpuModel
     /// <summary>
     /// Executes batched prefill for the layers assigned to this stage.
     /// </summary>
-    public void ForwardBatchStage(
+    public virtual void ForwardBatchStage(
         ReadOnlySpan<int> tokens,
         int startPos,
         ReadOnlySpan<float> inputXBatch,

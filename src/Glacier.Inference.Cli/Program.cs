@@ -405,7 +405,7 @@ public static class Program
         {
             if (kv.Value is System.Collections.IList list)
             {
-                if (list.Count <= 16)
+                if (list.Count <= 64)
                     Console.WriteLine($"  {kv.Key}: [{string.Join(", ", list.Cast<object>())}]");
                 else
                     Console.WriteLine($"  {kv.Key}: [list of {list.Count} items]");

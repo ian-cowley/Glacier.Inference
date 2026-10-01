@@ -14,6 +14,11 @@ public static class CpuModelFactory
         int layerCount = -1,
         bool isLastStage = true)
     {
+        if (weights.ArchitectureFamily == UniversalArchitecture.Gemma4)
+        {
+            return new Gemma4Model(weights, maxSeqLen, startLayer, layerCount, isLastStage);
+        }
+
         if (weights.IsHybridSsm || weights.ArchitectureFamily == UniversalArchitecture.HybridSsm)
         {
             return new Qwen3HybridModel(weights, maxSeqLen, startLayer, layerCount, isLastStage);

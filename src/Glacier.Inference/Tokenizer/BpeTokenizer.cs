@@ -120,6 +120,20 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<｜begin of sentence｜>");
         RegisterSpecialToken("<｜end of sentence｜>");
 
+        // Gemma 4 special tokens
+        RegisterSpecialToken("<|turn>");
+        RegisterSpecialToken("<turn|>");
+        RegisterSpecialToken("<|channel>");
+        RegisterSpecialToken("<channel|>");
+        RegisterSpecialToken("<|tool>");
+        RegisterSpecialToken("<tool|>");
+        RegisterSpecialToken("<|tool_call>");
+        RegisterSpecialToken("<tool_call|>");
+        RegisterSpecialToken("<|tool_response>");
+        RegisterSpecialToken("<tool_response|>");
+        RegisterSpecialToken("<|think|>");
+        RegisterSpecialToken("<eos>");
+
         // Dynamically register model's configured BOS/EOS
         if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
         {
@@ -139,6 +153,10 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("<|eot_id|>");
         RegisterStopToken("</s>");
         RegisterStopToken("<｜end of sentence｜>");
+        RegisterStopToken("<turn|>");
+        RegisterStopToken("<eos>");
+        RegisterStopToken("<|tool_call>");
+        RegisterStopToken("<|tool_response>");
     }
 
     public BpeTokenizer(IEnumerable<string> vocab, int eosTokenId = 151643, int bosTokenId = 151644)
@@ -188,6 +206,23 @@ public sealed partial class BpeTokenizer
     /// </summary>
     public string FormatChatML(string prompt, string systemPrompt = "You are a helpful assistant.")
     {
+        // 0. Check for Gemma 4 turn format
+        if (_specialTokens.ContainsKey("<|turn>"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
+            {
+                sb.Append($"<|turn>system\n{systemPrompt}<turn|>\n");
+            }
+            sb.Append($"<|turn>user\n{prompt}<turn|>\n");
+            sb.Append("<|turn>model\n<|channel>thought\n<channel|>");
+            return sb.ToString();
+        }
+
         // 1. Check for LLaMA 3 header format
         if (_specialTokens.ContainsKey("<|start_header_id|>"))
         {
