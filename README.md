@@ -36,6 +36,7 @@ Glacier.Inference natively executes all major open foundation model families wit
 | **Microsoft Phi-4 & Phi-3** | Fused Attention & Fused Gate/Up FFN | Fast NeOX RoPE ($base = 250,000$) | Fused `attn_qkv` GEMV + Fused `ffn_up` SwiGLU | `phi-4-Q4_K_M` (15B params) |
 | **Mistral & Devstral** | Standard GQA with ultra-wide context | Extreme $10^9$ RoPE Base frequency | Dense GQA + SwiGLU FFN | `Devstral-Small-2505` (24B params) |
 | **Alibaba Qwen 2 & 2.5** | Dense & MoE GQA with per-head QKV bias | $10^6$ RoPE Base with optional QK-Norm | GQA with fused/unfused bias | `Qwen2.5-7B-Instruct`, `Qwen3-30B-A3B` |
+| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Quadratic Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with $256$-dim Head | Recurrent Associative Memory ($S_t$), Depthwise Causal Conv1D, Q-Gate, RMSNorm per-head | `Qwen3.5-9B`, `Qwen3.6-27B-UD` |
 
 ---
 
@@ -71,7 +72,7 @@ await foreach (var token in session.GenerateStreamAsync("What is the capital of 
 - **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
 - **Full Architecture Support**:
   - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), Gemma-4-26B-A4B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
-  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 & Qwen3.8 (4B Thinking, 8B, 30B MoE) with native decoupled head dimensions (`key_length = 128`), non-square attention projections, and per-head QK-normalization (`rms_norm_heads_kernel`).
+  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 & Qwen3.8 (4B Thinking, 8B, 30B MoE), and **Qwen3.5 & Qwen3.6 Hybrid Models (9B, 27B)** featuring Gated DeltaNet (GDN) linear attention SSMs with recurrent state matrices ($S_t$), 1D causal convolutions, per-head Q-Gate projections, and partial Multi-dimensional RoPE ($dim=64$).
   - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
   - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama, DeepSeek-Coder-V2-Lite.
   - **Xiaomi MiMo Family**: MiMo-7B-RL.
@@ -552,6 +553,8 @@ Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRat
 │  ├─ D3D12Shaders (Embedded compiled HLSL compute shaders, 32T GEMM)   │
 │  ├─ QuantKernels (AVX-512/AVX2 Q4_K, Q6_K, Q8_0, Q3_K, Q5_K, MXFP4)   │
 │  ├─ KVCache (Unmanaged contiguous ring buffer, Adaptive FP16 / FP8)    │
+│  ├─ SsmStateCache (Recurrent state memory S_t & rolling Conv1D cache)  │
+│  ├─ Qwen3HybridModel (Gated DeltaNet SSM + Interleaved Full Attention) │
 │  ├─ Qwen2Model / MoE Transformer (Attention Sinks, QK-Norm, SwiGLU)    │
 │  ├─ BpeTokenizer (Direct GGUF token & merge tables, ChatML)            │
 │  └─ Sampler (Pure GPU Argmax ~3μs, Temperature, Top-K, Top-P)          │

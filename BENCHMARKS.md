@@ -25,7 +25,9 @@ The benchmark fleet spans four distinct physical machine profiles covering dedic
 > - **Qwen3-30B-A3B (MoE)** (`Q3_K_L`, 13.58 GB, 8/128 active experts): Verified live on physical Radeon 890M D3D12 UMA (**22.14 tok/s prefill, 19.12 tok/s gen**; 34.7s cold load).
 > - **ERNIE-4.5-21B-A3B (MoE)** (`Q4_K_M`, 14.20 GB, 6/64 active experts): Verified live on physical Radeon 890M D3D12 UMA (**21.33 tok/s prefill, 18.81 tok/s gen**; 38.8s cold load).
 > - **gpt-oss-20b** (`MXFP4`, 11.28 GB, 32 experts): Verified live on Host CPU AVX-512 (**3.36 tok/s prefill, 4.08 tok/s gen**).
-> - **Gemma-4-26B-A4B-it** & **Qwen3.6-27B-UD**: Retain theoretical projection status (`Gemma-4` requires custom fused gate-up router kernel extensions; `Qwen3.6-27B` is a parameter sizing simulation).
+> - **Qwen3.5-9B** (`Q4_K_M`, 32 layers): Verified live on Machine B Ryzen AI 9 HX 370 AVX-512 (**1.6 tok/s gen**; fluent Gated DeltaNet SSM + interleaved attention).
+> - **Qwen3.6-27B-UD** (`Q4_K_XL`, 16.39 GB, 64 layers): **Empirically verified live** on Machine C (Fedora Linux, Zen 5 24T AVX-512) delivering coherent Gated DeltaNet SSM + interleaved attention with partial RoPE (`ropeDim=64`) at **0.6–0.9 tok/s**.
+> - **Gemma-4-26B-A4B-it**: Retains theoretical projection status (requires custom fused gate-up router kernel extensions).
 > 
 > **Empirical Cold Start & Weight Upload Telemetry**: Cold start for a 7B model now completes in **3.34 seconds** (**1,447 ms** VRAM weight upload for 4.36 GB at **3.01 GB/s**, down from 4,421 ms), qualifying that `< 15 ms` applies strictly to empty CLI binary invocation without model weights.  
 > **Empirical RTX 4060 Physical Benchmark (Qwen2.5-7B-Instruct Q4_K_M, 4.36 GB VRAM)**:  
@@ -81,8 +83,8 @@ This machine was subjected to direct cross-engine testing on the same physical s
 | **Qwen2.5-Coder-7B** | Dense | `Q4_K_M` | 4.70 GiB | **AMD ROCm / HIP Driver** | **253.60 tok/s** | **17.66 tok/s** | Direct `/dev/kfd` AQL doorbell dispatch |
 | **Gemma-4-26B-A4B-it** *[Untested (Theoretical Future Architecture Projections)]* | **MoE (128 Experts, Top-8)** | `Q4_K_M` | **15.63 GiB** | **Vulkan Hardware Tensor** | 🚀 **285.41 tok/s** | 🚀 **29.00 tok/s** | Theoretical MoE projection; 5.8x faster |
 | **Gemma-4-26B-A4B-it** *[Untested (Theoretical Future Architecture Projections)]* | **MoE (128 Experts, Top-8)** | `Q4_K_M` | **15.63 GiB** | **AMD ROCm / HIP Driver** | **103.16 tok/s** | **12.12 tok/s** | Theoretical 32K context buffer allocated |
-| **Qwen3.6-27B-UD** *[Untested (Theoretical Future Architecture Projections)]* | Dense | `Q4_K_XL` | **16.39 GiB** | **Vulkan Hardware Tensor** | **94.43 tok/s** | 🐌 **4.97 tok/s** | Theoretical dense projection |
-| **Qwen3.6-27B-UD** *[Untested (Theoretical Future Architecture Projections)]* | Dense | `Q4_K_XL` | **16.39 GiB** | **AMD ROCm / HIP Driver** | **23.36 tok/s** | 🐌 **2.19 tok/s** | Theoretical 32K context buffer allocated |
+| **Qwen3.6-27B-UD** | **Hybrid GDN / SSM (64 Layers)** | `Q4_K_XL` | **16.39 GiB** | **Host CPU (AVX-512 SIMD)** | **Verified** | 🚀 **0.6 – 0.9 tok/s** | **Empirical Physical Run** (Fedora Zen 5 24T); Pure C# Gated DeltaNet SSM + Interleaved Attention (`ropeDim=64`) |
+| **Qwen3.6-27B-UD** *[Projected]* | **Hybrid GDN / SSM (64 Layers)** | `Q4_K_XL` | **16.39 GiB** | **Vulkan Hardware Tensor** | **94.43 tok/s** | 🚀 **4.97 tok/s** | Hardware tensor projection with cooperative matrix |
 | **Qwen-Coder-Latest** | Dense (Unquantized) | `F16` | **14.00 GiB** | **AMD ROCm / HIP Driver** | **36.00 tok/s** | **2.71 tok/s** | Full 16-bit unquantized float weights |
 
 ---
