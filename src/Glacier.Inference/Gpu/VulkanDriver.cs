@@ -8,7 +8,7 @@ using System.Text;
 /// Direct, zero-dependency P/Invoke bindings to the native Vulkan driver (vulkan-1.dll on Windows, libvulkan.so.1 on Linux).
 /// Enables universal cross-vendor compute acceleration and checks for VK_KHR_cooperative_matrix hardware tensor support.
 /// </summary>
-public static class VulkanDriver
+public static unsafe class VulkanDriver
 {
     private const string VulkanLib = "vulkan-1.dll";
 
@@ -436,6 +436,9 @@ public static class VulkanDriver
     public static extern int QueueSubmit(IntPtr queue, uint submitCount, ref VkSubmitInfo pSubmits, IntPtr fence);
 
     public static uint MakeVersion(uint major, uint minor, uint patch) => (major << 22) | (minor << 12) | patch;
+    public static uint VersionMajor(uint version) => version >> 22;
+    public static uint VersionMinor(uint version) => (version >> 12) & 0x3FF;
+    public static uint VersionPatch(uint version) => version & 0xFFF;
 
     public static void Check(int res, string op)
     {

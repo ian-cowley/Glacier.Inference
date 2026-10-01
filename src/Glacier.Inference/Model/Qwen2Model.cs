@@ -85,9 +85,27 @@ public sealed unsafe partial class Qwen2Model : IDisposable
     private float* _compressedKvBatch;
     private float* _decompressedKvBatch;
 
+    // Preallocated Gated DeltaNet (GDN) / Hybrid SSM scratch buffers & cache
+    private SsmStateCache? _ssmCache;
+    private float* _gdnQkv;
+    private float* _gdnConvOut;
+    private float* _gdnZ;
+    private float* _gdnA;
+    private float* _gdnB;
+    private float* _gdnY;
+    private float* _gdnYSums;
+    private readonly int _ssmConvKernel;
+    private readonly int _ssmStateDim;
+    private readonly int _ssmGroupCount;
+    private readonly int _ssmHeads;
+    private readonly int _ssmInnerSize;
+    private readonly int _gdnConvChannels;
+    private readonly bool _hasGdn;
+
     private bool _disposed;
 
     public ModelWeights Weights => _weights;
+    public SsmStateCache? SsmCache => _ssmCache;
     public int MaxSeqLen => _maxSeqLen;
     public int StartLayer { get; }
     public int LayerCount { get; }
@@ -209,6 +227,28 @@ public sealed unsafe partial class Qwen2Model : IDisposable
         _gateUpFused = (float*)NativeMemory.AllocZeroed((nuint)(gateUpDim * sizeof(float)));
         _qkvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qkvDim * sizeof(float)));
         _gateUpBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * gateUpDim * sizeof(float)));
+
+        bool hasGdn = _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm;
+        if (!hasGdn)
+        {
+            for (int i = 0; i < _weights.Layers.Length; i++)
+            {
+                if (_weights.Layers[i].IsGdn)
+                {
+                    hasGdn = true;
+                    break;
+                }
+            }
+        }
+        _hasGdn = hasGdn;
+        _ssmConvKernel = _weights.Gguf.SsmConvKernel;
+        _ssmStateDim = _weights.Gguf.SsmStateSize;
+        _ssmGroupCount = _weights.Gguf.SsmGroupCount;
+        _ssmHeads = _weights.Gguf.SsmTimeStepRank;
+        _ssmInnerSize = _weights.Gguf.SsmInnerSize;
+        _gdnConvChannels = (_ssmGroupCount * 2 + _ssmHeads) * _ssmStateDim;
+
+        InitializeGdnBuffers();
     }
 
     private const int ParallelAttentionSeqThreshold = 256;
@@ -386,6 +426,15 @@ public sealed unsafe partial class Qwen2Model : IDisposable
             FreeIfAllocated(ref _yarnInvFreq);
             FreeIfAllocated(ref _compressedKvBatch);
             FreeIfAllocated(ref _decompressedKvBatch);
+
+            _ssmCache?.Dispose();
+            FreeIfAllocated(ref _gdnQkv);
+            FreeIfAllocated(ref _gdnConvOut);
+            FreeIfAllocated(ref _gdnZ);
+            FreeIfAllocated(ref _gdnA);
+            FreeIfAllocated(ref _gdnB);
+            FreeIfAllocated(ref _gdnY);
+            FreeIfAllocated(ref _gdnYSums);
 
             _disposed = true;
         }

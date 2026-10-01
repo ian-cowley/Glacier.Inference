@@ -155,4 +155,61 @@ public class UniversalArchitectureTests
         Assert.NotEmpty(top5);
         Assert.Contains(top5, t => tokenizer.DecodeToken(t.id).Contains("Paris") || tokenizer.DecodeToken(t.id).Contains("The"));
     }
+
+    [Fact]
+    public void ModelArchitectureDetector_DetectsHybridSsm_WhenSsmTensorsPresent()
+    {
+        Assert.True(UniversalArchitecture.HybridSsm != UniversalArchitecture.Qwen);
+        Assert.Equal("HybridSsm", UniversalArchitecture.HybridSsm.ToString());
+    }
+
+    [Fact]
+    public unsafe void SsmStateCache_AllocatesAndMaintainsRecurrentAndConvState()
+    {
+        int layers = 4;
+        int kernel = 4;
+        int channels = 10240;
+        int heads = 48;
+        int stateDim = 128;
+
+        using var cache = new SsmStateCache(layers, kernel, channels, heads, stateDim);
+        Assert.Equal(layers, cache.LayerCount);
+        Assert.Equal(kernel, cache.ConvKernel);
+        Assert.Equal(channels, cache.ConvChannels);
+        Assert.Equal(heads, cache.Heads);
+        Assert.Equal(stateDim, cache.StateDim);
+
+        // Conv state: (kernel - 1) * channels floats per layer
+        float* conv0 = cache.GetConvState(0);
+        float* conv1 = cache.GetConvState(1);
+        Assert.True(conv0 != null);
+        Assert.True(conv1 != null);
+        Assert.True(conv1 > conv0);
+
+        // Verify write and read
+        conv0[0] = 3.14159f;
+        conv0[channels * 3 - 1] = 2.71828f;
+        Assert.Equal(3.14159f, conv0[0]);
+        Assert.Equal(2.71828f, conv0[channels * 3 - 1]);
+
+        // Recurrent state: heads * stateDim * stateDim floats per layer
+        float* rec0_0 = cache.GetRecurrentState(0, 0);
+        float* rec0_1 = cache.GetRecurrentState(0, 1);
+        float* rec1_0 = cache.GetRecurrentState(1, 0);
+        Assert.True(rec0_0 != null);
+        Assert.True(rec0_1 != null);
+        Assert.True(rec1_0 != null);
+        Assert.True(rec0_1 > rec0_0);
+        Assert.True(rec1_0 > rec0_0);
+
+        rec0_0[0] = 42.0f;
+        rec0_0[stateDim * stateDim - 1] = 99.0f;
+        Assert.Equal(42.0f, rec0_0[0]);
+        Assert.Equal(99.0f, rec0_0[stateDim * stateDim - 1]);
+
+        // Test Reset clears state
+        cache.Reset();
+        Assert.Equal(0.0f, conv0[0]);
+        Assert.Equal(0.0f, rec0_0[0]);
+    }
 }

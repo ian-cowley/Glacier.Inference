@@ -133,7 +133,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             Device = targetDevice;
             Engine = targetEngine;
 
-            if (!_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+            if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
                 {
@@ -156,7 +156,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
-            else if (!_weights.IsMla && !_weights.Layers[0].HasFusedQkv && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+            else if (!_weights.IsHybridSsm && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
             {
                 try
@@ -181,15 +181,38 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             }
             else
             {
+                var settings = GlacierSettings.Load();
+                if (!settings.FallbackToCpu && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu)
+                {
+                    string reason = _weights.IsHybridSsm
+                        ? $"Model uses Qwen 3.5/3.6 Gated DeltaNet (Hybrid SSM) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
+                        : targetDevice.Vendor switch
+                        {
+                            GpuVendor.Amd when !OperatingSystem.IsWindows() =>
+                                $"GPU hardware acceleration on {targetDevice.Name} currently requires Direct3D 12 on Windows. On Linux, please specify '--device cpu'.",
+                            GpuVendor.Nvidia =>
+                                $"Bare-metal SASS engine is not available for {targetDevice.Name} or requires an unsupported model architecture variant.",
+                            _ =>
+                                $"No compatible GPU hardware engine available for device '{targetDevice.Name}' under engine '{targetEngine}' on this operating system."
+                        };
+                    throw new InvalidOperationException($"Cannot run on {targetDevice.Name} with engine '{targetEngine}': {reason}");
+                }
+
                 _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                 _cpuModel = new Qwen2Model(_weights, maxSeqLen);
+                string cpuDeviceName = DeviceManager.ResolveDevice("cpu").Name;
+                string prefix = targetDevice.Vendor != GpuVendor.Cpu
+                    ? $"{cpuDeviceName} [Fallback from {targetDevice.Name} | "
+                    : $"{targetDevice.Name} [";
                 ActiveDevice = _weights.IsMla
-                    ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (DeepSeek MLA)]"
-                    : _weights.Layers[0].HasFusedQkv
-                        ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 (Microsoft Phi Fused QKV/SwiGLU)]"
-                        : _weights.IsMoe
-                            ? $"{targetDevice.Name} [Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
-                            : $"{targetDevice.Name} [Engine: SIMD AVX2/AVX-512 Optimized ({_weights.ArchitectureFamily})]";
+                    ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (DeepSeek MLA)]"
+                    : _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm
+                        ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (Qwen Gated DeltaNet / Hybrid SSM)]"
+                        : _weights.Layers[0].HasFusedQkv
+                            ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (Microsoft Phi Fused QKV/SwiGLU)]"
+                            : _weights.IsMoe
+                                ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 MoE]"
+                                : $"{prefix}Engine: SIMD AVX2/AVX-512 Optimized ({_weights.ArchitectureFamily})]";
             }
         }
     }

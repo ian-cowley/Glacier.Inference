@@ -34,6 +34,11 @@ public enum UniversalArchitecture
     Mistral,
 
     /// <summary>
+    /// Hybrid State Space Model (SSM) / Gated DeltaNet (GDN) linear attention architecture (e.g. Qwen 3.5 / 3.6 GDN).
+    /// </summary>
+    HybridSsm,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -44,8 +49,23 @@ public enum UniversalArchitecture
 /// </summary>
 public static class ModelArchitectureDetector
 {
+    public static bool HasSsmTensors(GgufFile gguf)
+    {
+        foreach (var key in gguf.Tensors.Keys)
+        {
+            if (key.Contains(".ssm_") || key.Contains(".linear_attn"))
+                return true;
+        }
+        return false;
+    }
+
     public static UniversalArchitecture Detect(string arch, GgufFile gguf)
     {
+        if (HasSsmTensors(gguf))
+        {
+            return UniversalArchitecture.HybridSsm;
+        }
+
         if (string.Equals(arch, "deepseek2", StringComparison.OrdinalIgnoreCase) ||
             arch.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase) ||
             gguf.IsMla)

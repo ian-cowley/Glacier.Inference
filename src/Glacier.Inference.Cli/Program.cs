@@ -895,6 +895,7 @@ public static class Program
 
         Console.WriteLine(">> Initializing inference session...");
         var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
+        Console.WriteLine($">> Model ready on {session.ActiveDevice}\n");
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         var appBuilder = WebApplication.CreateBuilder();
@@ -1175,9 +1176,9 @@ public static class Program
         Console.WriteLine(new string('-', 108));
         Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("* To switch your active hardware & driver engine:");
-        Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|directml|cpu>]");
+        Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
         Console.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine baremetal");
-        Console.WriteLine("  Example: glacier config --device amd-890m --engine directml");
+        Console.WriteLine("  Example: glacier config --device amd-890m --engine vulkan");
         Console.WriteLine("  Example: glacier config --device cpu");
         Console.ResetColor();
 
@@ -1216,7 +1217,7 @@ public static class Program
             Console.WriteLine($"Default Top-P:     {settings.DefaultTopP}");
             Console.WriteLine();
             Console.WriteLine("Commands to configure:");
-            Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|directml|cpu>]");
+            Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
             Console.WriteLine("  glacier config --reset");
             return 0;
         }

@@ -159,7 +159,7 @@ public static class DeviceManager
         return results;
     }
 
-    private static void EnumerateNativeGpuDrivers(List<DeviceInfo> results)
+    private static unsafe void EnumerateNativeGpuDrivers(List<DeviceInfo> results)
     {
         // 1. AMD ROCm / HIP devices
         if (HipDriver.IsAvailable())
@@ -252,6 +252,92 @@ public static class DeviceManager
             catch
             {
                 // Ignore CUDA failure on Linux
+            }
+        }
+
+        // 3. Vulkan devices (Cross-vendor AMD, Intel, NVIDIA on Linux & Windows)
+        if (VulkanDriver.IsAvailable())
+        {
+            try
+            {
+                var appInfo = new VulkanDriver.VkApplicationInfo
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                    apiVersion = VulkanDriver.MakeVersion(1, 2, 0)
+                };
+                var createInfo = new VulkanDriver.VkInstanceCreateInfo
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                    pApplicationInfo = new IntPtr(&appInfo)
+                };
+                if (VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out IntPtr inst) == 0 && inst != IntPtr.Zero)
+                {
+                    uint devCount = 0;
+                    VulkanDriver.EnumeratePhysicalDevices(inst, ref devCount, null);
+                    if (devCount > 0)
+                    {
+                        var devHandles = new IntPtr[devCount];
+                        VulkanDriver.EnumeratePhysicalDevices(inst, ref devCount, devHandles);
+                        for (int i = 0; i < devCount; i++)
+                        {
+                            VulkanDriver.GetPhysicalDeviceProperties(devHandles[i], out var props);
+                            // Skip CPU / llvmpipe / software rasterizers (VK_PHYSICAL_DEVICE_TYPE_CPU = 4)
+                            if (props.deviceType == 4) continue;
+
+                            string name = props.deviceName;
+                            if (string.IsNullOrWhiteSpace(name) || name.Contains("llvmpipe", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            // Avoid duplicate devices already discovered by HIP, CUDA, or DXGI
+                            if (results.Exists(d => d.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+                                continue;
+
+                            var vendor = props.vendorID switch
+                            {
+                                0x10DE => GpuVendor.Nvidia,
+                                0x1002 => GpuVendor.Amd,
+                                0x8086 => GpuVendor.Intel,
+                                _ => GpuVendor.Unknown
+                            };
+
+                            VulkanDriver.GetPhysicalDeviceMemoryProperties(devHandles[i], out var memProps);
+                            ulong vramBytes = 0;
+                            var heaps = (VulkanDriver.VkMemoryHeap*)memProps.memoryHeaps;
+                            for (uint h = 0; h < memProps.memoryHeapCount; h++)
+                            {
+                                if ((heaps[h].flags & 1) != 0)
+                                    vramBytes += heaps[h].size;
+                            }
+                            if (vramBytes == 0)
+                            {
+                                for (uint h = 0; h < memProps.memoryHeapCount; h++)
+                                    vramBytes += heaps[h].size;
+                            }
+
+                            string slug = GenerateSlug(name, vendor, results.Count);
+                            var engines = new List<InferenceEngineType> { InferenceEngineType.Vulkan, InferenceEngineType.BareMetal, InferenceEngineType.Cpu };
+
+                            results.Add(new DeviceInfo
+                            {
+                                Id = slug,
+                                Index = results.Count,
+                                Name = name,
+                                Vendor = vendor,
+                                DedicatedVramBytes = vramBytes,
+                                SharedVramBytes = 0,
+                                IsDisplayDevice = false,
+                                SupportedEngines = engines,
+                                RecommendedEngine = InferenceEngineType.Vulkan,
+                                SafetyNotes = $"Vulkan compute accelerator (API {VulkanDriver.VersionMajor(props.apiVersion)}.{VulkanDriver.VersionMinor(props.apiVersion)})."
+                            });
+                        }
+                    }
+                    VulkanDriver.DestroyInstance(inst, IntPtr.Zero);
+                }
+            }
+            catch
+            {
+                // Ignore Vulkan enumeration failure
             }
         }
     }

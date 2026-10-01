@@ -28,11 +28,24 @@ public sealed unsafe class LayerWeights
     public required GgufType AttnOutType { get; init; }
     public float* AttnOutBias { get; init; }
 
-    // Fused QKV (Phi-3, Phi-4)
+    // Fused QKV (Phi-3, Phi-4, Qwen3.5/3.6 GDN)
     public bool HasFusedQkv => QkvWeight != null;
     public byte* QkvWeight { get; init; }
     public GgufType QkvType { get; init; }
     public float* QkvBias { get; init; }
+
+    // Gated DeltaNet (GDN) / State Space Model (SSM)
+    public bool IsGdn { get; init; }
+    public byte* AttnGateWeight { get; init; }
+    public GgufType AttnGateType { get; init; }
+    public float* SsmConv1dWeight { get; init; }
+    public float* SsmAWeight { get; init; }
+    public float* SsmAlphaWeight { get; init; }
+    public float* SsmBetaWeight { get; init; }
+    public float* SsmDtBias { get; init; }
+    public float* SsmNormWeight { get; init; }
+    public byte* SsmOutWeight { get; init; }
+    public GgufType SsmOutType { get; init; }
 
     // Multi-Head Latent Attention (MLA)
     public bool IsMla { get; init; }
@@ -129,6 +142,14 @@ public sealed unsafe class ModelWeights
     public float* RopeFreqsWeight { get; }
     public bool HasRopeFreqs => RopeFreqsWeight != null;
 
+    public bool IsHybridSsm => Gguf.IsHybridSsm;
+    public int FullAttentionInterval => Gguf.FullAttentionInterval;
+    public int SsmConvKernel => Gguf.SsmConvKernel;
+    public int SsmStateSize => Gguf.SsmStateSize;
+    public int SsmGroupCount => Gguf.SsmGroupCount;
+    public int SsmTimeStepRank => Gguf.SsmTimeStepRank;
+    public int SsmInnerSize => Gguf.SsmInnerSize;
+
     public bool IsMoe => Gguf.IsMoe;
     public bool NormTopK => Gguf.NormTopK;
     public int ExpertCount => Gguf.ExpertCount;
@@ -166,14 +187,29 @@ public sealed unsafe class ModelWeights
             RopeFreqsWeight = (float*)gguf.GetTensorPointer(ropeFreqs);
         }
 
+
         // Embedding
-        var embdInfo = gguf.Tensors["token_embd.weight"];
+        if (!gguf.TryGetTensor("token_embd.weight", out var embdInfo) || embdInfo == null)
+        {
+            string fileName = Path.GetFileName(gguf.FilePath);
+            throw new InvalidDataException(
+                $"Model '{fileName}' is missing the required token embedding tensor ('token_embd.weight'). " +
+                $"Please ensure this GGUF file is complete and not a LoRA adapter or unmerged split shard.");
+        }
         EmbdWeight = gguf.GetTensorPointer(embdInfo);
         EmbdType = embdInfo.Type;
         VocabSize = (int)embdInfo.Dimensions[1];
 
         // Final output norm
-        var outNormInfo = gguf.Tensors["output_norm.weight"];
+        if (!gguf.TryGetTensor("output_norm.weight", out var outNormInfo) || outNormInfo == null)
+        {
+            if (!gguf.TryGetTensor("norm.weight", out outNormInfo) || outNormInfo == null)
+            {
+                string fileName = Path.GetFileName(gguf.FilePath);
+                throw new InvalidDataException(
+                    $"Model '{fileName}' is missing the required final output normalization tensor ('output_norm.weight' / 'norm.weight').");
+            }
+        }
         OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
         OutNormType = outNormInfo.Type;
 
@@ -199,7 +235,20 @@ public sealed unsafe class ModelWeights
                 gguf.TryGetTensor($"blk.{l}.input_layernorm.weight", out attnNorm);
             }
 
-            bool isMla = gguf.TryGetTensor($"blk.{l}.attn_kv_a_mqa.weight", out var kvAMqa) && kvAMqa != null;
+            if (attnNorm == null)
+            {
+                string fileName = Path.GetFileName(gguf.FilePath);
+                throw new InvalidDataException(
+                    $"Model '{fileName}' is missing attention normalization tensor for layer {l} ('blk.{l}.attn_norm.weight' / 'blk.{l}.input_layernorm.weight'). " +
+                    $"Detected architecture: '{gguf.Architecture}'. Total layers specified in metadata: {BlockCount}. " +
+                    $"Please verify that the model architecture is supported and that this file is not an unmerged split shard.");
+            }
+
+            GgufTensorInfo? ssmOut = null;
+            bool isGdn = gguf.TryGetTensor($"blk.{l}.ssm_out.weight", out ssmOut) && ssmOut != null;
+
+            GgufTensorInfo? kvAMqa = null;
+            bool isMla = !isGdn && gguf.TryGetTensor($"blk.{l}.attn_kv_a_mqa.weight", out kvAMqa) && kvAMqa != null;
 
             byte* qWeight = null;
             GgufType qType = GgufType.F32;
@@ -214,38 +263,24 @@ public sealed unsafe class ModelWeights
             GgufType qkvType = GgufType.F32;
             float* qkvBias = null;
 
-            if (gguf.TryGetTensor($"blk.{l}.attn_q.weight", out var q) && q != null)
-            {
-                qWeight = gguf.GetTensorPointer(q);
-                qType = q.Type;
-                if (gguf.TryGetTensor($"blk.{l}.attn_q.bias", out var qBias) && qBias != null)
-                {
-                    qb = (float*)gguf.GetTensorPointer(qBias);
-                }
-            }
-            else if (gguf.TryGetTensor($"blk.{l}.attn_q_a.weight", out var qA) && qA != null)
-            {
-                qAWeight = gguf.GetTensorPointer(qA);
-                qAType = qA.Type;
-                if (gguf.TryGetTensor($"blk.{l}.attn_q_a_norm.weight", out var qANorm) && qANorm != null)
-                {
-                    qANormWeight = (float*)gguf.GetTensorPointer(qANorm);
-                }
-                if (gguf.TryGetTensor($"blk.{l}.attn_q_b.weight", out var qB) && qB != null)
-                {
-                    qBWeight = gguf.GetTensorPointer(qB);
-                    qBType = qB.Type;
-                }
-            }
-            else if (gguf.TryGetTensor($"blk.{l}.attn_qkv.weight", out var qkv) && qkv != null)
-            {
-                qkvWeight = gguf.GetTensorPointer(qkv);
-                qkvType = qkv.Type;
-                if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
-                {
-                    qkvBias = (float*)gguf.GetTensorPointer(qkvB);
-                }
-            }
+            byte* attnGateWeight = null;
+            GgufType attnGateType = GgufType.F32;
+            float* ssmConv1dWeight = null;
+            float* ssmAWeight = null;
+            float* ssmAlphaWeight = null;
+            float* ssmBetaWeight = null;
+            float* ssmDtBias = null;
+            float* ssmNormWeight = null;
+            byte* ssmOutWeight = null;
+            GgufType ssmOutType = GgufType.F32;
+
+            byte* attnOutWeight = null;
+            GgufType attnOutType = GgufType.F32;
+            float* attnOutB = null;
+
+            GgufTensorInfo? qNorm = null;
+            GgufTensorInfo? kNorm = null;
+            GgufTensorInfo? attnSinks = null;
 
             byte* kWeight = null;
             GgufType kType = GgufType.F32;
@@ -260,53 +295,146 @@ public sealed unsafe class ModelWeights
             byte* kvBWeight = null;
             GgufType kvBType = GgufType.F32;
 
-            if (isMla)
+            if (isGdn)
             {
-                kvAMqaWeight = gguf.GetTensorPointer(kvAMqa!);
-                kvAMqaType = kvAMqa!.Type;
-
-                if (gguf.TryGetTensor($"blk.{l}.attn_kv_a_norm.weight", out var kvANorm) && kvANorm != null)
+                // Parse Gated DeltaNet (SSM) layer
+                if (gguf.TryGetTensor($"blk.{l}.attn_qkv.weight", out var gdnQkv) && gdnQkv != null)
                 {
-                    kvANormWeight = (float*)gguf.GetTensorPointer(kvANorm);
+                    qkvWeight = gguf.GetTensorPointer(gdnQkv);
+                    qkvType = gdnQkv.Type;
                 }
-
-                if (gguf.TryGetTensor($"blk.{l}.attn_kv_b.weight", out var kvB) && kvB != null)
+                if (gguf.TryGetTensor($"blk.{l}.attn_gate.weight", out var gdnGate) && gdnGate != null)
                 {
-                    kvBWeight = gguf.GetTensorPointer(kvB);
-                    kvBType = kvB.Type;
+                    attnGateWeight = gguf.GetTensorPointer(gdnGate);
+                    attnGateType = gdnGate.Type;
                 }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_conv1d.weight", out var gdnConv) && gdnConv != null)
+                {
+                    ssmConv1dWeight = (float*)gguf.GetTensorPointer(gdnConv);
+                }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_a", out var gdnA) && gdnA != null)
+                {
+                    ssmAWeight = (float*)gguf.GetTensorPointer(gdnA);
+                }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_alpha.weight", out var gdnAlpha) && gdnAlpha != null)
+                {
+                    ssmAlphaWeight = (float*)gguf.GetTensorPointer(gdnAlpha);
+                }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_beta.weight", out var gdnBeta) && gdnBeta != null)
+                {
+                    ssmBetaWeight = (float*)gguf.GetTensorPointer(gdnBeta);
+                }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_dt.bias", out var gdnDt) && gdnDt != null)
+                {
+                    ssmDtBias = (float*)gguf.GetTensorPointer(gdnDt);
+                }
+                if (gguf.TryGetTensor($"blk.{l}.ssm_norm.weight", out var gdnNorm) && gdnNorm != null)
+                {
+                    ssmNormWeight = (float*)gguf.GetTensorPointer(gdnNorm);
+                }
+                ssmOutWeight = gguf.GetTensorPointer(ssmOut!);
+                ssmOutType = ssmOut!.Type;
+                attnOutWeight = ssmOutWeight;
+                attnOutType = ssmOutType;
             }
             else
             {
-                if (gguf.TryGetTensor($"blk.{l}.attn_k.weight", out var k) && k != null)
+                // Parse Standard Full-Attention layer
+                if (gguf.TryGetTensor($"blk.{l}.attn_q.weight", out var q) && q != null)
                 {
-                    kWeight = gguf.GetTensorPointer(k);
-                    kType = k.Type;
+                    qWeight = gguf.GetTensorPointer(q);
+                    qType = q.Type;
+                    if (gguf.TryGetTensor($"blk.{l}.attn_q.bias", out var qBias) && qBias != null)
+                    {
+                        qb = (float*)gguf.GetTensorPointer(qBias);
+                    }
                 }
-                if (gguf.TryGetTensor($"blk.{l}.attn_k.bias", out var kBias) && kBias != null)
+                else if (gguf.TryGetTensor($"blk.{l}.attn_q_a.weight", out var qA) && qA != null)
                 {
-                    kb = (float*)gguf.GetTensorPointer(kBias);
+                    qAWeight = gguf.GetTensorPointer(qA);
+                    qAType = qA.Type;
+                    if (gguf.TryGetTensor($"blk.{l}.attn_q_a_norm.weight", out var qANorm) && qANorm != null)
+                    {
+                        qANormWeight = (float*)gguf.GetTensorPointer(qANorm);
+                    }
+                    if (gguf.TryGetTensor($"blk.{l}.attn_q_b.weight", out var qB) && qB != null)
+                    {
+                        qBWeight = gguf.GetTensorPointer(qB);
+                        qBType = qB.Type;
+                    }
                 }
-                if (gguf.TryGetTensor($"blk.{l}.attn_v.weight", out var v) && v != null)
+                else if (gguf.TryGetTensor($"blk.{l}.attn_qkv.weight", out var qkv) && qkv != null)
                 {
-                    vWeight = gguf.GetTensorPointer(v);
-                    vType = v.Type;
+                    qkvWeight = gguf.GetTensorPointer(qkv);
+                    qkvType = qkv.Type;
+                    if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
+                    {
+                        qkvBias = (float*)gguf.GetTensorPointer(qkvB);
+                    }
                 }
-                if (gguf.TryGetTensor($"blk.{l}.attn_v.bias", out var vBias) && vBias != null)
-                {
-                    vb = (float*)gguf.GetTensorPointer(vBias);
-                }
-            }
 
-            if (!gguf.TryGetTensor($"blk.{l}.attn_output.weight", out var attnOut) || attnOut == null)
-            {
-                gguf.TryGetTensor($"blk.{l}.attn_wo.weight", out attnOut);
-            }
-            gguf.TryGetTensor($"blk.{l}.attn_output.bias", out var attnOutB);
+                if (isMla)
+                {
+                    kvAMqaWeight = gguf.GetTensorPointer(kvAMqa!);
+                    kvAMqaType = kvAMqa!.Type;
 
-            gguf.TryGetTensor($"blk.{l}.attn_q_norm.weight", out var qNorm);
-            gguf.TryGetTensor($"blk.{l}.attn_k_norm.weight", out var kNorm);
-            gguf.TryGetTensor($"blk.{l}.attn_sinks.weight", out var attnSinks);
+                    if (gguf.TryGetTensor($"blk.{l}.attn_kv_a_norm.weight", out var kvANorm) && kvANorm != null)
+                    {
+                        kvANormWeight = (float*)gguf.GetTensorPointer(kvANorm);
+                    }
+
+                    if (gguf.TryGetTensor($"blk.{l}.attn_kv_b.weight", out var kvB) && kvB != null)
+                    {
+                        kvBWeight = gguf.GetTensorPointer(kvB);
+                        kvBType = kvB.Type;
+                    }
+                }
+                else
+                {
+                    if (gguf.TryGetTensor($"blk.{l}.attn_k.weight", out var k) && k != null)
+                    {
+                        kWeight = gguf.GetTensorPointer(k);
+                        kType = k.Type;
+                    }
+                    if (gguf.TryGetTensor($"blk.{l}.attn_k.bias", out var kBias) && kBias != null)
+                    {
+                        kb = (float*)gguf.GetTensorPointer(kBias);
+                    }
+                    if (gguf.TryGetTensor($"blk.{l}.attn_v.weight", out var v) && v != null)
+                    {
+                        vWeight = gguf.GetTensorPointer(v);
+                        vType = v.Type;
+                    }
+                    if (gguf.TryGetTensor($"blk.{l}.attn_v.bias", out var vBias) && vBias != null)
+                    {
+                        vb = (float*)gguf.GetTensorPointer(vBias);
+                    }
+                }
+
+                if (!gguf.TryGetTensor($"blk.{l}.attn_output.weight", out var attnOut) || attnOut == null)
+                {
+                    gguf.TryGetTensor($"blk.{l}.attn_wo.weight", out attnOut);
+                }
+
+                if (attnOut == null)
+                {
+                    string fileName = Path.GetFileName(gguf.FilePath);
+                    throw new InvalidDataException(
+                        $"Model '{fileName}' is missing attention output projection tensor for layer {l} ('blk.{l}.attn_output.weight' / 'blk.{l}.attn_wo.weight').");
+                }
+
+                attnOutWeight = gguf.GetTensorPointer(attnOut);
+                attnOutType = attnOut.Type;
+
+                if (gguf.TryGetTensor($"blk.{l}.attn_output.bias", out var aob) && aob != null)
+                {
+                    attnOutB = (float*)gguf.GetTensorPointer(aob);
+                }
+
+                gguf.TryGetTensor($"blk.{l}.attn_q_norm.weight", out qNorm);
+                gguf.TryGetTensor($"blk.{l}.attn_k_norm.weight", out kNorm);
+                gguf.TryGetTensor($"blk.{l}.attn_sinks.weight", out attnSinks);
+            }
 
             if (!gguf.TryGetTensor($"blk.{l}.ffn_norm.weight", out var ffnNorm) || ffnNorm == null)
             {
@@ -314,6 +442,13 @@ public sealed unsafe class ModelWeights
                 {
                     gguf.TryGetTensor($"blk.{l}.post_attention_layernorm.weight", out ffnNorm);
                 }
+            }
+
+            if (ffnNorm == null)
+            {
+                string fileName = Path.GetFileName(gguf.FilePath);
+                throw new InvalidDataException(
+                    $"Model '{fileName}' is missing FFN normalization tensor for layer {l} ('blk.{l}.ffn_norm.weight' / 'blk.{l}.post_attention_norm.weight').");
             }
 
             // Check if this layer has MoE experts
@@ -457,12 +592,23 @@ public sealed unsafe class ModelWeights
                 AttnQANormWeight = qANormWeight,
                 AttnQBWeight = qBWeight,
                 AttnQBType = qBType,
-                AttnOutWeight = gguf.GetTensorPointer(attnOut!),
-                AttnOutType = attnOut!.Type,
-                AttnOutBias = attnOutB != null ? (float*)gguf.GetTensorPointer(attnOutB) : null,
+                AttnOutWeight = attnOutWeight!,
+                AttnOutType = attnOutType,
+                AttnOutBias = attnOutB,
                 AttnQNormWeight = qNorm != null ? (float*)gguf.GetTensorPointer(qNorm) : null,
                 AttnKNormWeight = kNorm != null ? (float*)gguf.GetTensorPointer(kNorm) : null,
                 AttnSinksWeight = attnSinks != null ? (float*)gguf.GetTensorPointer(attnSinks) : null,
+                IsGdn = isGdn,
+                AttnGateWeight = attnGateWeight,
+                AttnGateType = attnGateType,
+                SsmConv1dWeight = ssmConv1dWeight,
+                SsmAWeight = ssmAWeight,
+                SsmAlphaWeight = ssmAlphaWeight,
+                SsmBetaWeight = ssmBetaWeight,
+                SsmDtBias = ssmDtBias,
+                SsmNormWeight = ssmNormWeight,
+                SsmOutWeight = ssmOutWeight,
+                SsmOutType = ssmOutType,
                 FfnNormWeight = (float*)gguf.GetTensorPointer(ffnNorm!),
                 FfnNormType = ffnNorm!.Type,
                 IsMoe = hasMoE,

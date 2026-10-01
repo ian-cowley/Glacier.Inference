@@ -79,6 +79,14 @@ public sealed unsafe class GgufFile : IDisposable
     public bool NormTopK => Architecture != "deepseek2" && GetMetadataBool($"{Architecture}.expert_weights_norm", Architecture != "deepseek2");
     public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
 
+    public bool IsHybridSsm => Architecture == "qwen35" || Tensors.ContainsKey("blk.0.ssm_out.weight") || Tensors.ContainsKey("blk.0.ssm_conv1d.weight");
+    public int FullAttentionInterval => (int)GetMetadataUInt32($"{Architecture}.full_attention_interval", 4);
+    public int SsmConvKernel => (int)GetMetadataUInt32($"{Architecture}.ssm.conv_kernel", 4);
+    public int SsmStateSize => (int)GetMetadataUInt32($"{Architecture}.ssm.state_size", 128);
+    public int SsmGroupCount => (int)GetMetadataUInt32($"{Architecture}.ssm.group_count", 16);
+    public int SsmTimeStepRank => (int)GetMetadataUInt32($"{Architecture}.ssm.time_step_rank", 48);
+    public int SsmInnerSize => (int)GetMetadataUInt32($"{Architecture}.ssm.inner_size", 6144);
+
     public static GgufFile Open(string filePath) => new(filePath);
 
     public GgufFile(string filePath)
@@ -169,6 +177,7 @@ public sealed unsafe class GgufFile : IDisposable
 
     public byte* GetTensorPointer(GgufTensorInfo tensor)
     {
+        ArgumentNullException.ThrowIfNull(tensor);
         ObjectDisposedException.ThrowIf(_disposed, this);
         return _basePointer + TensorDataOffset + tensor.Offset;
     }

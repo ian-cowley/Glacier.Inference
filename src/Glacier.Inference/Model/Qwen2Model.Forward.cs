@@ -59,7 +59,11 @@ public sealed unsafe partial class Qwen2Model
             QuantKernels.RMSNorm(_x, layer.AttnNormWeight, _normX, _dim, _weights.RmsNormEps);
             QuantKernels.ComputeBlockSums32(_normX, _normXSums, _dim);
 
-            if (layer.IsMla)
+            if (layer.IsGdn)
+            {
+                ForwardGdnLayer(l, modelLayer, _x);
+            }
+            else if (layer.IsMla)
             {
                 ForwardMlaLayer(l, modelLayer, pos, kvCache);
             }
@@ -367,7 +371,17 @@ public sealed unsafe partial class Qwen2Model
                 QuantKernels.ComputeBlockSums32(normXt, _normXSumBatch + t * normXChunks, _dim);
             }
 
-            if (layer.IsMla)
+            if (layer.IsGdn)
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* xt = _xBatch + t * _dim;
+                    float* normXt = _normXBatch + t * _dim;
+                    float* normXSumT = _normXSumBatch + t * normXChunks;
+                    ForwardGdnLayerWithNorm(l, modelLayer, xt, normXt, normXSumT);
+                }
+            }
+            else if (layer.IsMla)
             {
                 ForwardMlaBatchChunkLayer(l, modelLayer, chunkStartPos, batchSize, kvCache);
             }
