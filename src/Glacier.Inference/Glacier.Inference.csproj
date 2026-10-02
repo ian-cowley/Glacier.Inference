@@ -12,7 +12,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.2.9</Version>
+    <Version>1.2.10</Version>
+
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>

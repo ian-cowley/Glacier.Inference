@@ -49,6 +49,21 @@ public enum UniversalArchitecture
     Gemma = Gemma4,
 
     /// <summary>
+    /// Flux.1 flow-matching Diffusion Transformer (DiT) architecture with double and single stream blocks.
+    /// </summary>
+    Flux,
+
+    /// <summary>
+    /// Stable Diffusion 1.5, 2.1, SDXL, and SD-Turbo UNet latent diffusion models.
+    /// </summary>
+    StableDiffusion,
+
+    /// <summary>
+    /// Stable Diffusion 3 / 3.5 MMDiT architecture.
+    /// </summary>
+    SD3,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -71,6 +86,30 @@ public static class ModelArchitectureDetector
 
     public static UniversalArchitecture Detect(string arch, GgufFile gguf)
     {
+        // 1. Diffusion Model Architectures
+        if (string.Equals(arch, "flux", StringComparison.OrdinalIgnoreCase) ||
+            gguf.Tensors.ContainsKey("double_blocks.0.img_attn.qkv.weight") ||
+            gguf.Tensors.ContainsKey("model.diffusion_model.double_blocks.0.img_attn.qkv.weight"))
+        {
+            return UniversalArchitecture.Flux;
+        }
+
+        if (string.Equals(arch, "sd3", StringComparison.OrdinalIgnoreCase) ||
+            gguf.Tensors.ContainsKey("joint_blocks.0.x_block.attn.qkv.weight") ||
+            gguf.Tensors.ContainsKey("model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight"))
+        {
+            return UniversalArchitecture.SD3;
+        }
+
+        if (string.Equals(arch, "sd1", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arch, "sdxl", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arch, "sd2", StringComparison.OrdinalIgnoreCase) ||
+            gguf.Tensors.ContainsKey("model.diffusion_model.input_blocks.0.0.weight") ||
+            gguf.Tensors.ContainsKey("diffusion_model.input_blocks.0.0.weight"))
+        {
+            return UniversalArchitecture.StableDiffusion;
+        }
+
         if (string.Equals(arch, "gemma4", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(arch, "gemma2", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(arch, "gemma", StringComparison.OrdinalIgnoreCase) ||

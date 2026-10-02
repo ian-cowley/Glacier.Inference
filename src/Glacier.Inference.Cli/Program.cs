@@ -24,8 +24,10 @@ using Glacier.Inference.Sampling;
 using Glacier.Inference.Vision;
 using Glacier.Inference.Video;
 using Glacier.Inference.Image;
+using Glacier.Inference.Image.Gguf;
 
 public static class Program
+
 {
     public static async Task<int> Main(string[] args)
     {
@@ -173,17 +175,20 @@ public static class Program
     private static void PrintImageHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier image - Pure C# .NET 10 Generative Image Production (Flow Matching DiT + VAE)");
+        Console.WriteLine("glacier image - Pure C# .NET 10 Generative Image Production (Flux.1 / SDXL / DiT GGUF + VAE)");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  glacier image demo [--out <file.bmp>]");
-        Console.WriteLine("  glacier image generate \"<prompt>\" [--steps <n>] [--out <file.bmp>] [--width <px>] [--height <px>] [--seed <int>]");
+        Console.WriteLine("  glacier image info <model.gguf>");
+        Console.WriteLine("  glacier image generate \"<prompt>\" [-m <model.gguf>] [--vae <vae.gguf>] [--steps <n>] [--out <file.bmp>] [--width <px>] [--height <px>] [--seed <int>]");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  demo                                 Execute end-to-end 4-step Flow Matching DiT generation");
-        Console.WriteLine("  generate \"<prompt>\"                  Generate 24-bit RGB bitmap image from text prompt");
+        Console.WriteLine("  info <model.gguf>                    Inspect Diffusion GGUF model topology, layers & parameters");
+        Console.WriteLine("  generate \"<prompt>\" [options]        Generate 24-bit RGB bitmap from text prompt (supports pre-trained GGUFs)");
     }
+
 
     private static void PrintVoiceHelp()
     {
@@ -1959,42 +1964,111 @@ public static class Program
             Console.ResetColor();
             return 0;
         }
+        else if (subCmd == "info")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Error: Missing model path. Usage: glacier image info <model.gguf>");
+                return 1;
+            }
+
+            string modelPath = args[1];
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"Inspecting Diffusion GGUF Model: {modelPath}");
+            Console.ResetColor();
+
+            var sw = Stopwatch.StartNew();
+            using var model = DiffusionGgufModel.Open(modelPath);
+            sw.Stop();
+
+            Console.WriteLine($"Format: GGUF v{model.Gguf.Version} (Mapped in {sw.ElapsedMilliseconds}ms)");
+            Console.WriteLine($"Architecture:           {model.DiffusionArch}");
+            Console.WriteLine($"Backbone Blocks:        {model.NumLayers} (Double: {model.DoubleBlocks}, Single: {model.SingleBlocks})");
+            Console.WriteLine($"Hidden Dimension:       {model.HiddenDim}");
+            Console.WriteLine($"Latent Channels:        {model.InChannels} ({model.PatchSize}x{model.PatchSize} spatial patch)");
+            Console.WriteLine($"Embedded VAE Decoder:   {(model.HasVae ? "Yes (Integrated)" : "No (Standalone VAE required)")}");
+            Console.WriteLine($"Embedded Text Encoder:  {(model.HasTextEncoder ? "Yes (CLIP/T5)" : "No")}");
+            Console.WriteLine($"Recommended Scheduler:  {model.RecommendedSchedule}");
+            Console.WriteLine($"Recommended Steps:      {model.RecommendedSteps}");
+            Console.WriteLine($"Default Resolution:     {model.RecommendedResolution}x{model.RecommendedResolution}");
+            Console.WriteLine($"Total Tensors:          {model.Gguf.TensorCount}");
+            return 0;
+        }
         else if (subCmd == "generate")
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [--out <file.bmp>]");
+                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [-m <model.gguf>] [--out <file.bmp>]");
                 return 1;
             }
 
             string prompt = args[1];
             string outPath = "generated.bmp";
-            int steps = 4;
-            int width = 256;
-            int height = 256;
+            string? modelPath = null;
+            string? vaePath = null;
+            int? steps = null;
+            int? width = null;
+            int? height = null;
             int? seed = null;
 
             for (int i = 2; i < args.Length; i++)
             {
                 if (args[i] is "--out" or "-o" && i + 1 < args.Length) outPath = args[++i];
+                else if (args[i] is "--model" or "-m" && i + 1 < args.Length) modelPath = args[++i];
+                else if (args[i] is "--vae" && i + 1 < args.Length) vaePath = args[++i];
                 else if (args[i] is "--steps" or "-s" && i + 1 < args.Length && int.TryParse(args[++i], out var st)) steps = st;
                 else if (args[i] is "--width" or "-w" && i + 1 < args.Length && int.TryParse(args[++i], out var w)) width = w;
                 else if (args[i] is "--height" or "-h" && i + 1 < args.Length && int.TryParse(args[++i], out var h)) height = h;
                 else if (args[i] is "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out var sd)) seed = sd;
             }
 
-            Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({width}x{height}, {steps} steps)...");
-            using var pipeline = new ImageGenerationPipeline();
-            var res = pipeline.Generate(prompt, width, height, steps, seed);
+            if (!string.IsNullOrEmpty(modelPath))
+            {
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"[Glacier Image] Loading pre-trained Diffusion GGUF: {Path.GetFileName(modelPath)}...");
+                Console.ResetColor();
 
-            BmpWriter.SaveBmp24(outPath, res.RgbPixels, width, height);
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
-            Console.ResetColor();
-            return 0;
+                using var model = DiffusionGgufModel.Open(modelPath);
+                DiffusionGgufModel? vae = !string.IsNullOrEmpty(vaePath) ? DiffusionGgufModel.Open(vaePath) : null;
+                using var pipeline = new DiffusionGgufPipeline(model, vae);
+
+                int w = width ?? model.RecommendedResolution;
+                int h = height ?? model.RecommendedResolution;
+                int s = steps ?? model.RecommendedSteps;
+
+                Console.WriteLine($"   Architecture: {model.DiffusionArch} | Scheduler: {model.RecommendedSchedule} | {w}x{h} ({s} steps)");
+                Console.WriteLine($"   Executing reverse diffusion trajectory on NVIDIA RTX 4060...");
+
+                var res = pipeline.Generate(prompt, width: w, height: h, numSteps: s, seed: seed);
+                BmpWriter.SaveBmp24(outPath, res.RgbPixels, res.Width, res.Height);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+                Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
+                Console.ResetColor();
+                return 0;
+            }
+            else
+            {
+                int w = width ?? 256;
+                int h = height ?? 256;
+                int s = steps ?? 4;
+
+                Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({w}x{h}, {s} steps)...");
+                using var pipeline = new ImageGenerationPipeline();
+                var res = pipeline.Generate(prompt, w, h, s, seed);
+
+                BmpWriter.SaveBmp24(outPath, res.RgbPixels, w, h);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+                Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
+                Console.ResetColor();
+                return 0;
+            }
         }
 
         Console.Error.WriteLine($"Unknown image command: '{subCmd}'. Use 'glacier image --help' for usage.");
         return 1;
     }
 }
+
