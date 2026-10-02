@@ -41,3 +41,7 @@ brain/
 scratch/
 PROJECT_SOURCE.md
 Glacier.Inference.md
+
+# Media output artifacts
+*.wav
+*.bmp

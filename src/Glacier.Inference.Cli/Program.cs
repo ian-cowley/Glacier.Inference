@@ -23,6 +23,7 @@ using Glacier.Inference.Memory;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Vision;
 using Glacier.Inference.Video;
+using Glacier.Inference.Image;
 
 public static class Program
 {
@@ -63,6 +64,7 @@ public static class Program
                 "voice" => RunVoice(cmdArgs),
                 "vision" => RunVision(cmdArgs),
                 "video" => RunVideo(cmdArgs),
+                "image" => RunImage(cmdArgs),
                 _ => HandleUnknownCommand(command)
             };
         }
@@ -108,6 +110,7 @@ public static class Program
         Console.WriteLine("  voice   <tts|stt|demo> [options]     Speech-to-text, text-to-speech & full-duplex voice");
         Console.WriteLine("  vision  <demo|query> [options]       Vision-Language Model (VLM) patchification & analysis");
         Console.WriteLine("  video   <demo|query> [options]       Video-Language Model multi-frame temporal reasoning & 3D-RoPE");
+        Console.WriteLine("  image   <demo|generate> [options]    Text-to-Image production (Flow Matching DiT + VAE)");
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
@@ -155,6 +158,9 @@ public static class Program
             case "video":
                 PrintVideoHelp();
                 break;
+            case "image":
+                PrintImageHelp();
+                break;
             default:
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.WriteLine($"Unknown command: '{command}'\n");
@@ -162,6 +168,21 @@ public static class Program
                 PrintHelp();
                 break;
         }
+    }
+
+    private static void PrintImageHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier image - Pure C# .NET 10 Generative Image Production (Flow Matching DiT + VAE)");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier image demo [--out <file.bmp>]");
+        Console.WriteLine("  glacier image generate \"<prompt>\" [--steps <n>] [--out <file.bmp>] [--width <px>] [--height <px>] [--seed <int>]");
+        Console.WriteLine();
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  demo                                 Execute end-to-end 4-step Flow Matching DiT generation");
+        Console.WriteLine("  generate \"<prompt>\"                  Generate 24-bit RGB bitmap image from text prompt");
     }
 
     private static void PrintVoiceHelp()
@@ -1886,6 +1907,94 @@ public static class Program
         }
 
         Console.Error.WriteLine($"Unknown video command: '{subCmd}'. Use 'glacier video --help' for usage.");
+        return 1;
+    }
+
+    private static int RunImage(string[] args)
+    {
+        if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+        {
+            PrintImageHelp();
+            return 0;
+        }
+
+        string subCmd = args[0].ToLowerInvariant();
+        if (subCmd == "demo")
+        {
+            string outPath = "glacier_generated_image.bmp";
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] is "--out" or "-o" && i + 1 < args.Length) outPath = args[++i];
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("==========================================================================");
+            Console.WriteLine("  GLACIER.INFERENCE: GENERATIVE IMAGE PRODUCTION (T2I) WORKING DEMO       ");
+            Console.WriteLine("   Pure C# .NET 10 | Flow Matching (Euler ODE) + DiT + Latent VAE Decoder  ");
+            Console.WriteLine("==========================================================================");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            string prompt = "A majestic crystal glacier fortress illuminated by cyan auroras";
+            Console.WriteLine($"[1. Prompt Ingestion] Prompt: \"{prompt}\"");
+            Console.WriteLine($"   -> Target Canvas: 256x256 (32x32 Latent Grid, 16 Channels, 4 Euler Steps)");
+            Console.WriteLine();
+
+            Console.WriteLine("[2. Latent Flow Matching] Initializing Gaussian noise z_1 ~ N(0, I) & running 4-step Euler ODE...");
+            using var pipeline = new ImageGenerationPipeline(numLayers: 2, hiddenDim: 256, numHeads: 4);
+
+            var result = pipeline.Generate(prompt, width: 256, height: 256, numSteps: 4, seed: 42);
+            Console.WriteLine($"   -> 4-Step Flow Matching completed in {result.ElapsedMilliseconds}ms ({result.PixelsPerSecond:F0} pixels/sec)");
+            Console.WriteLine();
+
+            Console.WriteLine($"[3. Latent VAE Reconstruction & Export] Writing 24-bit RGB bitmap to '{outPath}'...");
+            BmpWriter.SaveBmp24(outPath, result.RgbPixels, result.Width, result.Height);
+            var fi = new FileInfo(outPath);
+            Console.WriteLine($"   -> Saved {fi.Length / 1024} KB standard 24-bit BMP image ({result.Width}x{result.Height})");
+            Console.WriteLine();
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[VERIFIED] End-to-end Image Generation completed in {result.ElapsedMilliseconds}ms with zero C++ DLLs!");
+            Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
+            Console.ResetColor();
+            return 0;
+        }
+        else if (subCmd == "generate")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [--out <file.bmp>]");
+                return 1;
+            }
+
+            string prompt = args[1];
+            string outPath = "generated.bmp";
+            int steps = 4;
+            int width = 256;
+            int height = 256;
+            int? seed = null;
+
+            for (int i = 2; i < args.Length; i++)
+            {
+                if (args[i] is "--out" or "-o" && i + 1 < args.Length) outPath = args[++i];
+                else if (args[i] is "--steps" or "-s" && i + 1 < args.Length && int.TryParse(args[++i], out var st)) steps = st;
+                else if (args[i] is "--width" or "-w" && i + 1 < args.Length && int.TryParse(args[++i], out var w)) width = w;
+                else if (args[i] is "--height" or "-h" && i + 1 < args.Length && int.TryParse(args[++i], out var h)) height = h;
+                else if (args[i] is "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out var sd)) seed = sd;
+            }
+
+            Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({width}x{height}, {steps} steps)...");
+            using var pipeline = new ImageGenerationPipeline();
+            var res = pipeline.Generate(prompt, width, height, steps, seed);
+
+            BmpWriter.SaveBmp24(outPath, res.RgbPixels, width, height);
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+            Console.ResetColor();
+            return 0;
+        }
+
+        Console.Error.WriteLine($"Unknown image command: '{subCmd}'. Use 'glacier image --help' for usage.");
         return 1;
     }
 }
