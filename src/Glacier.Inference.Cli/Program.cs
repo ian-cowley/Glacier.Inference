@@ -1346,12 +1346,17 @@ public static class Program
             string outPath = "speech.wav";
             KokoroVoice voice = KokoroVoice.AfHeart;
             float speed = 1.0f;
+            bool play = false;
 
             for (int i = 2; i < args.Length; i++)
             {
                 if (args[i] is "--out" or "-o" && i + 1 < args.Length)
                 {
                     outPath = args[++i];
+                }
+                else if (args[i] is "--play" or "-p")
+                {
+                    play = true;
                 }
                 else if (args[i] is "--voice" or "-v" && i + 1 < args.Length)
                 {
@@ -1385,6 +1390,12 @@ public static class Program
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"[Success] Synthesized {durationSec:F2}s of 24kHz audio in {sw.ElapsedMilliseconds}ms ({rtf:F1}x Real-Time) -> '{outPath}'");
             Console.ResetColor();
+
+            if (play)
+            {
+                Console.WriteLine("[Audio] Playing audio through speakers...");
+                AudioPlayer.PlayFile(outPath, wait: true);
+            }
             return 0;
         }
         else if (subCmd == "stt")
@@ -1427,6 +1438,12 @@ public static class Program
         }
         else if (subCmd == "demo")
         {
+            bool play = false;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] is "--play" or "-p") play = true;
+            }
+
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
             Console.WriteLine("   GLACIER.INFERENCE: FULL-DUPLEX VOICE SUBSYSTEM WORKING DEMONSTRATION   ");
@@ -1451,6 +1468,11 @@ public static class Program
             WavWriter.WritePcm16(demoWav, generatedSpeech, pipeline.Tts.SampleRate, 1);
             Console.WriteLine($"   -> Synthesized {durationSec:F2}s of 24kHz audio in {ttsSw.ElapsedMilliseconds}ms ({rtf:F1}x Real-Time)");
             Console.WriteLine($"   -> Audio written to '{demoWav}' ({new FileInfo(demoWav).Length / 1024} KB)");
+            if (play)
+            {
+                Console.WriteLine("   -> Playing prompt speech through speakers...");
+                AudioPlayer.PlayFile(demoWav, wait: true);
+            }
             Console.WriteLine();
 
             // Step 2: Extract Log-Mel Spectrogram using Pure C# SIMD DSP
@@ -1484,6 +1506,11 @@ public static class Program
             Console.WriteLine($"   - User Input:    \"{userIn}\"");
             Console.WriteLine($"   - Agent Output:  \"{agentResp}\"");
             Console.WriteLine($"   - Agent Audio:   {respAudio.Length} samples ({respAudio.Length / 24000f:F2}s @ 24kHz)");
+            if (play)
+            {
+                Console.WriteLine("   -> Playing conversational response speech through speakers...");
+                AudioPlayer.Play(respAudio, pipeline.Tts.SampleRate, wait: true);
+            }
             Console.WriteLine();
 
             sw.Stop();
