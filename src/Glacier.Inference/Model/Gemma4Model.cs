@@ -112,6 +112,7 @@ public sealed unsafe class Gemma4Model : CpuModelBase
     private readonly int _expertUsedCount;
     private readonly int _slidingWindow;
     private readonly float _finalLogitSoftcapping;
+    private readonly float _attnLogitSoftcapping;
     private readonly float _embeddingScale;
 
     // Attention scratch buffers
@@ -171,6 +172,7 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         _maxTopK = Math.Max(16, _expertUsedCount);
         _slidingWindow = weights.SlidingWindow > 0 ? weights.SlidingWindow : 1024;
         _finalLogitSoftcapping = weights.FinalLogitSoftcapping;
+        _attnLogitSoftcapping = weights.AttnLogitSoftcapping > 0f ? weights.AttnLogitSoftcapping : (weights.Gguf.Architecture.StartsWith("gemma", StringComparison.OrdinalIgnoreCase) ? 50.0f : 0f);
         _embeddingScale = MathF.Sqrt(_dim);
 
         // Preallocate unmanaged attention buffers
@@ -442,11 +444,17 @@ public sealed unsafe class Gemma4Model : CpuModelBase
             float* qHead = _q + h * headDim;
             float* attnOutHead = _attnOut + h * headDim;
 
-            // Attention scores: dot(Q, K) with attention_scale = 1.0 (no sqrt(headDim) division)
+            // Attention scores: dot(Q, K) with attention_scale = 1.0 / sqrt(headDim) and optional softcapping
+            float attnScale = headDim > 0 ? (1.0f / MathF.Sqrt(headDim)) : 1.0f;
             for (int p = windowStart; p <= pos; p++)
             {
                 float* kPtr = _gemmaKvCache.GetKeyPtr(modelLayer, kvHead, p);
-                _headScores[p - windowStart] = QuantKernels.VecDotF32(qHead, kPtr, headDim);
+                float score = QuantKernels.VecDotF32(qHead, kPtr, headDim) * attnScale;
+                if (_attnLogitSoftcapping > 0f)
+                {
+                    score = _attnLogitSoftcapping * MathF.Tanh(score / _attnLogitSoftcapping);
+                }
+                _headScores[p - windowStart] = score;
             }
 
             // Softmax over valid window positions

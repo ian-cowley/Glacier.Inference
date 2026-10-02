@@ -157,6 +157,33 @@ public class UniversalArchitectureTests
     }
 
     [Fact]
+    public void ModelArchitectureDetector_DetectsGemma2AndGemma()
+    {
+        Assert.Equal(UniversalArchitecture.Gemma4, UniversalArchitecture.Gemma);
+        Assert.Equal(UniversalArchitecture.Gemma4, ModelArchitectureDetector.Detect("gemma2", null!));
+        Assert.Equal(UniversalArchitecture.Gemma4, ModelArchitectureDetector.Detect("gemma", null!));
+        Assert.Equal(UniversalArchitecture.Gemma4, ModelArchitectureDetector.Detect("gemma4", null!));
+    }
+
+    [Fact]
+    public unsafe void SoftcapLogits_BoundsExtremeValues()
+    {
+        float[] logits = [-1000.0f, -50.0f, 0.0f, 50.0f, 1000.0f];
+        float cap = 30.0f;
+        fixed (float* p = logits)
+        {
+            Quant.QuantKernels.SoftcapLogits(p, logits.Length, cap);
+        }
+
+        // Tanh bounds output strictly within (-cap, +cap)
+        Assert.True(logits[0] >= -30.0f && logits[0] < -29.9f);
+        Assert.True(logits[1] > -30.0f && logits[1] < 0.0f);
+        Assert.Equal(0.0f, logits[2]);
+        Assert.True(logits[3] < 30.0f && logits[3] > 0.0f);
+        Assert.True(logits[4] <= 30.0f && logits[4] > 29.9f);
+    }
+
+    [Fact]
     public void ModelArchitectureDetector_DetectsHybridSsm_WhenSsmTensorsPresent()
     {
         Assert.True(UniversalArchitecture.HybridSsm != UniversalArchitecture.Qwen);

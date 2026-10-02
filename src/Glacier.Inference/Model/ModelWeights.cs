@@ -180,8 +180,9 @@ public sealed unsafe class ModelWeights
     public int ExpertFeedForwardLength => Gguf.ExpertFeedForwardLength > 0 ? Gguf.ExpertFeedForwardLength : FeedForwardLength;
     public int ExpertSharedCount => Gguf.ExpertSharedCount;
 
-    // Gemma 4 metadata
+    // Gemma metadata
     public float FinalLogitSoftcapping => Gguf.FinalLogitSoftcapping;
+    public float AttnLogitSoftcapping => Gguf.AttnLogitSoftcapping;
     public int SlidingWindow => Gguf.SlidingWindow;
     public float RopeFreqBaseSwa => Gguf.RopeFreqBaseSwa;
     public int KeyLengthSwa => Gguf.KeyLengthSwa;
@@ -690,7 +691,13 @@ public sealed unsafe class ModelWeights
             {
                 isSwa = gguf.SlidingWindowPattern[l];
             }
-            else if (gguf.Architecture == "gemma4")
+            else if (gguf.Architecture.Equals("gemma2", StringComparison.OrdinalIgnoreCase) ||
+                     gguf.Architecture.Equals("gemma", StringComparison.OrdinalIgnoreCase))
+            {
+                // Gemma 2 alternates sliding window attention on even layers (0, 2, 4...)
+                isSwa = (l % 2 == 0);
+            }
+            else if (gguf.Architecture.StartsWith("gemma", StringComparison.OrdinalIgnoreCase))
             {
                 isSwa = (l + 1) % 6 != 0;
             }
@@ -700,7 +707,7 @@ public sealed unsafe class ModelWeights
             {
                 headsKv = gguf.HeadCountKvPattern[l];
             }
-            else if (gguf.Architecture == "gemma4" && HeadCountKv == 0)
+            else if (gguf.Architecture.StartsWith("gemma", StringComparison.OrdinalIgnoreCase) && HeadCountKv == 0)
             {
                 headsKv = isSwa ? 8 : 2;
             }
@@ -710,7 +717,7 @@ public sealed unsafe class ModelWeights
             {
                 layerHeadDim = (int)qNorm.Dimensions[0];
             }
-            else if (gguf.Architecture == "gemma4" && HeadDim == 0)
+            else if (gguf.Architecture.StartsWith("gemma", StringComparison.OrdinalIgnoreCase) && HeadDim == 0)
             {
                 layerHeadDim = isSwa ? 256 : 512;
             }

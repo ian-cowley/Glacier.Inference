@@ -88,6 +88,8 @@ public sealed unsafe class GgufFile : IDisposable
     public int SsmInnerSize => (int)GetMetadataUInt32($"{Architecture}.ssm.inner_size", 6144);
 
     public float FinalLogitSoftcapping => GetMetadataSingle($"{Architecture}.final_logit_softcapping", 0f);
+    public float AttnLogitSoftcapping => GetMetadataSingle($"{Architecture}.attention.logit_softcapping",
+        GetMetadataSingle($"{Architecture}.attn_logit_softcapping", 0f));
     public int SlidingWindow => (int)GetMetadataUInt32($"{Architecture}.attention.sliding_window", 0);
     public float RopeFreqBaseSwa => GetMetadataSingle($"{Architecture}.rope.freq_base_swa", 10000.0f);
     public int KeyLengthSwa => (int)GetMetadataUInt32($"{Architecture}.attention.key_length_swa", 256);
