@@ -12,15 +12,15 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.2.5</Version>
+    <Version>1.2.6</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>Universal pure C# .NET 10 LLM &amp; Voice inference engine supporting Meta Llama 3, DeepSeek V2/V3/R1 (MLA + MoE), Microsoft Phi-3/Phi-4, Google Gemma 2/4, Mistral, Alibaba Qwen 2/2.5, Whisper STT, and Kokoro-82M TTS. Native AOT compatible, zero-copy GGUF memory-mapped files, AVX-512/AVX2 quantized SIMD kernels, bare-metal GPU acceleration, pure C# Log-Mel audio DSP, and full-duplex conversational voice. Zero Python, zero C++ runtime dependencies.</Description>
+    <Description>Universal pure C# .NET 10 Multimodal LLM, Vision &amp; Voice inference engine supporting Meta Llama 3, DeepSeek V2/V3/R1 (MLA + MoE), Microsoft Phi-3/Phi-4, Google Gemma 2/4, Mistral, Alibaba Qwen 2/2.5/Qwen2-VL, ViT/SigLIP Vision Preprocessing, 2D Spatial Multimodal Projectors, Whisper STT, and Kokoro-82M TTS. Native AOT compatible, zero-copy GGUF memory-mapped files, AVX-512/AVX2 quantized SIMD kernels, bare-metal GPU acceleration, pure C# Log-Mel audio DSP, and full-duplex conversational voice. Zero Python, zero C++ runtime dependencies.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Inference</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Inference.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>llm;inference;audio;tts;stt;whisper;kokoro;voice;llama;deepseek;phi4;mistral;qwen;gemma2;gguf;simd;avx512;quantization;net10;aot;nativeaot;glacier</PackageTags>
+    <PackageTags>llm;inference;vision;vlm;vit;siglip;multimodal;audio;tts;stt;whisper;kokoro;voice;llama;deepseek;phi4;mistral;qwen;gemma2;gguf;simd;avx512;quantization;net10;aot;nativeaot;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
