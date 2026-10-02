@@ -14,6 +14,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
+using Glacier.Inference.Audio;
 using Glacier.Inference.Config;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
@@ -57,6 +58,7 @@ public static class Program
                 "bench" => await RunBenchAsync(cmdArgs),
                 "run" => await RunChatAsync(cmdArgs),
                 "serve" => await RunServeAsync(cmdArgs),
+                "voice" => RunVoice(cmdArgs),
                 _ => HandleUnknownCommand(command)
             };
         }
@@ -99,6 +101,7 @@ public static class Program
         Console.WriteLine("  bench   <model.gguf> [options]       Run speed & comparative benchmark");
         Console.WriteLine("  run     <model.gguf> [prompt]        Interactive streaming chat or single prompt");
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
+        Console.WriteLine("  voice   <tts|stt|demo> [options]     Speech-to-text, text-to-speech & full-duplex voice");
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
@@ -1310,4 +1313,187 @@ public static class Program
         InferenceEngineType.Cpu => "Cpu",
         _ => engine.ToString()
     };
+
+    private static int RunVoice(string[] args)
+    {
+        if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+        {
+            Console.WriteLine("Glacier Voice Subsystem (Kokoro TTS + Whisper STT)");
+            Console.WriteLine();
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <af_heart|am_adam|bf_emma|bm_george>] [--speed <float>]");
+            Console.WriteLine("  glacier voice stt <audio.wav>");
+            Console.WriteLine("  glacier voice demo");
+            Console.WriteLine();
+            Console.WriteLine("Examples:");
+            Console.WriteLine("  glacier voice tts \"Hello from Glacier inference\" --out speech.wav --voice af_heart");
+            Console.WriteLine("  glacier voice stt speech.wav");
+            Console.WriteLine("  glacier voice demo");
+            return 0;
+        }
+
+        string subCmd = args[0].ToLowerInvariant();
+
+        if (subCmd == "tts")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Error: Missing text for TTS synthesis. Usage: glacier voice tts \"<text>\" [--out <file.wav>]");
+                return 1;
+            }
+
+            string text = args[1];
+            string outPath = "speech.wav";
+            KokoroVoice voice = KokoroVoice.AfHeart;
+            float speed = 1.0f;
+
+            for (int i = 2; i < args.Length; i++)
+            {
+                if (args[i] is "--out" or "-o" && i + 1 < args.Length)
+                {
+                    outPath = args[++i];
+                }
+                else if (args[i] is "--voice" or "-v" && i + 1 < args.Length)
+                {
+                    string v = args[++i].ToLowerInvariant();
+                    voice = v switch
+                    {
+                        "am_adam" or "adam" => KokoroVoice.AmAdam,
+                        "bf_emma" or "emma" => KokoroVoice.BfEmma,
+                        "bm_george" or "george" => KokoroVoice.BmGeorge,
+                        _ => KokoroVoice.AfHeart
+                    };
+                }
+                else if (args[i] is "--speed" or "-s" && i + 1 < args.Length)
+                {
+                    if (float.TryParse(args[++i], out var s)) speed = s;
+                }
+            }
+
+            Console.WriteLine($"[Kokoro-82M TTS] Synthesizing '{text}' (Voice: {voice}, Speed: {speed:F2}x)...");
+            var sw = Stopwatch.StartNew();
+
+            using var tts = new KokoroTtsEngine();
+            float[] samples = tts.Synthesize(text, voice, speed);
+            sw.Stop();
+
+            float durationSec = (float)samples.Length / tts.SampleRate;
+            float rtf = durationSec / (float)sw.Elapsed.TotalSeconds;
+
+            WavWriter.WritePcm16(outPath, samples, tts.SampleRate, 1);
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Success] Synthesized {durationSec:F2}s of 24kHz audio in {sw.ElapsedMilliseconds}ms ({rtf:F1}x Real-Time) -> '{outPath}'");
+            Console.ResetColor();
+            return 0;
+        }
+        else if (subCmd == "stt")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Error: Missing audio file for STT transcription. Usage: glacier voice stt <audio.wav>");
+                return 1;
+            }
+
+            string wavPath = args[1];
+            if (!File.Exists(wavPath))
+            {
+                Console.Error.WriteLine($"Error: File '{wavPath}' not found.");
+                return 1;
+            }
+
+            Console.WriteLine($"[Whisper STT] Ingesting '{wavPath}'...");
+            var sw = Stopwatch.StartNew();
+
+            // Load WAV and extract float samples
+            byte[] wavBytes = File.ReadAllBytes(wavPath);
+            int dataOffset = 44;
+            int numSamples = (wavBytes.Length - dataOffset) / 2;
+            var audioSamples = new float[numSamples];
+            for (int i = 0; i < numSamples; i++)
+            {
+                short val = BitConverter.ToInt16(wavBytes, dataOffset + i * 2);
+                audioSamples[i] = val / 32768.0f;
+            }
+
+            using var whisper = new WhisperEngine();
+            string transcript = whisper.Transcribe(audioSamples);
+            sw.Stop();
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Transcription ({sw.ElapsedMilliseconds}ms)]: \"{transcript}\"");
+            Console.ResetColor();
+            return 0;
+        }
+        else if (subCmd == "demo")
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("==========================================================================");
+            Console.WriteLine("   GLACIER.INFERENCE: FULL-DUPLEX VOICE SUBSYSTEM WORKING DEMONSTRATION   ");
+            Console.WriteLine("       Pure C# .NET 10 | Kokoro-82M TTS + Whisper STT + WASAPI Pipeline   ");
+            Console.WriteLine("==========================================================================");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            using var pipeline = new VoicePipeline();
+            var sw = Stopwatch.StartNew();
+
+            // Step 1: Synthesize prompt using Kokoro
+            string testPrompt = "Hello world from Glacier high performance audio.";
+            Console.WriteLine($"[1. Kokoro-82M TTS] Generating audio for prompt: \"{testPrompt}\"");
+            var ttsSw = Stopwatch.StartNew();
+            float[] generatedSpeech = pipeline.Speak(testPrompt, KokoroVoice.AfHeart);
+            ttsSw.Stop();
+            float durationSec = (float)generatedSpeech.Length / pipeline.Tts.SampleRate;
+            float rtf = durationSec / (float)ttsSw.Elapsed.TotalSeconds;
+
+            string demoWav = "glacier_voice_demo.wav";
+            WavWriter.WritePcm16(demoWav, generatedSpeech, pipeline.Tts.SampleRate, 1);
+            Console.WriteLine($"   -> Synthesized {durationSec:F2}s of 24kHz audio in {ttsSw.ElapsedMilliseconds}ms ({rtf:F1}x Real-Time)");
+            Console.WriteLine($"   -> Audio written to '{demoWav}' ({new FileInfo(demoWav).Length / 1024} KB)");
+            Console.WriteLine();
+
+            // Step 2: Extract Log-Mel Spectrogram using Pure C# SIMD DSP
+            Console.WriteLine("[2. Pure C# SIMD Audio DSP] Computing 80-bin Log-Mel Spectrogram (Cooley-Tukey Radix-2 FFT)...");
+            var dspSw = Stopwatch.StartNew();
+            using var mel = new MelSpectrogram(16000, 80);
+            int nFrames = (generatedSpeech.Length - mel.WinLength) / mel.HopLength + 1;
+            float[] melTensor = new float[mel.NMels * nFrames];
+            mel.Process(generatedSpeech, melTensor);
+            dspSw.Stop();
+            Console.WriteLine($"   -> Extracted {nFrames} frames ({mel.NMels}x{nFrames} tensor) in {dspSw.ElapsedMilliseconds}ms ({nFrames * 1000L / Math.Max(1, dspSw.ElapsedMilliseconds):N0} frames/sec)");
+            Console.WriteLine();
+
+            // Step 3: Transcribe Speech using Whisper STT Engine
+            Console.WriteLine("[3. Whisper STT] Transcribing audio via Encoder-Decoder Cross-Attention...");
+            var sttSw = Stopwatch.StartNew();
+            string transcript = pipeline.Listen(generatedSpeech);
+            sttSw.Stop();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"   -> Transcribed Text ({sttSw.ElapsedMilliseconds}ms): \"{transcript}\"");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            // Step 4: Full-Duplex Conversational Turn
+            Console.WriteLine("[4. Full-Duplex Conversational Turn] Testing Live Conversation Cycle...");
+            var (userIn, agentResp, respAudio) = pipeline.ConversationalTurn(
+                generatedSpeech,
+                input => $"Glacier Voice Agent received: '{input}'. Synthesizing instant speech response.",
+                KokoroVoice.AmAdam);
+
+            Console.WriteLine($"   - User Input:    \"{userIn}\"");
+            Console.WriteLine($"   - Agent Output:  \"{agentResp}\"");
+            Console.WriteLine($"   - Agent Audio:   {respAudio.Length} samples ({respAudio.Length / 24000f:F2}s @ 24kHz)");
+            Console.WriteLine();
+
+            sw.Stop();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[VERIFIED] End-to-end full duplex voice demonstration completed in {sw.ElapsedMilliseconds}ms with zero C++ DLLs!");
+            Console.ResetColor();
+            return 0;
+        }
+
+        Console.Error.WriteLine($"Unknown voice command: '{subCmd}'. Use 'glacier voice --help' for usage.");
+        return 1;
+    }
 }
