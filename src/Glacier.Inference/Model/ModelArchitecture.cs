@@ -74,8 +74,9 @@ public enum UniversalArchitecture
 /// </summary>
 public static class ModelArchitectureDetector
 {
-    public static bool HasSsmTensors(GgufFile gguf)
+    public static bool HasSsmTensors(GgufFile? gguf)
     {
+        if (gguf?.Tensors == null) return false;
         foreach (var key in gguf.Tensors.Keys)
         {
             if (key.Contains(".ssm_") || key.Contains(".linear_attn"))
@@ -84,19 +85,19 @@ public static class ModelArchitectureDetector
         return false;
     }
 
-    public static UniversalArchitecture Detect(string arch, GgufFile gguf)
+    public static UniversalArchitecture Detect(string arch, GgufFile? gguf)
     {
         // 1. Diffusion Model Architectures
         if (string.Equals(arch, "flux", StringComparison.OrdinalIgnoreCase) ||
-            gguf.Tensors.ContainsKey("double_blocks.0.img_attn.qkv.weight") ||
-            gguf.Tensors.ContainsKey("model.diffusion_model.double_blocks.0.img_attn.qkv.weight"))
+            (gguf?.Tensors != null && (gguf.Tensors.ContainsKey("double_blocks.0.img_attn.qkv.weight") ||
+                                      gguf.Tensors.ContainsKey("model.diffusion_model.double_blocks.0.img_attn.qkv.weight"))))
         {
             return UniversalArchitecture.Flux;
         }
 
         if (string.Equals(arch, "sd3", StringComparison.OrdinalIgnoreCase) ||
-            gguf.Tensors.ContainsKey("joint_blocks.0.x_block.attn.qkv.weight") ||
-            gguf.Tensors.ContainsKey("model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight"))
+            (gguf?.Tensors != null && (gguf.Tensors.ContainsKey("joint_blocks.0.x_block.attn.qkv.weight") ||
+                                      gguf.Tensors.ContainsKey("model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight"))))
         {
             return UniversalArchitecture.SD3;
         }
@@ -104,8 +105,8 @@ public static class ModelArchitectureDetector
         if (string.Equals(arch, "sd1", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(arch, "sdxl", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(arch, "sd2", StringComparison.OrdinalIgnoreCase) ||
-            gguf.Tensors.ContainsKey("model.diffusion_model.input_blocks.0.0.weight") ||
-            gguf.Tensors.ContainsKey("diffusion_model.input_blocks.0.0.weight"))
+            (gguf?.Tensors != null && (gguf.Tensors.ContainsKey("model.diffusion_model.input_blocks.0.0.weight") ||
+                                      gguf.Tensors.ContainsKey("diffusion_model.input_blocks.0.0.weight"))))
         {
             return UniversalArchitecture.StableDiffusion;
         }
@@ -125,14 +126,14 @@ public static class ModelArchitectureDetector
 
         if (string.Equals(arch, "deepseek2", StringComparison.OrdinalIgnoreCase) ||
             arch.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase) ||
-            gguf.IsMla)
+            (gguf?.IsMla == true))
         {
             return UniversalArchitecture.DeepSeek;
         }
 
         if (string.Equals(arch, "phi3", StringComparison.OrdinalIgnoreCase) ||
             arch.StartsWith("phi", StringComparison.OrdinalIgnoreCase) ||
-            gguf.Tensors.ContainsKey("blk.0.attn_qkv.weight"))
+            (gguf?.Tensors != null && gguf.Tensors.ContainsKey("blk.0.attn_qkv.weight")))
         {
             return UniversalArchitecture.Phi;
         }
@@ -151,7 +152,7 @@ public static class ModelArchitectureDetector
         if (string.Equals(arch, "llama", StringComparison.OrdinalIgnoreCase))
         {
             // Devstral / Mistral-derived models often identify as llama with 1e9 rope freq base or mistral vocab
-            if (gguf.RopeFreqBase >= 1e8f)
+            if (gguf != null && gguf.RopeFreqBase >= 1e8f)
             {
                 return UniversalArchitecture.Mistral;
             }

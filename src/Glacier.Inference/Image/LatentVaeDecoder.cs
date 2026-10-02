@@ -23,35 +23,48 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
         _latentChannels = latentChannels;
         _colorWeights = new float[3 * _latentChannels];
 
-        // Red channel projection:
-        _colorWeights[0 * _latentChannels + 0] = 0.50f;  // Base luminance
-        _colorWeights[0 * _latentChannels + 1] = 0.05f;  // Cyan keeps red low
-        _colorWeights[0 * _latentChannels + 2] = 0.15f;  // Ice blue keeps red low
-        _colorWeights[0 * _latentChannels + 3] = 0.90f;  // Warm interior lights / sunset boost red
-        _colorWeights[0 * _latentChannels + 4] = 0.30f;  // Edge definition
-        _colorWeights[0 * _latentChannels + 5] = 0.80f;  // Specular gleam
+        // Full-spectrum multi-channel latent to RGB projection:
+        // Ch 0: Core structural luminance (neutral achromatic)
+        _colorWeights[0 * _latentChannels + 0] = 0.55f;
+        _colorWeights[1 * _latentChannels + 0] = 0.55f;
+        _colorWeights[2 * _latentChannels + 0] = 0.55f;
 
-        // Green channel projection:
-        _colorWeights[1 * _latentChannels + 0] = 0.65f;  // Base luminance
-        _colorWeights[1 * _latentChannels + 1] = 1.20f;  // Aurora green/teal peak
-        _colorWeights[1 * _latentChannels + 2] = 0.60f;  // Ice green reflection
-        _colorWeights[1 * _latentChannels + 3] = 0.40f;  // Warmth
-        _colorWeights[1 * _latentChannels + 4] = 0.30f;  // Edge definition
-        _colorWeights[1 * _latentChannels + 5] = 0.85f;  // Specular gleam
+        // Ch 1: Cyan / Aqua / Electric Blue
+        _colorWeights[0 * _latentChannels + 1] = 0.05f;
+        _colorWeights[1 * _latentChannels + 1] = 0.85f;
+        _colorWeights[2 * _latentChannels + 1] = 1.05f;
 
-        // Blue channel projection:
-        _colorWeights[2 * _latentChannels + 0] = 0.80f;  // High nocturnal blue luminance
-        _colorWeights[2 * _latentChannels + 1] = 1.10f;  // Aurora cyan blue component
-        _colorWeights[2 * _latentChannels + 2] = 1.30f;  // Intense glacial / crystal ice blue
-        _colorWeights[2 * _latentChannels + 3] = 0.10f;  // Low warm in blue
-        _colorWeights[2 * _latentChannels + 4] = 0.35f;  // Edge definition
-        _colorWeights[2 * _latentChannels + 5] = 1.00f;  // Specular gleam
+        // Ch 2: Magenta / Violet / Neon Pink
+        _colorWeights[0 * _latentChannels + 2] = 1.00f;
+        _colorWeights[1 * _latentChannels + 2] = 0.10f;
+        _colorWeights[2 * _latentChannels + 2] = 0.85f;
 
-        for (int c = 6; c < _latentChannels; c++)
+        // Ch 3: Amber / Warm Gold / Orange Flare
+        _colorWeights[0 * _latentChannels + 3] = 1.05f;
+        _colorWeights[1 * _latentChannels + 3] = 0.70f;
+        _colorWeights[2 * _latentChannels + 3] = 0.05f;
+
+        // Ch 4: Emerald / Foliage Green / Viridian
+        _colorWeights[0 * _latentChannels + 4] = 0.10f;
+        _colorWeights[1 * _latentChannels + 4] = 0.95f;
+        _colorWeights[2 * _latentChannels + 4] = 0.20f;
+
+        // Ch 5: Specular Gleam / White Starburst / Caustic Highlights
+        _colorWeights[0 * _latentChannels + 5] = 0.95f;
+        _colorWeights[1 * _latentChannels + 5] = 0.95f;
+        _colorWeights[2 * _latentChannels + 5] = 0.95f;
+
+        // Ch 6: Volumetric Atmospheric Mist / Deep Indigo Shadow
+        _colorWeights[0 * _latentChannels + 6] = 0.15f;
+        _colorWeights[1 * _latentChannels + 6] = 0.18f;
+        _colorWeights[2 * _latentChannels + 6] = 0.28f;
+
+        // Ch 7..15: Micro-texture modulation
+        for (int c = 7; c < _latentChannels; c++)
         {
-            _colorWeights[0 * _latentChannels + c] = 0.02f;
-            _colorWeights[1 * _latentChannels + c] = 0.02f;
-            _colorWeights[2 * _latentChannels + c] = 0.03f;
+            _colorWeights[0 * _latentChannels + c] = 0.03f;
+            _colorWeights[1 * _latentChannels + c] = 0.03f;
+            _colorWeights[2 * _latentChannels + c] = 0.04f;
         }
     }
 

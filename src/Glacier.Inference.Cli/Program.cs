@@ -179,14 +179,14 @@ public static class Program
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier image demo [--out <file.bmp>]");
+        Console.WriteLine("  glacier image demo [--out <file.png>]");
         Console.WriteLine("  glacier image info <model.gguf>");
-        Console.WriteLine("  glacier image generate \"<prompt>\" [-m <model.gguf>] [--vae <vae.gguf>] [--steps <n>] [--out <file.bmp>] [--width <px>] [--height <px>] [--seed <int>]");
+        Console.WriteLine("  glacier image generate \"<prompt>\" [-m <model.gguf>] [--vae <vae.gguf>] [--steps <n>] [--out <file.png>] [--width <px>] [--height <px>] [--seed <int>]");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  demo                                 Execute end-to-end 4-step Flow Matching DiT generation");
         Console.WriteLine("  info <model.gguf>                    Inspect Diffusion GGUF model topology, layers & parameters");
-        Console.WriteLine("  generate \"<prompt>\" [options]        Generate 24-bit RGB bitmap from text prompt (supports pre-trained GGUFs)");
+        Console.WriteLine("  generate \"<prompt>\" [options]        Generate standard 24-bit PNG/BMP from text prompt (supports pre-trained GGUFs)");
     }
 
 
@@ -1915,6 +1915,19 @@ public static class Program
         return 1;
     }
 
+    private static void SaveImage(string path, byte[] rgbPixels, int width, int height)
+    {
+        if (path.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase))
+        {
+            BmpWriter.SaveBmp24(path, rgbPixels, width, height);
+        }
+        else
+        {
+            // Default to W3C-standard 24-bit PNG
+            PngWriter.SavePng24(path, rgbPixels, width, height);
+        }
+    }
+
     private static int RunImage(string[] args)
     {
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
@@ -1926,7 +1939,7 @@ public static class Program
         string subCmd = args[0].ToLowerInvariant();
         if (subCmd == "demo")
         {
-            string outPath = "glacier_generated_image.bmp";
+            string outPath = "glacier_generated_image.png";
             for (int i = 1; i < args.Length; i++)
             {
                 if (args[i] is "--out" or "-o" && i + 1 < args.Length) outPath = args[++i];
@@ -1952,10 +1965,11 @@ public static class Program
             Console.WriteLine($"   -> 4-Step Flow Matching completed in {result.ElapsedMilliseconds}ms ({result.PixelsPerSecond:F0} pixels/sec)");
             Console.WriteLine();
 
-            Console.WriteLine($"[3. Latent VAE Reconstruction & Export] Writing 24-bit RGB bitmap to '{outPath}'...");
-            BmpWriter.SaveBmp24(outPath, result.RgbPixels, result.Width, result.Height);
+            string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
+            Console.WriteLine($"[3. Latent VAE Reconstruction & Export] Writing 24-bit RGB {fmt} to '{outPath}'...");
+            SaveImage(outPath, result.RgbPixels, result.Width, result.Height);
             var fi = new FileInfo(outPath);
-            Console.WriteLine($"   -> Saved {fi.Length / 1024} KB standard 24-bit BMP image ({result.Width}x{result.Height})");
+            Console.WriteLine($"   -> Saved {fi.Length / 1024} KB standard 24-bit {fmt} image ({result.Width}x{result.Height})");
             Console.WriteLine();
 
             Console.ForegroundColor = ConsoleColor.Green;
@@ -1998,12 +2012,12 @@ public static class Program
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [-m <model.gguf>] [--out <file.bmp>]");
+                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [-m <model.gguf>] [--out <file.png>]");
                 return 1;
             }
 
             string prompt = args[1];
-            string outPath = "generated.bmp";
+            string outPath = "generated.png";
             string? modelPath = null;
             string? vaePath = null;
             int? steps = null;
@@ -2040,10 +2054,11 @@ public static class Program
                 Console.WriteLine($"   Executing reverse diffusion trajectory on NVIDIA RTX 4060...");
 
                 var res = pipeline.Generate(prompt, width: w, height: h, numSteps: s, seed: seed);
-                BmpWriter.SaveBmp24(outPath, res.RgbPixels, res.Width, res.Height);
+                SaveImage(outPath, res.RgbPixels, res.Width, res.Height);
 
+                string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+                Console.WriteLine($"[Generated] Saved to '{outPath}' ({fmt}) in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
                 Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
                 Console.ResetColor();
                 return 0;
@@ -2058,9 +2073,10 @@ public static class Program
                 using var pipeline = new ImageGenerationPipeline();
                 var res = pipeline.Generate(prompt, w, h, s, seed);
 
-                BmpWriter.SaveBmp24(outPath, res.RgbPixels, w, h);
+                SaveImage(outPath, res.RgbPixels, w, h);
+                string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[Generated] Saved to '{outPath}' in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+                Console.WriteLine($"[Generated] Saved to '{outPath}' ({fmt}) in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
                 Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
                 Console.ResetColor();
                 return 0;

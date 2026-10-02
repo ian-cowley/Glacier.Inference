@@ -44,6 +44,37 @@ public class ImageGenerationTests
     }
 
     [Fact]
+    public void PngWriter_WritesValid24BitPngFile()
+    {
+        string tmpFile = Path.Combine(Path.GetTempPath(), $"glacier_test_{Guid.NewGuid():N}.png");
+        try
+        {
+            int w = 64;
+            int h = 48;
+            byte[] pixels = new byte[w * h * 3];
+            Array.Fill(pixels, (byte)180);
+
+            PngWriter.SavePng24(tmpFile, pixels, w, h);
+
+            Assert.True(File.Exists(tmpFile));
+            byte[] bytes = File.ReadAllBytes(tmpFile);
+            Assert.True(bytes.Length > 8);
+
+            // Verify PNG magic signature: 0x89 'P' 'N' 'G' '\r' '\n' 0x1A '\n'
+            byte[] expectedSig = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+            for (int i = 0; i < 8; i++)
+            {
+                Assert.Equal(expectedSig[i], bytes[i]);
+            }
+        }
+        finally
+        {
+            if (File.Exists(tmpFile)) File.Delete(tmpFile);
+        }
+    }
+
+
+    [Fact]
     public void FlowMatchingScheduler_GeneratesDecreasingTrajectoryAndSteps()
     {
         int steps = 4;

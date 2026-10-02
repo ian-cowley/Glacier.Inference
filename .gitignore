@@ -45,3 +45,7 @@ Glacier.Inference.md
 # Media output artifacts
 *.wav
 *.bmp
+*.png
+*.gguf
+models/
+

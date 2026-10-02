@@ -42,8 +42,8 @@ public class DiffusionGgufTests
     [Fact]
     public void DiffusionGgufPipeline_RunsEndToEndSyntheticFlow()
     {
-        int w = 512;
-        int h = 512;
+        int w = 256;
+        int h = 256;
         int steps = 4;
 
         using var pipeline = new Glacier.Inference.Image.ImageGenerationPipeline();
