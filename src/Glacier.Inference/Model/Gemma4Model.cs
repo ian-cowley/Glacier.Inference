@@ -506,82 +506,89 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         // ---------------------------------------------------------------------
         // Part 2: Sparse MoE (128 Experts, Top-8 routing)
         // ---------------------------------------------------------------------
-        QuantKernels.RMSNorm(_attnOutResidual, layer.FfnPreNorm2Weight, _moeNorm, _dim, _weights.RmsNormEps);
-        QuantKernels.ComputeBlockSums32(_moeNorm, _moeNormSums, _dim);
-
-        // Custom router input: RMSNorm(attn_out) / sqrt(dim) * ffn_gate_inp.scale
-        QuantKernels.RMSNorm(_attnOutResidual, null, _routerIn, _dim, _weights.RmsNormEps);
-        QuantKernels.ScaleAndMul(_routerIn, layer.FfnGateInpScaleWeight, 1.0f / _embeddingScale, _routerIn, _dim);
-
-        // Router logits
-        for (int e = 0; e < _expertCount; e++)
+        if (layer.FfnGateInpWeight != null && _expertCount > 0)
         {
-            float* row = layer.FfnGateInpWeight + (long)e * _dim;
-            _routerLogits[e] = QuantKernels.VecDotF32(row, _routerIn, _dim);
-        }
+            QuantKernels.RMSNorm(_attnOutResidual, layer.FfnPreNorm2Weight, _moeNorm, _dim, _weights.RmsNormEps);
+            QuantKernels.ComputeBlockSums32(_moeNorm, _moeNormSums, _dim);
 
-        // Softmax & Top-8 selection with renormalization
-        QuantKernels.SoftmaxTopK(_routerLogits, _expertCount, _expertUsedCount, selectedIndices, selectedWeights, normTopK: true);
+            // Custom router input: RMSNorm(attn_out) / sqrt(dim) * ffn_gate_inp.scale
+            QuantKernels.RMSNorm(_attnOutResidual, null, _routerIn, _dim, _weights.RmsNormEps);
+            QuantKernels.ScaleAndMul(_routerIn, layer.FfnGateInpScaleWeight, 1.0f / _embeddingScale, _routerIn, _dim);
 
-        // Execute active experts concurrently across CPU cores
-        Parallel.For(0, _expertUsedCount, k =>
-        {
-            int expertIdx = selectedIndices[k];
-            float weight = selectedWeights[k];
-
-            float* scratchFused = _expertScratchFused + (long)k * (2 * _expertFfnDim);
-            float* scratchAct = _expertScratchAct + (long)k * _expertFfnDim;
-            float* scratchActSums = _expertScratchActSums + (long)k * (((_expertFfnDim + 31) / 32));
-            float* expertOut = _expertOutputs + (long)k * _dim;
-
-            QuantKernels.ExecuteGemma4Expert(
-                expertIdx,
-                weight,
-                _moeNorm,
-                _moeNormSums,
-                layer.FfnGateUpExpsWeight,
-                layer.FfnGateUpExpsType,
-                layer.FfnDownExpsWeight,
-                layer.FfnDownExpsType,
-                layer.FfnDownExpsScaleWeight,
-                _dim,
-                _expertFfnDim,
-                scratchFused,
-                scratchAct,
-                scratchActSums,
-                expertOut);
-        });
-
-        // Reduce expert outputs into _moeOut
-        new Span<float>(_moeOut, _dim).Clear();
-        for (int k = 0; k < _expertUsedCount; k++)
-        {
-            float* expertOut = _expertOutputs + (long)k * _dim;
-            int i = 0;
-            if (Vector256.IsHardwareAccelerated)
+            // Router logits
+            for (int e = 0; e < _expertCount; e++)
             {
-                int vecLimit = _dim - 8;
-                for (; i <= vecLimit; i += 8)
+                float* row = layer.FfnGateInpWeight + (long)e * _dim;
+                _routerLogits[e] = QuantKernels.VecDotF32(row, _routerIn, _dim);
+            }
+
+            // Softmax & Top-8 selection with renormalization
+            QuantKernels.SoftmaxTopK(_routerLogits, _expertCount, _expertUsedCount, selectedIndices, selectedWeights, normTopK: true);
+
+            // Execute active experts concurrently across CPU cores
+            Parallel.For(0, _expertUsedCount, k =>
+            {
+                int expertIdx = selectedIndices[k];
+                float weight = selectedWeights[k];
+
+                float* scratchFused = _expertScratchFused + (long)k * (2 * _expertFfnDim);
+                float* scratchAct = _expertScratchAct + (long)k * _expertFfnDim;
+                float* scratchActSums = _expertScratchActSums + (long)k * (((_expertFfnDim + 31) / 32));
+                float* expertOut = _expertOutputs + (long)k * _dim;
+
+                QuantKernels.ExecuteGemma4Expert(
+                    expertIdx,
+                    weight,
+                    _moeNorm,
+                    _moeNormSums,
+                    layer.FfnGateUpExpsWeight,
+                    layer.FfnGateUpExpsType,
+                    layer.FfnDownExpsWeight,
+                    layer.FfnDownExpsType,
+                    layer.FfnDownExpsScaleWeight,
+                    _dim,
+                    _expertFfnDim,
+                    scratchFused,
+                    scratchAct,
+                    scratchActSums,
+                    expertOut);
+            });
+
+            // Reduce expert outputs into _moeOut
+            new Span<float>(_moeOut, _dim).Clear();
+            for (int k = 0; k < _expertUsedCount; k++)
+            {
+                float* expertOut = _expertOutputs + (long)k * _dim;
+                int i = 0;
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    var vm = Vector256.Load(_moeOut + i);
-                    var ve = Vector256.Load(expertOut + i);
-                    (vm + ve).Store(_moeOut + i);
+                    int vecLimit = _dim - 8;
+                    for (; i <= vecLimit; i += 8)
+                    {
+                        var vm = Vector256.Load(_moeOut + i);
+                        var ve = Vector256.Load(expertOut + i);
+                        (vm + ve).Store(_moeOut + i);
+                    }
+                }
+                for (; i < _dim; i++)
+                {
+                    _moeOut[i] += expertOut[i];
                 }
             }
-            for (; i < _dim; i++)
+
+            QuantKernels.RMSNorm(_moeOut, layer.FfnPostNorm2Weight, _moeOut, _dim, _weights.RmsNormEps);
+
+            // ---------------------------------------------------------------------
+            // Part 3: Combine Shared MLP + Sparse MoE
+            // ---------------------------------------------------------------------
+            for (int i = 0; i < _dim; i++)
             {
-                _moeOut[i] += expertOut[i];
+                _combinedFfn[i] = _mlpOut[i] + _moeOut[i];
             }
         }
-
-        QuantKernels.RMSNorm(_moeOut, layer.FfnPostNorm2Weight, _moeOut, _dim, _weights.RmsNormEps);
-
-        // ---------------------------------------------------------------------
-        // Part 3: Combine Shared MLP + Sparse MoE
-        // ---------------------------------------------------------------------
-        for (int i = 0; i < _dim; i++)
+        else
         {
-            _combinedFfn[i] = _mlpOut[i] + _moeOut[i];
+            Buffer.MemoryCopy(_mlpOut, _combinedFfn, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
         }
     }
 

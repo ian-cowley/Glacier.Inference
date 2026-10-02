@@ -111,7 +111,7 @@ public class D3D12ShaderTests
             Vortice.Direct3D12.RootSignatureFlags.None,
             new Vortice.Direct3D12.RootParameter[]
             {
-                new(new Vortice.Direct3D12.RootConstants(0, 0, 5), Vortice.Direct3D12.ShaderVisibility.All),
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
@@ -136,13 +136,14 @@ public class D3D12ShaderTests
         cmd.SetComputeRootSignature(rootSig);
         cmd.SetPipelineState(psoGemv);
 
-        uint* pConsts = stackalloc uint[5];
+        uint* pConsts = stackalloc uint[6];
         pConsts[0] = (uint)kCols;
         pConsts[1] = (uint)mRows;
         pConsts[2] = 0;
         pConsts[3] = 0;
         pConsts[4] = 1; // has_y
-        cmd.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
@@ -199,7 +200,7 @@ public class D3D12ShaderTests
             Vortice.Direct3D12.RootSignatureFlags.None,
             new Vortice.Direct3D12.RootParameter[]
             {
-                new(new Vortice.Direct3D12.RootConstants(0, 0, 5), Vortice.Direct3D12.ShaderVisibility.All),
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
@@ -223,13 +224,14 @@ public class D3D12ShaderTests
         cmd.SetComputeRootSignature(rootSig);
         cmd.SetPipelineState(psoGemv);
 
-        uint* pConsts = stackalloc uint[5];
+        uint* pConsts = stackalloc uint[6];
         pConsts[0] = (uint)kCols;
         pConsts[1] = (uint)mRows;
         pConsts[2] = 0;
         pConsts[3] = 0;
         pConsts[4] = 1; // has_y
-        cmd.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
@@ -284,7 +286,7 @@ public class D3D12ShaderTests
             Vortice.Direct3D12.RootSignatureFlags.None,
             new Vortice.Direct3D12.RootParameter[]
             {
-                new(new Vortice.Direct3D12.RootConstants(0, 0, 5), Vortice.Direct3D12.ShaderVisibility.All),
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
                 new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
@@ -308,13 +310,14 @@ public class D3D12ShaderTests
         cmd.SetComputeRootSignature(rootSig);
         cmd.SetPipelineState(psoGemv);
 
-        uint* pConsts = stackalloc uint[5];
+        uint* pConsts = stackalloc uint[6];
         pConsts[0] = (uint)kCols;
         pConsts[1] = (uint)mRows;
         pConsts[2] = 0;
         pConsts[3] = 0;
         pConsts[4] = 1; // has_y
-        cmd.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
         cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
         cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);

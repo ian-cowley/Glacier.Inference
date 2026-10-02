@@ -10,6 +10,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 ByteAddressBuffer W : register(t0);
@@ -45,7 +46,7 @@ void get_scale_min(uint j, uint s0, uint s1, uint s2, out float d_out, out float
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
@@ -132,6 +133,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 ByteAddressBuffer W : register(t0);
@@ -167,7 +169,7 @@ void get_scale_min_q5(uint j, uint s0, uint s1, uint s2, out float d_out, out fl
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
@@ -253,6 +255,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 ByteAddressBuffer W : register(t0);
@@ -277,7 +280,7 @@ int get_scale_q3(uint idx, uint sc0, uint sc1, uint sc2, uint sc3)
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
@@ -371,6 +374,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 ByteAddressBuffer W : register(t0);
@@ -390,7 +394,7 @@ int decode_signed_byte(uint b)
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
@@ -485,6 +489,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 ByteAddressBuffer W : register(t0);
@@ -499,7 +504,7 @@ groupshared float s_mem[128];
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
@@ -561,6 +566,7 @@ cbuffer Params : register(b0)
     uint has_bias;
     uint has_residual;
     uint has_y;
+    uint row_offset;
 };
 
 StructuredBuffer<float> W : register(t0);
@@ -575,18 +581,18 @@ groupshared float s_mem[128];
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint row_in_grp = gtid.y;
-    uint warp_id = gid.x * 4 + row_in_grp;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
     uint lane_id = gtid.x;
     uint s_idx = row_in_grp * 32 + lane_id;
 
     if (warp_id < m_rows)
     {
-        uint row_offset = warp_id * k_cols;
+        uint row_data_offset = warp_id * k_cols;
         float row_sum = 0.0f;
 
         for (uint i = lane_id; i < k_cols; i += 32)
         {
-            row_sum += W[row_offset + i] * x[i];
+            row_sum += W[row_data_offset + i] * x[i];
         }
 
         s_mem[s_idx] = row_sum;

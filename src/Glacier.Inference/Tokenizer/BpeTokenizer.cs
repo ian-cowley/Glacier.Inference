@@ -206,7 +206,22 @@ public sealed partial class BpeTokenizer
     /// </summary>
     public string FormatChatML(string prompt, string systemPrompt = "You are a helpful assistant.")
     {
-        // 0. Check for Gemma 4 turn format
+        // 0. Check for Gemma format (<start_of_turn> or <|turn>)
+        if (_specialTokens.ContainsKey("<start_of_turn>"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
+            {
+                sb.Append($"<start_of_turn>system\n{systemPrompt}<end_of_turn>\n");
+            }
+            sb.Append($"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n");
+            return sb.ToString();
+        }
+
         if (_specialTokens.ContainsKey("<|turn>"))
         {
             var sb = new StringBuilder();
@@ -219,7 +234,7 @@ public sealed partial class BpeTokenizer
                 sb.Append($"<|turn>system\n{systemPrompt}<turn|>\n");
             }
             sb.Append($"<|turn>user\n{prompt}<turn|>\n");
-            sb.Append("<|turn>model\n<|channel>thought\n<channel|>");
+            sb.Append("<|turn>model\n");
             return sb.ToString();
         }
 

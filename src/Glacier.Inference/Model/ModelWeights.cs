@@ -700,7 +700,7 @@ public sealed unsafe class ModelWeights
             {
                 headsKv = gguf.HeadCountKvPattern[l];
             }
-            else if (gguf.Architecture == "gemma4")
+            else if (gguf.Architecture == "gemma4" && HeadCountKv == 0)
             {
                 headsKv = isSwa ? 8 : 2;
             }
@@ -710,7 +710,7 @@ public sealed unsafe class ModelWeights
             {
                 layerHeadDim = (int)qNorm.Dimensions[0];
             }
-            else if (gguf.Architecture == "gemma4")
+            else if (gguf.Architecture == "gemma4" && HeadDim == 0)
             {
                 layerHeadDim = isSwa ? 256 : 512;
             }

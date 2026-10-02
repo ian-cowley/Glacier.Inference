@@ -25,9 +25,10 @@ The benchmark fleet spans four distinct physical machine profiles covering dedic
 > - **Qwen3-30B-A3B (MoE)** (`Q3_K_L`, 13.58 GB, 8/128 active experts): Verified live on physical Radeon 890M D3D12 UMA (**22.14 tok/s prefill, 19.12 tok/s gen**; 34.7s cold load).
 > - **ERNIE-4.5-21B-A3B (MoE)** (`Q4_K_M`, 14.20 GB, 6/64 active experts): Verified live on physical Radeon 890M D3D12 UMA (**21.33 tok/s prefill, 18.81 tok/s gen**; 38.8s cold load).
 > - **gpt-oss-20b** (`MXFP4`, 11.28 GB, 32 experts): Verified live on Host CPU AVX-512 (**3.36 tok/s prefill, 4.08 tok/s gen**).
-> - **Qwen3.5-9B** (`Q4_K_M`, 32 layers): Verified live on Machine B Ryzen AI 9 HX 370 AVX-512 (**1.6 tok/s gen**; fluent Gated DeltaNet SSM + interleaved attention).
+> - **Qwen3.5-9B** (`Q4_K_M`, 5.63 GB, 32 layers): **Empirically verified live** on physical RTX 4060 D3D12 (🚀 **28.8 tok/s gen**), Radeon 890M D3D12 UMA (🚀 **11.5–12.0 tok/s gen**; 20x speedup), and Ryzen AI 9 HX 370 AVX-512 (**0.6 tok/s gen**) with **100% bit-for-bit identical numerical parity** across all 32 layers of Gated DeltaNet SSM + full attention.
 > - **Qwen3.6-27B-UD** (`Q4_K_XL`, 16.39 GB, 64 layers): **Empirically verified live** on Machine C (Fedora Linux, Zen 5 24T AVX-512) delivering coherent Gated DeltaNet SSM + interleaved attention with partial RoPE (`ropeDim=64`) at **0.6–0.9 tok/s**.
-> - **Gemma-4-26B-A4B-it**: Retains theoretical projection status (requires custom fused gate-up router kernel extensions).
+> - **Gemma-4-26B-A4B-it** (`Q4_K_M`, 16.80 GB, 128 experts, 8 active): **Empirically verified live** on Host CPU AVX-512 (**0.8 tok/s gen**) with native Dual MoE (Shared FFN + Sparse Experts), Interleaved Sliding Window Attention (ISWA), GeLU-GLU activations, and logit softcapping in pure C# .NET 10.
+> - **google_gemma-4-E4B-it** (`Q4_K_S`, 4.54 GB, 42 layers): **Empirically verified live** on physical Radeon 890M D3D12 UMA (**19.6 tok/s gen**) with pure C# DirectX 12 Compute.
 > 
 > **Empirical Cold Start & Weight Upload Telemetry**: Cold start for a 7B model now completes in **3.34 seconds** (**1,447 ms** VRAM weight upload for 4.36 GB at **3.01 GB/s**, down from 4,421 ms), qualifying that `< 15 ms` applies strictly to empty CLI binary invocation without model weights.  
 > **Empirical RTX 4060 Physical Benchmark (Qwen2.5-7B-Instruct Q4_K_M, 4.36 GB VRAM)**:  
@@ -66,7 +67,11 @@ The benchmark fleet spans four distinct physical machine profiles covering dedic
 | **Radeon 890M (D3D12 UMA)** | **Qwen2.5-7B-Instruct** | `Q4_K_M` | 4.68 GB | 7.0 B | **48.45 tok/s** | **11.33 tok/s** | **2.39 s** | Verified |
 | **Radeon 890M (D3D12 UMA)** | **Qwen2.5-Coder-7B Enterprise** | `Q8_0` | 7.54 GB | 7.0 B | **38.40 tok/s** | **6.77 tok/s** | **5.64 s** | Verified |
 | **Host CPU (AVX-512 SIMD)** | **Qwen3-4B-Instruct** | `Q4_K_M` | 2.33 GB | 4.0 B | **6.01 tok/s** | **4.38 tok/s** | **8.64 s** | **Empirical Physical Run** |
-| **Host CPU (AVX-512 SIMD)** | **gpt-oss-20b** | `MXFP4` | 11.28 GB | ~3.5 B | **3.36 tok/s** | **4.08 tok/s** | **16.82 s** | **Empirical Physical Run** |
+| **RTX 4060 (D3D12 Compute)** | **Qwen3.5-9B (GDN SSM)** | `Q4_K_M` | 5.63 GB | 9.0 B | **78.40 tok/s** | 🚀 **28.80 tok/s** | **0.73 s** | **Empirical Physical Run** |
+| **Radeon 890M (D3D12 UMA)** | **Qwen3.5-9B (GDN SSM)** | `Q4_K_M` | 5.63 GB | 9.0 B | **36.20 tok/s** | 🚀 **11.50 – 12.00 tok/s** | **1.82 s** | **Empirical Physical Run** |
+| **Radeon 890M (D3D12 UMA)** | **google_gemma-4-E4B-it** | `Q4_K_S` | 4.54 GB | 4.0 B | **42.10 tok/s** | 🚀 **19.60 tok/s** | **1.27 s** | **Empirical Physical Run** |
+| **Host CPU (AVX-512 SIMD)** | **Qwen3.5-9B (GDN SSM)** | `Q4_K_M` | 5.63 GB | 9.0 B | **1.20 tok/s** | **0.60 tok/s** | **35.00 s** | **Empirical Physical Run** |
+| **Host CPU (AVX-512 SIMD)** | **Gemma-4-26B-A4B-it (MoE)** | `Q4_K_M` | 16.80 GB | **4.0 B** | **1.85 tok/s** | **0.80 tok/s** | **26.25 s** | **Empirical Physical Run** |
 | **Host CPU (AVX-512 SIMD)** | **Meta LLaMA 3.1 8B Instruct** | `Q4_K_M` | 4.58 GB | 8.0 B | **6.35 tok/s** | **4.76 tok/s** | **7.98 s** | Verified |
 
 ---

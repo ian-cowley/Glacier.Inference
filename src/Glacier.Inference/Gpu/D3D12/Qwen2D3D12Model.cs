@@ -13,7 +13,7 @@ using Vortice.Direct3D12;
 /// Bare-metal Direct3D 12 Compute transformer runtime for Qwen2 / Qwen2.5 models.
 /// Executes directly on AMD Radeon (Wave32 RDNA 2/3/3.5) and DirectX 12 hardware with zero external C++ DLL dependencies.
 /// </summary>
-public sealed unsafe partial class Qwen2D3D12Model : IDisposable
+public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
 {
     private readonly D3D12Context _ctx;
     private readonly ModelWeights _weights;

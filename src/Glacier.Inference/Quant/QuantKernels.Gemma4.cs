@@ -46,6 +46,10 @@ public static unsafe partial class QuantKernels
         for (int r = 0; r < fusedRows; r++)
         {
             byte* rowPtr = expertGateUpPtr + (long)r * rowBytesGateUp;
+            if (r + 1 < fusedRows && System.Runtime.Intrinsics.X86.Sse.IsSupported)
+            {
+                System.Runtime.Intrinsics.X86.Sse.Prefetch0(rowPtr + rowBytesGateUp);
+            }
             scratchFused[r] = ComputeDot(gateUpExpsType, rowPtr, x, xSums, dim);
         }
 
@@ -66,6 +70,10 @@ public static unsafe partial class QuantKernels
         for (int r = 0; r < dim; r++)
         {
             byte* rowPtr = expertDownPtr + (long)r * rowBytesDown;
+            if (r + 1 < dim && System.Runtime.Intrinsics.X86.Sse.IsSupported)
+            {
+                System.Runtime.Intrinsics.X86.Sse.Prefetch0(rowPtr + rowBytesDown);
+            }
             float d = ComputeDot(downExpsType, rowPtr, scratchAct, scratchActSums, expertFfnLength);
             moeAccumulator[r] = d * finalScale;
         }

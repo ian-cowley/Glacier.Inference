@@ -57,6 +57,41 @@ public sealed class D3D12LayerWeights : IDisposable
     public GgufType FfnUpShexpType { get; init; }
     public GgufType FfnDownShexpType { get; init; }
 
+    // Gemma 4 specific fields
+    public ID3D12Resource? FfnGateUpExpsWeight { get; init; }
+    public GgufType FfnGateUpExpsType { get; init; }
+    public ID3D12Resource? FfnDownExpsScaleWeight { get; init; }
+    public ID3D12Resource? FfnGateInpScaleWeight { get; init; }
+    public ID3D12Resource? AttnPostNormWeight { get; init; }
+    public ID3D12Resource? FfnPostNormWeight { get; init; }
+    public ID3D12Resource? FfnPostNorm1Weight { get; init; }
+    public ID3D12Resource? FfnPreNorm2Weight { get; init; }
+    public ID3D12Resource? FfnPostNorm2Weight { get; init; }
+    public ID3D12Resource? LayerOutputScaleWeight { get; init; }
+
+    // Qwen 3.5 / 3.6 SSM (Gated DeltaNet) specific fields
+    public bool IsSsm { get; init; }
+    public bool IsGdn { get; init; }
+    public bool HasQGate { get; init; }
+    public ID3D12Resource? QkvWeight { get; init; }
+    public GgufType QkvType { get; init; }
+    public ID3D12Resource? AttnGateWeight { get; init; }
+    public GgufType AttnGateType { get; init; }
+    public ID3D12Resource? SsmAlphaWeight { get; init; }
+    public GgufType SsmAlphaType { get; init; }
+    public ID3D12Resource? SsmBetaWeight { get; init; }
+    public GgufType SsmBetaType { get; init; }
+    public ID3D12Resource? SsmInWeight { get; init; }
+    public GgufType SsmInType { get; init; }
+    public ID3D12Resource? SsmConv1dWeight { get; init; }
+    public ID3D12Resource? SsmXWeight { get; init; }
+    public GgufType SsmXType { get; init; }
+    public ID3D12Resource? SsmDtBias { get; init; }
+    public ID3D12Resource? SsmAWeight { get; init; }
+    public ID3D12Resource? SsmOutWeight { get; init; }
+    public GgufType SsmOutType { get; init; }
+    public ID3D12Resource? SsmNormWeight { get; init; }
+
     public void Dispose()
     {
         AttnNormWeight?.Dispose();
@@ -82,5 +117,27 @@ public sealed class D3D12LayerWeights : IDisposable
         FfnGateShexpWeight?.Dispose();
         FfnUpShexpWeight?.Dispose();
         FfnDownShexpWeight?.Dispose();
+
+        FfnGateUpExpsWeight?.Dispose();
+        FfnDownExpsScaleWeight?.Dispose();
+        FfnGateInpScaleWeight?.Dispose();
+        AttnPostNormWeight?.Dispose();
+        FfnPostNormWeight?.Dispose();
+        FfnPostNorm1Weight?.Dispose();
+        FfnPreNorm2Weight?.Dispose();
+        FfnPostNorm2Weight?.Dispose();
+        LayerOutputScaleWeight?.Dispose();
+
+        QkvWeight?.Dispose();
+        AttnGateWeight?.Dispose();
+        SsmAlphaWeight?.Dispose();
+        SsmBetaWeight?.Dispose();
+        SsmInWeight?.Dispose();
+        SsmConv1dWeight?.Dispose();
+        SsmXWeight?.Dispose();
+        SsmDtBias?.Dispose();
+        SsmAWeight?.Dispose();
+        SsmOutWeight?.Dispose();
+        SsmNormWeight?.Dispose();
     }
 }

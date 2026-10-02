@@ -373,12 +373,14 @@ public static unsafe partial class QuantKernels
     }
 
     /// <summary>
-    /// Computes GeLU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    /// Computes GeLU approximation: x / (1 + exp(-1.5957691216 * x * (1 + 0.044715 * x^2)))
+    /// Mathematically identical to 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) but eliminates transcendental tanh.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static float Gelu(float x)
     {
-        return 0.5f * x * (1.0f + MathF.Tanh(0.7978845608f * x * (1.0f + 0.044715f * x * x)));
+        float z = -1.5957691216f * x * (1.0f + 0.044715f * x * x);
+        return z > 15.0f ? 0.0f : (z < -15.0f ? x : (x / (1.0f + MathF.Exp(z))));
     }
 
     /// <summary>
@@ -390,7 +392,8 @@ public static unsafe partial class QuantKernels
         for (int i = 0; i < size; i++)
         {
             float g = gate[i];
-            float gelu = 0.5f * g * (1.0f + MathF.Tanh(0.7978845608f * g * (1.0f + 0.044715f * g * g)));
+            float z = -1.5957691216f * g * (1.0f + 0.044715f * g * g);
+            float gelu = z > 15.0f ? 0.0f : (z < -15.0f ? g : (g / (1.0f + MathF.Exp(z))));
             dst[i] = gelu * up[i];
         }
     }

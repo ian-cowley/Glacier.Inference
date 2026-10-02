@@ -67,7 +67,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     private readonly ModelWeights _weights;
     private readonly GpuContext? _gpu;
     private readonly Qwen2GpuModel? _gpuModel;
-    private readonly Qwen2D3D12Model? _d3d12Model;
+    private readonly ID3D12Model? _d3d12Model;
     private readonly ICpuModel? _cpuModel;
     private readonly KVCache? _kvCache;
     private readonly PipelineSession? _pipelineSession;
@@ -89,7 +89,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public PipelineSession? PipelineSession => _pipelineSession;
     public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
-    public Qwen2D3D12Model? D3D12Model => _d3d12Model;
+    public ID3D12Model? D3D12Model => _d3d12Model;
     public ICpuModel? CpuModel => _cpuModel;
     public UniversalArchitecture Architecture => _weights.ArchitectureFamily;
     public int MaxSeqLen => _maxSeqLen;
@@ -156,18 +156,32 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
-            else if (!_weights.IsHybridSsm && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && _weights.ArchitectureFamily != UniversalArchitecture.Gemma4 && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
-                     targetDevice.Vendor == GpuVendor.Amd && OperatingSystem.IsWindows())
+            else if (!_weights.IsMla && (_weights.IsHybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+                     (targetDevice.Vendor == GpuVendor.Amd || targetDevice.Vendor == GpuVendor.Nvidia || targetDevice.Vendor == GpuVendor.Intel) && OperatingSystem.IsWindows())
             {
                 try
                 {
                     var d3dCtx = new D3D12Context(targetDevice.Index);
-                    _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                    if (_weights.ArchitectureFamily == UniversalArchitecture.Gemma4)
+                    {
+                        _d3d12Model = new Gemma4D3D12Model(d3dCtx, _weights, maxSeqLen);
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (Google Gemma 4 ISWA + Dual MoE) | KV: FP32 | Arch: Gemma 4]";
+                    }
+                    else if (_weights.IsHybridSsm || _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm)
+                    {
+                        _d3d12Model = new Qwen3HybridD3D12Model(d3dCtx, _weights, maxSeqLen);
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (Qwen 3.5/3.6 Gated DeltaNet SSM) | KV: FP32 | Arch: HybridSsm]";
+                    }
+                    else
+                    {
+                        _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                    }
                     _kvCache = null; // GPU maintains all KV states in device VRAM
-                    ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
                 }
                 catch (Exception ex)
                 {
+                    Console.Error.WriteLine($"[D3D12 Warning]: Direct3D 12 initialization failed on {targetDevice.Name}: {ex}");
                     var settings = GlacierSettings.Load();
                     if (!settings.FallbackToCpu)
                         throw new InvalidOperationException($"Failed to initialize Direct3D 12 Compute inference on {targetDevice.Name}: {ex.Message}", ex);

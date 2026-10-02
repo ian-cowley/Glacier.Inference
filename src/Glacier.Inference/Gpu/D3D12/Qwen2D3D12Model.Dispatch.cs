@@ -52,21 +52,28 @@ public sealed unsafe partial class Qwen2D3D12Model
         };
         cmdList.SetPipelineState(pso);
 
-        uint* pConsts = stackalloc uint[5];
-        pConsts[0] = (uint)k_cols;
-        pConsts[1] = (uint)m_rows;
-        pConsts[2] = bias != null ? 1u : 0u;
-        pConsts[3] = residual != null ? 1u : 0u;
-        pConsts[4] = y != null ? 1u : 0u;
-        cmdList.SetComputeRoot32BitConstants(0, 5, (IntPtr)pConsts, 0);
-
         cmdList.SetComputeRootShaderResourceView(1, wGpuVirtualAddress);
         cmdList.SetComputeRootShaderResourceView(2, bias?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, residual?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(5, y?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
 
-        cmdList.Dispatch(((uint)m_rows + 3) / 4, 1, 1);
+        const int chunkSize = D3D12TensorAlign.GemvChunkRows;
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)k_cols;
+        pConsts[1] = (uint)m_rows;
+        pConsts[2] = bias != null ? 1u : 0u;
+        pConsts[3] = residual != null ? 1u : 0u;
+        pConsts[4] = y != null ? 1u : 0u;
+
+        for (int r = 0; r < m_rows; r += chunkSize)
+        {
+            int currentChunk = Math.Min(m_rows - r, chunkSize);
+            pConsts[5] = (uint)r;
+            cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+            cmdList.Dispatch(((uint)currentChunk + 3) / 4, 1, 1);
+        }
     }
 
     private void DispatchGemv(

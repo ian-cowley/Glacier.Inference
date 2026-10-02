@@ -16,7 +16,7 @@ public sealed unsafe partial class Qwen2D3D12Model
         // 1. GEMV Root Signature: (Params b0, W t0, bias t1, x u0, residual u1, y u2)
         var gemvParams = new RootParameter[]
         {
-            new RootParameter(new RootConstants(0, 0, 5), ShaderVisibility.All),
+            new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
             new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),

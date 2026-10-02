@@ -27,6 +27,8 @@ public sealed unsafe class D3D12Context : IDisposable
     private AutoResetEvent _fenceEvent = null!;
 
     private ID3D12Resource _dummyBuffer = null!;
+    private ID3D12Resource _stagingUploadBuffer = null!;
+    private const ulong StagingUploadBufferSize = 32 * 1024 * 1024; // 32 MB reusable staging buffer
     private string _deviceName = string.Empty;
     private bool _disposed;
 
@@ -109,6 +111,7 @@ public sealed unsafe class D3D12Context : IDisposable
         _fenceEvent = new AutoResetEvent(false);
 
         _dummyBuffer = CreateDeviceBuffer(256);
+        _stagingUploadBuffer = CreateUploadBuffer(StagingUploadBufferSize);
     }
 
     public ID3D12Resource CreateDeviceBuffer(ulong sizeInBytes, ResourceFlags flags = ResourceFlags.AllowUnorderedAccess)
@@ -148,23 +151,31 @@ public sealed unsafe class D3D12Context : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (sizeInBytes == 0) return;
 
-        // Use upload staging buffer
-        using var uploadBuffer = CreateUploadBuffer(sizeInBytes);
-        void* pUpload = null;
-        uploadBuffer.Map(0, null, &pUpload);
-        Buffer.MemoryCopy((void*)pHostData, pUpload, sizeInBytes, sizeInBytes);
-        uploadBuffer.Unmap(0);
+        ulong offset = 0;
+        byte* pSrc = (byte*)pHostData;
 
-        _cmdAlloc.Reset();
-        _cmdList.Reset(_cmdAlloc, null);
+        while (offset < sizeInBytes)
+        {
+            ulong chunkSize = Math.Min(sizeInBytes - offset, StagingUploadBufferSize);
 
-        _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.Common, ResourceStates.CopyDest);
-        _cmdList.CopyBufferRegion(deviceBuffer, 0, uploadBuffer, 0, sizeInBytes);
-        _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.CopyDest, ResourceStates.Common);
+            void* pUpload = null;
+            _stagingUploadBuffer.Map(0, null, &pUpload);
+            Buffer.MemoryCopy(pSrc + offset, pUpload, chunkSize, chunkSize);
+            _stagingUploadBuffer.Unmap(0);
 
-        _cmdList.Close();
-        _queue.ExecuteCommandList(_cmdList);
-        Synchronize();
+            _cmdAlloc.Reset();
+            _cmdList.Reset(_cmdAlloc, null);
+
+            _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.Common, ResourceStates.CopyDest);
+            _cmdList.CopyBufferRegion(deviceBuffer, offset, _stagingUploadBuffer, 0, chunkSize);
+            _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.CopyDest, ResourceStates.Common);
+
+            _cmdList.Close();
+            _queue.ExecuteCommandList(_cmdList);
+            Synchronize();
+
+            offset += chunkSize;
+        }
     }
 
     public void CopyToHost(Span<byte> hostData, ID3D12Resource deviceBuffer, ulong sizeInBytes)
@@ -264,6 +275,7 @@ public sealed unsafe class D3D12Context : IDisposable
             _disposed = true;
             Synchronize();
 
+            _stagingUploadBuffer?.Dispose();
             _dummyBuffer?.Dispose();
             _fenceEvent?.Dispose();
             _fence?.Dispose();
