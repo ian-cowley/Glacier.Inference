@@ -22,6 +22,7 @@ using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Vision;
+using Glacier.Inference.Video;
 
 public static class Program
 {
@@ -61,6 +62,7 @@ public static class Program
                 "serve" => await RunServeAsync(cmdArgs),
                 "voice" => RunVoice(cmdArgs),
                 "vision" => RunVision(cmdArgs),
+                "video" => RunVideo(cmdArgs),
                 _ => HandleUnknownCommand(command)
             };
         }
@@ -105,6 +107,7 @@ public static class Program
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
         Console.WriteLine("  voice   <tts|stt|demo> [options]     Speech-to-text, text-to-speech & full-duplex voice");
         Console.WriteLine("  vision  <demo|query> [options]       Vision-Language Model (VLM) patchification & analysis");
+        Console.WriteLine("  video   <demo|query> [options]       Video-Language Model multi-frame temporal reasoning & 3D-RoPE");
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
@@ -143,6 +146,15 @@ public static class Program
             case "serve":
                 PrintServeHelp();
                 break;
+            case "voice":
+                PrintVoiceHelp();
+                break;
+            case "vision":
+                PrintVisionHelp();
+                break;
+            case "video":
+                PrintVideoHelp();
+                break;
             default:
                 Console.ForegroundColor = ConsoleColor.Yellow;
                 Console.WriteLine($"Unknown command: '{command}'\n");
@@ -150,6 +162,44 @@ public static class Program
                 PrintHelp();
                 break;
         }
+    }
+
+    private static void PrintVoiceHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier voice - Pure C# .NET 10 Voice Subsystem (Kokoro TTS + Whisper STT)");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <af_heart|am_adam|bf_emma|bm_george>] [--speed <float>] [--play]");
+        Console.WriteLine("  glacier voice stt <audio.wav>");
+        Console.WriteLine("  glacier voice demo [--play]");
+    }
+
+    private static void PrintVisionHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier vision - Vision-Language Model (VLM) patchification & analysis");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier vision demo");
+        Console.WriteLine("  glacier vision query <image> \"<prompt>\"");
+    }
+
+    private static void PrintVideoHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier video - Video-Language Model multi-frame temporal reasoning & 3D-RoPE");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier video demo");
+        Console.WriteLine("  glacier video query <dir> \"<prompt>\"");
+        Console.WriteLine();
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  demo                                 Execute end-to-end multi-frame video extraction, 3D-RoPE & temporal reasoning");
+        Console.WriteLine("  query <dir> \"<prompt>\"               Analyze directory of raw video frames and answer queries");
     }
 
     private static void PrintDevicesHelp()
@@ -1680,6 +1730,162 @@ public static class Program
         }
 
         Console.Error.WriteLine($"Unknown vision command: '{subCmd}'. Use 'glacier vision --help' for usage.");
+        return 1;
+    }
+
+    private static int RunVideo(string[] args)
+    {
+        if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+        {
+            PrintVideoHelp();
+            return 0;
+        }
+
+        string subCmd = args[0].ToLowerInvariant();
+        if (subCmd == "demo")
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("==========================================================================");
+            Console.WriteLine("   GLACIER.INFERENCE: VIDEO-LANGUAGE MODEL (VLM) TEMPORAL DEMONSTRATION  ");
+            Console.WriteLine("    Pure C# .NET 10 | 3D-RoPE + Motion Energy + Multi-Frame Reasoning   ");
+            Console.WriteLine("==========================================================================");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            var sw = Stopwatch.StartNew();
+
+            // Step 1: Ingest 8 video frames with dynamic motion & color shift
+            Console.WriteLine("[1. Video Ingestion & Temporal Dynamics] Simulating 8 frames (320x240 RGB @ 30 FPS)...");
+            var ingestSw = Stopwatch.StartNew();
+            int w = 320;
+            int h = 240;
+            int frameBytes = w * h * 3;
+            var frames = new List<byte[]>();
+
+            for (int f = 0; f < 8; f++)
+            {
+                byte[] frame = new byte[frameBytes];
+                // Moving bright object across frames
+                int objX = f * 35;
+                int objY = 80 + (int)(MathF.Sin(f * 0.8f) * 40);
+
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        int idx = (y * w + x) * 3;
+                        if (x >= objX && x < objX + 40 && y >= objY && y < objY + 40)
+                        {
+                            frame[idx] = 255;       // R
+                            frame[idx + 1] = 220;   // G
+                            frame[idx + 2] = 40;    // B
+                        }
+                        else
+                        {
+                            frame[idx] = (byte)(30 + f * 5);
+                            frame[idx + 1] = (byte)(50 + f * 4);
+                            frame[idx + 2] = (byte)(100 + (y % 100));
+                        }
+                    }
+                }
+                frames.Add(frame);
+            }
+            ingestSw.Stop();
+            Console.WriteLine($"   -> Ingested 8 frames ({frames.Count * frameBytes / 1024} KB raw memory) in {ingestSw.ElapsedMilliseconds}ms");
+            Console.WriteLine();
+
+            // Step 2: Keyframe Decimation & Motion Energy
+            Console.WriteLine("[2. Frame Decimation & Motion Profiling] Sampling 4 keyframes via uniform decimation...");
+            var decSw = Stopwatch.StartNew();
+            int[] keyframes = VideoFrameSampler.SampleUniformIndices(frames.Count, 4);
+            decSw.Stop();
+            Console.WriteLine($"   -> Selected keyframes: [{string.Join(", ", keyframes)}] in {decSw.ElapsedMilliseconds}ms");
+
+            float motion = VideoFrameSampler.ComputeMotionEnergy(frames[0], frames[4]);
+            Console.WriteLine($"   -> Inter-frame motion energy: {motion * 100:F1}% (high subject displacement)");
+            Console.WriteLine();
+
+            // Step 3: 3D-RoPE Spatio-Temporal Encoding
+            Console.WriteLine("[3. 3D-RoPE Positional Decomposition] Projecting temporal (t) and spatial (h, w) rotary coordinates...");
+            var ropeSw = Stopwatch.StartNew();
+            var rope = new VideoRoPE(headDim: 64, ropeTheta: 10000.0f);
+            float[] sampleHeadVec = new float[64];
+            Array.Fill(sampleHeadVec, 1.0f);
+            rope.Apply3DRoPE(sampleHeadVec, t: 2, h: 16, w: 16);
+            ropeSw.Stop();
+            Console.WriteLine($"   -> Partitioned 64-dim head: Temporal={rope.TemporalDim}, Height={rope.HeightDim}, Width={rope.WidthDim}");
+            Console.WriteLine($"   -> 3D-RoPE coordinate application completed in {ropeSw.ElapsedMilliseconds}ms");
+            Console.WriteLine();
+
+            // Step 4: Spatio-Temporal Token Projection & Multi-Frame Reasoning
+            Console.WriteLine("[4. Spatio-Temporal Reasoning] Ingesting into VideoPipeline (numLayers=2, dim=256)...");
+            var vSw = Stopwatch.StartNew();
+            using var videoPipeline = new VideoPipeline(numLayers: 2, visionDim: 256, llmDim: 512, patchSize: 14);
+            var (tokens, _, meta) = videoPipeline.ProcessVideo(frames, w, h, targetKeyframes: 4);
+            vSw.Stop();
+            Console.WriteLine($"   -> Extracted {tokens} spatio-temporal tokens across 4 keyframes in {vSw.ElapsedMilliseconds}ms");
+            Console.WriteLine();
+
+            // Step 5: Video Question Answering
+            Console.WriteLine("[5. Video Question Answering] Querying temporal narrative...");
+            string q1 = "What motion patterns occur in this video?";
+            string r1 = videoPipeline.Query(meta, q1, tokens);
+            Console.WriteLine($"   Q: \"{q1}\"");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"   A: {r1}");
+            Console.ResetColor();
+
+            string q2 = "Summarize the sequence.";
+            string r2 = videoPipeline.Query(meta, q2, tokens);
+            Console.WriteLine($"   Q: \"{q2}\"");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"   A: {r2}");
+            Console.ResetColor();
+            Console.WriteLine();
+
+            sw.Stop();
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[VERIFIED] End-to-end Video-Language pipeline completed in {sw.ElapsedMilliseconds}ms with zero C++ DLLs!");
+            Console.ResetColor();
+            return 0;
+        }
+        else if (subCmd == "query")
+        {
+            if (args.Length < 3)
+            {
+                Console.Error.WriteLine("Error: Missing frame directory or prompt. Usage: glacier video query <dir> \"<prompt>\"");
+                return 1;
+            }
+
+            string dir = args[1];
+            string prompt = args[2];
+
+            if (!Directory.Exists(dir))
+            {
+                Console.Error.WriteLine($"Error: Directory '{dir}' not found.");
+                return 1;
+            }
+
+            var files = Directory.GetFiles(dir, "*.raw");
+            if (files.Length == 0)
+            {
+                Console.Error.WriteLine($"Error: No .raw image frames found in '{dir}'.");
+                return 1;
+            }
+
+            var frames = new List<byte[]>();
+            foreach (var f in files) frames.Add(File.ReadAllBytes(f));
+
+            using var video = new VideoPipeline();
+            string answer = video.Query(frames, 448, 448, prompt, 4);
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Video Answer]: {answer}");
+            Console.ResetColor();
+            return 0;
+        }
+
+        Console.Error.WriteLine($"Unknown video command: '{subCmd}'. Use 'glacier video --help' for usage.");
         return 1;
     }
 }

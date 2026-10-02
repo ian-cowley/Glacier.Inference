@@ -25,9 +25,14 @@ public sealed class VisionPipeline : IDisposable
         int numLayers = 4,
         int visionDim = 768,
         int llmDim = 3584,
-        int patchSize = DefaultPatchSize)
+        int patchSize = DefaultPatchSize,
+        int numHeads = 0)
     {
-        _vit = new VisionTransformer(numLayers, visionDim, 12, patchSize);
+        if (numHeads <= 0)
+        {
+            numHeads = (visionDim % 12 == 0) ? 12 : (visionDim % 8 == 0) ? 8 : (visionDim % 4 == 0) ? 4 : 2;
+        }
+        _vit = new VisionTransformer(numLayers, visionDim, numHeads, patchSize);
         _projector = new MultimodalProjector(visionDim, llmDim, 2);
     }
 
