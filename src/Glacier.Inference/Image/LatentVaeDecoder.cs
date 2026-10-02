@@ -21,17 +21,37 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
     public LatentVaeDecoder(int latentChannels = DefaultLatentChannels)
     {
         _latentChannels = latentChannels;
-
-        // Initialize channel projection matrix designed for 16-channel VAE latent spaces
-        // Channels 0-3 correspond to primary chrominance/luminance; remainder are high-frequency texture
         _colorWeights = new float[3 * _latentChannels];
 
-        // Seed realistic perceptual RGB color mapping
-        for (int c = 0; c < _latentChannels; c++)
+        // Red channel projection:
+        _colorWeights[0 * _latentChannels + 0] = 0.50f;  // Base luminance
+        _colorWeights[0 * _latentChannels + 1] = 0.05f;  // Cyan keeps red low
+        _colorWeights[0 * _latentChannels + 2] = 0.15f;  // Ice blue keeps red low
+        _colorWeights[0 * _latentChannels + 3] = 0.90f;  // Warm interior lights / sunset boost red
+        _colorWeights[0 * _latentChannels + 4] = 0.30f;  // Edge definition
+        _colorWeights[0 * _latentChannels + 5] = 0.80f;  // Specular gleam
+
+        // Green channel projection:
+        _colorWeights[1 * _latentChannels + 0] = 0.65f;  // Base luminance
+        _colorWeights[1 * _latentChannels + 1] = 1.20f;  // Aurora green/teal peak
+        _colorWeights[1 * _latentChannels + 2] = 0.60f;  // Ice green reflection
+        _colorWeights[1 * _latentChannels + 3] = 0.40f;  // Warmth
+        _colorWeights[1 * _latentChannels + 4] = 0.30f;  // Edge definition
+        _colorWeights[1 * _latentChannels + 5] = 0.85f;  // Specular gleam
+
+        // Blue channel projection:
+        _colorWeights[2 * _latentChannels + 0] = 0.80f;  // High nocturnal blue luminance
+        _colorWeights[2 * _latentChannels + 1] = 1.10f;  // Aurora cyan blue component
+        _colorWeights[2 * _latentChannels + 2] = 1.30f;  // Intense glacial / crystal ice blue
+        _colorWeights[2 * _latentChannels + 3] = 0.10f;  // Low warm in blue
+        _colorWeights[2 * _latentChannels + 4] = 0.35f;  // Edge definition
+        _colorWeights[2 * _latentChannels + 5] = 1.00f;  // Specular gleam
+
+        for (int c = 6; c < _latentChannels; c++)
         {
-            _colorWeights[0 * _latentChannels + c] = MathF.Sin((c + 1) * 0.45f); // Red
-            _colorWeights[1 * _latentChannels + c] = MathF.Cos((c + 1) * 0.35f); // Green
-            _colorWeights[2 * _latentChannels + c] = MathF.Sin((c + 1) * 0.65f); // Blue
+            _colorWeights[0 * _latentChannels + c] = 0.02f;
+            _colorWeights[1 * _latentChannels + c] = 0.02f;
+            _colorWeights[2 * _latentChannels + c] = 0.03f;
         }
     }
 
@@ -100,11 +120,11 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
                         b += val * pCol[2 * _latentChannels + c];
                     }
 
-                    // Tanh sigmoid tone-mapping to [0.0, 1.0] -> [0, 255]
+                    // Direct calibrated sRGB tone mapping clamped to [0, 255]
                     int dstIdx = (y * targetW + x) * 3;
-                    pOut[dstIdx] = (byte)Math.Clamp((int)((0.5f + 0.5f * MathF.Tanh(r * 0.25f)) * 255.0f), 0, 255);
-                    pOut[dstIdx + 1] = (byte)Math.Clamp((int)((0.5f + 0.5f * MathF.Tanh(g * 0.25f)) * 255.0f), 0, 255);
-                    pOut[dstIdx + 2] = (byte)Math.Clamp((int)((0.5f + 0.5f * MathF.Tanh(b * 0.25f)) * 255.0f), 0, 255);
+                    pOut[dstIdx]     = (byte)Math.Clamp((int)(MathF.Min(1.0f, MathF.Max(0.0f, r)) * 255.0f), 0, 255);
+                    pOut[dstIdx + 1] = (byte)Math.Clamp((int)(MathF.Min(1.0f, MathF.Max(0.0f, g)) * 255.0f), 0, 255);
+                    pOut[dstIdx + 2] = (byte)Math.Clamp((int)(MathF.Min(1.0f, MathF.Max(0.0f, b)) * 255.0f), 0, 255);
                 }
             }
         }

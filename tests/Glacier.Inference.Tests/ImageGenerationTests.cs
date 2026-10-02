@@ -132,4 +132,44 @@ public class ImageGenerationTests
         Assert.True(result.ElapsedMilliseconds >= 0);
         Assert.Equal(w * h * 3, result.RgbPixels.Length);
     }
+
+    [Fact]
+    public void PipelineGeneration_ProducesValidContinuousImage()
+    {
+        string tmpFile = Path.Combine(Path.GetTempPath(), $"glacier_pipeline_{Guid.NewGuid():N}.bmp");
+        try
+        {
+            using var pipeline = new ImageGenerationPipeline(numLayers: 2, hiddenDim: 256, numHeads: 4);
+            var result = pipeline.Generate("A majestic crystal glacier fortress illuminated by cyan auroras", width: 256, height: 256, numSteps: 4, seed: 42);
+
+            BmpWriter.SaveBmp24(tmpFile, result.RgbPixels, 256, 256);
+            Assert.True(File.Exists(tmpFile));
+
+            // Verify smooth spatial continuity: no scanline alternation between adjacent rows
+            for (int y = 8; y < 248; y += 8)
+            {
+                int idxCurrent = (y * 256 + 128) * 3;
+                int idxPrev = ((y - 1) * 256 + 128) * 3;
+
+                // Differences between consecutive scanlines must be smooth (< 40 delta, not 255 black/white flip)
+                int deltaR = Math.Abs(result.RgbPixels[idxCurrent] - result.RgbPixels[idxPrev]);
+                int deltaG = Math.Abs(result.RgbPixels[idxCurrent + 1] - result.RgbPixels[idxPrev + 1]);
+                int deltaB = Math.Abs(result.RgbPixels[idxCurrent + 2] - result.RgbPixels[idxPrev + 2]);
+
+                Assert.True(deltaR < 40, $"Scanline jump in R at y={y}: delta={deltaR}");
+                Assert.True(deltaG < 40, $"Scanline jump in G at y={y}: delta={deltaG}");
+                Assert.True(deltaB < 40, $"Scanline jump in B at y={y}: delta={deltaB}");
+            }
+        }
+        finally
+        {
+            if (File.Exists(tmpFile)) File.Delete(tmpFile);
+        }
+    }
 }
+
+
+
+
+
+

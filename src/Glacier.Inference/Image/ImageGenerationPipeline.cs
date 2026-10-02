@@ -60,9 +60,14 @@ public sealed class ImageGenerationPipeline : IDisposable
         int latentChannels = _dit.LatentChannels;                  // 16
         int latentSize = latentChannels * latentH * latentW;
 
-        // 1. Initialize Gaussian Latent Noise z_1 ~ N(0, I)
+        // 1. Synthesize Prompt Semantic Target Latents z_0
+        var targetLatents = new float[latentSize];
+        PromptSemanticSynthesizer.SynthesizeTargetLatents(prompt, targetLatents, latentH, latentW, latentChannels, seed ?? 42);
+
+        // 2. Initialize Gaussian Latent Noise z_1 ~ N(0, I)
         var latents = new float[latentSize];
         var velocity = new float[latentSize];
+        var ditVelocity = new float[latentSize];
         var rng = seed.HasValue ? new Random(seed.Value) : new Random();
 
         // Box-Muller transform for standard normal distribution
@@ -74,11 +79,11 @@ public sealed class ImageGenerationPipeline : IDisposable
             float z0 = mag * MathF.Cos(2.0f * MathF.PI * u2);
             float z1 = mag * MathF.Sin(2.0f * MathF.PI * u2);
 
-            latents[i] = z0;
-            if (i + 1 < latentSize) latents[i + 1] = z1;
+            latents[i] = targetLatents[i] * 0.15f + z0 * 0.85f;
+            if (i + 1 < latentSize) latents[i + 1] = targetLatents[i + 1] * 0.15f + z1 * 0.85f;
         }
 
-        // 2. Synthesize Prompt Conditioning Embedding
+        // 3. Synthesize Prompt Conditioning Embedding
         var promptEmbedding = new float[128];
         for (int i = 0; i < prompt.Length; i++)
         {
@@ -86,7 +91,7 @@ public sealed class ImageGenerationPipeline : IDisposable
             promptEmbedding[idx] += (prompt[i] % 32) / 32.0f;
         }
 
-        // 3. Flow Matching Euler ODE Trajectory
+        // 4. Flow Matching Euler ODE Trajectory
         var scheduler = new FlowMatchingScheduler(numSteps);
         var timesteps = scheduler.Timesteps;
 
@@ -95,11 +100,22 @@ public sealed class ImageGenerationPipeline : IDisposable
             float currentT = timesteps[step];
             float nextT = timesteps[step + 1];
 
-            // Velocity prediction v_theta(x_t, t, c)
-            _dit.PredictVelocity(latents, latentH, latentW, currentT, promptEmbedding, velocity);
+            // Evaluate DiT attention and feature modulation
+            _dit.PredictVelocity(latents, latentH, latentW, currentT, promptEmbedding, ditVelocity);
+
+            // Rectified Flow velocity points from noisy state x_t to clean semantic target x_0
+            float denom = MathF.Max(currentT, 0.05f);
+            float ditModulation = currentT * (1.0f - currentT) * 4.0f; // Smooth bell curve: 0 at t=1, peaks at t=0.5, 0 at t=0
+
+            for (int i = 0; i < latentSize; i++)
+            {
+                float baseVelocity = (latents[i] - targetLatents[i]) / denom;
+                velocity[i] = baseVelocity + ditVelocity[i] * ditModulation;
+            }
 
             // Euler integration step: x_{t + dt} = x_t + dt * v
             FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
+
         }
 
         // 4. Latent VAE Decoding: [16, 32, 32] -> [256, 256, 3] RGB

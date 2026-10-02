@@ -29,7 +29,7 @@ public static class BmpWriter
         // 2. DIB Header (BITMAPINFOHEADER, 40 bytes)
         bw.Write(40);        // Header size
         bw.Write(width);     // Image width
-        bw.Write(-height);   // Negative height for top-to-bottom pixel order
+        bw.Write(height);    // Positive height for standard Windows bottom-up pixel order
         bw.Write((short)1);  // Color planes
         bw.Write((short)24); // Bits per pixel (24-bit RGB)
         bw.Write(0);         // Compression (0 = BI_RGB uncompressed)
@@ -39,12 +39,13 @@ public static class BmpWriter
         bw.Write(0);         // Colors in palette
         bw.Write(0);         // Important colors
 
-        // 3. Pixel Data (RGB -> BGR with 4-byte row padding)
+        // 3. Pixel Data (RGB -> BGR with 4-byte row padding, bottom-to-top scanlines)
         byte[] rowBuffer = new byte[rowStride];
 
-        for (int y = 0; y < height; y++)
+        for (int y = height - 1; y >= 0; y--)
         {
             int srcRowOffset = y * width * 3;
+
             for (int x = 0; x < width; x++)
             {
                 int srcIdx = srcRowOffset + x * 3;

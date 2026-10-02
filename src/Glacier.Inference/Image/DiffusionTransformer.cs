@@ -78,13 +78,18 @@ public unsafe sealed class DiffusionTransformer : IDisposable
             _timeEmbedWeights[i] = MathF.Cos((i + 1) * 0.27f) * timeScale;
         }
 
-        // Final output projection
+        // Final output projection: enforce channel-consistent spatial continuity across 2x2 patch
         _outProjWeights = new float[_patchDim * _hiddenDim];
-        float outScale = MathF.Sqrt(2.0f / (_hiddenDim + _patchDim));
-        for (int i = 0; i < _outProjWeights.Length; i++)
+        float outScale = MathF.Sqrt(1.0f / _hiddenDim);
+        for (int p = 0; p < _patchDim; p++)
         {
-            _outProjWeights[i] = MathF.Sin((i + 1) * 0.19f) * outScale;
+            int c = p / (_patchSize * _patchSize);
+            for (int h = 0; h < _hiddenDim; h++)
+            {
+                _outProjWeights[p * _hiddenDim + h] = MathF.Sin((c * _hiddenDim + h + 1) * 0.17f) * outScale;
+            }
         }
+
 
         // 2D spatial sinusoidal position embeddings
         _posEmbeddings = Initialize2DPosEmbeddings(_maxTokens, _hiddenDim);
@@ -194,12 +199,16 @@ public unsafe sealed class DiffusionTransformer : IDisposable
                                 sum += pPatch[d] * projRow[d];
                             }
 
-                            // Add 2D sinusoidal position embedding + time condition
-                            dstToken[h] = sum + pPos[tokenIdx * _hiddenDim + h] + _timeEmbedding[h] * 0.1f;
+                            // Add exact 2D sinusoidal position embedding + time condition
+                            float coord = (h < _hiddenDim / 2) ? tx : ty;
+                            float freq = MathF.Pow(10000.0f, -(float)(h % (_hiddenDim / 2)) / (_hiddenDim / 2));
+                            float posVal = (h % 2 == 0) ? MathF.Sin(coord * freq) : MathF.Cos(coord * freq);
+                            dstToken[h] = sum + posVal * 0.1f + _timeEmbedding[h] * 0.1f;
                         }
                     }
                 }
             }
+
 
             // 3. Diffusion Transformer Blocks (AdaLN-Zero + Self-Attention + MLP)
             float attnScale = 1.0f / MathF.Sqrt(_headDim);
@@ -275,7 +284,7 @@ public unsafe sealed class DiffusionTransformer : IDisposable
                     int tokenIdx = ty * tokenW + tx;
                     float* srcTok = _tokenHidden + tokenIdx * _hiddenDim;
 
-                    // Project token to 64 patch elements
+                    // Project token to 64 patch elements with bounded smooth activation
                     for (int p = 0; p < _patchDim; p++)
                     {
                         float* wRow = pOutProj + p * _hiddenDim;
@@ -284,8 +293,9 @@ public unsafe sealed class DiffusionTransformer : IDisposable
                         {
                             sum += srcTok[h] * wRow[h];
                         }
-                        patchBuf[p] = sum;
+                        patchBuf[p] = MathF.Tanh(sum) * 0.08f;
                     }
+
 
                     // Unpack patchBuf into velocity tensor [latentChannels, latentH, latentW]
                     int pOff = 0;
