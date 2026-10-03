@@ -15,7 +15,7 @@ public sealed class CudaFactAttribute : FactAttribute
         ? @"D:\lmstudio\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf"
         : @"D:\models\lmstudio-community\Qwen2.5-7B-Instruct-1M-GGUF\Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf";
 
-    public CudaFactAttribute()
+    public CudaFactAttribute(bool requireModel = true)
     {
         if (!CuDriver.IsAvailable())
         {
@@ -25,7 +25,7 @@ public sealed class CudaFactAttribute : FactAttribute
         {
             Skip = "No CUDA-capable GPU hardware device detected.";
         }
-        else if (!File.Exists(ModelPath))
+        else if (requireModel && !File.Exists(ModelPath))
         {
             Skip = $"Benchmark model file not found at '{ModelPath}'.";
         }

@@ -215,7 +215,7 @@ public class DiffusionGgufTests
         Console.WriteLine($"[T5 ENCODER SUCCESS] Encoded 64 tokens across 24 layers in {sw.ElapsedMilliseconds} ms. L1 sum: {sum}");
     }
 
-    [Fact]
+    [CudaFact(false)]
     public void GpuContext_InspectVramAndKernel()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -232,7 +232,7 @@ public class DiffusionGgufTests
         Console.WriteLine($"[D3D12 INFO] Device: {d3d.DeviceName}");
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_VerifyBatchedGemmQ4K()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -355,7 +355,7 @@ public class DiffusionGgufTests
         foreach (var kvp in types) Console.WriteLine($"  Weight type {kvp.Key}: {kvp.Value} tensors");
     }
 
-    [Fact]
+    [CudaFact(false)]
     public void GpuContext_TestLargeVramAllocation()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -370,7 +370,7 @@ public class DiffusionGgufTests
         gpu.FreeDevice(ptr);
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_BenchmarkFluxGemm()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -436,7 +436,7 @@ public class DiffusionGgufTests
         Glacier.Inference.Gpu.CuDriver.ModuleUnload(module);
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_VerifyRealGgufFluxGemm()
     {
         string fluxPath = @"C:\Users\spuri\source\repos\PolarsPlus\Glacier.Inference\models\flux1-schnell-Q4_K_S.gguf";
@@ -529,7 +529,7 @@ public class DiffusionGgufTests
         Assert.True(maxDiff < 1e-2f, $"MaxDiff too high: {maxDiff}");
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_VerifyBidirectionalFlashAttention()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -653,7 +653,7 @@ public class DiffusionGgufTests
         Assert.True(maxDiff < 1e-4f, $"MaxDiff too high: {maxDiff}");
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_VerifyFluxFusedKernels()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
@@ -800,11 +800,11 @@ public class DiffusionGgufTests
 
         float[] cpuQRope = (float[])qRope.Clone();
         float[] cpuKRope = (float[])kRope.Clone();
+        float* cRope = stackalloc float[64];
+        float* sRope = stackalloc float[64];
         for (int t = 0; t < numTokens; t++)
         {
-            float* c = stackalloc float[64];
-            float* s = stackalloc float[64];
-            for (int i = 0; i < 64; i++) { c[i] = ropeCos[t * 64 + i]; s[i] = ropeSin[t * 64 + i]; }
+            for (int i = 0; i < 64; i++) { cRope[i] = ropeCos[t * 64 + i]; sRope[i] = ropeSin[t * 64 + i]; }
 
             for (int h = 0; h < nHeads; h++)
             {
@@ -821,12 +821,12 @@ public class DiffusionGgufTests
                 for (int i = 0; i < 64; i++)
                 {
                     float q0 = cpuQRope[offset + 2 * i], q1 = cpuQRope[offset + 2 * i + 1];
-                    cpuQRope[offset + 2 * i] = q0 * c[i] - q1 * s[i];
-                    cpuQRope[offset + 2 * i + 1] = q0 * s[i] + q1 * c[i];
+                    cpuQRope[offset + 2 * i] = q0 * cRope[i] - q1 * sRope[i];
+                    cpuQRope[offset + 2 * i + 1] = q0 * sRope[i] + q1 * cRope[i];
 
                     float k0 = cpuKRope[offset + 2 * i], k1 = cpuKRope[offset + 2 * i + 1];
-                    cpuKRope[offset + 2 * i] = k0 * c[i] - k1 * s[i];
-                    cpuKRope[offset + 2 * i + 1] = k0 * s[i] + k1 * c[i];
+                    cpuKRope[offset + 2 * i] = k0 * cRope[i] - k1 * sRope[i];
+                    cpuKRope[offset + 2 * i + 1] = k0 * sRope[i] + k1 * cRope[i];
                 }
             }
         }
@@ -893,7 +893,7 @@ public class DiffusionGgufTests
         Glacier.Inference.Gpu.CuDriver.ModuleUnload(module);
     }
 
-    [Fact]
+    [CudaFact(false)]
     public unsafe void GpuContext_VerifyFluxQkvPrep()
     {
         if (!Glacier.Inference.Gpu.GpuContext.IsSupported) return;
