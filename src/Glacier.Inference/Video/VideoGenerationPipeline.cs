@@ -60,8 +60,8 @@ public sealed class VideoGenerationPipeline : IDisposable
         int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;  // e.g. 32
         int latentChannels = _dit.LatentChannels;                          // 16
 
-        // Compute keyframe latent count (temporal downscale factor 4, min 2 frames)
-        int temporalLatentFrames = Math.Max(2, Math.Min(numFrames, (numFrames + 3) / 4));
+        // Compute keyframe latent count (temporal downscale factor 4, min 2 frames, max _dit.MaxFrames)
+        int temporalLatentFrames = Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);
 
         int frameLatentSize = latentChannels * latentH * latentW;
         int totalLatentSize = temporalLatentFrames * frameLatentSize;
@@ -181,7 +181,7 @@ public sealed class VideoGenerationPipeline : IDisposable
         int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;  // e.g. 32
         int latentChannels = _dit.LatentChannels;                          // 16
 
-        int temporalLatentFrames = Math.Max(2, Math.Min(numFrames, (numFrames + 3) / 4));
+        int temporalLatentFrames = Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);
         int frameLatentSize = latentChannels * latentH * latentW;
         int totalLatentSize = temporalLatentFrames * frameLatentSize;
 

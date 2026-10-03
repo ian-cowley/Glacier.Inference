@@ -48,6 +48,8 @@ public unsafe sealed class SpatioTemporalDiT : IDisposable
     public int NumHeads => _numHeads;
     public int LatentChannels => _latentChannels;
     public int PatchDim => _patchDim;
+    public int MaxFrames => _maxFrames;
+    public int MaxTokensPerFrame => _maxTokensPerFrame;
     public VideoRoPE VideoRoPE => _videoRope;
 
     public SpatioTemporalDiT(
@@ -55,8 +57,8 @@ public unsafe sealed class SpatioTemporalDiT : IDisposable
         int hiddenDim = DefaultHiddenDim,
         int numHeads = DefaultNumHeads,
         int latentChannels = DefaultLatentChannels,
-        int maxTokensPerFrame = 512,
-        int maxFrames = 16)
+        int maxTokensPerFrame = 2048,
+        int maxFrames = 32)
     {
         _numLayers = numLayers;
         _hiddenDim = hiddenDim;
