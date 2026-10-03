@@ -163,6 +163,126 @@ public static class ImageDecoder
     }
 
     /// <summary>
+    /// Decodes a W3C-standard 32-bit RGBA PNG image with transparency.
+    /// </summary>
+    public static (byte[] rgbaPixels, int width, int height) DecodePngRgba(ReadOnlySpan<byte> pngBytes)
+    {
+        if (pngBytes.Length < 33 || pngBytes[0] != 0x89 || pngBytes[1] != 0x50)
+        {
+            throw new InvalidDataException("Invalid PNG signature.");
+        }
+
+        int width = (pngBytes[16] << 24) | (pngBytes[17] << 16) | (pngBytes[18] << 8) | pngBytes[19];
+        int height = (pngBytes[20] << 24) | (pngBytes[21] << 16) | (pngBytes[22] << 8) | pngBytes[23];
+        byte bitDepth = pngBytes[24];
+        byte colorType = pngBytes[25];
+
+        if (bitDepth != 8 || (colorType != 6 && colorType != 2))
+        {
+            throw new NotSupportedException($"Unsupported PNG bitDepth={bitDepth}, colorType={colorType}.");
+        }
+
+        int bytesPerPixel = (colorType == 6) ? 4 : 3;
+
+        // Collect all IDAT chunk payloads
+        using var compressedMs = new MemoryStream();
+        int offset = 8;
+        while (offset + 8 <= pngBytes.Length)
+        {
+            int chunkLen = (pngBytes[offset] << 24) | (pngBytes[offset + 1] << 16) | (pngBytes[offset + 2] << 8) | pngBytes[offset + 3];
+            string chunkType = System.Text.Encoding.ASCII.GetString(pngBytes.Slice(offset + 4, 4));
+
+            if (chunkType == "IDAT")
+            {
+                compressedMs.Write(pngBytes.Slice(offset + 8, chunkLen));
+            }
+            else if (chunkType == "IEND")
+            {
+                break;
+            }
+
+            offset += 12 + chunkLen;
+        }
+
+        compressedMs.Position = 0;
+
+        // Decompress raw scanlines
+        int rowBytes = width * bytesPerPixel;
+        byte[] decompressed = new byte[height * (1 + rowBytes)];
+        using (var zlib = new ZLibStream(compressedMs, CompressionMode.Decompress))
+        {
+            int read = 0;
+            while (read < decompressed.Length)
+            {
+                int n = zlib.Read(decompressed, read, decompressed.Length - read);
+                if (n == 0) break;
+                read += n;
+            }
+        }
+
+        byte[] uncompressedScanlines = new byte[height * rowBytes];
+        byte[] prevRow = new byte[rowBytes];
+        byte[] currRow = new byte[rowBytes];
+
+        for (int y = 0; y < height; y++)
+        {
+            int srcOffset = y * (1 + rowBytes);
+            byte filterType = decompressed[srcOffset];
+            ReadOnlySpan<byte> rawRow = decompressed.AsSpan(srcOffset + 1, rowBytes);
+
+            for (int i = 0; i < rowBytes; i++)
+            {
+                byte raw = rawRow[i];
+                byte a = (i >= bytesPerPixel) ? currRow[i - bytesPerPixel] : (byte)0;
+                byte b = prevRow[i];
+                byte c = (i >= bytesPerPixel) ? prevRow[i - bytesPerPixel] : (byte)0;
+
+                byte filtered = filterType switch
+                {
+                    0 => raw,
+                    1 => (byte)(raw + a),
+                    2 => (byte)(raw + b),
+                    3 => (byte)(raw + (a + b) / 2),
+                    4 => (byte)(raw + PaethPredictor(a, b, c)),
+                    _ => raw
+                };
+
+                currRow[i] = filtered;
+            }
+
+            currRow.CopyTo(uncompressedScanlines.AsSpan(y * rowBytes, rowBytes));
+            Array.Copy(currRow, prevRow, rowBytes);
+        }
+
+        byte[] rgbaPixels = new byte[width * height * 4];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int srcIdx = y * rowBytes + x * bytesPerPixel;
+                int dstIdx = (y * width + x) * 4;
+
+                if (colorType == 6)
+                {
+                    rgbaPixels[dstIdx] = uncompressedScanlines[srcIdx];
+                    rgbaPixels[dstIdx + 1] = uncompressedScanlines[srcIdx + 1];
+                    rgbaPixels[dstIdx + 2] = uncompressedScanlines[srcIdx + 2];
+                    rgbaPixels[dstIdx + 3] = uncompressedScanlines[srcIdx + 3];
+                }
+                else
+                {
+                    rgbaPixels[dstIdx] = uncompressedScanlines[srcIdx];
+                    rgbaPixels[dstIdx + 1] = uncompressedScanlines[srcIdx + 1];
+                    rgbaPixels[dstIdx + 2] = uncompressedScanlines[srcIdx + 2];
+                    rgbaPixels[dstIdx + 3] = 255;
+                }
+            }
+        }
+
+        return (rgbaPixels, width, height);
+    }
+
+    /// <summary>
     /// Decodes an uncompressed standard 24-bit Windows Bitmap (.bmp).
     /// </summary>
     public static (byte[] rgbPixels, int width, int height) DecodeBmp(ReadOnlySpan<byte> bmpBytes)

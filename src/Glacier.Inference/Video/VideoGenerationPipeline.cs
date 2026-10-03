@@ -195,9 +195,9 @@ public sealed class VideoGenerationPipeline : IDisposable
 
         SubjectActorType resolvedSubject = ResolveSubject(subject, prompt);
 
-        // Clean static drone from background plate if present, so the moving actor is autonomous
+        // Clean static drone from background plate if present, so the scene is pristine
         byte[] activePixels = rgbPixels;
-        if (resolvedSubject == SubjectActorType.Drone)
+        if (resolvedSubject != SubjectActorType.None)
         {
             activePixels = InpaintPlateIfNeeded(rgbPixels, sourceWidth, sourceHeight);
         }

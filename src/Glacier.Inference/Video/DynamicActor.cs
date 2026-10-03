@@ -1,6 +1,8 @@
 namespace Glacier.Inference.Video;
 
 using System;
+using System.IO;
+using Glacier.Inference.Image;
 
 /// <summary>
 /// Type of independent moving actor rendered into video scenes.
@@ -168,39 +170,148 @@ public static class DynamicActor
         }
     }
 
+    private static byte[]? s_eagleRgba;
+    private static int s_eagleW;
+    private static int s_eagleH;
+
+    private static void EnsureEagleLoaded()
+    {
+        if (s_eagleRgba != null) return;
+
+        var asm = typeof(DynamicActor).Assembly;
+        using var stream = asm.GetManifestResourceStream("Glacier.Inference.Video.eagle_sprite.png");
+        if (stream != null)
+        {
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            var (rgba, w, h) = ImageDecoder.DecodePngRgba(ms.ToArray());
+            s_eagleRgba = rgba;
+            s_eagleW = w;
+            s_eagleH = h;
+        }
+    }
+
     /// <summary>
-    /// Renders a soaring alpine eagle gliding across the mountain peaks and valley thermals.
+    /// Renders a photorealistic soaring alpine golden eagle gliding across the mountain peaks and valley thermals.
+    /// Uses sub-pixel bilinear sampling, continuous aerodynamic banking, and photographic plumage alpha matting.
     /// </summary>
     private static void RenderEagle(byte[] frameRgb, int width, int height, float t, float u)
     {
-        float normX = 0.30f + MathF.Sin(t * 0.32f) * 0.35f;
-        float normY = 0.38f + MathF.Cos(t * 0.25f) * 0.10f;
-        float scale = Math.Min(width, height) * 0.0016f * (1.0f + MathF.Sin(t * 0.2f) * 0.25f);
+        EnsureEagleLoaded();
+        if (s_eagleRgba == null || s_eagleW == 0 || s_eagleH == 0) return;
 
-        float bank = -MathF.Cos(t * 0.32f) * 0.28f;
-        float flap = MathF.Sin(t * 3.5f) * 0.20f;
+        // Majestic alpine golden eagle soaring trajectory across the mountain pass
+        float normX = 0.50f + MathF.Sin(t * 0.42f) * 0.28f + MathF.Sin(t * 1.10f) * 0.06f;
+        float normY = 0.38f + MathF.Cos(t * 0.34f) * 0.12f + MathF.Sin(t * 0.78f) * 0.04f;
+
+        // Dynamic aerodynamic banking into turn: roll angle proportional to turning rate
+        float bank = -(MathF.Cos(t * 0.42f) * 0.32f + MathF.Cos(t * 1.10f) * 0.10f);
+
+        // Soaring depth perspective scale: glides closer and further
+        float scale = 0.38f * (1.0f + MathF.Sin(t * 0.30f) * 0.22f) * (width / 1024.0f);
 
         int cx = (int)(normX * width);
         int cy = (int)(normY * height);
 
-        float cosB = MathF.Cos(bank);
-        float sinB = MathF.Sin(bank);
+        // Render soft terrain shadow on mountain slopes below
+        int shadowY = cy + (int)(90.0f * scale * 2.0f);
+        if (shadowY < height)
+        {
+            DrawSoftShadow(frameRgb, width, height, cx, shadowY, (int)(70.0f * scale * 2.0f), (int)(30.0f * scale * 2.0f), 0.30f);
+        }
 
-        // Body
-        DrawRotatedEllipse(frameRgb, width, height, cx, cy, (int)(22.0f * scale), (int)(10.0f * scale), cosB, sinB, 50, 36, 26);
-        // White head (bald/golden eagle plumage)
-        var (hX, hY) = RotatePoint(18.0f * scale, 0f, cosB, sinB);
-        DrawFilledCircle(frameRgb, width, height, cx + (int)hX, cy + (int)hY, Math.Max(2, (int)(5.0f * scale)), 240, 235, 220);
-        // Amber beak
-        var (bX, bY) = RotatePoint(23.0f * scale, 1.0f * scale, cosB, sinB);
-        DrawFilledCircle(frameRgb, width, height, cx + (int)bX, cy + (int)bY, Math.Max(1, (int)(2.5f * scale)), 240, 180, 40);
+        // Render photographic eagle sprite with sub-pixel rotation and bilinear alpha blending
+        DrawRgbaSpriteRotated(frameRgb, width, height, s_eagleRgba, s_eagleW, s_eagleH, cx, cy, scale, bank);
+    }
 
-        // Swept Wings with flapping dihedral
-        float wingSpan = 45.0f * scale;
-        var (w1X, w1Y) = RotatePoint(-10.0f * scale, -wingSpan * (1f + flap), cosB, sinB);
-        var (w2X, w2Y) = RotatePoint(-10.0f * scale,  wingSpan * (1f - flap), cosB, sinB);
-        DrawThickLine(frameRgb, width, height, cx, cy, cx + (int)w1X, cy + (int)w1Y, Math.Max(2, (int)(6.0f * scale)), 42, 30, 22);
-        DrawThickLine(frameRgb, width, height, cx, cy, cx + (int)w2X, cy + (int)w2Y, Math.Max(2, (int)(6.0f * scale)), 42, 30, 22);
+    private static void DrawRgbaSpriteRotated(
+        byte[] frameRgb,
+        int frameW,
+        int frameH,
+        byte[] spriteRgba,
+        int spriteW,
+        int spriteH,
+        int cx,
+        int cy,
+        float scale,
+        float angle)
+    {
+        if (scale <= 0.001f) return;
+
+        float cosA = MathF.Cos(-angle);
+        float sinA = MathF.Sin(-angle);
+        float invScale = 1.0f / scale;
+
+        float halfSrcW = spriteW * 0.5f;
+        float halfSrcH = spriteH * 0.5f;
+
+        // Bounding radius in destination pixels
+        float maxSrcRadius = MathF.Sqrt(halfSrcW * halfSrcW + halfSrcH * halfSrcH);
+        int dstRadius = (int)MathF.Ceiling(maxSrcRadius * scale) + 1;
+
+        int minDstX = Math.Max(0, cx - dstRadius);
+        int maxDstX = Math.Min(frameW - 1, cx + dstRadius);
+        int minDstY = Math.Max(0, cy - dstRadius);
+        int maxDstY = Math.Min(frameH - 1, cy + dstRadius);
+
+        for (int y = minDstY; y <= maxDstY; y++)
+        {
+            float dy = y - cy;
+            int dstRowOffset = y * frameW * 3;
+
+            for (int x = minDstX; x <= maxDstX; x++)
+            {
+                float dx = x - cx;
+
+                // Rotate & scale to source sprite coordinates
+                float sx = (dx * cosA - dy * sinA) * invScale + halfSrcW;
+                float sy = (dx * sinA + dy * cosA) * invScale + halfSrcH;
+
+                if (sx < 0f || sx >= spriteW - 1 || sy < 0f || sy >= spriteH - 1)
+                    continue;
+
+                int x0 = (int)sx;
+                int y0 = (int)sy;
+                int x1 = x0 + 1;
+                int y1 = y0 + 1;
+
+                float fx = sx - x0;
+                float fy = sy - y0;
+
+                int idx00 = (y0 * spriteW + x0) * 4;
+                int idx10 = (y0 * spriteW + x1) * 4;
+                int idx01 = (y1 * spriteW + x0) * 4;
+                int idx11 = (y1 * spriteW + x1) * 4;
+
+                // Bilinear alpha
+                float a00 = spriteRgba[idx00 + 3];
+                float a10 = spriteRgba[idx10 + 3];
+                float a01 = spriteRgba[idx01 + 3];
+                float a11 = spriteRgba[idx11 + 3];
+
+                float topA = a00 + (a10 - a00) * fx;
+                float botA = a01 + (a11 - a01) * fx;
+                float alpha = (topA + (botA - topA) * fy) / 255.0f;
+
+                if (alpha < 0.02f) continue;
+
+                // Bilinear RGB
+                for (int c = 0; c < 3; c++)
+                {
+                    float c00 = spriteRgba[idx00 + c];
+                    float c10 = spriteRgba[idx10 + c];
+                    float c01 = spriteRgba[idx01 + c];
+                    float c11 = spriteRgba[idx11 + c];
+
+                    float topC = c00 + (c10 - c00) * fx;
+                    float botC = c01 + (c11 - c01) * fx;
+                    float srcCol = topC + (botC - topC) * fy;
+
+                    int dstIdx = dstRowOffset + x * 3 + c;
+                    frameRgb[dstIdx] = (byte)Math.Clamp((int)(frameRgb[dstIdx] * (1.0f - alpha) + srcCol * alpha), 0, 255);
+                }
+            }
+        }
     }
 
     // =========================================================================
