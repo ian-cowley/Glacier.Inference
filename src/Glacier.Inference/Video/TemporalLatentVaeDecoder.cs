@@ -89,7 +89,8 @@ public sealed class TemporalLatentVaeDecoder
                 float p2 = spatioTemporalLatents[off2 + i];
                 float p3 = spatioTemporalLatents[off3 + i];
 
-                interpolatedLatent[i] = w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3;
+                float val = w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3;
+                interpolatedLatent[i] = Math.Clamp(val, -1.0f, 2.5f);
             }
 
             // Spatial progressive decode of interpolated latent frame to RGB

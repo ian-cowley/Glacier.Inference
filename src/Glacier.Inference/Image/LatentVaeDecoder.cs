@@ -23,48 +23,48 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
         _latentChannels = latentChannels;
         _colorWeights = new float[3 * _latentChannels];
 
-        // Full-spectrum multi-channel latent to RGB projection:
-        // Ch 0: Core structural luminance (neutral achromatic)
-        _colorWeights[0 * _latentChannels + 0] = 0.55f;
-        _colorWeights[1 * _latentChannels + 0] = 0.55f;
-        _colorWeights[2 * _latentChannels + 0] = 0.55f;
+        // Full-spectrum photographic latent to RGB projection:
+        // Ch 0: Core structural luminance (clean achromatic tone curve)
+        _colorWeights[0 * _latentChannels + 0] = 0.90f;
+        _colorWeights[1 * _latentChannels + 0] = 0.90f;
+        _colorWeights[2 * _latentChannels + 0] = 0.90f;
 
-        // Ch 1: Cyan / Aqua / Electric Blue
+        // Ch 1: Cyan / Aqua / Glacial Blue / Cool Skylight
         _colorWeights[0 * _latentChannels + 1] = 0.05f;
-        _colorWeights[1 * _latentChannels + 1] = 0.85f;
-        _colorWeights[2 * _latentChannels + 1] = 1.05f;
+        _colorWeights[1 * _latentChannels + 1] = 0.35f;
+        _colorWeights[2 * _latentChannels + 1] = 0.70f;
 
-        // Ch 2: Magenta / Violet / Neon Pink
-        _colorWeights[0 * _latentChannels + 2] = 1.00f;
-        _colorWeights[1 * _latentChannels + 2] = 0.10f;
-        _colorWeights[2 * _latentChannels + 2] = 0.85f;
+        // Ch 2: Magenta / Sunset Rose / Violet
+        _colorWeights[0 * _latentChannels + 2] = 0.60f;
+        _colorWeights[1 * _latentChannels + 2] = 0.12f;
+        _colorWeights[2 * _latentChannels + 2] = 0.45f;
 
-        // Ch 3: Amber / Warm Gold / Orange Flare
-        _colorWeights[0 * _latentChannels + 3] = 1.05f;
-        _colorWeights[1 * _latentChannels + 3] = 0.70f;
-        _colorWeights[2 * _latentChannels + 3] = 0.05f;
+        // Ch 3: Amber / Warm Gold / Sunlight Flare
+        _colorWeights[0 * _latentChannels + 3] = 0.70f;
+        _colorWeights[1 * _latentChannels + 3] = 0.48f;
+        _colorWeights[2 * _latentChannels + 3] = 0.08f;
 
-        // Ch 4: Emerald / Foliage Green / Viridian
-        _colorWeights[0 * _latentChannels + 4] = 0.10f;
-        _colorWeights[1 * _latentChannels + 4] = 0.95f;
-        _colorWeights[2 * _latentChannels + 4] = 0.20f;
+        // Ch 4: Emerald / Alpine Foliage / Green
+        _colorWeights[0 * _latentChannels + 4] = 0.12f;
+        _colorWeights[1 * _latentChannels + 4] = 0.60f;
+        _colorWeights[2 * _latentChannels + 4] = 0.18f;
 
-        // Ch 5: Specular Gleam / White Starburst / Caustic Highlights
-        _colorWeights[0 * _latentChannels + 5] = 0.95f;
-        _colorWeights[1 * _latentChannels + 5] = 0.95f;
-        _colorWeights[2 * _latentChannels + 5] = 0.95f;
+        // Ch 5: Specular Gleam / Sunlight Glint / Caustic Highlights
+        _colorWeights[0 * _latentChannels + 5] = 0.85f;
+        _colorWeights[1 * _latentChannels + 5] = 0.85f;
+        _colorWeights[2 * _latentChannels + 5] = 0.85f;
 
         // Ch 6: Volumetric Atmospheric Mist / Deep Indigo Shadow
-        _colorWeights[0 * _latentChannels + 6] = 0.15f;
-        _colorWeights[1 * _latentChannels + 6] = 0.18f;
-        _colorWeights[2 * _latentChannels + 6] = 0.28f;
+        _colorWeights[0 * _latentChannels + 6] = 0.18f;
+        _colorWeights[1 * _latentChannels + 6] = 0.22f;
+        _colorWeights[2 * _latentChannels + 6] = 0.32f;
 
-        // Ch 7..15: Micro-texture modulation
+        // Ch 7..15: Micro-texture modulation (subtle high-frequency detail)
         for (int c = 7; c < _latentChannels; c++)
         {
-            _colorWeights[0 * _latentChannels + c] = 0.03f;
-            _colorWeights[1 * _latentChannels + c] = 0.03f;
-            _colorWeights[2 * _latentChannels + c] = 0.04f;
+            _colorWeights[0 * _latentChannels + c] = 0.02f;
+            _colorWeights[1 * _latentChannels + c] = 0.02f;
+            _colorWeights[2 * _latentChannels + c] = 0.025f;
         }
     }
 

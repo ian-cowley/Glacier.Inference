@@ -254,6 +254,7 @@ public static class Program
         Console.WriteLine("  query <dir> \"<prompt>\"               Analyze directory of raw video frames and answer queries");
         Console.WriteLine();
         Console.WriteLine("Options (for generate):");
+        Console.WriteLine("  --image <path>                       Optional reference image to animate with camera motion");
         Console.WriteLine("  --frames <int>                       Number of output frames (default: 16)");
         Console.WriteLine("  --fps <int>                          Framerate in FPS (default: 8)");
         Console.WriteLine("  --width <int>                        Video width in pixels (default: 256)");
@@ -1878,6 +1879,7 @@ public static class Program
             string outPath = "glacier_video.apng";
             string format = "apng";
             int? seed = null;
+            string? imagePath = null;
 
             for (int i = 2; i < args.Length; i++)
             {
@@ -1889,6 +1891,7 @@ public static class Program
                 else if (args[i] == "--out" && i + 1 < args.Length) outPath = args[++i];
                 else if (args[i] == "--format" && i + 1 < args.Length) format = args[++i].ToLowerInvariant();
                 else if (args[i] == "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out int sd)) seed = sd;
+                else if ((args[i] == "--image" || args[i] == "-i") && i + 1 < args.Length) imagePath = args[++i];
                 else if (args[i] == "--motion" && i + 1 < args.Length)
                 {
                     string mStr = args[++i].ToLowerInvariant();
@@ -1907,20 +1910,38 @@ public static class Program
                 }
             }
 
+            // Auto-detect format from file extension if format was left at default
+            if (format == "apng")
+            {
+                if (outPath.EndsWith(".gif", StringComparison.OrdinalIgnoreCase)) format = "gif";
+                else if (outPath.EndsWith(".avi", StringComparison.OrdinalIgnoreCase)) format = "avi";
+            }
+
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO PRODUCTION (TEXT-TO-VIDEO)         ");
+            Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO PRODUCTION                         ");
             Console.WriteLine("   Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE Splines       ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
             Console.WriteLine($"Prompt: \"{prompt}\"");
+            if (!string.IsNullOrEmpty(imagePath)) Console.WriteLine($"Reference Image: {imagePath}");
             Console.WriteLine($"Resolution: {width}x{height} | Frames: {frames} @ {fps} FPS | Motion: {motion}");
-            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver");
+            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver | Format: {format.ToUpperInvariant()}");
             Console.WriteLine();
 
             using var pipeline = new VideoGenerationPipeline();
-            var result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
+            VideoGenerationResult result;
+            if (!string.IsNullOrEmpty(imagePath) && File.Exists(imagePath))
+            {
+                Console.WriteLine($"Animating reference image: {imagePath} with camera motion {motion}...");
+                var (rgb, srcW, srcH) = ImageDecoder.Load(imagePath);
+                result = pipeline.GenerateFromImage(rgb, srcW, srcH, prompt, width, height, frames, fps, motion);
+            }
+            else
+            {
+                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
+            }
 
             if (format == "all")
             {

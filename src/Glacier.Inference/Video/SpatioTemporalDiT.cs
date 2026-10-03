@@ -395,12 +395,12 @@ public unsafe sealed class SpatioTemporalDiT : IDisposable
                     }
                 }
 
-                // 6. Direct Prompt Semantic Flow Matching & Dynamic Motion Vector Steering
-                // v = Target - Noise (Rectified Flow formulation) modulated by motion trajectory
+                // 6. Spatio-temporal neural velocity modulation & motion steering
                 for (int c = 0; c < _latentChannels; c++)
                 {
                     int planeOffset = frameOffset + c * latentH * latentW;
-                    int targetOffset = c * latentH * latentW;
+                    int targetBaseOffset = (promptTarget.Length >= totalLatentSize) ? frameOffset : 0;
+                    int targetChannelOffset = targetBaseOffset + c * latentH * latentW;
 
                     for (int y = 0; y < latentH; y++)
                     {
@@ -410,20 +410,14 @@ public unsafe sealed class SpatioTemporalDiT : IDisposable
                             float nx = (float)x / (latentW - 1);
                             int idx = planeOffset + y * latentW + x;
 
-                            // Calculate motion offset trajectory
+                            // Calculate camera motion trajectory perturbation
                             var (dx, dy) = GetMotionDisplacement(motion, temporalT, nx, ny);
-                            int srcX = Math.Clamp((int)((nx - dx) * (latentW - 1)), 0, latentW - 1);
-                            int srcY = Math.Clamp((int)((ny - dy) * (latentH - 1)), 0, latentH - 1);
-                            int targetIdx = targetOffset + srcY * latentW + srcX;
+                            float motionVector = (dx * 1.5f + dy * 1.0f);
 
-                            float targetVal = (promptTarget.Length > targetIdx) ? promptTarget[targetIdx] : 0.0f;
-                            float currentVal = latents[idx];
+                            // Bounded neural modulation from spatial & temporal attention
+                            float ditPerturb = MathF.Tanh(velocityOut[idx] * 0.15f) * 0.35f;
 
-                            // Rectified Flow Velocity: v = Target - Noise
-                            float flowVelocity = (targetVal - currentVal);
-
-                            // Blend DiT neural prediction with flow-matching target velocity
-                            velocityOut[idx] = velocityOut[idx] * 0.40f + flowVelocity * 0.60f;
+                            velocityOut[idx] = ditPerturb + motionVector * 0.20f;
                         }
                     }
                 }

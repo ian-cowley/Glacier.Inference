@@ -2,6 +2,7 @@ namespace Glacier.Inference.Video;
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using Glacier.Inference.Image;
 
 /// <summary>
@@ -31,14 +32,6 @@ public sealed class VideoGenerationPipeline : IDisposable
     /// <summary>
     /// Generates a cinematic video sequence from a textual prompt with camera motion steering.
     /// </summary>
-    /// <param name="prompt">Semantic scene description.</param>
-    /// <param name="width">Output video frame pixel width (must be divisible by 16).</param>
-    /// <param name="height">Output video frame pixel height (must be divisible by 16).</param>
-    /// <param name="numFrames">Total output video frame count (e.g. 16 frames).</param>
-    /// <param name="fps">Video playback framerate (e.g. 8 or 12 FPS).</param>
-    /// <param name="numSteps">Flow-Matching ODE integration steps (e.g. 4 or 8).</param>
-    /// <param name="motion">Camera motion dynamics trajectory (e.g. PanRight, ZoomIn, Orbit).</param>
-    /// <param name="seed">Random seed for noise generation.</param>
     public VideoGenerationResult Generate(
         string prompt,
         int width = 256,
@@ -73,13 +66,30 @@ public sealed class VideoGenerationPipeline : IDisposable
         int frameLatentSize = latentChannels * latentH * latentW;
         int totalLatentSize = temporalLatentFrames * frameLatentSize;
 
-        // 1. Synthesize Semantic Prompt Target Latents (z_0)
-        var targetLatents = new float[frameLatentSize];
-        PromptSemanticSynthesizer.SynthesizeTargetLatents(prompt, targetLatents, latentH, latentW, latentChannels, seed ?? 42);
+        // 1. Synthesize Semantic Prompt Target Latents (z_0) for each keyframe with continuous camera motion
+        var targetLatents = new float[totalLatentSize];
+        for (int k = 0; k < temporalLatentFrames; k++)
+        {
+            float u = (temporalLatentFrames <= 1) ? 0.0f : (float)k / (temporalLatentFrames - 1);
+            var (offX, offY, zoom) = GetCameraTransform(motion, u);
+            int frameOffset = k * frameLatentSize;
+
+            PromptSemanticSynthesizer.SynthesizeTargetLatents(
+                prompt,
+                targetLatents.AsSpan(frameOffset, frameLatentSize),
+                latentH,
+                latentW,
+                latentChannels,
+                seed ?? 42,
+                offX,
+                offY,
+                zoom);
+        }
 
         // 2. Initialize Spatio-Temporal Gaussian Noise Latents (z_1 ~ N(0, I))
         var latents = new float[totalLatentSize];
         var velocity = new float[totalLatentSize];
+        var ditVelocity = new float[totalLatentSize];
 
         var rnd = new Random(seed ?? 42);
         for (int i = 0; i < totalLatentSize; i++)
@@ -87,24 +97,36 @@ public sealed class VideoGenerationPipeline : IDisposable
             // Box-Muller standard normal transform
             double u1 = Math.Max(1e-7, rnd.NextDouble());
             double u2 = rnd.NextDouble();
-            latents[i] = (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+            float z = (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+
+            // Structured latent initial condition: 25% semantic target scaffold + 75% Gaussian noise
+            latents[i] = targetLatents[i] * 0.25f + z * 0.75f;
         }
 
         // 3. Flow Matching (Euler ODE Integration Loop across continuous time t in [1.0 -> 0.0])
-        float dt = 1.0f / numSteps;
+        var scheduler = new FlowMatchingScheduler(numSteps);
+        var timesteps = scheduler.Timesteps;
 
         for (int step = 0; step < numSteps; step++)
         {
-            float t = 1.0f - (step * dt);
+            float currentT = timesteps[step];
+            float nextT = timesteps[step + 1];
 
-            // Predict velocity field across spatio-temporal latents
-            _dit.PredictVelocity(latents, t, targetLatents, motion, temporalLatentFrames, latentH, latentW, velocity);
+            // Evaluate Spatio-Temporal DiT (Intra-frame 3D-RoPE Attention + Inter-frame Cross Attention)
+            _dit.PredictVelocity(latents, currentT, targetLatents, motion, temporalLatentFrames, latentH, latentW, ditVelocity);
 
-            // Euler integration step: z_{t - dt} = z_t - dt * v_t
+            float denom = MathF.Max(currentT, 0.05f);
+            float ditModulation = currentT * (1.0f - currentT) * 2.0f; // Smooth bell curve peaking at t=0.5
+
             for (int i = 0; i < totalLatentSize; i++)
             {
-                latents[i] -= dt * velocity[i];
+                // Rectified Flow Velocity points from noisy state x_t to clean semantic target x_0
+                float baseVelocity = (latents[i] - targetLatents[i]) / denom;
+                velocity[i] = baseVelocity + ditVelocity[i] * ditModulation;
             }
+
+            // Euler integration step: x_{t + dt} = x_t + dt * v (where dt = nextT - currentT < 0)
+            FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
         }
 
         // 4. 3D VAE Temporal Spline Upsampling + Spatial Progressive Deconvolution to RGB
@@ -120,6 +142,149 @@ public sealed class VideoGenerationPipeline : IDisposable
             sw.ElapsedMilliseconds,
             prompt,
             motion);
+    }
+
+    /// <summary>
+    /// Generates video by animating an input reference image with continuous camera motion and 3D VAE splines.
+    /// </summary>
+    public VideoGenerationResult GenerateFromImage(
+        byte[] rgbPixels,
+        int sourceWidth,
+        int sourceHeight,
+        string prompt = "cinematic camera animation",
+        int width = 256,
+        int height = 256,
+        int numFrames = 16,
+        int fps = 8,
+        CameraMotion motion = CameraMotion.PanRight)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var sw = Stopwatch.StartNew();
+
+        int latentH = height / TemporalLatentVaeDecoder.SpatialScaleFactor; // e.g. 32
+        int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;  // e.g. 32
+        int latentChannels = _dit.LatentChannels;                          // 16
+
+        int temporalLatentFrames = Math.Max(2, Math.Min(numFrames, (numFrames + 3) / 4));
+        int frameLatentSize = latentChannels * latentH * latentW;
+        int totalLatentSize = temporalLatentFrames * frameLatentSize;
+
+        // Downsample input RGB to base latent representation
+        float[] baseLatents = new float[frameLatentSize];
+        int hw = latentH * latentW;
+
+        for (int y = 0; y < latentH; y++)
+        {
+            int srcY = Math.Clamp((int)((float)y / latentH * sourceHeight), 0, sourceHeight - 1);
+            for (int x = 0; x < latentW; x++)
+            {
+                int srcX = Math.Clamp((int)((float)x / latentW * sourceWidth), 0, sourceWidth - 1);
+                int srcIdx = (srcY * sourceWidth + srcX) * 3;
+
+                float r = rgbPixels[srcIdx] / 255.0f;
+                float g = rgbPixels[srcIdx + 1] / 255.0f;
+                float b = rgbPixels[srcIdx + 2] / 255.0f;
+
+                float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+                float cyan = MathF.Max(0f, (b + g) * 0.5f - r);
+                float amber = MathF.Max(0f, (r + g) * 0.5f - b);
+                float emerald = MathF.Max(0f, g - (r + b) * 0.5f);
+                float specular = (lum > 0.85f) ? (lum - 0.85f) * 5.0f : 0f;
+
+                int spatialIdx = y * latentW + x;
+                baseLatents[0 * hw + spatialIdx] = lum;
+                baseLatents[1 * hw + spatialIdx] = cyan * 0.8f;
+                baseLatents[3 * hw + spatialIdx] = amber * 0.7f;
+                baseLatents[4 * hw + spatialIdx] = emerald * 0.6f;
+                baseLatents[5 * hw + spatialIdx] = specular;
+            }
+        }
+
+        // Synthesize camera-shifted keyframes with bilinear texture coordinate sampling
+        var latents = new float[totalLatentSize];
+        for (int k = 0; k < temporalLatentFrames; k++)
+        {
+            float u = (temporalLatentFrames <= 1) ? 0.0f : (float)k / (temporalLatentFrames - 1);
+            var (offX, offY, zoom) = GetCameraTransform(motion, u);
+            int frameOffset = k * frameLatentSize;
+
+            for (int c = 0; c < latentChannels; c++)
+            {
+                int cOff = c * hw;
+                for (int y = 0; y < latentH; y++)
+                {
+                    float ny = (float)y / (latentH - 1);
+                    float sy = (ny - 0.5f) / zoom + 0.5f + offY;
+
+                    for (int x = 0; x < latentW; x++)
+                    {
+                        float nx = (float)x / (latentW - 1);
+                        float sx = (nx - 0.5f) / zoom + 0.5f + offX;
+
+                        float sampleX = Math.Clamp(sx * (latentW - 1), 0f, latentW - 1);
+                        float sampleY = Math.Clamp(sy * (latentH - 1), 0f, latentH - 1);
+
+                        int x0 = (int)sampleX;
+                        int y0 = (int)sampleY;
+                        int x1 = Math.Min(x0 + 1, latentW - 1);
+                        int y1 = Math.Min(y0 + 1, latentH - 1);
+
+                        float fx = sampleX - x0;
+                        float fy = sampleY - y0;
+
+                        float v00 = baseLatents[cOff + y0 * latentW + x0];
+                        float v10 = baseLatents[cOff + y0 * latentW + x1];
+                        float v01 = baseLatents[cOff + y1 * latentW + x0];
+                        float v11 = baseLatents[cOff + y1 * latentW + x1];
+
+                        float val = (v00 * (1f - fx) + v10 * fx) * (1f - fy) + (v01 * (1f - fx) + v11 * fx) * fy;
+                        latents[frameOffset + cOff + y * latentW + x] = val;
+                    }
+                }
+            }
+        }
+
+        // Decode through 3D VAE with Catmull-Rom temporal spline upsampling
+        var frames = _vae.DecodeVideo(latents, temporalLatentFrames, numFrames, latentH, latentW);
+
+        sw.Stop();
+
+        return new VideoGenerationResult(
+            frames,
+            width,
+            height,
+            fps,
+            sw.ElapsedMilliseconds,
+            prompt,
+            motion);
+    }
+
+    /// <summary>
+    /// Computes the camera transformation vector (offsetX, offsetY, zoom) along the timeline u in [0, 1].
+    /// </summary>
+    public static (float offX, float offY, float zoom) GetCameraTransform(CameraMotion motion, float u)
+    {
+        return motion switch
+        {
+            CameraMotion.PanRight => (u * 0.22f, 0.0f, 1.0f),
+            CameraMotion.PanLeft => (-u * 0.22f, 0.0f, 1.0f),
+            CameraMotion.TiltUp => (0.0f, -u * 0.15f, 1.0f),
+            CameraMotion.TiltDown => (0.0f, u * 0.15f, 1.0f),
+            CameraMotion.ZoomIn => (0.0f, 0.0f, 1.0f + u * 0.30f),
+            CameraMotion.ZoomOut => (0.0f, 0.0f, 1.30f - u * 0.30f),
+            CameraMotion.Orbit => (
+                MathF.Sin(u * MathF.PI * 0.8f) * 0.15f,
+                MathF.Cos(u * MathF.PI * 0.8f) * 0.06f,
+                1.0f + MathF.Sin(u * MathF.PI) * 0.08f
+            ),
+            CameraMotion.DynamicFluid => (
+                MathF.Sin(u * 3.0f) * 0.10f,
+                MathF.Cos(u * 2.5f) * 0.06f,
+                1.0f
+            ),
+            _ => (0.0f, 0.0f, 1.0f)
+        };
     }
 
     public void Dispose()
