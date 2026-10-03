@@ -10,6 +10,45 @@ using System;
 /// </summary>
 public static class PromptSemanticSynthesizer
 {
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static float Hash(float x, float y)
+    {
+        float h = MathF.Sin(x * 12.9898f + y * 78.233f) * 43758.5453f;
+        return h - MathF.Floor(h);
+    }
+
+    private static float ValueNoise(float x, float y)
+    {
+        float ix = MathF.Floor(x);
+        float iy = MathF.Floor(y);
+        float fx = x - ix;
+        float fy = y - iy;
+
+        float ux = fx * fx * (3.0f - 2.0f * fx);
+        float uy = fy * fy * (3.0f - 2.0f * fy);
+
+        float a = Hash(ix, iy);
+        float b = Hash(ix + 1f, iy);
+        float c = Hash(ix, iy + 1f);
+        float d = Hash(ix + 1f, iy + 1f);
+
+        return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+    }
+
+    private static float Fbm(float x, float y, int octaves = 3)
+    {
+        float val = 0.0f;
+        float amp = 0.5f;
+        float freq = 1.0f;
+        for (int i = 0; i < octaves; i++)
+        {
+            val += amp * ValueNoise(x * freq, y * freq);
+            freq *= 2.0f;
+            amp *= 0.5f;
+        }
+        return val;
+    }
+
     public static void SynthesizeTargetLatents(
         string prompt,
         Span<float> targetLatents,
@@ -78,17 +117,28 @@ public static class PromptSemanticSynthesizer
                     // DOMAIN: MAJESTIC GLACIER MOUNTAINS & CINEMATIC AERIAL DRONE SHOT
                     // =========================================================
                     
-                    // 1. High-Altitude Alpine Sky & Gradient (base atmospheric layer)
-                    // Deep cobalt blue in upper sky, graduating to warm sunset / horizon haze
-                    float skyT = Math.Clamp(wy / 0.50f, 0f, 1f);
+                    // 1. High-Altitude Alpine Sky & Sunset Atmospheric Layer
+                    float skyT = Math.Clamp(wy / 0.52f, 0f, 1f);
                     lum = 0.16f + skyT * 0.18f;
-                    ch1_cyan = 0.45f - skyT * 0.15f; // Deep atmospheric azure at zenith
-                    ch6_mist = 0.05f + skyT * 0.25f; // Horizon haze
+                    ch1_cyan = 0.46f - skyT * 0.18f; // Azure at zenith
+                    ch6_mist = 0.05f + skyT * 0.25f; // Soft haze
 
                     if (hasSunset)
                     {
                         ch3_amber = skyT * 0.35f;
                         ch2_magenta = skyT * 0.18f;
+                    }
+
+                    // Natural volumetric cloud wisps in upper atmosphere
+                    if (wy < 0.40f)
+                    {
+                        float cloud = Fbm(wxBg * 4.0f + 0.5f, wy * 3.5f, 3);
+                        if (cloud > 0.55f)
+                        {
+                            float cW = (cloud - 0.55f) / 0.45f;
+                            lum += cW * 0.22f;
+                            if (hasSunset) ch3_amber += cW * 0.25f;
+                        }
                     }
 
                     // Sun flare / directional lighting disc (sun at x=0.82, y=0.10)
@@ -104,19 +154,22 @@ public static class PromptSemanticSynthesizer
                     }
 
                     // 2. Distant Alpine Peaks (Background Parallax wxBg)
-                    // Jagged ridgelines with fractal octaves
-                    float peak1 = 0.26f + MathF.Sin(wxBg * 4.2f + 1.1f) * 0.11f 
-                                        + MathF.Cos(wxBg * 8.7f + 0.3f) * 0.05f 
-                                        + MathF.Sin(wxBg * 19.5f) * 0.02f;
+                    // Majestic alpine ridgeline using harmonic trigonometric octaves
+                    float peak1 = 0.28f + MathF.Sin(wxBg * 3.1f + 0.8f) * 0.08f 
+                                        + MathF.Cos(wxBg * 6.7f + 2.1f) * 0.04f 
+                                        + MathF.Sin(wxBg * 13.5f + 1.4f) * 0.02f 
+                                        + MathF.Cos(wxBg * 27.2f) * 0.008f;
                     float peakTrans1 = Math.Clamp((wy - peak1) / 0.025f, 0f, 1f);
                     if (peakTrans1 > 0f)
                     {
-                        float slope = MathF.Cos(wxBg * 4.2f + 1.1f) * 0.50f - MathF.Sin(wxBg * 8.7f) * 0.40f;
-                        float sunlit = Math.Clamp(slope * 1.6f + 0.4f, 0f, 1f);
+                        float slope1 = MathF.Cos(wxBg * 3.1f + 0.8f) * 0.55f 
+                                     - MathF.Sin(wxBg * 6.7f + 2.1f) * 0.40f 
+                                     + MathF.Cos(wxBg * 13.5f + 1.4f) * 0.25f;
+                        float sunlit = Math.Clamp(slope1 * 1.6f + 0.45f, 0f, 1f);
 
                         // High contrast: dark slate granite in shadow vs crisp golden snow
-                        float mntLum = 0.14f + sunlit * 0.45f;      // 0.14 dark rock -> 0.59 snow crest
-                        float mntCyan = (1.0f - sunlit) * 0.40f;    // Deep cold ambient blue in shadow
+                        float mntLum = 0.14f + sunlit * 0.46f;
+                        float mntCyan = (1.0f - sunlit) * 0.38f;
                         float mntAmber = sunlit * (hasSunset ? 0.35f : 0.10f);
                         float mntSpec = sunlit * 0.15f;
 
@@ -127,32 +180,25 @@ public static class PromptSemanticSynthesizer
                         ch5_specular = ch5_specular * (1f - peakTrans1) + mntSpec * peakTrans1;
                     }
 
-                    // 3. Midground Mountain Spire & Cirque (Midground Parallax wxMid)
-                    float peak2 = 0.44f + MathF.Sin(wxMid * 5.4f + 2.4f) * 0.10f 
-                                        + MathF.Cos(wxMid * 12.1f) * 0.05f 
-                                        + MathF.Sin(wxMid * 26.0f) * 0.02f;
+                    // 3. Midground Towering Alpine Mountain & Cirques (Midground Parallax wxMid)
+                    float peak2 = 0.44f + MathF.Sin(wxMid * 2.8f + 2.3f) * 0.10f 
+                                        + MathF.Cos(wxMid * 5.9f + 1.2f) * 0.05f 
+                                        + MathF.Sin(wxMid * 11.7f + 3.1f) * 0.025f 
+                                        + MathF.Cos(wxMid * 23.4f) * 0.010f;
                     float peakTrans2 = Math.Clamp((wy - peak2) / 0.025f, 0f, 1f);
                     if (peakTrans2 > 0f)
                     {
-                        float midSlope = MathF.Cos(wxMid * 5.4f + 2.4f) * 0.55f - MathF.Sin(wxMid * 12.1f) * 0.35f;
-                        float sunlit2 = Math.Clamp(midSlope * 1.5f + 0.45f, 0f, 1f);
+                        float slope2 = MathF.Cos(wxMid * 2.8f + 2.3f) * 0.55f 
+                                     - MathF.Sin(wxMid * 5.9f + 1.2f) * 0.40f 
+                                     + MathF.Cos(wxMid * 11.7f + 3.1f) * 0.25f;
+                        float sunlit2 = Math.Clamp(slope2 * 1.6f + 0.45f, 0f, 1f);
 
-                        // Rock ribs / couloirs striations
-                        float rockStrata = MathF.Sin(wxMid * 32.0f + wy * 18.0f) * 0.05f;
-                        float mntLum2 = 0.13f + rockStrata + sunlit2 * 0.46f;
-                        float mntCyan2 = (1.0f - sunlit2) * 0.35f;
+                        // Rock couloirs and striations
+                        float rockGrain = MathF.Sin(wxMid * 18.0f + wy * 14.0f) * 0.04f;
+                        float mntLum2 = 0.13f + rockGrain + sunlit2 * 0.48f;
+                        float mntCyan2 = (1.0f - sunlit2) * 0.32f;
                         float mntAmber2 = sunlit2 * (hasSunset ? 0.38f : 0.12f);
                         float mntSpec2 = sunlit2 * 0.18f;
-
-                        // Deep glacial crevasse fissures cutting through midground ice
-                        float crevasse = MathF.Sin(wxMid * 22.0f + wy * 15.0f);
-                        if (crevasse > 0.65f && wy > 0.48f)
-                        {
-                            float cWeight = (crevasse - 0.65f) / 0.35f;
-                            mntCyan2 += cWeight * 0.55f; // Intense glacial turquoise
-                            mntLum2 = mntLum2 * (1f - cWeight) + 0.22f * cWeight; // Deep shadow fissure
-                            mntSpec2 = 0.0f;
-                        }
 
                         lum = lum * (1f - peakTrans2) + mntLum2 * peakTrans2;
                         ch1_cyan = ch1_cyan * (1f - peakTrans2) + mntCyan2 * peakTrans2;
@@ -160,56 +206,44 @@ public static class PromptSemanticSynthesizer
                         ch5_specular = ch5_specular * (1f - peakTrans2) + mntSpec2 * peakTrans2;
                     }
 
-                    // 4. Foreground Glacial Valley & Moraines (wy >= 0.58, fast parallax wxFg)
-                    float valleyTrans = Math.Clamp((wy - 0.58f) / 0.06f, 0f, 1f);
+                    // 4. Foreground Glacial Trough & Valley Floor (wy >= 0.56, fast parallax wxFg)
+                    float valleyTrans = Math.Clamp((wy - 0.56f) / 0.06f, 0f, 1f);
                     if (valleyTrans > 0f)
                     {
-                        // Structural terrain features:
-                        // Lateral moraine ridges (dark rocky scree along valley borders)
-                        float moraineNoise = MathF.Sin(wxFg * 9.0f) * 0.12f;
-                        bool isMoraine = MathF.Abs(wxFg - 0.5f + moraineNoise) > 0.28f;
+                        // Natural curving glacial valley trough (no square boxes!)
+                        float valleyMeander = MathF.Sin(wy * 3.8f + 0.6f) * 0.12f;
+                        float centerDist = MathF.Abs(wxFg - 0.50f - valleyMeander);
 
-                        float valleyLum;
-                        float valleyCyan = 0.0f;
-                        float valleyAmber = 0.0f;
-                        float valleyEmerald = 0.0f;
-                        float valleySpec = 0.0f;
+                        // Smooth transition across valley zones:
+                        // Central zone: Glacier ice tongue with sastrugi and organic crevasse fractures
+                        // Flank zone: Dark rocky lateral moraine scree and alpine pine forests
+                        float iceWeight = Math.Clamp((0.32f - centerDist) / 0.12f, 0f, 1f);
+                        float forestWeight = Math.Clamp((centerDist - 0.28f) / 0.12f, 0f, 1f);
 
-                        if (isMoraine)
+                        // Ice tongue: natural sastrugi flow ripples
+                        float iceNoise = Fbm(wxFg * 8.0f, wy * 12.0f, 3);
+                        float iceLum = 0.28f + iceNoise * 0.18f;
+                        float iceCyan = 0.40f + (1.0f - iceNoise) * 0.20f;
+                        float iceSpec = 0.08f;
+
+                        // Natural organic crevasse veins (non-periodic, branching fractal fracture lines)
+                        float crevasseField = Fbm(wxFg * 14.0f + 1.2f, wy * 18.0f + 2.4f, 3);
+                        if (crevasseField > 0.68f)
                         {
-                            // Dark granite scree & gravel moraine
-                            float gravel = MathF.Sin(wxFg * 45.0f + wy * 60.0f) * 0.04f;
-                            valleyLum = 0.14f + gravel + (wy - 0.58f) * 0.08f;
-                            valleyEmerald = 0.18f; // Alpine moss / low scrub
-                            valleyCyan = 0.10f;
+                            float cW = (crevasseField - 0.68f) / 0.32f;
+                            iceCyan += cW * 0.40f; // Saturated electric turquoise
+                            iceLum = iceLum * (1f - cW) + 0.16f * cW; // Deep crevasse shadow
                         }
-                        else
-                        {
-                            // Sculpted glacial ice tongue with sastrugi ripples and crevasses
-                            float sastrugi = MathF.Sin(wy * 40.0f + wxFg * 14.0f) * 0.05f 
-                                           + MathF.Cos(wxFg * 24.0f) * 0.03f;
-                            
-                            // Ice tongue body: crisp sculpted ice, not blown out
-                            valleyLum = 0.32f + sastrugi + (wy - 0.58f) * 0.12f;
-                            valleyCyan = 0.45f + MathF.Sin(wxFg * 8.0f) * 0.12f; // Rich turquoise glacial tint
-                            valleyAmber = hasSunset ? 0.15f : 0.05f;
 
-                            // Deep turquoise crevasse cracks
-                            float crack = MathF.Sin(wxFg * 28.0f - wy * 16.0f);
-                            if (crack > 0.72f)
-                            {
-                                float cWeight = (crack - 0.72f) / 0.28f;
-                                valleyCyan += cWeight * 0.45f; // Intense electric azure
-                                valleyLum = valleyLum * (1f - cWeight) + 0.18f * cWeight; // Deep crack shadow
-                            }
-                            else if (crack < -0.80f)
-                            {
-                                // Glacial meltwater stream with specular glint
-                                valleyCyan = 0.65f;
-                                valleyLum = 0.22f;
-                                valleySpec = 0.35f;
-                            }
-                        }
+                        // Flank terrain: dark granite scree & alpine conifer forest
+                        float rockLum = 0.14f + Fbm(wxFg * 18.0f, wy * 20.0f, 2) * 0.06f;
+                        float forestLum = 0.11f + Fbm(wxFg * 24.0f, wy * 26.0f, 2) * 0.05f;
+
+                        float valleyLum = iceLum * iceWeight + rockLum * (1f - iceWeight) * (1f - forestWeight) + forestLum * forestWeight;
+                        float valleyCyan = iceCyan * iceWeight + 0.10f * (1f - iceWeight);
+                        float valleyAmber = (hasSunset ? 0.14f : 0.05f) * iceWeight;
+                        float valleyEmerald = 0.38f * forestWeight;
+                        float valleySpec = iceSpec * iceWeight;
 
                         lum = lum * (1f - valleyTrans) + valleyLum * valleyTrans;
                         ch1_cyan = ch1_cyan * (1f - valleyTrans) + valleyCyan * valleyTrans;
