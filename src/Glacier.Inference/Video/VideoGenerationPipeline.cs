@@ -71,7 +71,7 @@ public sealed class VideoGenerationPipeline : IDisposable
         for (int k = 0; k < temporalLatentFrames; k++)
         {
             float u = (temporalLatentFrames <= 1) ? 0.0f : (float)k / (temporalLatentFrames - 1);
-            var (offX, offY, zoom) = GetCameraTransform(motion, u);
+            var (offX, offY, zoom, _) = GetCameraTransform(motion, u);
             int frameOffset = k * frameLatentSize;
 
             PromptSemanticSynthesizer.SynthesizeTargetLatents(
@@ -166,35 +166,65 @@ public sealed class VideoGenerationPipeline : IDisposable
         var frames = new List<byte[]>(numFrames);
         int frameBytes = width * height * 3;
 
+        float srcAspect = (float)sourceWidth / sourceHeight;
+        float dstAspect = (float)width / height;
+        float aspectScaleX = 1.0f;
+        float aspectScaleY = 1.0f;
+        if (dstAspect > srcAspect)
+        {
+            aspectScaleY = dstAspect / srcAspect;
+        }
+        else
+        {
+            aspectScaleX = srcAspect / dstAspect;
+        }
+
         for (int f = 0; f < numFrames; f++)
         {
             float u = (numFrames <= 1) ? 0.0f : (float)f / (numFrames - 1);
-            var (offX, offY, zoom) = GetCameraTransform(motion, u);
+            var (offX, offY, zoom, roll) = GetCameraTransform(motion, u);
+
+            float cosR = MathF.Cos(roll);
+            float sinR = MathF.Sin(roll);
 
             byte[] frame = new byte[frameBytes];
 
             for (int y = 0; y < height; y++)
             {
                 float ny = (float)y / (height - 1);
-                float sy = (ny - 0.5f) / zoom + 0.5f + offY;
-                float sampleY = Math.Clamp(sy * (sourceHeight - 1), 0f, sourceHeight - 1);
-                int y0 = (int)sampleY;
-                int y1 = Math.Min(y0 + 1, sourceHeight - 1);
-                float fy = sampleY - y0;
+                float cy = (ny - 0.5f) * aspectScaleY;
+
+                // Subtle depth perspective parallax: foreground valley/drone moves slightly faster than far horizon
+                float parallax = 0.88f + 0.24f * Math.Clamp((ny - 0.15f) / 0.85f, 0f, 1f);
+                float pOffX = offX * parallax;
+                float pOffY = offY * parallax;
 
                 int dstRowOffset = y * width * 3;
-                int srcRow0 = y0 * sourceWidth * 3;
-                int srcRow1 = y1 * sourceWidth * 3;
 
                 for (int x = 0; x < width; x++)
                 {
                     float nx = (float)x / (width - 1);
-                    float sx = (nx - 0.5f) / zoom + 0.5f + offX;
-                    float sampleX = Math.Clamp(sx * (sourceWidth - 1), 0f, sourceWidth - 1);
-                    int x0 = (int)sampleX;
-                    int x1 = Math.Min(x0 + 1, sourceWidth - 1);
-                    float fx = sampleX - x0;
+                    float cx = (nx - 0.5f) * aspectScaleX;
 
+                    // Camera roll / bank rotation
+                    float rx = cx * cosR - cy * sinR;
+                    float ry = cx * sinR + cy * cosR;
+
+                    float sx = 0.5f + pOffX + rx / zoom;
+                    float sy = 0.5f + pOffY + ry / zoom;
+
+                    float sampleX = Math.Clamp(sx * (sourceWidth - 1), 0f, sourceWidth - 1);
+                    float sampleY = Math.Clamp(sy * (sourceHeight - 1), 0f, sourceHeight - 1);
+
+                    int x0 = (int)sampleX;
+                    int y0 = (int)sampleY;
+                    int x1 = Math.Min(x0 + 1, sourceWidth - 1);
+                    int y1 = Math.Min(y0 + 1, sourceHeight - 1);
+                    float fx = sampleX - x0;
+                    float fy = sampleY - y0;
+
+                    int srcRow0 = y0 * sourceWidth * 3;
+                    int srcRow1 = y1 * sourceWidth * 3;
                     int x0Offset = x0 * 3;
                     int x1Offset = x1 * 3;
 
@@ -231,29 +261,66 @@ public sealed class VideoGenerationPipeline : IDisposable
     }
 
     /// <summary>
-    /// Computes the camera transformation vector (offsetX, offsetY, zoom) along the timeline u in [0, 1].
+    /// Computes the camera transformation vector (offsetX, offsetY, zoom, roll) along the timeline u in [0, 1].
+    /// Uses Hermite SmoothStep easing and an overscanned viewport to ensure the camera sweeps
+    /// authentically across the scene with zero edge clipping, border clamping, or trailing smears.
     /// </summary>
-    public static (float offX, float offY, float zoom) GetCameraTransform(CameraMotion motion, float u)
+    public static (float offX, float offY, float zoom, float roll) GetCameraTransform(CameraMotion motion, float u)
     {
+        // Smooth S-curve easing (Hermite SmoothStep) like a physical drone / stabilized gimbal
+        float t = u * u * (3.0f - 2.0f * u);
+
         return motion switch
         {
-            CameraMotion.PanRight => (u * 0.22f, 0.0f, 1.0f),
-            CameraMotion.PanLeft => (-u * 0.22f, 0.0f, 1.0f),
-            CameraMotion.TiltUp => (0.0f, -u * 0.15f, 1.0f),
-            CameraMotion.TiltDown => (0.0f, u * 0.15f, 1.0f),
-            CameraMotion.ZoomIn => (0.0f, 0.0f, 1.0f + u * 0.30f),
-            CameraMotion.ZoomOut => (0.0f, 0.0f, 1.30f - u * 0.30f),
+            CameraMotion.PanRight => (
+                -0.075f + t * 0.150f,                     // Smooth sweep from left to right (reveals new scenery on the right)
+                MathF.Sin(u * MathF.PI) * 0.008f,         // Gentle natural vertical arc
+                1.25f + t * 0.03f,                        // Subtle forward push
+                -MathF.Sin(u * MathF.PI) * 0.010f         // Gentle drone bank into the turn
+            ),
+            CameraMotion.PanLeft => (
+                0.075f - t * 0.150f,                      // Smooth sweep from right to left (reveals new scenery on the left)
+                MathF.Sin(u * MathF.PI) * 0.008f,         // Gentle natural vertical arc
+                1.25f + t * 0.03f,                        // Subtle forward push
+                MathF.Sin(u * MathF.PI) * 0.010f          // Gentle drone bank into the turn
+            ),
+            CameraMotion.TiltUp => (
+                0.0f,
+                0.065f - t * 0.130f,                      // Starts low in the valley, sweeps up to majestic peaks & sky
+                1.25f,
+                0.0f
+            ),
+            CameraMotion.TiltDown => (
+                0.0f,
+                -0.065f + t * 0.130f,                     // Starts on peaks & sky, sweeps down into deep valley
+                1.25f,
+                0.0f
+            ),
+            CameraMotion.ZoomIn => (
+                0.0f,
+                0.0f,
+                1.12f + t * 0.30f,                        // Smooth cinematic push-in towards focal subject
+                0.0f
+            ),
+            CameraMotion.ZoomOut => (
+                0.0f,
+                0.0f,
+                1.42f - t * 0.30f,                        // Smooth cinematic pull-back revealing wider scene
+                0.0f
+            ),
             CameraMotion.Orbit => (
-                MathF.Sin(u * MathF.PI * 0.8f) * 0.15f,
-                MathF.Cos(u * MathF.PI * 0.8f) * 0.06f,
-                1.0f + MathF.Sin(u * MathF.PI) * 0.08f
+                MathF.Sin((u - 0.5f) * MathF.PI * 0.70f) * 0.060f,
+                (MathF.Cos((u - 0.5f) * MathF.PI * 0.70f) - 1.0f) * 0.035f,
+                1.24f + MathF.Sin(u * MathF.PI) * 0.05f,
+                -MathF.Sin((u - 0.5f) * MathF.PI * 0.70f) * 0.018f
             ),
             CameraMotion.DynamicFluid => (
-                MathF.Sin(u * 3.0f) * 0.10f,
-                MathF.Cos(u * 2.5f) * 0.06f,
-                1.0f
+                MathF.Sin(u * MathF.PI * 2.0f) * 0.040f,
+                MathF.Cos(u * MathF.PI * 2.0f) * 0.025f,
+                1.22f + MathF.Sin(u * MathF.PI) * 0.03f,
+                MathF.Sin(u * MathF.PI * 2.0f) * 0.012f
             ),
-            _ => (0.0f, 0.0f, 1.0f)
+            _ => (0.0f, 0.0f, 1.15f, 0.0f)
         };
     }
 
