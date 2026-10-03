@@ -14,18 +14,103 @@ public sealed class DiffusionGgufPipeline : IDisposable
 {
     private readonly DiffusionGgufModel _model;
     private readonly DiffusionGgufModel? _vaeModel;
+    private readonly Glacier.Inference.Image.Flux.FluxVaeDecoder? _neuralVae;
+    private readonly Glacier.Inference.Image.Flux.FluxDiT? _fluxDit;
+    private readonly Glacier.Inference.Image.Flux.FluxClipEncoder? _clipEncoder;
+    private readonly Glacier.Inference.Image.Flux.FluxT5Encoder? _t5Encoder;
     private readonly LatentVaeDecoder _fallbackVae;
     private bool _disposed;
 
     public DiffusionGgufModel Model => _model;
     public DiffusionGgufModel? VaeModel => _vaeModel;
+    public Glacier.Inference.Image.Flux.FluxVaeDecoder? NeuralVae => _neuralVae;
+    public Glacier.Inference.Image.Flux.FluxDiT? FluxDiT => _fluxDit;
+    public Glacier.Inference.Image.Flux.FluxT5Encoder? T5Encoder => _t5Encoder;
 
-    public DiffusionGgufPipeline(DiffusionGgufModel model, DiffusionGgufModel? vaeModel = null)
+    public DiffusionGgufPipeline(
+        DiffusionGgufModel model,
+        DiffusionGgufModel? vaeModel = null,
+        string? vaeSafetensorsPath = null,
+        string? clipSafetensorsPath = null,
+        string? t5GgufPath = null)
     {
         _model = model;
         _vaeModel = vaeModel;
         _fallbackVae = new LatentVaeDecoder(_model.InChannels);
+
+        string? vaePath = vaeSafetensorsPath;
+        if (string.IsNullOrEmpty(vaePath))
+        {
+            if (File.Exists("models/ae.safetensors")) vaePath = "models/ae.safetensors";
+            else if (File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "ae.safetensors")))
+                vaePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "ae.safetensors");
+        }
+
+        if (!string.IsNullOrEmpty(vaePath) && File.Exists(vaePath))
+        {
+            try
+            {
+                _neuralVae = Glacier.Inference.Image.Flux.FluxVaeDecoder.Open(vaePath);
+            }
+            catch
+            {
+                _neuralVae = null;
+            }
+        }
+
+        string? clipPath = clipSafetensorsPath;
+        if (string.IsNullOrEmpty(clipPath))
+        {
+            if (File.Exists("models/clip_l.safetensors")) clipPath = "models/clip_l.safetensors";
+            else if (File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "clip_l.safetensors")))
+                clipPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "clip_l.safetensors");
+        }
+
+        if (!string.IsNullOrEmpty(clipPath) && File.Exists(clipPath))
+        {
+            try
+            {
+                _clipEncoder = Glacier.Inference.Image.Flux.FluxClipEncoder.Open(clipPath);
+            }
+            catch
+            {
+                _clipEncoder = null;
+            }
+        }
+
+        string? t5Path = t5GgufPath;
+        if (string.IsNullOrEmpty(t5Path))
+        {
+            if (File.Exists("models/t5xxl.gguf")) t5Path = "models/t5xxl.gguf";
+            else if (File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "t5xxl.gguf")))
+                t5Path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", "t5xxl.gguf");
+        }
+
+        if (!string.IsNullOrEmpty(t5Path) && File.Exists(t5Path))
+        {
+            try
+            {
+                _t5Encoder = Glacier.Inference.Image.Flux.FluxT5Encoder.Open(t5Path);
+            }
+            catch
+            {
+                _t5Encoder = null;
+            }
+        }
+
+        if (_model.DiffusionArch == UniversalArchitecture.Flux)
+        {
+            try
+            {
+                _fluxDit = Glacier.Inference.Image.Flux.FluxDiT.Open(_model.Gguf.FilePath);
+            }
+            catch
+            {
+                _fluxDit = null;
+            }
+        }
     }
+
 
     /// <summary>
     /// Executes end-to-end text-to-image generation from prompt using pre-trained GGUF weights.
@@ -79,7 +164,44 @@ public sealed class DiffusionGgufPipeline : IDisposable
         }
 
         // 4. Multi-Step Trajectory
-        if (_model.RecommendedSchedule == "FlowMatching")
+        if (_fluxDit != null)
+        {
+            var scheduler = new FlowMatchingScheduler(steps);
+            var timesteps = scheduler.Timesteps;
+
+            float[] pooledY = _clipEncoder != null ? _clipEncoder.EncodePrompt(prompt) : new float[768];
+            int numTxtTokens = 64;
+            float[] contextTxt;
+
+            if (_t5Encoder != null)
+            {
+                contextTxt = _t5Encoder.Encode(prompt, seqLen: numTxtTokens);
+            }
+            else
+            {
+                contextTxt = new float[numTxtTokens * 4096];
+                for (int i = 0; i < prompt.Length; i++)
+                {
+                    int tokIdx = i % numTxtTokens;
+                    int dimIdx = (i * 31) % 4096;
+                    contextTxt[tokIdx * 4096 + dimIdx] = ((prompt[i] % 32) - 16) / 16.0f;
+                }
+            }
+
+            var swStep = Stopwatch.StartNew();
+            for (int step = 0; step < steps; step++)
+            {
+                var swS = Stopwatch.StartNew();
+                float currentT = timesteps[step];
+                float nextT = timesteps[step + 1];
+
+                _fluxDit.PredictVelocity(latents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
+                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
+                Console.WriteLine($"[PIPELINE TIMING] Step {step + 1}/{steps}: {swS.ElapsedMilliseconds} ms (Flow velocity + Euler step)");
+            }
+            Console.WriteLine($"[PIPELINE TIMING] Total DiT Latent Trajectory ({steps} steps): {swStep.ElapsedMilliseconds} ms");
+        }
+        else if (_model.RecommendedSchedule == "FlowMatching")
         {
             var scheduler = new FlowMatchingScheduler(steps);
             var timesteps = scheduler.Timesteps;
@@ -113,7 +235,16 @@ public sealed class DiffusionGgufPipeline : IDisposable
 
         // 5. Decode Latents to RGB Pixels
         var rgbPixels = new byte[targetW * targetH * 3];
-        _fallbackVae.Decode(latents, latentH, latentW, rgbPixels);
+        var swVae = Stopwatch.StartNew();
+        if (_neuralVae != null)
+        {
+            _neuralVae.Decode(latents, latentH, latentW, rgbPixels);
+        }
+        else
+        {
+            _fallbackVae.Decode(latents, latentH, latentW, rgbPixels);
+        }
+        Console.WriteLine($"[PIPELINE TIMING] VAE Latent Decode ({latentW}x{latentH} -> {targetW}x{targetH}): {swVae.ElapsedMilliseconds} ms");
 
         sw.Stop();
         float pxPerSec = (targetW * targetH) / (float)sw.Elapsed.TotalSeconds;
@@ -133,8 +264,13 @@ public sealed class DiffusionGgufPipeline : IDisposable
         {
             _model.Dispose();
             _vaeModel?.Dispose();
+            _neuralVae?.Dispose();
+            _fluxDit?.Dispose();
+            _clipEncoder?.Dispose();
+            _t5Encoder?.Dispose();
             _fallbackVae.Dispose();
             _disposed = true;
         }
     }
 }
+

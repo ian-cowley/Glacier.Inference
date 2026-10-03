@@ -2,78 +2,81 @@ namespace Glacier.Inference.Audio;
 
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
-using System.Text;
+using System.IO;
 
 /// <summary>
-/// Predefined voice style profiles for Kokoro TTS.
+/// Predefined voice style profiles for Kokoro TTS covering USA and British English accents.
 /// </summary>
 public enum KokoroVoice
 {
-    AfHeart,   // American Female (Warm, expressive)
-    AmAdam,    // American Male (Clear, professional)
-    BfEmma,    // British Female (Polite, articulate)
-    BmGeorge   // British Male (Authoritative, narrative)
+    // American Female Voices
+    AfHeart,    // American Female: Warm, natural, expressive narrator
+    AfBella,    // American Female: Bright, conversational, clear
+    AfSarah,    // American Female: Calm, smooth, executive
+    AfSky,      // American Female: Light, youthful, melodic
+
+    // American Male Voices
+    AmAdam,     // American Male: Deep broadcast baritone, authoritative
+    AmMichael,  // American Male: Clear, engaging, professional
+    AmEcho,     // American Male: Resonant, youthful conversational
+    AmEric,     // American Male: Grounded, warm storyteller
+
+    // British Female Voices
+    BfEmma,     // British Female: Elegant, articulate Received Pronunciation (RP)
+    BfIsabella, // British Female: Refined, classic BBC documentary style
+    BfAlice,    // British Female: Gentle, conversational Southern English
+    BfLily,     // British Female: Crisp, melodic modern English
+
+    // British Male Voices
+    BmGeorge,   // British Male: Authoritative, rich classical RP orator
+    BmLewis,    // British Male: Warm, engaging British storyteller
+    BmDaniel,   // British Male: Deep resonant theatrical narrator
+    BmFable     // British Male: Conversational, friendly London gentleman
 }
 
 /// <summary>
-/// Pure C# high-performance Text-to-Speech (TTS) synthesis engine based on the Kokoro-82M architecture.
-/// Synthesizes 24kHz CD-quality speech with sub-50ms latency and zero GC allocations on hot synthesis paths.
+/// Pure C# high-performance Text-to-Speech (TTS) synthesis engine based on the Kokoro architecture.
+/// Synthesizes 24kHz CD-quality human speech with physical glottal flow dynamics (Liljencrants-Fant),
+/// recursive digital biquad vocal tract resonators, G2P dialect phonology (USA &amp; British RP),
+/// pitch prosody contours, coarticulation smoothing, and zero native C++ runtime dependencies.
 /// </summary>
-public sealed unsafe class KokoroTtsEngine : IDisposable
+public sealed class KokoroTtsEngine : IDisposable
 {
     public const int DefaultSampleRate = 24000;
     public int SampleRate => DefaultSampleRate;
 
-    // Vocoder / Acoustic synthesis constants
-    private const int HopLength = 300;     // 12.5ms frame rate at 24kHz (80 frames/sec)
-    private const int FftSize = 1024;
-    private const int StyleDim = 256;
-
-    private readonly float[] _voiceEmbeddings; // [NumVoices * StyleDim]
-    private readonly Dictionary<string, float[]> _phonemeFormants;
+    private readonly VocalTractSynthesizer _synthesizer;
+    private readonly Dictionary<KokoroVoice, VoiceProfile> _voiceProfiles;
     private bool _disposed;
+
+    public IReadOnlyDictionary<KokoroVoice, VoiceProfile> VoiceProfiles => _voiceProfiles;
 
     public KokoroTtsEngine()
     {
-        _voiceEmbeddings = InitializeVoiceStyles();
-        _phonemeFormants = InitializePhonemeDictionary();
+        _synthesizer = new VocalTractSynthesizer(DefaultSampleRate);
+        _voiceProfiles = InitializeVoiceProfiles();
     }
 
     /// <summary>
-    /// Synthesizes text into 24kHz single-channel float audio samples.
+    /// Synthesizes plain English text into 24kHz single-channel float audio samples.
     /// </summary>
     public float[] Synthesize(string text, KokoroVoice voice = KokoroVoice.AfHeart, float speed = 1.0f)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (string.IsNullOrWhiteSpace(text)) return Array.Empty<float>();
 
-        // 1. Grapheme-to-phoneme tokenization with prosody pauses
-        var phonemes = TokenizeToPhonemes(text, speed);
-        if (phonemes.Count == 0) return Array.Empty<float>();
+        var profile = GetVoiceProfile(voice);
 
-        // 2. Compute total audio frame count
-        int totalFrames = 0;
-        foreach (var p in phonemes)
-        {
-            totalFrames += p.DurationFrames;
-        }
+        // 1. Grapheme-to-Phoneme tokenization with dialect phonology and prosody
+        var tokens = PhonemeEngine.ConvertTextToTokens(text, profile.Accent, profile.BaseF0, speed);
+        if (tokens.Count == 0) return Array.Empty<float>();
 
-        int totalSamples = totalFrames * HopLength;
-        var audio = new float[totalSamples];
-
-        fixed (float* pAudio = audio)
-        {
-            SynthesizeWaveform(phonemes, voice, pAudio, totalSamples);
-        }
-
-        return audio;
+        // 2. Physical acoustic vocal tract rendering
+        return _synthesizer.Render(tokens, profile, speed);
     }
 
     /// <summary>
-    /// Synthesizes speech and writes it directly to a WAV file on disk.
+    /// Synthesizes speech and writes it directly to a 24kHz 16-bit PCM WAV file on disk.
     /// </summary>
     public void SynthesizeToFile(string text, string outputPath, KokoroVoice voice = KokoroVoice.AfHeart, float speed = 1.0f)
     {
@@ -81,246 +84,325 @@ public sealed unsafe class KokoroTtsEngine : IDisposable
         WavWriter.WritePcm16(outputPath, samples, SampleRate, 1);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private void SynthesizeWaveform(List<PhonemeToken> phonemes, KokoroVoice voice, float* pAudio, int totalSamples)
+    /// <summary>
+    /// Retrieves the voice profile definition for a given voice enum.
+    /// </summary>
+    public VoiceProfile GetVoiceProfile(KokoroVoice voice)
     {
-        // Voice style pitch and formant multipliers
-        float baseF0;
-        float formantScale;
-        switch (voice)
+        if (_voiceProfiles.TryGetValue(voice, out var profile))
         {
-            case KokoroVoice.AfHeart:
-                baseF0 = 210.0f; // Female pitch
-                formantScale = 1.15f;
-                break;
-            case KokoroVoice.AmAdam:
-                baseF0 = 125.0f; // Male pitch
-                formantScale = 0.92f;
-                break;
-            case KokoroVoice.BfEmma:
-                baseF0 = 195.0f;
-                formantScale = 1.10f;
-                break;
-            case KokoroVoice.BmGeorge:
-                baseF0 = 110.0f;
-                formantScale = 0.88f;
-                break;
-            default:
-                baseF0 = 180.0f;
-                formantScale = 1.0f;
-                break;
+            return profile;
         }
-
-        int sampleCursor = 0;
-        float phase = 0.0f;
-        float prevF1 = 500f, prevF2 = 1500f, prevF3 = 2500f;
-
-        for (int i = 0; i < phonemes.Count; i++)
-        {
-            var p = phonemes[i];
-            int tokenSamples = p.DurationFrames * HopLength;
-
-            if (p.IsSilence)
-            {
-                // Smooth envelope release to zero
-                int releaseLen = Math.Min(tokenSamples, 240);
-                for (int s = 0; s < releaseLen && (sampleCursor + s) < totalSamples; s++)
-                {
-                    float factor = 1.0f - (float)s / releaseLen;
-                    pAudio[sampleCursor + s] *= factor;
-                }
-                sampleCursor += tokenSamples;
-                continue;
-            }
-
-            // Target formants for current phoneme
-            float targetF1 = p.F1 * formantScale;
-            float targetF2 = p.F2 * formantScale;
-            float targetF3 = p.F3 * formantScale;
-            float targetF0 = baseF0 * p.PitchMultiplier;
-
-            float phaseInc = 2.0f * MathF.PI * targetF0 / SampleRate;
-
-            for (int s = 0; s < tokenSamples && (sampleCursor + s) < totalSamples; s++)
-            {
-                float tNorm = (float)s / tokenSamples;
-                // Interpolate formants across phoneme boundary (coarticulation)
-                float f1 = prevF1 + (targetF1 - prevF1) * MathF.Min(1.0f, tNorm * 3.0f);
-                float f2 = prevF2 + (targetF2 - prevF2) * MathF.Min(1.0f, tNorm * 3.0f);
-                float f3 = prevF3 + (targetF3 - prevF3) * MathF.Min(1.0f, tNorm * 3.0f);
-
-                // Natural vocal tract glottal source: pulse with rich harmonics
-                phase += phaseInc;
-                if (phase > 2.0f * MathF.PI) phase -= 2.0f * MathF.PI;
-
-                // Glottal flow pulse approximation (Liljencrants-Fant model surrogate)
-                float glottalSource;
-                if (p.IsVoiced)
-                {
-                    glottalSource = MathF.Sin(phase) +
-                                    0.5f * MathF.Sin(2.0f * phase) +
-                                    0.25f * MathF.Sin(3.0f * phase) +
-                                    0.125f * MathF.Sin(4.0f * phase);
-                }
-                else
-                {
-                    // Unvoiced fricative / aspiration noise source
-                    glottalSource = ((float)Random.Shared.NextDouble() * 2.0f - 1.0f) * 0.7f;
-                }
-
-                // Resonant formant synthesis (F1, F2, F3 bandpass response)
-                float r1 = MathF.Sin(phase * (f1 / targetF0)) * 0.45f;
-                float r2 = MathF.Sin(phase * (f2 / targetF0)) * 0.25f;
-                float r3 = MathF.Sin(phase * (f3 / targetF0)) * 0.15f;
-
-                float sample = glottalSource * 0.3f + r1 + r2 + r3;
-
-                // Envelope attack and decay
-                float env = 1.0f;
-                if (s < 120) env = (float)s / 120f;
-                else if (s > tokenSamples - 120) env = (float)(tokenSamples - s) / 120f;
-
-                pAudio[sampleCursor + s] = Math.Clamp(sample * env * 0.6f, -1.0f, 1.0f);
-            }
-
-            prevF1 = targetF1;
-            prevF2 = targetF2;
-            prevF3 = targetF3;
-            sampleCursor += tokenSamples;
-        }
-
-        // Final gentle SIMD moving-average lowpass filter to eliminate aliasing clicks
-        if (totalSamples > 4)
-        {
-            for (int s = 1; s < totalSamples - 1; s++)
-            {
-                pAudio[s] = 0.25f * pAudio[s - 1] + 0.5f * pAudio[s] + 0.25f * pAudio[s + 1];
-            }
-        }
+        return _voiceProfiles[KokoroVoice.AfHeart];
     }
 
-    private readonly struct PhonemeToken
+    private static Dictionary<KokoroVoice, VoiceProfile> InitializeVoiceProfiles()
     {
-        public readonly string Phoneme;
-        public readonly int DurationFrames;
-        public readonly float F1;
-        public readonly float F2;
-        public readonly float F3;
-        public readonly bool IsVoiced;
-        public readonly bool IsSilence;
-        public readonly float PitchMultiplier;
-
-        public PhonemeToken(string phoneme, int durationFrames, float f1, float f2, float f3, bool isVoiced, bool isSilence, float pitchMult = 1.0f)
+        return new Dictionary<KokoroVoice, VoiceProfile>
         {
-            Phoneme = phoneme;
-            DurationFrames = durationFrames;
-            F1 = f1;
-            F2 = f2;
-            F3 = f3;
-            IsVoiced = isVoiced;
-            IsSilence = isSilence;
-            PitchMultiplier = pitchMult;
-        }
-    }
-
-    private List<PhonemeToken> TokenizeToPhonemes(string text, float speed)
-    {
-        var result = new List<PhonemeToken>();
-        float speedMultiplier = Math.Clamp(speed, 0.5f, 2.0f);
-
-        // Leading silence
-        result.Add(new PhonemeToken("_sil", (int)(6 / speedMultiplier), 0, 0, 0, false, true));
-
-        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        for (int w = 0; w < words.Length; w++)
-        {
-            string word = words[w].Trim();
-            bool hasPeriod = word.EndsWith('.') || word.EndsWith('!') || word.EndsWith('?');
-            bool hasComma = word.EndsWith(',') || word.EndsWith(';');
-
-            string clean = word.TrimEnd('.', ',', '!', '?', ';', ':', '-', '"', '\'').ToLowerInvariant();
-
-            foreach (char c in clean)
+            // =========================================================================
+            // AMERICAN FEMALE VOICES
+            // =========================================================================
+            [KokoroVoice.AfHeart] = new VoiceProfile
             {
-                string key = c.ToString();
-                if (!_phonemeFormants.TryGetValue(key, out var formants))
-                {
-                    key = "a";
-                    formants = _phonemeFormants[key];
-                }
-
-                int dur = (int)(formants[3] / speedMultiplier);
-                bool isVoiced = formants[4] > 0.5f;
-
-                result.Add(new PhonemeToken(key, Math.Max(2, dur), formants[0], formants[1], formants[2], isVoiced, false));
-            }
-
-            // Word boundary gap
-            result.Add(new PhonemeToken("_gap", (int)(4 / speedMultiplier), 0, 0, 0, false, true));
-
-            // Punctuation pauses
-            if (hasComma)
+                Name = "af_heart",
+                DisplayName = "Heart (US Female)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Female,
+                BaseF0 = 215.0f,
+                PitchRange = 45.0f,
+                FormantScale = 1.15f,
+                Breathiness = 0.05f,
+                JitterAmount = 0.007f,
+                ShimmerAmount = 0.035f,
+                OpenQuotient = 0.58f,
+                Warmth = 1.05f,
+                VibratoRate = 5.2f,
+                VibratoDepth = 1.3f,
+                Description = "Warm, melodious, and highly natural American female narrator"
+            },
+            [KokoroVoice.AfBella] = new VoiceProfile
             {
-                result.Add(new PhonemeToken("_comma", (int)(16 / speedMultiplier), 0, 0, 0, false, true));
-            }
-            else if (hasPeriod)
+                Name = "af_bella",
+                DisplayName = "Bella (US Female)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Female,
+                BaseF0 = 230.0f,
+                PitchRange = 55.0f,
+                FormantScale = 1.18f,
+                Breathiness = 0.04f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.030f,
+                OpenQuotient = 0.55f,
+                Warmth = 1.02f,
+                VibratoRate = 5.5f,
+                VibratoDepth = 1.4f,
+                Description = "Bright, clear, and engaging American female voice for conversational UI"
+            },
+            [KokoroVoice.AfSarah] = new VoiceProfile
             {
-                result.Add(new PhonemeToken("_period", (int)(32 / speedMultiplier), 0, 0, 0, false, true));
-            }
-        }
-
-        // Trailing silence
-        result.Add(new PhonemeToken("_sil", (int)(10 / speedMultiplier), 0, 0, 0, false, true));
-        return result;
-    }
-
-    private static float[] InitializeVoiceStyles()
-    {
-        var styles = new float[4 * StyleDim];
-        for (int v = 0; v < 4; v++)
-        {
-            for (int i = 0; i < StyleDim; i++)
+                Name = "af_sarah",
+                DisplayName = "Sarah (US Female)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Female,
+                BaseF0 = 195.0f,
+                PitchRange = 40.0f,
+                FormantScale = 1.12f,
+                Breathiness = 0.06f,
+                JitterAmount = 0.008f,
+                ShimmerAmount = 0.040f,
+                OpenQuotient = 0.60f,
+                Warmth = 1.08f,
+                VibratoRate = 5.0f,
+                VibratoDepth = 1.1f,
+                Description = "Calm, executive, authoritative American female voice with rich chest resonance"
+            },
+            [KokoroVoice.AfSky] = new VoiceProfile
             {
-                styles[v * StyleDim + i] = MathF.Sin((v + 1) * (i + 1) * 0.1f);
+                Name = "af_sky",
+                DisplayName = "Sky (US Female)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Female,
+                BaseF0 = 240.0f,
+                PitchRange = 60.0f,
+                FormantScale = 1.20f,
+                Breathiness = 0.045f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.028f,
+                OpenQuotient = 0.54f,
+                Warmth = 1.00f,
+                VibratoRate = 5.6f,
+                VibratoDepth = 1.5f,
+                Description = "Light, crisp, youthful American female voice with high clarity"
+            },
+
+            // =========================================================================
+            // AMERICAN MALE VOICES
+            // =========================================================================
+            [KokoroVoice.AmAdam] = new VoiceProfile
+            {
+                Name = "am_adam",
+                DisplayName = "Adam (US Male)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Male,
+                BaseF0 = 112.0f,
+                PitchRange = 30.0f,
+                FormantScale = 0.90f,
+                Breathiness = 0.055f,
+                JitterAmount = 0.008f,
+                ShimmerAmount = 0.040f,
+                OpenQuotient = 0.62f,
+                Warmth = 1.12f,
+                VibratoRate = 4.8f,
+                VibratoDepth = 0.9f,
+                Description = "Deep, resonant broadcast baritone American male narrator"
+            },
+            [KokoroVoice.AmMichael] = new VoiceProfile
+            {
+                Name = "am_michael",
+                DisplayName = "Michael (US Male)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Male,
+                BaseF0 = 128.0f,
+                PitchRange = 35.0f,
+                FormantScale = 0.94f,
+                Breathiness = 0.045f,
+                JitterAmount = 0.007f,
+                ShimmerAmount = 0.035f,
+                OpenQuotient = 0.59f,
+                Warmth = 1.06f,
+                VibratoRate = 5.0f,
+                VibratoDepth = 1.0f,
+                Description = "Clear, articulate, engaging American male voice for technology & news"
+            },
+            [KokoroVoice.AmEcho] = new VoiceProfile
+            {
+                Name = "am_echo",
+                DisplayName = "Echo (US Male)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Male,
+                BaseF0 = 142.0f,
+                PitchRange = 42.0f,
+                FormantScale = 0.97f,
+                Breathiness = 0.040f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.030f,
+                OpenQuotient = 0.56f,
+                Warmth = 1.03f,
+                VibratoRate = 5.2f,
+                VibratoDepth = 1.2f,
+                Description = "Dynamic, friendly, youthful American male conversational voice"
+            },
+            [KokoroVoice.AmEric] = new VoiceProfile
+            {
+                Name = "am_eric",
+                DisplayName = "Eric (US Male)",
+                Accent = EnglishAccent.American,
+                Gender = VoiceGender.Male,
+                BaseF0 = 118.0f,
+                PitchRange = 32.0f,
+                FormantScale = 0.92f,
+                Breathiness = 0.060f,
+                JitterAmount = 0.008f,
+                ShimmerAmount = 0.042f,
+                OpenQuotient = 0.61f,
+                Warmth = 1.10f,
+                VibratoRate = 4.9f,
+                VibratoDepth = 0.95f,
+                Description = "Grounded, warm American male storyteller with natural cadence"
+            },
+
+            // =========================================================================
+            // BRITISH FEMALE VOICES
+            // =========================================================================
+            [KokoroVoice.BfEmma] = new VoiceProfile
+            {
+                Name = "bf_emma",
+                DisplayName = "Emma (UK Female)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Female,
+                BaseF0 = 205.0f,
+                PitchRange = 50.0f,
+                FormantScale = 1.14f,
+                Breathiness = 0.045f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.032f,
+                OpenQuotient = 0.57f,
+                Warmth = 1.04f,
+                VibratoRate = 5.3f,
+                VibratoDepth = 1.3f,
+                Description = "Elegant, articulate British female voice with standard Received Pronunciation (RP)"
+            },
+            [KokoroVoice.BfIsabella] = new VoiceProfile
+            {
+                Name = "bf_isabella",
+                DisplayName = "Isabella (UK Female)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Female,
+                BaseF0 = 190.0f,
+                PitchRange = 44.0f,
+                FormantScale = 1.11f,
+                Breathiness = 0.055f,
+                JitterAmount = 0.007f,
+                ShimmerAmount = 0.036f,
+                OpenQuotient = 0.59f,
+                Warmth = 1.07f,
+                VibratoRate = 5.1f,
+                VibratoDepth = 1.15f,
+                Description = "Refined, cultured BBC narrator British female with classic cadence"
+            },
+            [KokoroVoice.BfAlice] = new VoiceProfile
+            {
+                Name = "bf_alice",
+                DisplayName = "Alice (UK Female)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Female,
+                BaseF0 = 218.0f,
+                PitchRange = 52.0f,
+                FormantScale = 1.16f,
+                Breathiness = 0.040f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.030f,
+                OpenQuotient = 0.56f,
+                Warmth = 1.02f,
+                VibratoRate = 5.4f,
+                VibratoDepth = 1.35f,
+                Description = "Gentle, conversational modern London / Southern English female voice"
+            },
+            [KokoroVoice.BfLily] = new VoiceProfile
+            {
+                Name = "bf_lily",
+                DisplayName = "Lily (UK Female)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Female,
+                BaseF0 = 228.0f,
+                PitchRange = 58.0f,
+                FormantScale = 1.18f,
+                Breathiness = 0.042f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.029f,
+                OpenQuotient = 0.55f,
+                Warmth = 1.01f,
+                VibratoRate = 5.5f,
+                VibratoDepth = 1.4f,
+                Description = "Crisp, melodic, contemporary British female voice with bright presence"
+            },
+
+            // =========================================================================
+            // BRITISH MALE VOICES
+            // =========================================================================
+            [KokoroVoice.BmGeorge] = new VoiceProfile
+            {
+                Name = "bm_george",
+                DisplayName = "George (UK Male)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Male,
+                BaseF0 = 104.0f,
+                PitchRange = 28.0f,
+                FormantScale = 0.88f,
+                Breathiness = 0.060f,
+                JitterAmount = 0.008f,
+                ShimmerAmount = 0.042f,
+                OpenQuotient = 0.63f,
+                Warmth = 1.14f,
+                VibratoRate = 4.7f,
+                VibratoDepth = 0.85f,
+                Description = "Authoritative, rich British documentary narrator with prestigious RP accent"
+            },
+            [KokoroVoice.BmLewis] = new VoiceProfile
+            {
+                Name = "bm_lewis",
+                DisplayName = "Lewis (UK Male)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Male,
+                BaseF0 = 122.0f,
+                PitchRange = 34.0f,
+                FormantScale = 0.92f,
+                Breathiness = 0.048f,
+                JitterAmount = 0.007f,
+                ShimmerAmount = 0.036f,
+                OpenQuotient = 0.60f,
+                Warmth = 1.08f,
+                VibratoRate = 5.0f,
+                VibratoDepth = 1.0f,
+                Description = "Warm, articulate British storyteller male with natural conversational inflection"
+            },
+            [KokoroVoice.BmDaniel] = new VoiceProfile
+            {
+                Name = "bm_daniel",
+                DisplayName = "Daniel (UK Male)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Male,
+                BaseF0 = 110.0f,
+                PitchRange = 30.0f,
+                FormantScale = 0.89f,
+                Breathiness = 0.055f,
+                JitterAmount = 0.008f,
+                ShimmerAmount = 0.038f,
+                OpenQuotient = 0.62f,
+                Warmth = 1.12f,
+                VibratoRate = 4.8f,
+                VibratoDepth = 0.9f,
+                Description = "Deep, resonant British classical orator with rich chest timbre"
+            },
+            [KokoroVoice.BmFable] = new VoiceProfile
+            {
+                Name = "bm_fable",
+                DisplayName = "Fable (UK Male)",
+                Accent = EnglishAccent.British,
+                Gender = VoiceGender.Male,
+                BaseF0 = 132.0f,
+                PitchRange = 38.0f,
+                FormantScale = 0.95f,
+                Breathiness = 0.042f,
+                JitterAmount = 0.006f,
+                ShimmerAmount = 0.032f,
+                OpenQuotient = 0.57f,
+                Warmth = 1.04f,
+                VibratoRate = 5.1f,
+                VibratoDepth = 1.1f,
+                Description = "Conversational, modern London gentleman voice with expressive cadence"
             }
-        }
-        return styles;
-    }
-
-    private static Dictionary<string, float[]> InitializePhonemeDictionary()
-    {
-        // Format: [F1 (Hz), F2 (Hz), F3 (Hz), duration (frames), isVoiced (0 or 1)]
-        return new Dictionary<string, float[]>(StringComparer.OrdinalIgnoreCase)
-        {
-            // Vowels
-            ["a"] = new float[] { 800, 1200, 2500, 10, 1.0f },
-            ["e"] = new float[] { 500, 1800, 2600, 9, 1.0f },
-            ["i"] = new float[] { 300, 2300, 3000, 8, 1.0f },
-            ["o"] = new float[] { 500, 900, 2400, 10, 1.0f },
-            ["u"] = new float[] { 350, 800, 2300, 9, 1.0f },
-            ["y"] = new float[] { 320, 2000, 2800, 8, 1.0f },
-
-            // Consonants
-            ["b"] = new float[] { 200, 1100, 2200, 4, 1.0f },
-            ["c"] = new float[] { 350, 1800, 2600, 5, 0.0f },
-            ["d"] = new float[] { 220, 1700, 2600, 4, 1.0f },
-            ["f"] = new float[] { 300, 1500, 2400, 7, 0.0f },
-            ["g"] = new float[] { 250, 1400, 2300, 5, 1.0f },
-            ["h"] = new float[] { 400, 1600, 2500, 6, 0.0f },
-            ["j"] = new float[] { 300, 2100, 2800, 6, 1.0f },
-            ["k"] = new float[] { 300, 1500, 2400, 5, 0.0f },
-            ["l"] = new float[] { 380, 1200, 2700, 7, 1.0f },
-            ["m"] = new float[] { 280, 1000, 2200, 8, 1.0f },
-            ["n"] = new float[] { 280, 1500, 2400, 7, 1.0f },
-            ["p"] = new float[] { 250, 1100, 2200, 4, 0.0f },
-            ["q"] = new float[] { 300, 1400, 2300, 5, 0.0f },
-            ["r"] = new float[] { 420, 1300, 1700, 7, 1.0f },
-            ["s"] = new float[] { 300, 1800, 4500, 8, 0.0f },
-            ["t"] = new float[] { 220, 1700, 3200, 4, 0.0f },
-            ["v"] = new float[] { 280, 1400, 2400, 6, 1.0f },
-            ["w"] = new float[] { 320, 800, 2200, 6, 1.0f },
-            ["x"] = new float[] { 300, 1800, 4000, 7, 0.0f },
-            ["z"] = new float[] { 280, 1700, 4200, 7, 1.0f },
         };
     }
 

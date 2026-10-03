@@ -65,6 +65,13 @@ public sealed class GpuContext : IDisposable
         CuDriver.CtxSetCurrent(_ctx);
     }
 
+    public (ulong FreeBytes, ulong TotalBytes) GetMemoryInfo()
+    {
+        CuDriver.CtxSetCurrent(_ctx);
+        CuDriver.Check(CuDriver.MemGetInfo(out nuint free, out nuint total), "cuMemGetInfo");
+        return ((ulong)free, (ulong)total);
+    }
+
     public IntPtr AllocateDevice(nuint bytes)
     {
         CuDriver.CtxSetCurrent(_ctx);

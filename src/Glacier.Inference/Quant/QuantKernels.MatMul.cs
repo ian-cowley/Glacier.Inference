@@ -82,37 +82,58 @@ public static unsafe partial class QuantKernels
         int threads = Environment.ProcessorCount;
         int sumsStride = nCols / 32;
 
-        if (nRows < threads * 2)
+        bool allocatedSums = false;
+        if (type == GgufType.Q4_K && xSumsBatch == null && nCols >= 32)
         {
-            for (int r = 0; r < nRows; r++)
+            xSumsBatch = (float*)NativeMemory.AlignedAlloc((nuint)(batchSize * sumsStride * sizeof(float)), 64);
+            allocatedSums = true;
+            for (int b = 0; b < batchSize; b++)
             {
-                byte* rowPtr = weightData + (long)r * rowBytes;
-                for (int b = 0; b < batchSize; b++)
-                {
-                    float* x = xBatch + b * nCols;
-                    float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
-                    yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
-                }
+                ComputeBlockSums32(xBatch + b * nCols, xSumsBatch + b * sumsStride, nCols);
             }
-            return;
         }
 
-        int rowsPerThread = (nRows + threads - 1) / threads;
-        Parallel.For(0, threads, t =>
+        try
         {
-            int startRow = t * rowsPerThread;
-            int endRow = Math.Min(startRow + rowsPerThread, nRows);
-            for (int r = startRow; r < endRow; r++)
+            if (nRows < threads * 2)
             {
-                byte* rowPtr = weightData + (long)r * rowBytes;
-                for (int b = 0; b < batchSize; b++)
+                for (int r = 0; r < nRows; r++)
                 {
-                    float* x = xBatch + b * nCols;
-                    float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
-                    yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
+                    byte* rowPtr = weightData + (long)r * rowBytes;
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        float* x = xBatch + b * nCols;
+                        float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
+                        yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
+                    }
                 }
+                return;
             }
-        });
+
+            int rowsPerThread = (nRows + threads - 1) / threads;
+            Parallel.For(0, threads, t =>
+            {
+                int startRow = t * rowsPerThread;
+                int endRow = Math.Min(startRow + rowsPerThread, nRows);
+                for (int r = startRow; r < endRow; r++)
+                {
+                    byte* rowPtr = weightData + (long)r * rowBytes;
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        float* x = xBatch + b * nCols;
+                        float* xSums = xSumsBatch != null ? xSumsBatch + b * sumsStride : null;
+                        yBatch[b * nRows + r] = ComputeDot(type, rowPtr, x, xSums, nCols);
+                    }
+                }
+            });
+        }
+        finally
+        {
+            if (allocatedSums && xSumsBatch != null)
+            {
+                NativeMemory.AlignedFree(xSumsBatch);
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

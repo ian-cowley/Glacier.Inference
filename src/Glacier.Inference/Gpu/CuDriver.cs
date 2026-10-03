@@ -63,6 +63,9 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuDeviceTotalMem_v2")]
     public static extern int DeviceTotalMem(out nuint bytes, int dev);
 
+    [DllImport(CudaLib, EntryPoint = "cuMemGetInfo_v2")]
+    public static extern int MemGetInfo(out nuint free, out nuint total);
+
     [DllImport(CudaLib, EntryPoint = "cuCtxCreate_v2")]
     public static extern int CtxCreate(out IntPtr pctx, uint flags, int dev);
 
@@ -83,6 +86,9 @@ public static class CuDriver
 
     [DllImport(CudaLib, EntryPoint = "cuModuleLoadData")]
     public static extern int ModuleLoadData(out IntPtr module, byte[] image);
+
+    [DllImport(CudaLib, EntryPoint = "cuModuleUnload")]
+    public static extern int ModuleUnload(IntPtr hmod);
 
     [DllImport(CudaLib, EntryPoint = "cuModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);

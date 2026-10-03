@@ -157,4 +157,101 @@ public class AudioTests
         Assert.Contains("Understood", responseText);
         Assert.True(responseAudio.Length > 20000, "Response audio must be synthesized");
     }
+
+    [Fact]
+    public void KokoroTtsEngine_ValidatesAll16VoiceProfiles()
+    {
+        using var tts = new KokoroTtsEngine();
+        var profiles = tts.VoiceProfiles;
+
+        Assert.Equal(16, profiles.Count);
+
+        int usaCount = 0, ukCount = 0, femaleCount = 0, maleCount = 0;
+
+        foreach (var kvp in profiles)
+        {
+            var p = kvp.Value;
+            Assert.NotEmpty(p.Name);
+            Assert.NotEmpty(p.DisplayName);
+            Assert.NotEmpty(p.Description);
+            Assert.InRange(p.BaseF0, 95.0f, 260.0f);
+            Assert.InRange(p.FormantScale, 0.80f, 1.30f);
+
+            if (p.Accent == EnglishAccent.American) usaCount++;
+            else if (p.Accent == EnglishAccent.British) ukCount++;
+
+            if (p.Gender == VoiceGender.Female) femaleCount++;
+            else if (p.Gender == VoiceGender.Male) maleCount++;
+        }
+
+        Assert.Equal(8, usaCount);
+        Assert.Equal(8, ukCount);
+        Assert.Equal(8, femaleCount);
+        Assert.Equal(8, maleCount);
+    }
+
+    [Fact]
+    public void PhonemeEngine_DifferentiatesAmericanAndBritishAccents()
+    {
+        var usTokens = PhonemeEngine.ConvertTextToTokens("Glacier water after path", EnglishAccent.American, 200f);
+        var ukTokens = PhonemeEngine.ConvertTextToTokens("Glacier water after path", EnglishAccent.British, 200f);
+
+        Assert.NotEmpty(usTokens);
+        Assert.NotEmpty(ukTokens);
+
+        // American tokens have rhotic R_US or FLAP; British tokens have non-rhotic schwa AX or British R_UK
+        bool usHasRhotic = usTokens.Any(t => t.Spec.Symbol == "R_US" || t.Spec.Symbol == "FLAP");
+        bool ukHasBritishPhonemes = ukTokens.Any(t => t.Spec.Symbol == "AO_UK" || t.Spec.Symbol == "R_UK" || t.Spec.Symbol == "AA");
+
+        Assert.True(usHasRhotic, "American dialect must contain rhotic /r/ or flap /ɾ/");
+        Assert.True(ukHasBritishPhonemes, "British dialect must contain RP broad vowels or British R");
+    }
+
+    [Fact]
+    public void KokoroTtsEngine_SpeedScalingAdjustsDuration()
+    {
+        using var tts = new KokoroTtsEngine();
+        string phrase = "High performance voice inference with Glacier.";
+
+        float[] fast = tts.Synthesize(phrase, KokoroVoice.AfHeart, speed: 1.5f);
+        float[] normal = tts.Synthesize(phrase, KokoroVoice.AfHeart, speed: 1.0f);
+        float[] slow = tts.Synthesize(phrase, KokoroVoice.AfHeart, speed: 0.75f);
+
+        Assert.True(fast.Length < normal.Length, "Fast speech must be shorter than normal");
+        Assert.True(normal.Length < slow.Length, "Normal speech must be shorter than slow");
+    }
+
+    [Fact]
+    public void KokoroTtsEngine_ProducesCleanAudioMetricsWithoutDCBiasOrClipping()
+    {
+        using var tts = new KokoroTtsEngine();
+        string text = "Acoustic physics and physical vocal tract simulation.";
+
+        float[] samples = tts.Synthesize(text, KokoroVoice.AmAdam);
+        Assert.NotEmpty(samples);
+
+        float peak = 0.0f;
+        double sum = 0.0;
+        double sumSq = 0.0;
+
+        for (int i = 0; i < samples.Length; i++)
+        {
+            float s = samples[i];
+            float abs = MathF.Abs(s);
+            if (abs > peak) peak = abs;
+            sum += s;
+            sumSq += s * s;
+
+            // Zero digital clipping
+            Assert.True(abs <= 1.0f, $"Sample {i} clipped at {s}");
+        }
+
+        float dcOffset = (float)(sum / samples.Length);
+        float rms = MathF.Sqrt((float)(sumSq / samples.Length));
+
+        // Verify zero DC bias (<0.05) and healthy vocal RMS (>0.05)
+        Assert.True(MathF.Abs(dcOffset) < 0.05f, $"DC offset too high: {dcOffset}");
+        Assert.True(rms > 0.05f, $"Signal energy too low: RMS={rms}");
+        Assert.True(peak > 0.3f, $"Signal peak too quiet: Peak={peak}");
+    }
 }

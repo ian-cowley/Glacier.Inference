@@ -644,5 +644,70 @@ __global__ void attention_causal_gqa_train_bwd_dk_dv(
     dv[kv_offset] = acc_dv;
 }
 
+// =========================================================================
+// 12. Bidirectional Full Multi-Head Self-Attention for Diffusion Transformers (FLUX.1 / SD3)
+// Grid: blockIdx.x = h (0..n_heads - 1), blockIdx.y = b (0..num_tokens - 1)
+// Block: 128 threads (threadIdx.x = d in 0..head_dim - 1)
+// Online register-tracked FlashAttention-2: O(1) extra memory, zero global DRAM write-backs
+// =========================================================================
+__global__ void attention_bidirectional_batch(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ attn_out,
+    int n_heads,
+    int head_dim,
+    int num_tokens,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads || b >= num_tokens) return;
+
+    int tid = threadIdx.x; // 0..127
+    size_t q_offset = (size_t)b * n_heads * head_dim + h * head_dim + tid;
+    float q_d = q[q_offset];
+
+    __shared__ float s_warp_sum[4];
+
+    // Online softmax tracking in registers (FlashAttention-2)
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (int t = 0; t < num_tokens; t++) {
+        size_t kv_offset = (size_t)t * n_heads * head_dim + h * head_dim + tid;
+        float k_d = k[kv_offset];
+        float v_d = v[kv_offset];
+
+        float prod = q_d * k_d;
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
+        __syncthreads();
+    }
+
+    size_t out_offset = (size_t)b * n_heads * head_dim + h * head_dim + tid;
+    attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
+}
+
 } // extern "C"
+
 

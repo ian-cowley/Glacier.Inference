@@ -81,10 +81,16 @@ public static class Program
 
     private static bool HasHelpFlag(string[] args)
     {
-        foreach (var a in args)
+        for (int i = 0; i < args.Length; i++)
         {
-            if (a is "-h" or "--help" or "help" or "/?" or "-?")
+            var a = args[i];
+            if (a is "--help" or "help" or "/?" or "-?") return true;
+            if (a == "-h")
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out _))
+                    continue;
                 return true;
+            }
         }
         return false;
     }
@@ -181,12 +187,22 @@ public static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  glacier image demo [--out <file.png>]");
         Console.WriteLine("  glacier image info <model.gguf>");
-        Console.WriteLine("  glacier image generate \"<prompt>\" [-m <model.gguf>] [--vae <vae.gguf>] [--steps <n>] [--out <file.png>] [--width <px>] [--height <px>] [--seed <int>]");
+        Console.WriteLine("  glacier image generate \"<prompt>\" [options]");
         Console.WriteLine();
-        Console.WriteLine("Commands:");
-        Console.WriteLine("  demo                                 Execute end-to-end 4-step Flow Matching DiT generation");
-        Console.WriteLine("  info <model.gguf>                    Inspect Diffusion GGUF model topology, layers & parameters");
-        Console.WriteLine("  generate \"<prompt>\" [options]        Generate standard 24-bit PNG/BMP from text prompt (supports pre-trained GGUFs)");
+        Console.WriteLine("Options (for 'generate'):");
+        Console.WriteLine("  -m, --model <file.gguf>              Path to Flux/SD DiT GGUF (auto-detected if in models/)");
+        Console.WriteLine("  --vae <file.safetensors|gguf>        Path to VAE decoder (default: models/ae.safetensors)");
+        Console.WriteLine("  --clip <file.safetensors>            Path to CLIP-L text encoder (default: models/clip_l.safetensors)");
+        Console.WriteLine("  --t5 <file.gguf>                     Path to T5-XXL text encoder (default: models/t5xxl.gguf)");
+        Console.WriteLine("  -w, --width <px>                     Output width in pixels (default: 512, multiple of 16)");
+        Console.WriteLine("  -h, --height <px>                    Output height in pixels (default: 512, multiple of 16)");
+        Console.WriteLine("  -s, --steps <count>                  Euler ODE flow matching steps (default: 4 for schnell)");
+        Console.WriteLine("  --seed <int>                         PRNG seed for reproducible latents (default: random)");
+        Console.WriteLine("  -o, --out <file.png>                 Destination PNG or BMP image file (default: generated.png)");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  dotnet run --project Glacier.Inference/src/Glacier.Inference.Cli -- image generate \"a futuristic neon metropolis\" -o city.png");
+        Console.WriteLine("  dotnet run --project Glacier.Inference/src/Glacier.Inference.Cli -- image generate \"a close up portrait of an astronaut\" -w 512 -h 512 -s 4 --seed 42 -o astronaut.png");
     }
 
 
@@ -197,9 +213,16 @@ public static class Program
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <af_heart|am_adam|bf_emma|bm_george>] [--speed <float>] [--play]");
-        Console.WriteLine("  glacier voice stt <audio.wav>");
-        Console.WriteLine("  glacier voice demo [--play]");
+        Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <id>] [--speed <float>] [--play]");
+        Console.WriteLine("  glacier voice voices                                 # List all 16 USA & UK voices");
+        Console.WriteLine("  glacier voice stt <audio.wav>                        # Transcribe speech with Whisper");
+        Console.WriteLine("  glacier voice demo [--play]                          # Run full-duplex multi-accent demonstration");
+        Console.WriteLine();
+        Console.WriteLine("Supported Voices (USA & British Accents):");
+        Console.WriteLine("  USA Female:     af_heart, af_bella, af_sarah, af_sky");
+        Console.WriteLine("  USA Male:       am_adam, am_michael, am_echo, am_eric");
+        Console.WriteLine("  British Female: bf_emma, bf_isabella, bf_alice, bf_lily");
+        Console.WriteLine("  British Male:   bm_george, bm_lewis, bm_daniel, bm_fable");
     }
 
     private static void PrintVisionHelp()
@@ -1397,23 +1420,36 @@ public static class Program
     {
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
-            Console.WriteLine("Glacier Voice Subsystem (Kokoro TTS + Whisper STT)");
-            Console.WriteLine();
-            Console.WriteLine("Usage:");
-            Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <af_heart|am_adam|bf_emma|bm_george>] [--speed <float>]");
-            Console.WriteLine("  glacier voice stt <audio.wav>");
-            Console.WriteLine("  glacier voice demo");
-            Console.WriteLine();
-            Console.WriteLine("Examples:");
-            Console.WriteLine("  glacier voice tts \"Hello from Glacier inference\" --out speech.wav --voice af_heart");
-            Console.WriteLine("  glacier voice stt speech.wav");
-            Console.WriteLine("  glacier voice demo");
+            PrintVoiceHelp();
             return 0;
         }
 
         string subCmd = args[0].ToLowerInvariant();
 
-        if (subCmd == "tts")
+        if (subCmd is "voices" or "list")
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("=========================================================================================================");
+            Console.WriteLine("                     GLACIER.INFERENCE: KOKORO TTS VOICE ROSTER (USA & BRITISH)                          ");
+            Console.WriteLine("=========================================================================================================");
+            Console.ResetColor();
+            Console.WriteLine($"{"Voice ID",-14} | {"Display Name",-22} | {"Accent",-10} | {"Gender",-8} | {"Base F0",-8} | {"Description",-32}");
+            Console.WriteLine(new string('-', 105));
+
+            using var tts = new KokoroTtsEngine();
+            foreach (var kvp in tts.VoiceProfiles)
+            {
+                var p = kvp.Value;
+                string accentStr = p.Accent == EnglishAccent.American ? "USA" : "British";
+                string genderStr = p.Gender == VoiceGender.Female ? "Female" : "Male";
+                Console.WriteLine($"{p.Name,-14} | {p.DisplayName,-22} | {accentStr,-10} | {genderStr,-8} | {$"{p.BaseF0:F0} Hz",-8} | {p.Description}");
+            }
+            Console.WriteLine(new string('-', 105));
+            Console.WriteLine();
+            Console.WriteLine("Usage: glacier voice tts \"<text>\" --voice <id> --out <speech.wav>");
+            return 0;
+        }
+        else if (subCmd == "tts")
         {
             if (args.Length < 2)
             {
@@ -1442,9 +1478,30 @@ public static class Program
                     string v = args[++i].ToLowerInvariant();
                     voice = v switch
                     {
+                        // USA Female
+                        "af_heart" or "heart" => KokoroVoice.AfHeart,
+                        "af_bella" or "bella" => KokoroVoice.AfBella,
+                        "af_sarah" or "sarah" => KokoroVoice.AfSarah,
+                        "af_sky" or "sky" => KokoroVoice.AfSky,
+
+                        // USA Male
                         "am_adam" or "adam" => KokoroVoice.AmAdam,
+                        "am_michael" or "michael" => KokoroVoice.AmMichael,
+                        "am_echo" or "echo" => KokoroVoice.AmEcho,
+                        "am_eric" or "eric" => KokoroVoice.AmEric,
+
+                        // British Female
                         "bf_emma" or "emma" => KokoroVoice.BfEmma,
+                        "bf_isabella" or "isabella" => KokoroVoice.BfIsabella,
+                        "bf_alice" or "alice" => KokoroVoice.BfAlice,
+                        "bf_lily" or "lily" => KokoroVoice.BfLily,
+
+                        // British Male
                         "bm_george" or "george" => KokoroVoice.BmGeorge,
+                        "bm_lewis" or "lewis" => KokoroVoice.BmLewis,
+                        "bm_daniel" or "daniel" => KokoroVoice.BmDaniel,
+                        "bm_fable" or "fable" => KokoroVoice.BmFable,
+
                         _ => KokoroVoice.AfHeart
                     };
                 }
@@ -1454,10 +1511,14 @@ public static class Program
                 }
             }
 
-            Console.WriteLine($"[Kokoro-82M TTS] Synthesizing '{text}' (Voice: {voice}, Speed: {speed:F2}x)...");
-            var sw = Stopwatch.StartNew();
-
             using var tts = new KokoroTtsEngine();
+            var profile = tts.GetVoiceProfile(voice);
+
+            Console.WriteLine($"[Kokoro TTS] Synthesizing '{text}'");
+            Console.WriteLine($"   Voice:       {profile.DisplayName} ({profile.Accent}, {profile.Gender}, {profile.BaseF0:F0}Hz)");
+            Console.WriteLine($"   Cadence:     {speed:F2}x Speed");
+
+            var sw = Stopwatch.StartNew();
             float[] samples = tts.Synthesize(text, voice, speed);
             sw.Stop();
 
@@ -1495,7 +1556,6 @@ public static class Program
             Console.WriteLine($"[Whisper STT] Ingesting '{wavPath}'...");
             var sw = Stopwatch.StartNew();
 
-            // Load WAV and extract float samples
             byte[] wavBytes = File.ReadAllBytes(wavPath);
             int dataOffset = 44;
             int numSamples = (wavBytes.Length - dataOffset) / 2;
@@ -1534,9 +1594,9 @@ public static class Program
             using var pipeline = new VoicePipeline();
             var sw = Stopwatch.StartNew();
 
-            // Step 1: Synthesize prompt using Kokoro
+            // Step 1: Synthesize prompt using Kokoro (US Female)
             string testPrompt = "Hello world from Glacier high performance audio.";
-            Console.WriteLine($"[1. Kokoro-82M TTS] Generating audio for prompt: \"{testPrompt}\"");
+            Console.WriteLine($"[1. Kokoro TTS] Generating audio for prompt: \"{testPrompt}\" (Voice: AfHeart - US Female)");
             var ttsSw = Stopwatch.StartNew();
             float[] generatedSpeech = pipeline.Speak(testPrompt, KokoroVoice.AfHeart);
             ttsSw.Stop();
@@ -1554,8 +1614,26 @@ public static class Program
             }
             Console.WriteLine();
 
-            // Step 2: Extract Log-Mel Spectrogram using Pure C# SIMD DSP
-            Console.WriteLine("[2. Pure C# SIMD Audio DSP] Computing 80-bin Log-Mel Spectrogram (Cooley-Tukey Radix-2 FFT)...");
+            // Step 2: Multi-Accent Showcase (USA vs British English)
+            Console.WriteLine("[2. Multi-Accent Showcase] Synthesizing American & British Voice Profiles...");
+            var showcaseVoices = new (KokoroVoice Voice, string OutFile)[]
+            {
+                (KokoroVoice.AmAdam, "demo_voice_us_male.wav"),
+                (KokoroVoice.BfEmma, "demo_voice_uk_female.wav"),
+                (KokoroVoice.BmGeorge, "demo_voice_uk_male.wav")
+            };
+
+            foreach (var (v, outF) in showcaseVoices)
+            {
+                var prof = pipeline.Tts.GetVoiceProfile(v);
+                float[] audio = pipeline.Speak(testPrompt, v);
+                WavWriter.WritePcm16(outF, audio, pipeline.Tts.SampleRate, 1);
+                Console.WriteLine($"   - {prof.DisplayName,-22} ({prof.Accent}, {prof.Gender}): {audio.Length / 24000f:F2}s -> '{outF}'");
+            }
+            Console.WriteLine();
+
+            // Step 3: Extract Log-Mel Spectrogram using Pure C# SIMD DSP
+            Console.WriteLine("[3. Pure C# SIMD Audio DSP] Computing 80-bin Log-Mel Spectrogram (Cooley-Tukey Radix-2 FFT)...");
             var dspSw = Stopwatch.StartNew();
             using var mel = new MelSpectrogram(16000, 80);
             int nFrames = (generatedSpeech.Length - mel.WinLength) / mel.HopLength + 1;
@@ -1565,8 +1643,8 @@ public static class Program
             Console.WriteLine($"   -> Extracted {nFrames} frames ({mel.NMels}x{nFrames} tensor) in {dspSw.ElapsedMilliseconds}ms ({nFrames * 1000L / Math.Max(1, dspSw.ElapsedMilliseconds):N0} frames/sec)");
             Console.WriteLine();
 
-            // Step 3: Transcribe Speech using Whisper STT Engine
-            Console.WriteLine("[3. Whisper STT] Transcribing audio via Encoder-Decoder Cross-Attention...");
+            // Step 4: Transcribe Speech using Whisper STT Engine
+            Console.WriteLine("[4. Whisper STT] Transcribing audio via Encoder-Decoder Cross-Attention...");
             var sttSw = Stopwatch.StartNew();
             string transcript = pipeline.Listen(generatedSpeech);
             sttSw.Stop();
@@ -1575,8 +1653,8 @@ public static class Program
             Console.ResetColor();
             Console.WriteLine();
 
-            // Step 4: Full-Duplex Conversational Turn
-            Console.WriteLine("[4. Full-Duplex Conversational Turn] Testing Live Conversation Cycle...");
+            // Step 5: Full-Duplex Conversational Turn
+            Console.WriteLine("[5. Full-Duplex Conversational Turn] Testing Live Conversation Cycle...");
             var (userIn, agentResp, respAudio) = pipeline.ConversationalTurn(
                 generatedSpeech,
                 input => $"Glacier Voice Agent received: '{input}'. Synthesizing instant speech response.",
@@ -2020,6 +2098,8 @@ public static class Program
             string outPath = "generated.png";
             string? modelPath = null;
             string? vaePath = null;
+            string? clipPath = null;
+            string? t5Path = null;
             int? steps = null;
             int? width = null;
             int? height = null;
@@ -2030,28 +2110,76 @@ public static class Program
                 if (args[i] is "--out" or "-o" && i + 1 < args.Length) outPath = args[++i];
                 else if (args[i] is "--model" or "-m" && i + 1 < args.Length) modelPath = args[++i];
                 else if (args[i] is "--vae" && i + 1 < args.Length) vaePath = args[++i];
+                else if (args[i] is "--clip" && i + 1 < args.Length) clipPath = args[++i];
+                else if (args[i] is "--t5" && i + 1 < args.Length) t5Path = args[++i];
                 else if (args[i] is "--steps" or "-s" && i + 1 < args.Length && int.TryParse(args[++i], out var st)) steps = st;
                 else if (args[i] is "--width" or "-w" && i + 1 < args.Length && int.TryParse(args[++i], out var w)) width = w;
                 else if (args[i] is "--height" or "-h" && i + 1 < args.Length && int.TryParse(args[++i], out var h)) height = h;
                 else if (args[i] is "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out var sd)) seed = sd;
             }
 
-            if (!string.IsNullOrEmpty(modelPath))
+            // Auto-detect default model paths if not explicitly provided
+            string FindFile(string filename)
+            {
+                string[] candidates = [
+                    filename,
+                    Path.Combine("models", filename),
+                    Path.Combine("Glacier.Inference", "models", filename),
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", filename),
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "models", filename)
+                ];
+                foreach (var c in candidates)
+                {
+                    if (File.Exists(c)) return Path.GetFullPath(c);
+                }
+                return string.Empty;
+            }
+
+            if (string.IsNullOrEmpty(modelPath))
+            {
+                string foundModel = FindFile("flux1-schnell-Q4_K_S.gguf");
+                if (!string.IsNullOrEmpty(foundModel)) modelPath = foundModel;
+            }
+
+            if (string.IsNullOrEmpty(vaePath))
+            {
+                string foundVae = FindFile("ae.safetensors");
+                if (!string.IsNullOrEmpty(foundVae)) vaePath = foundVae;
+            }
+
+            if (string.IsNullOrEmpty(clipPath))
+            {
+                string foundClip = FindFile("clip_l.safetensors");
+                if (!string.IsNullOrEmpty(foundClip)) clipPath = foundClip;
+            }
+
+            if (string.IsNullOrEmpty(t5Path))
+            {
+                string foundT5 = FindFile("t5xxl.gguf");
+                if (!string.IsNullOrEmpty(foundT5)) t5Path = foundT5;
+            }
+
+            if (!string.IsNullOrEmpty(modelPath) && File.Exists(modelPath))
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine($"[Glacier Image] Loading pre-trained Diffusion GGUF: {Path.GetFileName(modelPath)}...");
                 Console.ResetColor();
 
                 using var model = DiffusionGgufModel.Open(modelPath);
-                DiffusionGgufModel? vae = !string.IsNullOrEmpty(vaePath) ? DiffusionGgufModel.Open(vaePath) : null;
-                using var pipeline = new DiffusionGgufPipeline(model, vae);
+                string? safetensorsVae = (vaePath?.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) == true) ? vaePath : null;
+                DiffusionGgufModel? vaeGguf = (!string.IsNullOrEmpty(vaePath) && !vaePath.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)) ? DiffusionGgufModel.Open(vaePath) : null;
+                using var pipeline = new DiffusionGgufPipeline(model, vaeGguf, safetensorsVae, clipPath, t5Path);
 
-                int w = width ?? model.RecommendedResolution;
-                int h = height ?? model.RecommendedResolution;
-                int s = steps ?? model.RecommendedSteps;
+                int w = width ?? 512;
+                int h = height ?? 512;
+                int s = steps ?? (model.RecommendedSteps > 0 ? model.RecommendedSteps : 4);
 
                 Console.WriteLine($"   Architecture: {model.DiffusionArch} | Scheduler: {model.RecommendedSchedule} | {w}x{h} ({s} steps)");
-                Console.WriteLine($"   Executing reverse diffusion trajectory on NVIDIA RTX 4060...");
+                Console.WriteLine($"   VAE Decoder:  {(pipeline.NeuralVae != null ? "Active Neural Flux VAE (244 convolutional ResNet/Attn layers)" : "Calibrated Latent VAE")}");
+                Console.WriteLine($"   CLIP Encoder: {(pipeline.Model != null && !string.IsNullOrEmpty(clipPath) ? "Active CLIP ViT-L/14" : "None")}");
+                Console.WriteLine($"   T5 Encoder:   {(pipeline.T5Encoder != null ? "Active T5-XXL GGUF" : "None")}");
+                Console.WriteLine($"   Seed:         {(seed.HasValue ? seed.Value.ToString() : "Random")}");
+                Console.WriteLine($"   Executing reverse diffusion trajectory on GPU...");
 
                 var res = pipeline.Generate(prompt, width: w, height: h, numSteps: s, seed: seed);
                 SaveImage(outPath, res.RgbPixels, res.Width, res.Height);
@@ -2069,7 +2197,7 @@ public static class Program
                 int h = height ?? 256;
                 int s = steps ?? 4;
 
-                Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({w}x{h}, {s} steps)...");
+                Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({w}x{h}, {s} steps) via synthetic DiT...");
                 using var pipeline = new ImageGenerationPipeline();
                 var res = pipeline.Generate(prompt, w, h, s, seed);
 
