@@ -254,53 +254,12 @@ public static class PromptSemanticSynthesizer
                 }
                 else if (isCyberpunk)
                 {
-                    // =========================================================
-                    // DOMAIN: CYBERPUNK METROPOLIS AT NIGHT
-                    // =========================================================
-                    float buildingMod = (wxMid * 11.0f) % 1.0f;
-                    float buildingHeight = 0.20f + MathF.Sin(wxMid * 19.0f) * 0.15f + MathF.Cos(wxMid * 7.0f) * 0.12f;
-                    bool isBuilding = (wy > buildingHeight && wy < 0.65f) && (buildingMod > 0.08f);
-
-                    if (isBuilding)
-                    {
-                        lum = 0.22f;
-                        // Glowing window grid
-                        bool window = ((x % 3 == 0) && (y % 4 == 0) && wy > 0.30f);
-                        if (window)
-                        {
-                            lum += 0.55f;
-                            ch3_amber += 0.70f;
-                        }
-
-                        // Neon billboard signs
-                        if (nx > 0.35f && nx < 0.55f && wy > 0.35f && wy < 0.45f)
-                        {
-                            ch2_magenta += 1.4f;
-                            lum += 0.4f;
-                        }
-                        if (nx > 0.65f && nx < 0.82f && wy > 0.28f && wy < 0.36f)
-                        {
-                            ch1_cyan += 1.3f;
-                            lum += 0.4f;
-                        }
-                    }
-                    else if (wy < 0.65f)
-                    {
-                        // Sky & atmospheric smog
-                        lum = 0.04f + (1.0f - wy / 0.65f) * 0.06f;
-                        ch6_mist = 0.45f;
-                        if (MathF.Abs(wy - 0.22f) < 0.015f) ch1_cyan += 0.8f;
-                        if (MathF.Abs(wy - 0.38f - nx * 0.1f) < 0.012f) ch2_magenta += 0.9f;
-                    }
-
-                    if (wy >= 0.65f)
-                    {
-                        lum = 0.15f + (wy - 0.65f) * 0.18f;
-                        if (nx > 0.32f && nx < 0.58f) ch2_magenta += 0.85f * MathF.Exp(-(wy - 0.65f) * 2.5f);
-                        if (nx > 0.62f && nx < 0.85f) ch1_cyan += 0.80f * MathF.Exp(-(wy - 0.65f) * 2.5f);
-                        if (MathF.Abs(cx) < 0.20f) ch3_amber += 0.75f;
-                        if ((x % 7 == 0) && (y % 5 == 0)) ch5_specular = 0.65f;
-                    }
+                    // Ambient night city illumination (smooth, zero procedural grid or billboard boxes)
+                    float skyT = Math.Clamp(wy / 0.65f, 0f, 1f);
+                    lum = 0.08f + skyT * 0.12f;
+                    ch1_cyan = 0.15f * (1.0f - skyT);
+                    ch2_magenta = 0.12f * (1.0f - skyT);
+                    ch6_mist = 0.20f;
                 }
                 else if (isNature)
                 {

@@ -40,6 +40,7 @@ public sealed class DiffusionGgufModel : IDisposable
     {
         UniversalArchitecture.Flux => "FlowMatching",
         UniversalArchitecture.SD3 => "FlowMatching",
+        UniversalArchitecture.Wan => "FlowMatching",
         _ => "EulerA"
     };
 
@@ -47,6 +48,7 @@ public sealed class DiffusionGgufModel : IDisposable
     {
         UniversalArchitecture.Flux when _modelName.Contains("schnell", StringComparison.OrdinalIgnoreCase) => 4,
         UniversalArchitecture.Flux => 20,
+        UniversalArchitecture.Wan => 20,
         UniversalArchitecture.StableDiffusion when _modelName.Contains("turbo", StringComparison.OrdinalIgnoreCase) => 4,
         UniversalArchitecture.StableDiffusion when _modelName.Contains("lightning", StringComparison.OrdinalIgnoreCase) => 4,
         UniversalArchitecture.SD3 => 28,
@@ -57,6 +59,7 @@ public sealed class DiffusionGgufModel : IDisposable
     {
         UniversalArchitecture.Flux => 1024,
         UniversalArchitecture.SD3 => 1024,
+        UniversalArchitecture.Wan => 512,
         UniversalArchitecture.StableDiffusion when _modelName.Contains("xl", StringComparison.OrdinalIgnoreCase) => 1024,
         _ => 512
     };
@@ -96,6 +99,10 @@ public sealed class DiffusionGgufModel : IDisposable
         {
             _hiddenDim = 1536; // SD3 hidden dim
         }
+        else if (_diffusionArch == UniversalArchitecture.Wan)
+        {
+            _hiddenDim = 1536; // Wan 1.3B hidden dim
+        }
         else
         {
             _hiddenDim = 1280; // SDXL hidden dim
@@ -106,6 +113,7 @@ public sealed class DiffusionGgufModel : IDisposable
         {
             UniversalArchitecture.Flux => 16,
             UniversalArchitecture.SD3 => 16,
+            UniversalArchitecture.Wan => 16,
             _ => 4
         };
 
@@ -113,6 +121,7 @@ public sealed class DiffusionGgufModel : IDisposable
         {
             UniversalArchitecture.Flux => 2,
             UniversalArchitecture.SD3 => 2,
+            UniversalArchitecture.Wan => 2,
             _ => 1
         };
 

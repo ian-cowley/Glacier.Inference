@@ -64,6 +64,11 @@ public enum UniversalArchitecture
     SD3,
 
     /// <summary>
+    /// Wan2.1 video diffusion transformer architecture (1.3B / 14B) with 3D patch embedding and spatio-temporal self &amp; cross attention.
+    /// </summary>
+    Wan,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -100,6 +105,13 @@ public static class ModelArchitectureDetector
                                       gguf.Tensors.ContainsKey("model.diffusion_model.joint_blocks.0.x_block.attn.qkv.weight"))))
         {
             return UniversalArchitecture.SD3;
+        }
+
+        if (string.Equals(arch, "wan", StringComparison.OrdinalIgnoreCase) ||
+            (gguf?.Tensors != null && (gguf.Tensors.ContainsKey("blocks.0.cross_attn.k.weight") ||
+                                      gguf.Tensors.ContainsKey("patch_embedding.weight"))))
+        {
+            return UniversalArchitecture.Wan;
         }
 
         if (string.Equals(arch, "sd1", StringComparison.OrdinalIgnoreCase) ||

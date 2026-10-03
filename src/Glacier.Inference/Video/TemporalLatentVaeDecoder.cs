@@ -3,26 +3,31 @@ namespace Glacier.Inference.Video;
 using System;
 using System.Collections.Generic;
 using Glacier.Inference.Image;
+using Glacier.Inference.Image.Flux;
 
 /// <summary>
 /// 3D Spatio-Temporal Variational Autoencoder (VAE) Decoder.
 /// Reconstructs full-resolution RGB video frame sequences from 4D spatio-temporal latents
 /// [T_lat, C, H_lat, W_lat] through Catmull-Rom cubic temporal spline upsampling and
-/// 8x progressive spatial deconvolution in pure C# .NET 10.
+/// 8x progressive spatial deconvolution or pure CUDA neural VAE (ae.safetensors) in pure C# .NET 10.
 /// </summary>
-public sealed class TemporalLatentVaeDecoder
+public sealed class TemporalLatentVaeDecoder : IDisposable
 {
     public const int DefaultLatentChannels = 16;
     public const int SpatialScaleFactor = 8; // 8x spatial expansion (32x32 -> 256x256)
 
     private readonly LatentVaeDecoder _spatialDecoder;
+    private readonly FluxVaeDecoder? _neuralDecoder;
     private readonly int _latentChannels;
+    private bool _disposed;
 
     public int LatentChannels => _latentChannels;
+    public bool HasNeuralVae => _neuralDecoder != null;
 
-    public TemporalLatentVaeDecoder(int latentChannels = DefaultLatentChannels)
+    public TemporalLatentVaeDecoder(int latentChannels = DefaultLatentChannels, FluxVaeDecoder? neuralDecoder = null)
     {
         _latentChannels = latentChannels;
+        _neuralDecoder = neuralDecoder;
         _spatialDecoder = new LatentVaeDecoder(latentChannels);
     }
 
@@ -95,7 +100,14 @@ public sealed class TemporalLatentVaeDecoder
 
             // Spatial progressive decode of interpolated latent frame to RGB
             byte[] frameBytes = new byte[frameRgbBytes];
-            _spatialDecoder.Decode(interpolatedLatent, latentH, latentW, frameBytes);
+            if (_neuralDecoder != null)
+            {
+                _neuralDecoder.Decode(interpolatedLatent, latentH, latentW, frameBytes);
+            }
+            else
+            {
+                _spatialDecoder.Decode(interpolatedLatent, latentH, latentW, frameBytes);
+            }
 
             // Optional temporal anti-flicker smoothing against previous frame
             if (frames.Count > 0)
@@ -113,5 +125,15 @@ public sealed class TemporalLatentVaeDecoder
         }
 
         return frames;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            _disposed = true;
+            _neuralDecoder?.Dispose();
+            _spatialDecoder.Dispose();
+        }
     }
 }

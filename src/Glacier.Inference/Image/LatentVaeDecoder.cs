@@ -23,65 +23,65 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
         _latentChannels = latentChannels;
         _colorWeights = new float[3 * _latentChannels];
 
-        // Full-spectrum photographic latent to RGB projection:
-        // Ch 0: Core structural luminance (clean achromatic tone curve)
-        _colorWeights[0 * _latentChannels + 0] = 0.82f;
-        _colorWeights[1 * _latentChannels + 0] = 0.82f;
-        _colorWeights[2 * _latentChannels + 0] = 0.82f;
+        // Direct photographic latent-to-RGB projection:
+        // Ch 0: Primary Red channel
+        _colorWeights[0 * _latentChannels + 0] = 0.95f;
+        _colorWeights[1 * _latentChannels + 0] = 0.00f;
+        _colorWeights[2 * _latentChannels + 0] = 0.00f;
 
-        // Ch 1: Cyan / Aqua / Glacial Blue / Cool Skylight (differential chrominance)
-        _colorWeights[0 * _latentChannels + 1] = -0.12f;
-        _colorWeights[1 * _latentChannels + 1] = 0.15f;
-        _colorWeights[2 * _latentChannels + 1] = 0.52f;
+        // Ch 1: Primary Green channel
+        _colorWeights[0 * _latentChannels + 1] = 0.00f;
+        _colorWeights[1 * _latentChannels + 1] = 0.95f;
+        _colorWeights[2 * _latentChannels + 1] = 0.00f;
 
-        // Ch 2: Magenta / Sunset Rose / Violet (differential chrominance)
-        _colorWeights[0 * _latentChannels + 2] = 0.40f;
-        _colorWeights[1 * _latentChannels + 2] = -0.12f;
-        _colorWeights[2 * _latentChannels + 2] = 0.30f;
+        // Ch 2: Primary Blue channel
+        _colorWeights[0 * _latentChannels + 2] = 0.00f;
+        _colorWeights[1 * _latentChannels + 2] = 0.00f;
+        _colorWeights[2 * _latentChannels + 2] = 0.95f;
 
-        // Ch 3: Amber / Warm Gold / Sunlight Flare (differential chrominance)
-        _colorWeights[0 * _latentChannels + 3] = 0.45f;
-        _colorWeights[1 * _latentChannels + 3] = 0.25f;
-        _colorWeights[2 * _latentChannels + 3] = -0.25f;
+        // Ch 3: Core structural luminance (clean achromatic tone curve)
+        _colorWeights[0 * _latentChannels + 3] = 0.05f;
+        _colorWeights[1 * _latentChannels + 3] = 0.05f;
+        _colorWeights[2 * _latentChannels + 3] = 0.05f;
 
-        // Ch 4: Emerald / Alpine Foliage / Green (differential chrominance)
-        _colorWeights[0 * _latentChannels + 4] = -0.15f;
-        _colorWeights[1 * _latentChannels + 4] = 0.40f;
-        _colorWeights[2 * _latentChannels + 4] = -0.10f;
+        // Ch 4: Chroma warmth / amber flare
+        _colorWeights[0 * _latentChannels + 4] = 0.05f;
+        _colorWeights[1 * _latentChannels + 4] = 0.02f;
+        _colorWeights[2 * _latentChannels + 4] = -0.04f;
 
-        // Ch 5: Specular Gleam / Sunlight Glint / Caustic Highlights
-        _colorWeights[0 * _latentChannels + 5] = 0.25f;
-        _colorWeights[1 * _latentChannels + 5] = 0.25f;
-        _colorWeights[2 * _latentChannels + 5] = 0.25f;
+        // Ch 5: Specular Gleam / Caustic Highlights
+        _colorWeights[0 * _latentChannels + 5] = 0.08f;
+        _colorWeights[1 * _latentChannels + 5] = 0.08f;
+        _colorWeights[2 * _latentChannels + 5] = 0.08f;
 
-        // Ch 6: Volumetric Atmospheric Mist / Deep Indigo Shadow
-        _colorWeights[0 * _latentChannels + 6] = 0.06f;
-        _colorWeights[1 * _latentChannels + 6] = 0.08f;
-        _colorWeights[2 * _latentChannels + 6] = 0.14f;
+        // Ch 6: Deep shadow / atmospheric depth
+        _colorWeights[0 * _latentChannels + 6] = 0.02f;
+        _colorWeights[1 * _latentChannels + 6] = 0.02f;
+        _colorWeights[2 * _latentChannels + 6] = 0.04f;
 
         // Ch 7: Horizontal Relief / Ridge Edge Contrast
-        _colorWeights[0 * _latentChannels + 7] = 0.08f;
-        _colorWeights[1 * _latentChannels + 7] = 0.08f;
-        _colorWeights[2 * _latentChannels + 7] = 0.08f;
+        _colorWeights[0 * _latentChannels + 7] = 0.04f;
+        _colorWeights[1 * _latentChannels + 7] = 0.04f;
+        _colorWeights[2 * _latentChannels + 7] = 0.04f;
 
         // Ch 8: Vertical Relief / Ridge Edge Contrast
-        _colorWeights[0 * _latentChannels + 8] = 0.08f;
-        _colorWeights[1 * _latentChannels + 8] = 0.08f;
-        _colorWeights[2 * _latentChannels + 8] = 0.08f;
+        _colorWeights[0 * _latentChannels + 8] = 0.04f;
+        _colorWeights[1 * _latentChannels + 8] = 0.04f;
+        _colorWeights[2 * _latentChannels + 8] = 0.04f;
 
         // Ch 9..15: Micro-texture modulation (subtle high-frequency detail)
         for (int c = 9; c < _latentChannels; c++)
         {
-            _colorWeights[0 * _latentChannels + c] = 0.015f;
-            _colorWeights[1 * _latentChannels + c] = 0.015f;
-            _colorWeights[2 * _latentChannels + c] = 0.020f;
+            _colorWeights[0 * _latentChannels + c] = 0.010f;
+            _colorWeights[1 * _latentChannels + c] = 0.010f;
+            _colorWeights[2 * _latentChannels + c] = 0.012f;
         }
     }
 
     /// <summary>
     /// Evaluates Narkowicz ACES Filmic Tone Mapping curve.
     /// Maps high-dynamic-range linear color values smoothly into [0.0, 1.0] sRGB
-    /// with rich shadow contrast, photographic midtones, and soft highlight roll-off.
+    /// with rich shadow contrast, photographic midtones, and crisp highlight roll-off.
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static float FilmicToneMap(float x)
@@ -92,7 +92,7 @@ public unsafe sealed class LatentVaeDecoder : IDisposable
         float c = 2.43f;
         float d = 0.59f;
         float e = 0.14f;
-        float mapped = (x * (a * x + b)) / (x * (c * x + d) + e);
+        float mapped = ((x * (a * x + b)) / (x * (c * x + d) + e)) * 1.244f;
         return Math.Clamp(mapped, 0.0f, 1.0f);
     }
 
