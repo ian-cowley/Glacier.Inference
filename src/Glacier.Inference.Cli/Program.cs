@@ -1881,7 +1881,6 @@ public static class Program
             int? seed = null;
             string? imagePath = null;
             float? duration = null;
-            SubjectActorType subject = SubjectActorType.Auto;
 
             for (int i = 2; i < args.Length; i++)
             {
@@ -1895,17 +1894,6 @@ public static class Program
                 else if (args[i] == "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out int sd)) seed = sd;
                 else if ((args[i] == "--image" || args[i] == "-i") && i + 1 < args.Length) imagePath = args[++i];
                 else if (args[i] == "--duration" && i + 1 < args.Length && float.TryParse(args[++i], out float dur)) duration = dur;
-                else if (args[i] == "--subject" && i + 1 < args.Length)
-                {
-                    string sStr = args[++i].ToLowerInvariant();
-                    subject = sStr switch
-                    {
-                        "drone" or "quadcopter" or "uav" => SubjectActorType.Drone,
-                        "eagle" or "bird" => SubjectActorType.Eagle,
-                        "none" or "off" or "static" => SubjectActorType.None,
-                        _ => SubjectActorType.Auto
-                    };
-                }
                 else if (args[i] == "--motion" && i + 1 < args.Length)
                 {
                     string mStr = args[++i].ToLowerInvariant();
@@ -1948,7 +1936,7 @@ public static class Program
             if (!string.IsNullOrEmpty(imagePath)) Console.WriteLine($"Reference Image: {imagePath}");
             float totalDurationSec = (float)frames / fps;
             Console.WriteLine($"Resolution: {width}x{height} | Duration: {totalDurationSec:F1}s ({frames} frames @ {fps} FPS)");
-            Console.WriteLine($"Camera Motion: {motion} | Dynamic Subject: {subject} | Format: {format.ToUpperInvariant()}");
+            Console.WriteLine($"Camera Motion: {motion} | Format: {format.ToUpperInvariant()}");
             Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver");
             Console.WriteLine();
 
@@ -1958,11 +1946,11 @@ public static class Program
             {
                 Console.WriteLine($"Animating reference image: {imagePath} with camera motion {motion}...");
                 var (rgb, srcW, srcH) = ImageDecoder.Load(imagePath);
-                result = pipeline.GenerateFromImage(rgb, srcW, srcH, prompt, width, height, frames, fps, motion, subject);
+                result = pipeline.GenerateFromImage(rgb, srcW, srcH, prompt, width, height, frames, fps, steps, motion, seed);
             }
             else
             {
-                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed, subject);
+                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
             }
 
             if (format == "all")

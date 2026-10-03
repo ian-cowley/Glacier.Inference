@@ -290,4 +290,44 @@ public class VideoProductionTests
             if (Directory.Exists(tmpDir)) Directory.Delete(tmpDir, recursive: true);
         }
     }
+
+    [Fact]
+    public void VideoGenerationPipeline_RunsEndToEndImageToVideoFlow()
+    {
+        using var pipeline = new VideoGenerationPipeline(numLayers: 2, hiddenDim: 128, numHeads: 4);
+
+        // Generate synthetic reference image RGB [128x128x3]
+        byte[] rgbPixels = new byte[128 * 128 * 3];
+        for (int y = 0; y < 128; y++)
+        {
+            for (int x = 0; x < 128; x++)
+            {
+                int idx = (y * 128 + x) * 3;
+                rgbPixels[idx] = (byte)(x * 2);
+                rgbPixels[idx + 1] = (byte)(y * 2);
+                rgbPixels[idx + 2] = (byte)((x + y));
+            }
+        }
+
+        var result = pipeline.GenerateFromImage(
+            rgbPixels,
+            sourceWidth: 128,
+            sourceHeight: 128,
+            prompt: "Cinematic mountain panorama",
+            width: 128,
+            height: 128,
+            numFrames: 4,
+            fps: 8,
+            numSteps: 2,
+            motion: CameraMotion.PanRight,
+            seed: 42);
+
+        Assert.NotNull(result);
+        Assert.Equal(4, result.NumFrames);
+        Assert.Equal(128, result.Width);
+        Assert.Equal(128, result.Height);
+        Assert.Equal(8, result.Fps);
+        Assert.Equal(4, result.Frames.Count);
+        Assert.Equal(128 * 128 * 3, result.Frames[0].Length);
+    }
 }

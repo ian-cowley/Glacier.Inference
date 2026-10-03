@@ -29,7 +29,6 @@
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <EmbeddedResource Include="Gpu\Kernels\kernels.cubin" />
-    <EmbeddedResource Include="Video\eagle_sprite.png" />
   </ItemGroup>
 
   <ItemGroup>
