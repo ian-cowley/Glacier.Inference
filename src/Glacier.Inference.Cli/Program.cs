@@ -115,9 +115,9 @@ public static class Program
         Console.WriteLine("  bench   <model.gguf> [options]       Run speed & comparative benchmark");
         Console.WriteLine("  run     <model.gguf> [prompt]        Interactive streaming chat or single prompt");
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
-        Console.WriteLine("  voice   <tts|stt|demo> [options]     Speech-to-text, text-to-speech & full-duplex voice");
+        Console.WriteLine("  voice   <voices|tts|stt|demo>        Human-quality speech synthesis (16 voices), Whisper STT & voice");
         Console.WriteLine("  vision  <demo|query> [options]       Vision-Language Model (VLM) patchification & analysis");
-        Console.WriteLine("  video   <demo|query> [options]       Video-Language Model multi-frame temporal reasoning & 3D-RoPE");
+        Console.WriteLine("  video   <generate|demo|query>        Generative video production (DiT+VAE) & temporal reasoning");
         Console.WriteLine("  image   <demo|generate> [options]    Text-to-Image production (Flow Matching DiT + VAE)");
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");

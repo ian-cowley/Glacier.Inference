@@ -12,15 +12,15 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>glacier</ToolCommandName>
     <PackageId>Glacier.Inference.Cli</PackageId>
-    <Version>1.1.14</Version>
+    <Version>1.2.13</Version>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
-    <Description>High-performance pure C# .NET 10 LLM command-line application (glacier). Features interactive chat REPL, side-by-side comparative benchmarking against Ollama GPU, model inspection, and Ollama/OpenAI-compatible HTTP serving.</Description>
+    <Description>High-performance pure C# .NET 10 Multimodal LLM, Generative Video &amp; Image (Flow-Matching DiT + 3D VAE), Kokoro Voice TTS, Whisper STT, and Vision CLI application (glacier). Features interactive chat REPL, side-by-side comparative benchmarking against Ollama GPU, model inspection, APNG/GIF/AVI video generation, and Ollama/OpenAI-compatible HTTP serving. Zero Python, zero C++ runtime dependencies.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Inference</PackageProjectUrl>
     <RepositoryUrl>https://github.com/ian-cowley/Glacier.Inference.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>llm;inference;ollama;vllm;cli;terminal;gguf;qwen;simd;aot;glacier</PackageTags>
+    <PackageTags>llm;inference;ollama;vllm;cli;terminal;gguf;qwen;simd;aot;video;dit;flowmatching;tts;kokoro;whisper;voice;vision;vlm;imagegeneration;net10;glacier</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
