@@ -1880,6 +1880,8 @@ public static class Program
             string format = "apng";
             int? seed = null;
             string? imagePath = null;
+            float? duration = null;
+            SubjectActorType subject = SubjectActorType.Auto;
 
             for (int i = 2; i < args.Length; i++)
             {
@@ -1892,6 +1894,18 @@ public static class Program
                 else if (args[i] == "--format" && i + 1 < args.Length) format = args[++i].ToLowerInvariant();
                 else if (args[i] == "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out int sd)) seed = sd;
                 else if ((args[i] == "--image" || args[i] == "-i") && i + 1 < args.Length) imagePath = args[++i];
+                else if (args[i] == "--duration" && i + 1 < args.Length && float.TryParse(args[++i], out float dur)) duration = dur;
+                else if (args[i] == "--subject" && i + 1 < args.Length)
+                {
+                    string sStr = args[++i].ToLowerInvariant();
+                    subject = sStr switch
+                    {
+                        "drone" or "quadcopter" or "uav" => SubjectActorType.Drone,
+                        "eagle" or "bird" => SubjectActorType.Eagle,
+                        "none" or "off" or "static" => SubjectActorType.None,
+                        _ => SubjectActorType.Auto
+                    };
+                }
                 else if (args[i] == "--motion" && i + 1 < args.Length)
                 {
                     string mStr = args[++i].ToLowerInvariant();
@@ -1910,6 +1924,12 @@ public static class Program
                 }
             }
 
+            // Auto-compute frame count if duration in seconds was specified
+            if (duration.HasValue)
+            {
+                frames = Math.Max(2, (int)MathF.Round(duration.Value * fps));
+            }
+
             // Auto-detect format from file extension if format was left at default
             if (format == "apng")
             {
@@ -1926,8 +1946,10 @@ public static class Program
             Console.WriteLine();
             Console.WriteLine($"Prompt: \"{prompt}\"");
             if (!string.IsNullOrEmpty(imagePath)) Console.WriteLine($"Reference Image: {imagePath}");
-            Console.WriteLine($"Resolution: {width}x{height} | Frames: {frames} @ {fps} FPS | Motion: {motion}");
-            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver | Format: {format.ToUpperInvariant()}");
+            float totalDurationSec = (float)frames / fps;
+            Console.WriteLine($"Resolution: {width}x{height} | Duration: {totalDurationSec:F1}s ({frames} frames @ {fps} FPS)");
+            Console.WriteLine($"Camera Motion: {motion} | Dynamic Subject: {subject} | Format: {format.ToUpperInvariant()}");
+            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver");
             Console.WriteLine();
 
             using var pipeline = new VideoGenerationPipeline();
@@ -1936,11 +1958,11 @@ public static class Program
             {
                 Console.WriteLine($"Animating reference image: {imagePath} with camera motion {motion}...");
                 var (rgb, srcW, srcH) = ImageDecoder.Load(imagePath);
-                result = pipeline.GenerateFromImage(rgb, srcW, srcH, prompt, width, height, frames, fps, motion);
+                result = pipeline.GenerateFromImage(rgb, srcW, srcH, prompt, width, height, frames, fps, motion, subject);
             }
             else
             {
-                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
+                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed, subject);
             }
 
             if (format == "all")

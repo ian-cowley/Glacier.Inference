@@ -52,9 +52,40 @@ public static class GifWriter
         // Calculate inter-frame delay in hundredths of a second (100 / fps)
         ushort delayTime = (ushort)Math.Max(1, (int)MathF.Round(100.0f / Math.Clamp(fps, 1, 100)));
 
-        // Pre-build 15-bit color lookup table for fast Floyd-Steinberg dithering
+        // Pre-build full 15-bit color lookup table for fast lock-free Floyd-Steinberg dithering
         var colorLookup = new byte[32768];
-        Array.Fill(colorLookup, (byte)0xFF);
+        Parallel.For(0, 32768, idx =>
+        {
+            int r = ((idx >> 10) & 0x1F) * 255 / 31;
+            int g = ((idx >> 5) & 0x1F) * 255 / 31;
+            int b = (idx & 0x1F) * 255 / 31;
+
+            int bestIdx = 0;
+            int bestDist = int.MaxValue;
+            for (int c = 0; c < 256; c++)
+            {
+                int pr = globalPalette[c * 3 + 0];
+                int pg = globalPalette[c * 3 + 1];
+                int pb = globalPalette[c * 3 + 2];
+                int dr = r - pr;
+                int dg = g - pg;
+                int db = b - pb;
+                int dist = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    bestIdx = c;
+                }
+            }
+            colorLookup[idx] = (byte)bestIdx;
+        });
+
+        // Parallelize frame quantization across all CPU cores
+        byte[][] indexedFrames = new byte[frames.Count][];
+        Parallel.For(0, frames.Count, f =>
+        {
+            indexedFrames[f] = QuantizeFrameDithered(frames[f], globalPalette, width, height, colorLookup);
+        });
 
         // 5. Serialize Each Frame
         for (int f = 0; f < frames.Count; f++)
@@ -76,11 +107,8 @@ public static class GifWriter
             bw.Write((ushort)height);
             bw.Write((byte)0x00); // Packed: No local color table (use global)
 
-            // Quantize Frame RGB pixels with Floyd-Steinberg Error Diffusion Dithering
-            byte[] indexedPixels = QuantizeFrameDithered(frames[f], globalPalette, width, height, colorLookup);
-
             // Write LZW Compressed Image Data
-            WriteLzwData(bw, indexedPixels, 8);
+            WriteLzwData(bw, indexedFrames[f], 8);
         }
 
         // 6. GIF Trailer
