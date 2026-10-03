@@ -6,8 +6,8 @@ using System.IO;
 
 /// <summary>
 /// Pure C# .NET 10 Animated GIF89a Serializer.
-/// Features Netscape 2.0 looping, adaptive 256-color palette quantization,
-/// frame delay timing, and standard LZW variable-length compression with zero external dependencies.
+/// Features Netscape 2.0 looping, adaptive Median-Cut 256-color palette quantization,
+/// Floyd-Steinberg error diffusion dithering, and standard LZW variable-length compression.
 /// </summary>
 public static class GifWriter
 {
@@ -35,8 +35,8 @@ public static class GifWriter
         bw.Write((byte)0); // Background Color Index
         bw.Write((byte)0); // Pixel Aspect Ratio
 
-        // 3. Compute Global Color Table (256 colors * 3 bytes = 768 bytes) from all frames
-        byte[] globalPalette = GenerateGlobalPalette(frames, width, height, 256);
+        // 3. Compute Adaptive Median-Cut 256-Color Global Palette from video frames
+        byte[] globalPalette = GenerateAdaptivePalette(frames, 256);
         bw.Write(globalPalette);
 
         // 4. Netscape 2.0 Looping Application Extension (Infinite Loop)
@@ -51,6 +51,10 @@ public static class GifWriter
 
         // Calculate inter-frame delay in hundredths of a second (100 / fps)
         ushort delayTime = (ushort)Math.Max(1, (int)MathF.Round(100.0f / Math.Clamp(fps, 1, 100)));
+
+        // Pre-build 15-bit color lookup table for fast Floyd-Steinberg dithering
+        var colorLookup = new byte[32768];
+        Array.Fill(colorLookup, (byte)0xFF);
 
         // 5. Serialize Each Frame
         for (int f = 0; f < frames.Count; f++)
@@ -72,8 +76,8 @@ public static class GifWriter
             bw.Write((ushort)height);
             bw.Write((byte)0x00); // Packed: No local color table (use global)
 
-            // Quantize Frame RGB pixels to 8-bit Palette Indices
-            byte[] indexedPixels = QuantizeFrame(frames[f], globalPalette, width, height);
+            // Quantize Frame RGB pixels with Floyd-Steinberg Error Diffusion Dithering
+            byte[] indexedPixels = QuantizeFrameDithered(frames[f], globalPalette, width, height, colorLookup);
 
             // Write LZW Compressed Image Data
             WriteLzwData(bw, indexedPixels, 8);
@@ -83,54 +87,252 @@ public static class GifWriter
         bw.Write((byte)0x3B);
     }
 
-    private static byte[] GenerateGlobalPalette(IReadOnlyList<byte[]> frames, int width, int height, int maxColors)
+    /// <summary>
+    /// Generates an adaptive 256-color palette tailored to the exact color distribution of the frames using Median-Cut.
+    /// </summary>
+    private static byte[] GenerateAdaptivePalette(IReadOnlyList<byte[]> frames, int maxColors = 256)
     {
-        // 6x7x6 Uniform Color Cube (252 colors) + 4 Grayscale Accents = 256 colors
-        byte[] palette = new byte[maxColors * 3];
-        int idx = 0;
+        // 1. Sample up to 16,384 representative RGB pixels across frames
+        const int maxSamples = 16384;
+        var samples = new List<(byte r, byte g, byte b)>(maxSamples);
+        int totalPixelsAcrossFrames = frames.Count * (frames[0].Length / 3);
+        int stride = Math.Max(1, totalPixelsAcrossFrames / maxSamples);
 
-        for (int r = 0; r < 6; r++)
+        int sampleCounter = 0;
+        foreach (var frame in frames)
         {
-            byte red = (byte)(r * 255 / 5);
-            for (int g = 0; g < 7; g++)
+            int numPixels = frame.Length / 3;
+            for (int i = 0; i < numPixels; i++)
             {
-                byte green = (byte)(g * 255 / 6);
-                for (int b = 0; b < 6; b++)
+                if ((sampleCounter++ % stride) == 0 && samples.Count < maxSamples)
                 {
-                    byte blue = (byte)(b * 255 / 5);
-                    palette[idx++] = red;
-                    palette[idx++] = green;
-                    palette[idx++] = blue;
+                    samples.Add((frame[i * 3 + 0], frame[i * 3 + 1], frame[i * 3 + 2]));
                 }
             }
         }
 
-        // Fill remaining 4 slots with key shades (pure black, dark gray, light gray, pure white)
-        palette[idx++] = 0;   palette[idx++] = 0;   palette[idx++] = 0;
-        palette[idx++] = 64;  palette[idx++] = 64;  palette[idx++] = 64;
-        palette[idx++] = 192; palette[idx++] = 192; palette[idx++] = 192;
-        palette[idx++] = 255; palette[idx++] = 255; palette[idx++] = 255;
+        if (samples.Count == 0)
+        {
+            samples.Add((0, 0, 0));
+        }
+
+        // 2. Median-Cut Bounding Box Splitting
+        var boxes = new List<ColorBox>(maxColors)
+        {
+            new ColorBox(0, samples.Count, samples)
+        };
+
+        while (boxes.Count < maxColors)
+        {
+            // Find box with greatest range along its longest axis
+            int bestBoxIdx = -1;
+            int maxRange = -1;
+
+            for (int i = 0; i < boxes.Count; i++)
+            {
+                if (boxes[i].Count > 1 && boxes[i].MaxSpread > maxRange)
+                {
+                    maxRange = boxes[i].MaxSpread;
+                    bestBoxIdx = i;
+                }
+            }
+
+            if (bestBoxIdx == -1 || maxRange <= 0) break; // Cannot split further
+
+            var boxToSplit = boxes[bestBoxIdx];
+            int axis = boxToSplit.LongestAxis; // 0=R, 1=G, 2=B
+
+            // Sort samples within this box along the longest axis
+            if (axis == 0)
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.r.CompareTo(b.r)));
+            else if (axis == 1)
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.g.CompareTo(b.g)));
+            else
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.b.CompareTo(b.b)));
+
+            // Split at median
+            int half = boxToSplit.Count / 2;
+            var boxA = new ColorBox(boxToSplit.Start, half, samples);
+            var boxB = new ColorBox(boxToSplit.Start + half, boxToSplit.Count - half, samples);
+
+            boxes[bestBoxIdx] = boxA;
+            boxes.Add(boxB);
+        }
+
+        // 3. Compute centroid color for each box
+        byte[] palette = new byte[maxColors * 3];
+        for (int i = 0; i < boxes.Count && i < maxColors; i++)
+        {
+            var (avgR, avgG, avgB) = boxes[i].GetAverageColor(samples);
+            palette[i * 3 + 0] = avgR;
+            palette[i * 3 + 1] = avgG;
+            palette[i * 3 + 2] = avgB;
+        }
+
+        // Pad remaining slots if image has fewer unique colors
+        for (int i = boxes.Count; i < maxColors; i++)
+        {
+            byte shade = (byte)((i - boxes.Count) * 255 / Math.Max(1, maxColors - boxes.Count));
+            palette[i * 3 + 0] = shade;
+            palette[i * 3 + 1] = shade;
+            palette[i * 3 + 2] = shade;
+        }
 
         return palette;
     }
 
-    private static byte[] QuantizeFrame(byte[] rgbPixels, byte[] palette, int width, int height)
+    private struct ColorBox
+    {
+        public int Start;
+        public int Count;
+        public byte MinR, MaxR;
+        public byte MinG, MaxG;
+        public byte MinB, MaxB;
+
+        public ColorBox(int start, int count, List<(byte r, byte g, byte b)> samples)
+        {
+            Start = start;
+            Count = count;
+            MinR = MinG = MinB = 255;
+            MaxR = MaxG = MaxB = 0;
+
+            for (int i = start; i < start + count; i++)
+            {
+                var s = samples[i];
+                if (s.r < MinR) MinR = s.r;
+                if (s.r > MaxR) MaxR = s.r;
+                if (s.g < MinG) MinG = s.g;
+                if (s.g > MaxG) MaxG = s.g;
+                if (s.b < MinB) MinB = s.b;
+                if (s.b > MaxB) MaxB = s.b;
+            }
+        }
+
+        public int MaxSpread => Math.Max(MaxR - MinR, Math.Max(MaxG - MinG, MaxB - MinB));
+
+        public int LongestAxis
+        {
+            get
+            {
+                int rRange = MaxR - MinR;
+                int gRange = MaxG - MinG;
+                int bRange = MaxB - MinB;
+                if (rRange >= gRange && rRange >= bRange) return 0;
+                if (gRange >= rRange && gRange >= bRange) return 1;
+                return 2;
+            }
+        }
+
+        public (byte r, byte g, byte b) GetAverageColor(List<(byte r, byte g, byte b)> samples)
+        {
+            if (Count == 0) return (0, 0, 0);
+            long sumR = 0, sumG = 0, sumB = 0;
+            for (int i = Start; i < Start + Count; i++)
+            {
+                sumR += samples[i].r;
+                sumG += samples[i].g;
+                sumB += samples[i].b;
+            }
+            return ((byte)(sumR / Count), (byte)(sumG / Count), (byte)(sumB / Count));
+        }
+    }
+
+    /// <summary>
+    /// Quantizes a 24-bit RGB frame to 8-bit palette indices with Floyd-Steinberg error diffusion dithering.
+    /// Eliminates color banding, posterization, and harsh transitions.
+    /// </summary>
+    private static byte[] QuantizeFrameDithered(
+        byte[] rgbPixels,
+        byte[] palette,
+        int width,
+        int height,
+        byte[] colorLookup)
     {
         int numPixels = width * height;
         byte[] indices = new byte[numPixels];
 
-        for (int i = 0; i < numPixels; i++)
+        // Floyd-Steinberg error diffusion row buffers (current scanline and next scanline)
+        float[] errCurr = new float[(width + 2) * 3];
+        float[] errNext = new float[(width + 2) * 3];
+
+        for (int y = 0; y < height; y++)
         {
-            int r = rgbPixels[i * 3 + 0];
-            int g = rgbPixels[i * 3 + 1];
-            int b = rgbPixels[i * 3 + 2];
+            Array.Clear(errNext, 0, errNext.Length);
+            int rowOffset = y * width * 3;
 
-            // Fast uniform index calculation: 6x7x6 cube
-            int rIdx = Math.Clamp((r * 5 + 127) / 255, 0, 5);
-            int gIdx = Math.Clamp((g * 6 + 127) / 255, 0, 6);
-            int bIdx = Math.Clamp((b * 5 + 127) / 255, 0, 5);
+            for (int x = 0; x < width; x++)
+            {
+                int srcIdx = rowOffset + x * 3;
+                int errIdx = (x + 1) * 3;
 
-            indices[i] = (byte)(rIdx * 42 + gIdx * 6 + bIdx);
+                // Add diffused error to incoming pixel
+                float rF = Math.Clamp(rgbPixels[srcIdx + 0] + errCurr[errIdx + 0], 0f, 255f);
+                float gF = Math.Clamp(rgbPixels[srcIdx + 1] + errCurr[errIdx + 1], 0f, 255f);
+                float bF = Math.Clamp(rgbPixels[srcIdx + 2] + errCurr[errIdx + 2], 0f, 255f);
+
+                byte r = (byte)MathF.Round(rF);
+                byte g = (byte)MathF.Round(gF);
+                byte b = (byte)MathF.Round(bF);
+
+                // Fast nearest color lookup using 15-bit cache (32x32x32)
+                int key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+                byte palIdx = colorLookup[key];
+
+                if (palIdx == 0xFF)
+                {
+                    // Compute nearest color by squared Euclidean distance
+                    int bestIdx = 0;
+                    int bestDist = int.MaxValue;
+
+                    for (int p = 0; p < 256; p++)
+                    {
+                        int dr = r - palette[p * 3 + 0];
+                        int dg = g - palette[p * 3 + 1];
+                        int db = b - palette[p * 3 + 2];
+                        int dist = dr * dr + dg * dg + db * db;
+                        if (dist < bestDist)
+                        {
+                            bestDist = dist;
+                            bestIdx = p;
+                            if (dist == 0) break;
+                        }
+                    }
+
+                    palIdx = (byte)bestIdx;
+                    colorLookup[key] = palIdx;
+                }
+
+                indices[y * width + x] = palIdx;
+
+                // Quantization error
+                float errR = rF - palette[palIdx * 3 + 0];
+                float errG = gF - palette[palIdx * 3 + 1];
+                float errB = bF - palette[palIdx * 3 + 2];
+
+                // Diffuse error via Floyd-Steinberg kernel:
+                // (x+1, y): 7/16
+                errCurr[(x + 2) * 3 + 0] += errR * 0.4375f;
+                errCurr[(x + 2) * 3 + 1] += errG * 0.4375f;
+                errCurr[(x + 2) * 3 + 2] += errB * 0.4375f;
+
+                // (x-1, y+1): 3/16
+                errNext[x * 3 + 0] += errR * 0.1875f;
+                errNext[x * 3 + 1] += errG * 0.1875f;
+                errNext[x * 3 + 2] += errB * 0.1875f;
+
+                // (x, y+1): 5/16
+                errNext[(x + 1) * 3 + 0] += errR * 0.3125f;
+                errNext[(x + 1) * 3 + 1] += errG * 0.3125f;
+                errNext[(x + 1) * 3 + 2] += errB * 0.3125f;
+
+                // (x+1, y+1): 1/16
+                errNext[(x + 2) * 3 + 0] += errR * 0.0625f;
+                errNext[(x + 2) * 3 + 1] += errG * 0.0625f;
+                errNext[(x + 2) * 3 + 2] += errB * 0.0625f;
+            }
+
+            // Swap error buffers for next line
+            (errCurr, errNext) = (errNext, errCurr);
         }
 
         return indices;
