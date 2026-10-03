@@ -1875,7 +1875,7 @@ public static class Program
             int frames = 16;
             int fps = 8;
             int steps = 4;
-            CameraMotion motion = CameraMotion.PanRight;
+            CameraMotion? explicitMotion = null;
             string outPath = "glacier_video.apng";
             string format = "apng";
             int? seed = null;
@@ -1897,7 +1897,7 @@ public static class Program
                 else if (args[i] == "--motion" && i + 1 < args.Length)
                 {
                     string mStr = args[++i].ToLowerInvariant();
-                    motion = mStr switch
+                    explicitMotion = mStr switch
                     {
                         "pan-left" or "panleft" => CameraMotion.PanLeft,
                         "tilt-up" or "tiltup" => CameraMotion.TiltUp,
@@ -1911,6 +1911,9 @@ public static class Program
                     };
                 }
             }
+
+            // Dynamically infer camera motion from natural language prompt semantics if not explicitly specified
+            CameraMotion motion = explicitMotion ?? VideoGenerationPipeline.InferMotionFromPrompt(prompt, CameraMotion.PanRight);
 
             // Auto-compute frame count if duration in seconds was specified
             if (duration.HasValue)

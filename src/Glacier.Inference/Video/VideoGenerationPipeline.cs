@@ -285,6 +285,66 @@ public sealed class VideoGenerationPipeline : IDisposable
     }
 
     /// <summary>
+    /// Infers camera motion dynamically from natural language prompt semantics.
+    /// Enables 100% prompt-driven camera kinematics without requiring manual CLI motion flags.
+    /// </summary>
+    public static CameraMotion InferMotionFromPrompt(string prompt, CameraMotion defaultMotion = CameraMotion.PanRight)
+    {
+        if (string.IsNullOrWhiteSpace(prompt)) return defaultMotion;
+
+        string p = prompt.ToLowerInvariant();
+
+        if (p.Contains("walking toward") || p.Contains("walking towards") || p.Contains("approaching") ||
+            p.Contains("coming closer") || p.Contains("push in") || p.Contains("push-in") ||
+            p.Contains("zoom in") || p.Contains("zooming in") || p.Contains("dolly in"))
+        {
+            return CameraMotion.ZoomIn;
+        }
+
+        if (p.Contains("walking away") || p.Contains("receding") || p.Contains("pull back") ||
+            p.Contains("pull-back") || p.Contains("zoom out") || p.Contains("zooming out") || p.Contains("dolly out"))
+        {
+            return CameraMotion.ZoomOut;
+        }
+
+        if (p.Contains("orbit") || p.Contains("orbiting") || p.Contains("circle") || p.Contains("circling") ||
+            p.Contains("rotat") || p.Contains("around"))
+        {
+            return CameraMotion.Orbit;
+        }
+
+        if (p.Contains("tilt up") || p.Contains("tilting up") || p.Contains("rising") || p.Contains("looking up") ||
+            p.Contains("ascending") || p.Contains("crane up"))
+        {
+            return CameraMotion.TiltUp;
+        }
+
+        if (p.Contains("tilt down") || p.Contains("tilting down") || p.Contains("looking down") ||
+            p.Contains("descending") || p.Contains("crane down"))
+        {
+            return CameraMotion.TiltDown;
+        }
+
+        if (p.Contains("pan left") || p.Contains("panning left") || p.Contains("sweep left") || p.Contains("drift left"))
+        {
+            return CameraMotion.PanLeft;
+        }
+
+        if (p.Contains("pan right") || p.Contains("panning right") || p.Contains("sweep right") || p.Contains("drift right"))
+        {
+            return CameraMotion.PanRight;
+        }
+
+        if (p.Contains("drone") || p.Contains("fluid") || p.Contains("fly") || p.Contains("flying") ||
+            p.Contains("aerial") || p.Contains("dynamic") || p.Contains("handheld"))
+        {
+            return CameraMotion.DynamicFluid;
+        }
+
+        return defaultMotion;
+    }
+
+    /// <summary>
     /// Computes the camera transformation vector (offsetX, offsetY, zoom, roll) along the timeline u in [0, 1].
     /// Uses Hermite SmoothStep easing and an overscanned viewport to ensure the camera sweeps
     /// authentically across the scene with zero edge clipping, border clamping, or trailing smears.
