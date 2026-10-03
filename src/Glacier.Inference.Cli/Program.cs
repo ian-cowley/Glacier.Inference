@@ -239,16 +239,30 @@ public static class Program
     private static void PrintVideoHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier video - Video-Language Model multi-frame temporal reasoning & 3D-RoPE");
+        Console.WriteLine("glacier video - Generative Video Production & Video-Language Multimodal Reasoning");
+        Console.WriteLine("                Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE + APNG/GIF/AVI");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier video generate \"<prompt>\" [options]");
         Console.WriteLine("  glacier video demo");
         Console.WriteLine("  glacier video query <dir> \"<prompt>\"");
         Console.WriteLine();
         Console.WriteLine("Commands:");
-        Console.WriteLine("  demo                                 Execute end-to-end multi-frame video extraction, 3D-RoPE & temporal reasoning");
+        Console.WriteLine("  generate \"<prompt>\" [options]        Synthesize video from prompt (Spatio-Temporal DiT & 3D VAE)");
+        Console.WriteLine("  demo                                 Execute end-to-end video synthesis & temporal reasoning");
         Console.WriteLine("  query <dir> \"<prompt>\"               Analyze directory of raw video frames and answer queries");
+        Console.WriteLine();
+        Console.WriteLine("Options (for generate):");
+        Console.WriteLine("  --frames <int>                       Number of output frames (default: 16)");
+        Console.WriteLine("  --fps <int>                          Framerate in FPS (default: 8)");
+        Console.WriteLine("  --width <int>                        Video width in pixels (default: 256)");
+        Console.WriteLine("  --height <int>                       Video height in pixels (default: 256)");
+        Console.WriteLine("  --steps <int>                        Flow matching ODE steps (default: 4)");
+        Console.WriteLine("  --motion <name>                      pan-right, pan-left, zoom-in, zoom-out, tilt-up, orbit, fluid, static (default: pan-right)");
+        Console.WriteLine("  --format <ext>                       apng, gif, avi, or all (default: apng)");
+        Console.WriteLine("  --out <path>                         Output file path (default: glacier_video.apng)");
+        Console.WriteLine("  --seed <int>                         Random seed for reproducible video synthesis");
     }
 
     private static void PrintDevicesHelp()
@@ -1846,110 +1860,181 @@ public static class Program
         }
 
         string subCmd = args[0].ToLowerInvariant();
-        if (subCmd == "demo")
+        if (subCmd == "generate")
+        {
+            if (args.Length < 2)
+            {
+                Console.Error.WriteLine("Error: Missing prompt for video generation. Usage: glacier video generate \"<prompt>\" [options]");
+                return 1;
+            }
+
+            string prompt = args[1];
+            int width = 256;
+            int height = 256;
+            int frames = 16;
+            int fps = 8;
+            int steps = 4;
+            CameraMotion motion = CameraMotion.PanRight;
+            string outPath = "glacier_video.apng";
+            string format = "apng";
+            int? seed = null;
+
+            for (int i = 2; i < args.Length; i++)
+            {
+                if (args[i] == "--width" && i + 1 < args.Length && int.TryParse(args[++i], out int w)) width = w;
+                else if (args[i] == "--height" && i + 1 < args.Length && int.TryParse(args[++i], out int h)) height = h;
+                else if (args[i] == "--frames" && i + 1 < args.Length && int.TryParse(args[++i], out int fr)) frames = fr;
+                else if (args[i] == "--fps" && i + 1 < args.Length && int.TryParse(args[++i], out int r)) fps = r;
+                else if (args[i] == "--steps" && i + 1 < args.Length && int.TryParse(args[++i], out int st)) steps = st;
+                else if (args[i] == "--out" && i + 1 < args.Length) outPath = args[++i];
+                else if (args[i] == "--format" && i + 1 < args.Length) format = args[++i].ToLowerInvariant();
+                else if (args[i] == "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out int sd)) seed = sd;
+                else if (args[i] == "--motion" && i + 1 < args.Length)
+                {
+                    string mStr = args[++i].ToLowerInvariant();
+                    motion = mStr switch
+                    {
+                        "pan-left" or "panleft" => CameraMotion.PanLeft,
+                        "tilt-up" or "tiltup" => CameraMotion.TiltUp,
+                        "tilt-down" or "tiltdown" => CameraMotion.TiltDown,
+                        "zoom-in" or "zoomin" => CameraMotion.ZoomIn,
+                        "zoom-out" or "zoomout" => CameraMotion.ZoomOut,
+                        "orbit" => CameraMotion.Orbit,
+                        "fluid" or "dynamic" => CameraMotion.DynamicFluid,
+                        "static" => CameraMotion.Static,
+                        _ => CameraMotion.PanRight
+                    };
+                }
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("==========================================================================");
+            Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO PRODUCTION (TEXT-TO-VIDEO)         ");
+            Console.WriteLine("   Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE Splines       ");
+            Console.WriteLine("==========================================================================");
+            Console.ResetColor();
+            Console.WriteLine();
+            Console.WriteLine($"Prompt: \"{prompt}\"");
+            Console.WriteLine($"Resolution: {width}x{height} | Frames: {frames} @ {fps} FPS | Motion: {motion}");
+            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver");
+            Console.WriteLine();
+
+            using var pipeline = new VideoGenerationPipeline();
+            var result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
+
+            if (format == "all")
+            {
+                string baseName = Path.GetFileNameWithoutExtension(outPath);
+                string dir = Path.GetDirectoryName(outPath) ?? "";
+                string apngFile = string.IsNullOrEmpty(dir) ? $"{baseName}.apng" : Path.Combine(dir, $"{baseName}.apng");
+                string gifFile = string.IsNullOrEmpty(dir) ? $"{baseName}.gif" : Path.Combine(dir, $"{baseName}.gif");
+                string aviFile = string.IsNullOrEmpty(dir) ? $"{baseName}.avi" : Path.Combine(dir, $"{baseName}.avi");
+
+                result.SaveApng(apngFile);
+                result.SaveGif(gifFile);
+                result.SaveAvi(aviFile);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[Exported APNG] -> {apngFile} ({new FileInfo(apngFile).Length / 1024} KB)");
+                Console.WriteLine($"[Exported GIF]  -> {gifFile} ({new FileInfo(gifFile).Length / 1024} KB)");
+                Console.WriteLine($"[Exported AVI]  -> {aviFile} ({new FileInfo(aviFile).Length / 1024} KB)");
+                Console.ResetColor();
+            }
+            else
+            {
+                result.Save(outPath);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[Exported Video] -> {outPath} ({new FileInfo(outPath).Length / 1024} KB)");
+                Console.ResetColor();
+            }
+
+            Console.WriteLine($"Completed in {result.ElapsedMilliseconds} ms ({result.ElapsedMilliseconds / (float)frames:F1} ms/frame).");
+            return 0;
+        }
+        else if (subCmd == "demo")
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("   GLACIER.INFERENCE: VIDEO-LANGUAGE MODEL (VLM) TEMPORAL DEMONSTRATION  ");
-            Console.WriteLine("    Pure C# .NET 10 | 3D-RoPE + Motion Energy + Multi-Frame Reasoning   ");
+            Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO & VLM MULTIMODAL DEMONSTRATION     ");
+            Console.WriteLine("   Pure C# .NET 10 | Spatio-Temporal DiT + 3D VAE + 3D-RoPE + APNG/GIF/AVI ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
 
             var sw = Stopwatch.StartNew();
 
-            // Step 1: Ingest 8 video frames with dynamic motion & color shift
-            Console.WriteLine("[1. Video Ingestion & Temporal Dynamics] Simulating 8 frames (320x240 RGB @ 30 FPS)...");
-            var ingestSw = Stopwatch.StartNew();
-            int w = 320;
-            int h = 240;
-            int frameBytes = w * h * 3;
-            var frames = new List<byte[]>();
+            // Phase 1: Generative Text-to-Video Production
+            Console.WriteLine("[1. Generative Text-to-Video Synthesis] Synthesizing 16 cinematic frames (256x256 @ 8 FPS)...");
+            Console.WriteLine("    Prompt: \"A cinematic landscape of icy fjords under neon auroras\"");
+            Console.WriteLine("    Trajectory: CameraMotion.PanRight across continuous time");
+            using var genPipeline = new VideoGenerationPipeline();
+            var videoRes = genPipeline.Generate(
+                "A cinematic landscape of icy fjords under neon auroras",
+                width: 256,
+                height: 256,
+                numFrames: 16,
+                fps: 8,
+                numSteps: 4,
+                motion: CameraMotion.PanRight,
+                seed: 42);
 
-            for (int f = 0; f < 8; f++)
-            {
-                byte[] frame = new byte[frameBytes];
-                // Moving bright object across frames
-                int objX = f * 35;
-                int objY = 80 + (int)(MathF.Sin(f * 0.8f) * 40);
+            string demoApng = "glacier_demo_video.apng";
+            string demoGif = "glacier_demo_video.gif";
+            string demoAvi = "glacier_demo_video.avi";
+            videoRes.SaveApng(demoApng);
+            videoRes.SaveGif(demoGif);
+            videoRes.SaveAvi(demoAvi);
 
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        int idx = (y * w + x) * 3;
-                        if (x >= objX && x < objX + 40 && y >= objY && y < objY + 40)
-                        {
-                            frame[idx] = 255;       // R
-                            frame[idx + 1] = 220;   // G
-                            frame[idx + 2] = 40;    // B
-                        }
-                        else
-                        {
-                            frame[idx] = (byte)(30 + f * 5);
-                            frame[idx + 1] = (byte)(50 + f * 4);
-                            frame[idx + 2] = (byte)(100 + (y % 100));
-                        }
-                    }
-                }
-                frames.Add(frame);
-            }
-            ingestSw.Stop();
-            Console.WriteLine($"   -> Ingested 8 frames ({frames.Count * frameBytes / 1024} KB raw memory) in {ingestSw.ElapsedMilliseconds}ms");
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"    -> Generated 16 frames in {videoRes.ElapsedMilliseconds}ms ({videoRes.ElapsedMilliseconds / 16.0f:F1} ms/frame)");
+            Console.WriteLine($"    -> Saved APNG: {demoApng} ({new FileInfo(demoApng).Length / 1024} KB)");
+            Console.WriteLine($"    -> Saved GIF:  {demoGif} ({new FileInfo(demoGif).Length / 1024} KB)");
+            Console.WriteLine($"    -> Saved AVI:  {demoAvi} ({new FileInfo(demoAvi).Length / 1024} KB)");
+            Console.ResetColor();
             Console.WriteLine();
 
-            // Step 2: Keyframe Decimation & Motion Energy
-            Console.WriteLine("[2. Frame Decimation & Motion Profiling] Sampling 4 keyframes via uniform decimation...");
-            var decSw = Stopwatch.StartNew();
-            int[] keyframes = VideoFrameSampler.SampleUniformIndices(frames.Count, 4);
-            decSw.Stop();
-            Console.WriteLine($"   -> Selected keyframes: [{string.Join(", ", keyframes)}] in {decSw.ElapsedMilliseconds}ms");
+            // Phase 2: Keyframe Decimation & Spatio-Temporal Ingestion
+            Console.WriteLine("[2. Frame Decimation & Motion Profiling] Sampling 4 keyframes from generated video...");
+            var framesList = new List<byte[]>(videoRes.Frames);
+            int[] keyframes = VideoFrameSampler.SampleUniformIndices(framesList.Count, 4);
+            Console.WriteLine($"    -> Selected keyframes: [{string.Join(", ", keyframes)}]");
 
-            float motion = VideoFrameSampler.ComputeMotionEnergy(frames[0], frames[4]);
-            Console.WriteLine($"   -> Inter-frame motion energy: {motion * 100:F1}% (high subject displacement)");
+            float motionEnergy = VideoFrameSampler.ComputeMotionEnergy(framesList[0], framesList[^1]);
+            Console.WriteLine($"    -> Measured camera pan motion energy: {motionEnergy * 100:F1}%");
             Console.WriteLine();
 
-            // Step 3: 3D-RoPE Spatio-Temporal Encoding
-            Console.WriteLine("[3. 3D-RoPE Positional Decomposition] Projecting temporal (t) and spatial (h, w) rotary coordinates...");
-            var ropeSw = Stopwatch.StartNew();
+            // Phase 3: 3D-RoPE Spatio-Temporal Positional Encoding
+            Console.WriteLine("[3. 3D-RoPE Positional Decomposition] Projecting temporal (t) and spatial (h, w) coordinates...");
             var rope = new VideoRoPE(headDim: 64, ropeTheta: 10000.0f);
             float[] sampleHeadVec = new float[64];
             Array.Fill(sampleHeadVec, 1.0f);
-            rope.Apply3DRoPE(sampleHeadVec, t: 2, h: 16, w: 16);
-            ropeSw.Stop();
-            Console.WriteLine($"   -> Partitioned 64-dim head: Temporal={rope.TemporalDim}, Height={rope.HeightDim}, Width={rope.WidthDim}");
-            Console.WriteLine($"   -> 3D-RoPE coordinate application completed in {ropeSw.ElapsedMilliseconds}ms");
+            rope.Apply3DRoPE(sampleHeadVec, t: 3, h: 16, w: 16);
+            Console.WriteLine($"    -> Partitioned 64-dim head: Temporal={rope.TemporalDim}, Height={rope.HeightDim}, Width={rope.WidthDim}");
             Console.WriteLine();
 
-            // Step 4: Spatio-Temporal Token Projection & Multi-Frame Reasoning
-            Console.WriteLine("[4. Spatio-Temporal Reasoning] Ingesting into VideoPipeline (numLayers=2, dim=256)...");
-            var vSw = Stopwatch.StartNew();
+            // Phase 4: Video-Language Model Temporal Question Answering
+            Console.WriteLine("[4. Video-Language Understanding] Querying temporal narrative of generated video...");
             using var videoPipeline = new VideoPipeline(numLayers: 2, visionDim: 256, llmDim: 512, patchSize: 14);
-            var (tokens, _, meta) = videoPipeline.ProcessVideo(frames, w, h, targetKeyframes: 4);
-            vSw.Stop();
-            Console.WriteLine($"   -> Extracted {tokens} spatio-temporal tokens across 4 keyframes in {vSw.ElapsedMilliseconds}ms");
-            Console.WriteLine();
+            var (tokens, _, meta) = videoPipeline.ProcessVideo(framesList, 256, 256, targetKeyframes: 4);
 
-            // Step 5: Video Question Answering
-            Console.WriteLine("[5. Video Question Answering] Querying temporal narrative...");
             string q1 = "What motion patterns occur in this video?";
             string r1 = videoPipeline.Query(meta, q1, tokens);
-            Console.WriteLine($"   Q: \"{q1}\"");
+            Console.WriteLine($"    Q: \"{q1}\"");
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"   A: {r1}");
+            Console.WriteLine($"    A: {r1}");
             Console.ResetColor();
 
             string q2 = "Summarize the sequence.";
             string r2 = videoPipeline.Query(meta, q2, tokens);
-            Console.WriteLine($"   Q: \"{q2}\"");
+            Console.WriteLine($"    Q: \"{q2}\"");
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"   A: {r2}");
+            Console.WriteLine($"    A: {r2}");
             Console.ResetColor();
             Console.WriteLine();
 
             sw.Stop();
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VERIFIED] End-to-end Video-Language pipeline completed in {sw.ElapsedMilliseconds}ms with zero C++ DLLs!");
+            Console.WriteLine($"[VERIFIED] Complete Generative Video & VLM demo completed in {sw.ElapsedMilliseconds}ms with zero native DLLs!");
             Console.ResetColor();
             return 0;
         }

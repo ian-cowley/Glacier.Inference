@@ -81,7 +81,7 @@ await foreach (var token in session.GenerateStreamAsync("What is the capital of 
   - **Xiaomi MiMo Family**: MiMo-7B-RL.
   - **Generative Image & Diffusion Transformers**: Black Forest Labs FLUX.1 Schnell (`flux1-schnell-Q4_K_S.gguf`), 57-block DiT architecture (19 DoubleStreamBlocks + 38 SingleStreamBlocks + Final Layer) running 100% in-VRAM resident on NVIDIA GPUs with zero PCIe bus ping-pong.
   - **Pure CUDA Neural VAE Decoder**: 244-layer convolutional ResNet and spatial attention decoder (`ae.safetensors`) accelerated via custom GPU kernels (`conv2d_3x3` with 18x18 shared memory staging, `group_norm_silu`, FlashAttention-2 spatial self-attention, and `vae_clamp_rgb`), achieving **4.8s decode** (25.1x faster than CPU).
-  - **High-Resolution Tiled VAE Decoding**: Automatically slices large latent spaces (>512x512) into a 2x2 grid of overlapping $544\times 544$ tiles with 64-pixel linear feather blending in RGB space, reducing 1024x1024 VAE decode time from **566.8s down to 22.6s (25x speedup)** with minimal VRAM usage.
+  - **Generative Video Production & Spatio-Temporal 3D-DiT**: Pure C# .NET 10 Text-to-Video generation using decoupled Spatial & Temporal Attention, 3D Rotary Position Embeddings (3D-RoPE), Flow-Matching Rectified Flow ODE solver, Catmull-Rom cubic temporal spline 3D VAE decoding, and pure C# video container serialization (Animated PNG / APNG, Animated GIF89a with Netscape looping, and RIFF/AVI).
   - **Vision-Language Models (VLM) & Temporal Video Semantics**: Native ViT / SigLIP spatial patch extraction, 4-layer multi-head self-attention, 2D spatial merging (4x token compression), multimodal MLP projection, and multi-frame temporal video dynamics.
 - **Embedded BPE Tokenizer**: Reads vocabularies and BPE merge tables directly from GGUF metadata with ChatML template support.
 - **Dual-Protocol HTTP Server**: Drop-in compatible with Ollama (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI (`/v1/chat/completions`, `/v1/models`).
@@ -175,10 +175,13 @@ glacier image generate "a cinematic portrait of an astronaut on a neon planet" -
 glacier image info "models/flux1-schnell-Q4_K_S.gguf"
 glacier image demo
 
-# 8. Vision-Language & Multi-Frame Video Reasoning
+# 8. Generative Video Production & Video-Language Multimodal Reasoning
+glacier video generate "A cinematic landscape of neon auroras over icy fjords" --motion pan-right --format all --out glacier_video.apng
+glacier video generate "Cosmic nebula drifting across deep space" --frames 24 --fps 12 --motion orbit --out cosmic.gif
+glacier video demo                                   # Generative Video Production + VLM temporal Q&A
+glacier video query <dir> "Summarize the motion patterns"
 glacier vision query "photo.jpg" "Describe what is in this image"
 glacier vision demo
-glacier video demo
 
 # 9. Pure C# Voice Subsystem (Kokoro TTS & Whisper STT)
 glacier voice voices                                 # List all 16 USA & UK voices
