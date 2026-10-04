@@ -145,6 +145,21 @@ public sealed class TemporalLatentVaeDecoder : IDisposable
 
         for (int i = 0; i < targetFrames; i++)
         {
+            if (i == 0)
+            {
+                byte[] exact0 = new byte[frameBytes];
+                Array.Copy(keyframes[0], exact0, frameBytes);
+                result.Add(exact0);
+                continue;
+            }
+            if (i == targetFrames - 1)
+            {
+                byte[] exactLast = new byte[frameBytes];
+                Array.Copy(keyframes[nativeCount - 1], exactLast, frameBytes);
+                result.Add(exactLast);
+                continue;
+            }
+
             float u = (float)i / (targetFrames - 1);
             float s = u * (nativeCount - 1);
             int k1 = (int)MathF.Floor(s);

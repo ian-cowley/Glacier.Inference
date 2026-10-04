@@ -152,9 +152,9 @@ public sealed class VideoGenerationPipeline : IDisposable
         int latentChannels = _dit.LatentChannels;                          // 16
 
         // Compute keyframe latent count: for Wan 3D causal VAE, N_frames = 1 + 4 * (K - 1)
-        // Default to K=5 native keyframes (17 native frames @ 7,800 tokens for 832x480), upscaled to full duration via Catmull-Rom splines
+        // Default to K=9 native keyframes (33 native frames @ 14,040 tokens for 832x480), upscaled to full duration via Catmull-Rom splines
         int spatialTokens = (latentH / 2) * (latentW / 2);
-        int maxWanKeyframes = (_wanDit != null && spatialTokens > 0) ? Math.Min(5, _wanDit.MaxTokens / spatialTokens) : 5;
+        int maxWanKeyframes = (_wanDit != null && spatialTokens > 0) ? Math.Min(9, _wanDit.MaxTokens / spatialTokens) : 8;
         int temporalLatentFrames = (_wanDit != null)
             ? Math.Clamp((numFrames - 1) / 4 + 1, 2, maxWanKeyframes)
             : Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);
@@ -540,9 +540,17 @@ public sealed class VideoGenerationPipeline : IDisposable
 
         string p = prompt.ToLowerInvariant();
 
-        if (p.Contains("walking toward") || p.Contains("walking towards") || p.Contains("approaching") ||
-            p.Contains("coming closer") || p.Contains("push in") || p.Contains("push-in") ||
-            p.Contains("zoom in") || p.Contains("zooming in") || p.Contains("dolly in"))
+        if (p.Contains("toward the camera") || p.Contains("towards the camera") ||
+            p.Contains("toward camera") || p.Contains("towards camera") ||
+            p.Contains("walking toward") || p.Contains("walking towards") ||
+            p.Contains("approaching") || p.Contains("coming closer") ||
+            p.Contains("static") || p.Contains("tripod") || p.Contains("steady") || p.Contains("locked shot"))
+        {
+            return CameraMotion.Static;
+        }
+
+        if (p.Contains("push in") || p.Contains("push-in") || p.Contains("zoom in") ||
+            p.Contains("zooming in") || p.Contains("dolly in"))
         {
             return CameraMotion.ZoomIn;
         }
@@ -581,8 +589,8 @@ public sealed class VideoGenerationPipeline : IDisposable
             return CameraMotion.PanRight;
         }
 
-        if (p.Contains("drone") || p.Contains("fluid") || p.Contains("fly") || p.Contains("flying") ||
-            p.Contains("aerial") || p.Contains("dynamic") || p.Contains("handheld"))
+        if (p.Contains("drone") || p.Contains("aerial") || p.Contains("fly-through") || p.Contains("fpv") ||
+            p.Contains("handheld camera"))
         {
             return CameraMotion.DynamicFluid;
         }
