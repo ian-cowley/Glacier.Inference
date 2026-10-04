@@ -175,7 +175,9 @@ public sealed class VideoGenerationPipeline : IDisposable
             string? autoEmbedFile = null;
             string? autoNegFile = null;
 
-            if (prompt.Contains("woman", StringComparison.OrdinalIgnoreCase))
+            const string DefaultWomanPrompt = "A stunning stylish woman in a dark coat walking confidently toward the camera along a bustling modern city street at night, glowing neon signs, vibrant urban bokeh, wet pavement reflections, smooth fluid motion, cinematic 8k";
+
+            if (prompt.Trim().Equals(DefaultWomanPrompt, StringComparison.OrdinalIgnoreCase) && !prompt.Contains("leg", StringComparison.OrdinalIgnoreCase) && !prompt.Contains("full body", StringComparison.OrdinalIgnoreCase))
             {
                 string candidate = Path.Combine(repoBase, "woman_prompt_embeds.bin");
                 if (File.Exists(candidate) || File.Exists("woman_prompt_embeds.bin"))
@@ -184,7 +186,7 @@ public sealed class VideoGenerationPipeline : IDisposable
                     autoNegFile = File.Exists(Path.Combine(repoBase, "woman_neg_embeds.bin")) ? Path.Combine(repoBase, "woman_neg_embeds.bin") : "woman_neg_embeds.bin";
                 }
             }
-            else if (prompt.Contains("man", StringComparison.OrdinalIgnoreCase))
+            else if (prompt.Trim().Equals("A handsome man walking along a city street", StringComparison.OrdinalIgnoreCase))
             {
                 string candidate = Path.Combine(repoBase, "diffusers_prompt_embeds_832.bin");
                 if (File.Exists(candidate) || File.Exists("diffusers_prompt_embeds_832.bin"))
@@ -193,7 +195,7 @@ public sealed class VideoGenerationPipeline : IDisposable
                     autoNegFile = File.Exists(Path.Combine(repoBase, "diffusers_neg_embeds_832.bin")) ? Path.Combine(repoBase, "diffusers_neg_embeds_832.bin") : "diffusers_neg_embeds_832.bin";
                 }
             }
-            else if (File.Exists("prompt_embeds.bin"))
+            else if (File.Exists("prompt_embeds.bin") && !prompt.Contains("leg", StringComparison.OrdinalIgnoreCase))
             {
                 autoEmbedFile = "prompt_embeds.bin";
                 autoNegFile = "neg_embeds.bin";
@@ -221,14 +223,15 @@ public sealed class VideoGenerationPipeline : IDisposable
             }
             else if (_t5Encoder != null)
             {
-                Console.WriteLine($"[GLACIER VIDEO] Encoding prompt text context via T5-XXL (padded to {textSeqLen} tokens)...");
+                Console.WriteLine($"[GLACIER VIDEO] Encoding prompt text context via pure C# T5-XXL (padded to {textSeqLen} tokens)...");
                 var (promptEmbeds, validCount) = _t5Encoder.EncodeWithCount(prompt, maxSeqLen: textSeqLen);
                 contextTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
                 Array.Copy(promptEmbeds, contextTxt, promptEmbeds.Length);
 
                 if (guidanceScale > 1.0f)
                 {
-                    var (negEmbeds, _) = _t5Encoder.EncodeWithCount("", maxSeqLen: textSeqLen);
+                    const string defaultNegPrompt = "blurry, distorted, deformed, low quality, cartoon, static, bad anatomy";
+                    var (negEmbeds, _) = _t5Encoder.EncodeWithCount(defaultNegPrompt, maxSeqLen: textSeqLen);
                     uncondTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
                     Array.Copy(negEmbeds, uncondTxt, negEmbeds.Length);
                 }
