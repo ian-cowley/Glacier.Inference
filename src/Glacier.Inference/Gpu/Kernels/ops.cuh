@@ -769,6 +769,63 @@ __global__ void flux_adaln_kernel(
 }
 
 // =========================================================================
+// 19b. Affine LayerNorm: dst = ((x - mean) / std) * weight + bias
+// 1 block of 128 threads per token
+// =========================================================================
+__global__ void layer_norm_affine_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    int num_tokens,
+    int dim
+) {
+    int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    int tid = threadIdx.x;
+    const float* s = src + tok * dim;
+    float* d = dst + tok * dim;
+
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float v = s[i];
+        sum += v;
+        sum_sq += v * v;
+    }
+
+    sum = warp_reduce_sum(sum);
+    sum_sq = warp_reduce_sum(sum_sq);
+
+    __shared__ float s_sum[4];
+    __shared__ float s_sum_sq[4];
+
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    if (lane_id == 0) {
+        s_sum[warp_id] = sum;
+        s_sum_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+
+    float total_sum = s_sum[0] + s_sum[1] + s_sum[2] + s_sum[3];
+    float total_sum_sq = s_sum_sq[0] + s_sum_sq[1] + s_sum_sq[2] + s_sum_sq[3];
+
+    float mean = total_sum / (float)dim;
+    float var = fmaxf(0.0f, (total_sum_sq / (float)dim) - (mean * mean));
+    float inv_std = rsqrtf(var + 1e-6f);
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float w = weight ? weight[i] : 1.0f;
+        float b = bias ? bias[i] : 0.0f;
+        d[i] = ((s[i] - mean) * inv_std) * w + b;
+    }
+}
+
+// =========================================================================
 // 20. Residual Gated Add: target[i] += gate[i % dim] * update[i]
 // =========================================================================
 __global__ void flux_residual_gated(
@@ -1199,6 +1256,104 @@ __global__ void vae_clamp_rgb(
     dstRgb[dstIdx]     = (unsigned char)(ir < 0 ? 0 : (ir > 255 ? 255 : ir));
     dstRgb[dstIdx + 1] = (unsigned char)(ig < 0 ? 0 : (ig > 255 ? 255 : ig));
     dstRgb[dstIdx + 2] = (unsigned char)(ib < 0 ? 0 : (ib > 255 ? 255 : ib));
+}
+
+// =========================================================================
+// 23. Wan 3D VAE RMSNorm + Optional SiLU Activation across channels
+// Grid: blockIdx.x = (spatial + 255) / 256
+// Block: 256 threads (1 thread per spatial position s)
+// =========================================================================
+__global__ void wan_rmsnorm_silu(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const float* __restrict__ gamma,
+    int channels,
+    int spatial,
+    int applySilu
+) {
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= spatial) return;
+
+    float sumSq = 0.0f;
+    for (int c = 0; c < channels; c++) {
+        float val = src[(size_t)c * spatial + s];
+        sumSq += val * val;
+    }
+
+    float invRms = rsqrtf((sumSq / (float)channels) + 1e-12f);
+
+    for (int c = 0; c < channels; c++) {
+        float norm = src[(size_t)c * spatial + s] * invRms * gamma[c];
+        if (applySilu) {
+            norm = norm / (1.0f + __expf(-norm));
+        }
+        dst[(size_t)c * spatial + s] = norm;
+    }
+}
+
+// =========================================================================
+// 24. Wan VAE Spatial Self-Attention (FlashAttention with Online Softmax, channels<=384)
+// Grid: blockIdx.x = i (0 .. spatial - 1)
+// Block: 128 threads
+// =========================================================================
+__global__ void wan_spatial_attention(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ attn_out,
+    int spatial,
+    int channels,
+    float scale
+) {
+    int i = blockIdx.x;
+    if (i >= spatial) return;
+
+    int tid = threadIdx.x;
+
+    __shared__ float s_q[512];
+    for (int c = tid; c < channels; c += blockDim.x) {
+        s_q[c] = q[(size_t)c * spatial + i];
+    }
+    __syncthreads();
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+
+    __shared__ float s_warp_sum[4];
+
+    for (int j = 0; j < spatial; j++) {
+        float dot = 0.0f;
+        for (int c = tid; c < channels; c += blockDim.x) {
+            dot += s_q[c] * k[(size_t)c * spatial + j];
+        }
+        dot = warp_reduce_sum(dot);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+        if (lane_id == 0) s_warp_sum[warp_id] = dot;
+        __syncthreads();
+
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_j = total_dot * scale;
+
+        float m_new = fmaxf(m, s_j);
+        float alpha = expf(m - m_new);
+        float w_j = expf(s_j - m_new);
+
+        l = l * alpha + w_j;
+        m = m_new;
+
+        if (tid + 0 < channels)   acc0 = acc0 * alpha + w_j * v[(size_t)(tid + 0) * spatial + j];
+        if (tid + 128 < channels) acc1 = acc1 * alpha + w_j * v[(size_t)(tid + 128) * spatial + j];
+        if (tid + 256 < channels) acc2 = acc2 * alpha + w_j * v[(size_t)(tid + 256) * spatial + j];
+
+        __syncthreads();
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    if (tid + 0 < channels)   attn_out[(size_t)(tid + 0) * spatial + i] = acc0 * inv_l;
+    if (tid + 128 < channels) attn_out[(size_t)(tid + 128) * spatial + i] = acc1 * inv_l;
+    if (tid + 256 < channels) attn_out[(size_t)(tid + 256) * spatial + i] = acc2 * inv_l;
 }
 
 } // extern "C"

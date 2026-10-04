@@ -39,6 +39,7 @@ Glacier.Inference natively executes all major open foundation model families wit
 | **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Quadratic Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with $256$-dim Head | Recurrent Associative Memory ($S_t$), Depthwise Causal Conv1D, Q-Gate, RMSNorm per-head | `Qwen3.5-9B`, `Qwen3.6-27B-UD` |
 | **Google Gemma 4** | Interleaved Sliding Window Attention (ISWA) + Dual MoE (Shared MLP + Sparse Experts) + PLE | Independent SWA / Global RoPE Frequencies (`rope_freqs`) | Dual Shared FFN + Top-8 Gated MoE, GeLU-GLU, Logit Softcapping | `google_gemma-4-E4B-it`, `gemma-4-26B-A4B-it` |
 | **Black Forest Labs FLUX.1 (Schnell / Dev)** | 57-Block Diffusion Transformer (19 DoubleStream + 38 SingleStream) + Neural VAE | 3D Rotary Positional Embeddings (3D-RoPE) | In-VRAM Resident GEMM + FlashAttention-2 + GeLU Concat + Tiled VAE | `flux1-schnell-Q4_K_S.gguf` + `ae.safetensors` |
+| **Alibaba Wan 2.1 Video DiT (1.3B)** | 30-Block Spatio-Temporal Diffusion Transformer + 194-Tensor 3D Causal VAE | 3D-RoPE ($dim=64$) + QK-Norm + Self/Cross Attention | Flow-Matching Euler ODE ($shift=3.0$), 16-channel 3D Causal VAE, Catmull-Rom Splines | `Wan2.1-T2V-1.3B-Q4_K_M.gguf` + `wan_2.1_vae.safetensors` |
 
 ---
 
@@ -81,8 +82,8 @@ await foreach (var token in session.GenerateStreamAsync("What is the capital of 
   - **Xiaomi MiMo Family**: MiMo-7B-RL.
   - **Generative Image & Diffusion Transformers**: Black Forest Labs FLUX.1 Schnell (`flux1-schnell-Q4_K_S.gguf`), 57-block DiT architecture (19 DoubleStreamBlocks + 38 SingleStreamBlocks + Final Layer) running 100% in-VRAM resident on NVIDIA GPUs with zero PCIe bus ping-pong.
   - **Pure CUDA Neural VAE Decoder**: 244-layer convolutional ResNet and spatial attention decoder (`ae.safetensors`) accelerated via custom GPU kernels (`conv2d_3x3` with 18x18 shared memory staging, `group_norm_silu`, FlashAttention-2 spatial self-attention, and `vae_clamp_rgb`), achieving **4.8s decode** (25.1x faster than CPU).
-  - **Generative Video Production & Spatio-Temporal 3D-DiT**: Pure C# .NET 10 Text-to-Video generation using decoupled Spatial & Temporal Attention, 3D Rotary Position Embeddings (3D-RoPE), Flow-Matching Rectified Flow ODE solver, Catmull-Rom cubic temporal spline 3D VAE decoding, and pure C# video container serialization (Animated PNG / APNG, Animated GIF89a with Netscape looping, and RIFF/AVI).
-  - **Vision-Language Models (VLM) & Temporal Video Semantics**: Native ViT / SigLIP spatial patch extraction, 4-layer multi-head self-attention, 2D spatial merging (4x token compression), multimodal MLP projection, and multi-frame temporal video dynamics.
+  - **Generative Video Production & Spatio-Temporal 3D-DiT**: Pure C# .NET 10 Text-to-Video generation powered by Alibaba Wan 2.1 (1.3B) and Spatio-Temporal Diffusion Transformers with 3D Rotary Position Embeddings (3D-RoPE), per-head QK-Norm, UMT5 / T5-XXL text cross-attention, Flow-Matching Rectified Flow ODE solver (with Wan time-shift $\sigma_{\text{shifted}} = \frac{3\sigma}{1+2\sigma}$), native 832×480 widescreen generation, official 194-tensor 3D Causal Autoencoder (`wan_2.1_vae.safetensors`), $C^1$-continuous Catmull-Rom cubic temporal splines for arbitrary duration scaling (up to 15+ seconds), and pure C# video container serialization (lossless Truecolor APNG, Animated GIF89a with Netscape looping, and RIFF/AVI).
+  - **Pure CUDA Neural & 3D Causal VAE Decoders**: Fast convolutional ResNet and spatial attention decoders accelerated via custom GPU kernels (`conv2d_3x3` with 18x18 shared memory staging, `conv2d_1x1`, `wan_rmsnorm_silu`, FlashAttention spatial self-attention, and `vae_clamp_rgb`), achieving sub-second decoding directly into 24-bit sRGB with zero Python dependencies.
 - **Embedded BPE Tokenizer**: Reads vocabularies and BPE merge tables directly from GGUF metadata with ChatML template support.
 - **Dual-Protocol HTTP Server**: Drop-in compatible with Ollama (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI (`/v1/chat/completions`, `/v1/models`).
 - **Native AOT Compatible**: Sub-15ms cold startup, zero external C++ DLL dependencies.
@@ -176,6 +177,10 @@ glacier image info "models/flux1-schnell-Q4_K_S.gguf"
 glacier image demo
 
 # 8. Generative Video Production & Video-Language Multimodal Reasoning
+# High-fidelity 15-second cinematic 832x480 widescreen generation (240 frames @ 16 FPS)
+glacier video generate "A stunning stylish woman in a dark coat walking confidently toward the camera along a bustling modern city street at night, glowing neon signs, vibrant urban bokeh, wet pavement reflections, smooth fluid motion, cinematic 8k" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --guidance 5.0 --format all --out woman_walk.apng
+
+# Camera motion steered text-to-video synthesis
 glacier video generate "A cinematic landscape of neon auroras over icy fjords" --motion pan-right --format all --out glacier_video.apng
 glacier video generate "Cosmic nebula drifting across deep space" --frames 24 --fps 12 --motion orbit --out cosmic.gif
 glacier video demo                                   # Generative Video Production + VLM temporal Q&A

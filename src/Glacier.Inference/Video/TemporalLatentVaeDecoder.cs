@@ -4,30 +4,37 @@ using System;
 using System.Collections.Generic;
 using Glacier.Inference.Image;
 using Glacier.Inference.Image.Flux;
+using Glacier.Inference.Video.Wan;
 
 /// <summary>
 /// 3D Spatio-Temporal Variational Autoencoder (VAE) Decoder.
 /// Reconstructs full-resolution RGB video frame sequences from 4D spatio-temporal latents
-/// [T_lat, C, H_lat, W_lat] through Catmull-Rom cubic temporal spline upsampling and
-/// 8x progressive spatial deconvolution or pure CUDA neural VAE (ae.safetensors) in pure C# .NET 10.
+/// [T_lat, C, H_lat, W_lat] through official 3D Causal Autoencoder (wan_2.1_vae.safetensors),
+/// pure CUDA neural VAE (ae.safetensors), or Catmull-Rom cubic temporal spline upsampling in pure C# .NET 10.
 /// </summary>
 public sealed class TemporalLatentVaeDecoder : IDisposable
 {
     public const int DefaultLatentChannels = 16;
-    public const int SpatialScaleFactor = 8; // 8x spatial expansion (32x32 -> 256x256)
+    public const int SpatialScaleFactor = 8; // 8x spatial expansion (30x30 -> 240x240)
 
     private readonly LatentVaeDecoder _spatialDecoder;
     private readonly FluxVaeDecoder? _neuralDecoder;
+    private readonly Wan3DVaeDecoder? _wanDecoder;
     private readonly int _latentChannels;
     private bool _disposed;
 
     public int LatentChannels => _latentChannels;
-    public bool HasNeuralVae => _neuralDecoder != null;
+    public bool HasNeuralVae => _wanDecoder != null || _neuralDecoder != null;
+    public Wan3DVaeDecoder? WanDecoder => _wanDecoder;
 
-    public TemporalLatentVaeDecoder(int latentChannels = DefaultLatentChannels, FluxVaeDecoder? neuralDecoder = null)
+    public TemporalLatentVaeDecoder(
+        int latentChannels = DefaultLatentChannels,
+        FluxVaeDecoder? neuralDecoder = null,
+        Wan3DVaeDecoder? wanDecoder = null)
     {
         _latentChannels = latentChannels;
         _neuralDecoder = neuralDecoder;
+        _wanDecoder = wanDecoder;
         _spatialDecoder = new LatentVaeDecoder(latentChannels);
     }
 
@@ -51,6 +58,16 @@ public sealed class TemporalLatentVaeDecoder : IDisposable
         if (spatioTemporalLatents.Length < temporalLatentFrames * frameLatentFloats)
         {
             throw new ArgumentException("Latents buffer too small for specified dimensions.");
+        }
+
+        if (_wanDecoder != null)
+        {
+            var nativeFrames = _wanDecoder.DecodeVideo(spatioTemporalLatents, temporalLatentFrames, targetFrames, latentH, latentW);
+            if (nativeFrames.Count < targetFrames && nativeFrames.Count > 1)
+            {
+                return InterpolateFrames(nativeFrames, targetFrames, targetH, targetW);
+            }
+            return nativeFrames;
         }
 
         var frames = new List<byte[]>(targetFrames);
@@ -95,7 +112,7 @@ public sealed class TemporalLatentVaeDecoder : IDisposable
                 float p3 = spatioTemporalLatents[off3 + i];
 
                 float val = w0 * p0 + w1 * p1 + w2 * p2 + w3 * p3;
-                interpolatedLatent[i] = Math.Clamp(val, -1.0f, 2.5f);
+                interpolatedLatent[i] = (_neuralDecoder != null) ? val : Math.Clamp(val, 0.0f, 1.0f);
             }
 
             // Spatial progressive decode of interpolated latent frame to RGB
@@ -109,22 +126,66 @@ public sealed class TemporalLatentVaeDecoder : IDisposable
                 _spatialDecoder.Decode(interpolatedLatent, latentH, latentW, frameBytes);
             }
 
-            // Optional temporal anti-flicker smoothing against previous frame
-            if (frames.Count > 0)
-            {
-                byte[] prev = frames[^1];
-                for (int b = 0; b < frameBytes.Length; b++)
-                {
-                    // 15% temporal blend with previous frame for cinematic persistence of vision
-                    int smoothed = (int)(frameBytes[b] * 0.85f + prev[b] * 0.15f);
-                    frameBytes[b] = (byte)Math.Clamp(smoothed, 0, 255);
-                }
-            }
-
             frames.Add(frameBytes);
         }
 
         return frames;
+    }
+
+    /// <summary>
+    /// Smoothly interpolates native RGB keyframe sequence to the target frame count using C^1 Catmull-Rom cubic splines.
+    /// </summary>
+    public static List<byte[]> InterpolateFrames(IReadOnlyList<byte[]> keyframes, int targetFrames, int height, int width)
+    {
+        int nativeCount = keyframes.Count;
+        if (targetFrames <= nativeCount) return new List<byte[]>(keyframes);
+
+        int frameBytes = height * width * 3;
+        var result = new List<byte[]>(targetFrames);
+
+        for (int i = 0; i < targetFrames; i++)
+        {
+            float u = (float)i / (targetFrames - 1);
+            float s = u * (nativeCount - 1);
+            int k1 = (int)MathF.Floor(s);
+            int k2 = Math.Min(k1 + 1, nativeCount - 1);
+            int k0 = Math.Max(0, k1 - 1);
+            int k3 = Math.Min(nativeCount - 1, k2 + 1);
+            float frac = s - k1;
+
+            if (frac == 0f)
+            {
+                byte[] exact = new byte[frameBytes];
+                Array.Copy(keyframes[k1], exact, frameBytes);
+                result.Add(exact);
+                continue;
+            }
+
+            float f = frac;
+            float f2 = f * f;
+            float f3 = f2 * f;
+
+            float w0 = 0.5f * (-f + 2.0f * f2 - f3);
+            float w1 = 0.5f * (2.0f - 5.0f * f2 + 3.0f * f3);
+            float w2 = 0.5f * (f + 4.0f * f2 - 3.0f * f3);
+            float w3 = 0.5f * (-f2 + f3);
+
+            byte[] p0 = keyframes[k0];
+            byte[] p1 = keyframes[k1];
+            byte[] p2 = keyframes[k2];
+            byte[] p3 = keyframes[k3];
+
+            byte[] interp = new byte[frameBytes];
+            Parallel.For(0, frameBytes, p =>
+            {
+                float val = w0 * p0[p] + w1 * p1[p] + w2 * p2[p] + w3 * p3[p];
+                interp[p] = (byte)Math.Clamp((int)MathF.Round(val), 0, 255);
+            });
+
+            result.Add(interp);
+        }
+
+        return result;
     }
 
     public void Dispose()
@@ -132,6 +193,7 @@ public sealed class TemporalLatentVaeDecoder : IDisposable
         if (!_disposed)
         {
             _disposed = true;
+            _wanDecoder?.Dispose();
             _neuralDecoder?.Dispose();
             _spatialDecoder.Dispose();
         }

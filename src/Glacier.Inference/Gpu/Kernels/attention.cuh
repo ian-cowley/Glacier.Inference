@@ -708,6 +708,69 @@ __global__ void attention_bidirectional_batch(
     attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
+// =========================================================================
+// 13. Cross Multi-Head Attention for Wan 2.1 Video DiT
+// Grid: blockIdx.x = h (0..n_heads - 1), blockIdx.y = b (0..num_q_tokens - 1)
+// Block: 128 threads (threadIdx.x = d in 0..head_dim - 1)
+// =========================================================================
+__global__ void attention_cross_batch(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ attn_out,
+    int n_heads,
+    int head_dim,
+    int num_q_tokens,
+    int num_kv_tokens,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads || b >= num_q_tokens) return;
+
+    int tid = threadIdx.x;
+    size_t q_offset = (size_t)b * n_heads * head_dim + h * head_dim + tid;
+    float q_d = q[q_offset];
+
+    __shared__ float s_warp_sum[4];
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (int t = 0; t < num_kv_tokens; t++) {
+        size_t kv_offset = (size_t)t * n_heads * head_dim + h * head_dim + tid;
+        float k_d = k[kv_offset];
+        float v_d = v[kv_offset];
+
+        float prod = q_d * k_d;
+        prod = warp_reduce_sum(prod);
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+
+        if (lane_id == 0) {
+            s_warp_sum[warp_id] = prod;
+        }
+        __syncthreads();
+
+        float total_dot = s_warp_sum[0] + s_warp_sum[1] + s_warp_sum[2] + s_warp_sum[3];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
+        __syncthreads();
+    }
+
+    size_t out_offset = (size_t)b * n_heads * head_dim + h * head_dim + tid;
+    attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
+}
+
 } // extern "C"
 
 

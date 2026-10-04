@@ -1870,17 +1870,18 @@ public static class Program
             }
 
             string prompt = args[1];
-            int width = 256;
-            int height = 256;
-            int frames = 16;
-            int fps = 8;
-            int steps = 4;
+            int width = 832;
+            int height = 480;
+            int frames = 17;
+            int fps = 16;
+            int steps = 25;
             CameraMotion? explicitMotion = null;
             string outPath = "glacier_video.apng";
             string format = "apng";
             int? seed = null;
             string? imagePath = null;
             float? duration = null;
+            float guidance = 5.0f;
 
             for (int i = 2; i < args.Length; i++)
             {
@@ -1894,6 +1895,7 @@ public static class Program
                 else if (args[i] == "--seed" && i + 1 < args.Length && int.TryParse(args[++i], out int sd)) seed = sd;
                 else if ((args[i] == "--image" || args[i] == "-i") && i + 1 < args.Length) imagePath = args[++i];
                 else if (args[i] == "--duration" && i + 1 < args.Length && float.TryParse(args[++i], out float dur)) duration = dur;
+                else if (args[i] == "--guidance" && i + 1 < args.Length && float.TryParse(args[++i], out float gd)) guidance = gd;
                 else if (args[i] == "--motion" && i + 1 < args.Length)
                 {
                     string mStr = args[++i].ToLowerInvariant();
@@ -1940,11 +1942,11 @@ public static class Program
             float totalDurationSec = (float)frames / fps;
             Console.WriteLine($"Resolution: {width}x{height} | Duration: {totalDurationSec:F1}s ({frames} frames @ {fps} FPS)");
             Console.WriteLine($"Camera Motion: {motion} | Format: {format.ToUpperInvariant()}");
-            Console.WriteLine($"Flow Steps: {steps} | ODE: Rectified Flow Euler Solver");
+            Console.WriteLine($"Flow Steps: {steps} | Guidance: {guidance:F1} | ODE: Rectified Flow Euler Solver");
             Console.WriteLine();
 
-            using var pipeline = new VideoGenerationPipeline();
             VideoGenerationResult result;
+            using var pipeline = new VideoGenerationPipeline();
             if (!string.IsNullOrEmpty(imagePath) && File.Exists(imagePath))
             {
                 Console.WriteLine($"Animating reference image: {imagePath} with camera motion {motion}...");
@@ -1953,7 +1955,7 @@ public static class Program
             }
             else
             {
-                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed);
+                result = pipeline.Generate(prompt, width, height, frames, fps, steps, motion, seed, guidance);
             }
 
             if (format == "all")
@@ -1967,6 +1969,17 @@ public static class Program
                 result.SaveApng(apngFile);
                 result.SaveGif(gifFile);
                 result.SaveAvi(aviFile);
+
+                int totalF = result.Frames.Count;
+                int[] sampleIndices = [0, totalF / 4, totalF / 2, 3 * totalF / 4, totalF - 1];
+                foreach (int idx in sampleIndices)
+                {
+                    if (idx >= 0 && idx < totalF)
+                    {
+                        string frameFile = string.IsNullOrEmpty(dir) ? $"{baseName}_frame_{idx}.png" : Path.Combine(dir, $"{baseName}_frame_{idx}.png");
+                        Glacier.Inference.Image.PngWriter.SavePng24(frameFile, result.Frames[idx], result.Width, result.Height);
+                    }
+                }
 
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine($"[Exported APNG] -> {apngFile} ({new FileInfo(apngFile).Length / 1024} KB)");

@@ -15,7 +15,8 @@ using Glacier.Inference.Quant;
 /// <summary>
 /// Pre-trained Video Diffusion Transformer (Wan2.1-T2V-1.3B) executing flow-matching velocity prediction.
 /// Maps 30 Spatio-Temporal Transformer blocks directly from GGUF weights with 3D patch embedding,
-/// QK-Norm, 3D-RoPE, cross-attention with T5-XXL embeddings, AdaLN modulation, and NVIDIA GPU acceleration.
+/// across-head QK-Norm, 3D-RoPE, cross-attention with T5-XXL embeddings, AdaLN modulation,
+/// and NVIDIA bare-metal GPU acceleration.
 /// </summary>
 public unsafe sealed class WanDiT : IDisposable
 {
@@ -56,8 +57,13 @@ public unsafe sealed class WanDiT : IDisposable
     private IntPtr _fnGemmQ4KBatch;
     private IntPtr _fnGemmQ6KBatch;
     private IntPtr _fnAttnBidirectionalBatch;
+    private IntPtr _fnAttnCrossBatch;
     private IntPtr _fnGelu;
-    private IntPtr _fnRmsNormBatchHeads;
+    private IntPtr _fnRmsNormBatch;
+    private IntPtr _fnLayerNormAffine;
+    private IntPtr _fnAdaLn;
+    private IntPtr _fnResidualGated;
+    private IntPtr _fnVecAdd;
 
     private IntPtr _dXDevice = IntPtr.Zero;
     private IntPtr _dYDevice = IntPtr.Zero;
@@ -66,21 +72,33 @@ public unsafe sealed class WanDiT : IDisposable
     private IntPtr _dVDevice = IntPtr.Zero;
     private IntPtr _dAttnOut = IntPtr.Zero;
     private IntPtr _dFfnInter = IntPtr.Zero;
+    private IntPtr _dTxtDevice = IntPtr.Zero;
+
+    private IntPtr _dShiftMsa = IntPtr.Zero;
+    private IntPtr _dScaleMsa = IntPtr.Zero;
+    private IntPtr _dGateMsa = IntPtr.Zero;
+    private IntPtr _dCShiftMsa = IntPtr.Zero;
+    private IntPtr _dCScaleMsa = IntPtr.Zero;
+    private IntPtr _dCGateMsa = IntPtr.Zero;
+
     private nuint _dXCapacity = 0;
     private nuint _dFfnCapacity = 0;
+    private nuint _dTxtCapacity = 0;
     private bool _gpuWeightsUploaded = false;
 
     // Scratch buffers
     private readonly int _maxTokens;
-    private float* _timeVec;       // [1536]
-    private float* _timeModAll;    // [9216]
-    private float* _tokenBufferA;  // [maxTokens * 1536]
-    private float* _tokenBufferB;  // [maxTokens * 1536]
-    private float* _qBuffer;       // [maxTokens * 1536]
-    private float* _kBuffer;       // [maxTokens * 1536]
-    private float* _vBuffer;       // [maxTokens * 1536]
-    private float* _attnScores;    // [maxTokens * maxTokens]
-    private float* _ffnIntermediate; // [maxTokens * 8960]
+    private float* _timeVec;          // [1536]
+    private float* _timeModAll;       // [9216]
+    private float* _tokenBufferA;     // [maxTokens * 1536]
+    private float* _tokenBufferB;     // [maxTokens * 1536]
+    private float* _tokenBufferC;     // [maxTokens * 1536]
+    private float* _qBuffer;          // [maxTokens * 1536]
+    private float* _kBuffer;          // [maxTokens * 1536]
+    private float* _vBuffer;          // [maxTokens * 1536]
+    private float* _ffnIntermediate;  // [maxTokens * 8960]
+    private float* _ropeCos;          // [maxTokens * 64]
+    private float* _ropeSin;          // [maxTokens * 64]
     private bool _disposed;
 
     public int MaxTokens => _maxTokens;
@@ -120,9 +138,10 @@ public unsafe sealed class WanDiT : IDisposable
 
         public IntPtr D_Ffn0_W, D_Ffn0_B;
         public IntPtr D_Ffn2_W, D_Ffn2_B;
+        public IntPtr D_Norm3_W, D_Norm3_B;
     }
 
-    private WanDiT(GgufFile gguf, int maxTokens = 4096, bool enableGpu = true)
+    private WanDiT(GgufFile gguf, int maxTokens = 16384, bool enableGpu = true)
     {
         _gguf = gguf;
         _maxTokens = maxTokens;
@@ -188,11 +207,13 @@ public unsafe sealed class WanDiT : IDisposable
         _timeModAll = (float*)NativeMemory.AlignedAlloc(9216 * sizeof(float), 64);
         _tokenBufferA = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
         _tokenBufferB = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
+        _tokenBufferC = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
         _qBuffer = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
         _kBuffer = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
         _vBuffer = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * HiddenDim * sizeof(float)), 64);
-        _attnScores = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * 512 * sizeof(float)), 64);
         _ffnIntermediate = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * FfnDim * sizeof(float)), 64);
+        _ropeCos = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * 64 * sizeof(float)), 64);
+        _ropeSin = (float*)NativeMemory.AlignedAlloc((nuint)(_maxTokens * 64 * sizeof(float)), 64);
 
         // Hardware GPU Acceleration Initialization (NVIDIA RTX 4060)
         if (enableGpu && GpuContext.IsSupported)
@@ -205,8 +226,20 @@ public unsafe sealed class WanDiT : IDisposable
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _gpuModule, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _gpuModule, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnBidirectionalBatch, _gpuModule, "attention_bidirectional_batch"), "ModuleGetFunction(attention_bidirectional_batch)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttnCrossBatch, _gpuModule, "attention_cross_batch"), "ModuleGetFunction(attention_cross_batch)");
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGelu, _gpuModule, "flux_gelu_kernel"), "ModuleGetFunction(flux_gelu_kernel)");
-                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatchHeads, _gpuModule, "rms_norm_batch_heads_kernel"), "ModuleGetFunction(rms_norm_batch_heads_kernel)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _gpuModule, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnLayerNormAffine, _gpuModule, "layer_norm_affine_kernel"), "ModuleGetFunction(layer_norm_affine_kernel)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAdaLn, _gpuModule, "flux_adaln_kernel"), "ModuleGetFunction(flux_adaln_kernel)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnResidualGated, _gpuModule, "flux_residual_gated"), "ModuleGetFunction(flux_residual_gated)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _gpuModule, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
+
+                _dShiftMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
+                _dScaleMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
+                _dGateMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
+                _dCShiftMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
+                _dCScaleMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
+                _dCGateMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
 
                 UploadGpuBlockWeights();
                 Console.WriteLine($"[GLACIER GPU] Accelerated Wan2.1 Video DiT on {_gpu.DeviceName} ({_gpu.ArchString}). 30 blocks resident in VRAM.");
@@ -220,7 +253,7 @@ public unsafe sealed class WanDiT : IDisposable
         }
     }
 
-    public static WanDiT Open(string ggufPath, int maxTokens = 4096, bool enableGpu = true)
+    public static WanDiT Open(string ggufPath, int maxTokens = 16384, bool enableGpu = true)
     {
         var gguf = GgufFile.Open(ggufPath);
         return new WanDiT(gguf, maxTokens, enableGpu);
@@ -237,14 +270,19 @@ public unsafe sealed class WanDiT : IDisposable
             (blk.D_SelfK_W, blk.D_SelfK_B) = UploadWeightAndBias(blk.SelfK_W, blk.SelfK_B, HiddenDim);
             (blk.D_SelfV_W, blk.D_SelfV_B) = UploadWeightAndBias(blk.SelfV_W, blk.SelfV_B, HiddenDim);
             (blk.D_SelfO_W, blk.D_SelfO_B) = UploadWeightAndBias(blk.SelfO_W, blk.SelfO_B, HiddenDim);
+            (blk.D_SelfNormQ, _) = UploadWeightAndBias(blk.SelfNormQ, null, HiddenDim);
+            (blk.D_SelfNormK, _) = UploadWeightAndBias(blk.SelfNormK, null, HiddenDim);
 
             (blk.D_CrossQ_W, blk.D_CrossQ_B) = UploadWeightAndBias(blk.CrossQ_W, blk.CrossQ_B, HiddenDim);
             (blk.D_CrossK_W, blk.D_CrossK_B) = UploadWeightAndBias(blk.CrossK_W, blk.CrossK_B, HiddenDim);
             (blk.D_CrossV_W, blk.D_CrossV_B) = UploadWeightAndBias(blk.CrossV_W, blk.CrossV_B, HiddenDim);
             (blk.D_CrossO_W, blk.D_CrossO_B) = UploadWeightAndBias(blk.CrossO_W, blk.CrossO_B, HiddenDim);
+            (blk.D_CrossNormQ, _) = UploadWeightAndBias(blk.CrossNormQ, null, HiddenDim);
+            (blk.D_CrossNormK, _) = UploadWeightAndBias(blk.CrossNormK, null, HiddenDim);
 
             (blk.D_Ffn0_W, blk.D_Ffn0_B) = UploadWeightAndBias(blk.Ffn0_W, blk.Ffn0_B, FfnDim);
             (blk.D_Ffn2_W, blk.D_Ffn2_B) = UploadWeightAndBias(blk.Ffn2_W, blk.Ffn2_B, HiddenDim);
+            (blk.D_Norm3_W, blk.D_Norm3_B) = UploadWeightAndBias(blk.Norm3_W, blk.Norm3_B, HiddenDim);
         }
 
         _gpuWeightsUploaded = true;
@@ -261,23 +299,27 @@ public unsafe sealed class WanDiT : IDisposable
             FreeDevicePtr(ref blk.D_SelfK_W); FreeDevicePtr(ref blk.D_SelfK_B);
             FreeDevicePtr(ref blk.D_SelfV_W); FreeDevicePtr(ref blk.D_SelfV_B);
             FreeDevicePtr(ref blk.D_SelfO_W); FreeDevicePtr(ref blk.D_SelfO_B);
+            FreeDevicePtr(ref blk.D_SelfNormQ); FreeDevicePtr(ref blk.D_SelfNormK);
 
             FreeDevicePtr(ref blk.D_CrossQ_W); FreeDevicePtr(ref blk.D_CrossQ_B);
             FreeDevicePtr(ref blk.D_CrossK_W); FreeDevicePtr(ref blk.D_CrossK_B);
             FreeDevicePtr(ref blk.D_CrossV_W); FreeDevicePtr(ref blk.D_CrossV_B);
             FreeDevicePtr(ref blk.D_CrossO_W); FreeDevicePtr(ref blk.D_CrossO_B);
+            FreeDevicePtr(ref blk.D_CrossNormQ); FreeDevicePtr(ref blk.D_CrossNormK);
 
             FreeDevicePtr(ref blk.D_Ffn0_W); FreeDevicePtr(ref blk.D_Ffn0_B);
             FreeDevicePtr(ref blk.D_Ffn2_W); FreeDevicePtr(ref blk.D_Ffn2_B);
+            FreeDevicePtr(ref blk.D_Norm3_W); FreeDevicePtr(ref blk.D_Norm3_B);
         }
 
         _gpuWeightsUploaded = false;
     }
 
-    private void EnsureGpuBuffers(int numTokens)
+    private void EnsureGpuBuffers(int numTokens, int numTxtTokens = 0)
     {
         if (_gpu == null) return;
-        nuint xBytes = (nuint)((long)numTokens * HiddenDim * sizeof(float));
+        int maxTokens = Math.Max(numTokens, numTxtTokens);
+        nuint xBytes = (nuint)((long)maxTokens * HiddenDim * sizeof(float));
         nuint ffnBytes = (nuint)((long)numTokens * FfnDim * sizeof(float));
 
         if (xBytes > _dXCapacity)
@@ -304,9 +346,20 @@ public unsafe sealed class WanDiT : IDisposable
             _dFfnCapacity = ffnBytes * 12 / 10 + 1024 * 1024;
             _dFfnInter = _gpu.AllocateDevice(_dFfnCapacity);
         }
+
+        if (numTxtTokens > 0)
+        {
+            nuint txtBytes = (nuint)((long)numTxtTokens * HiddenDim * sizeof(float));
+            if (txtBytes > _dTxtCapacity)
+            {
+                FreeDevicePtr(ref _dTxtDevice);
+                _dTxtCapacity = txtBytes * 12 / 10 + 256 * 1024;
+                _dTxtDevice = _gpu.AllocateDevice(_dTxtCapacity);
+            }
+        }
     }
 
-    private (IntPtr dW, IntPtr dB) UploadWeightAndBias(GgufTensorInfo w, GgufTensorInfo b, int nRows)
+    private (IntPtr dW, IntPtr dB) UploadWeightAndBias(GgufTensorInfo w, GgufTensorInfo? b, int nRows)
     {
         if (_gpu == null) return (IntPtr.Zero, IntPtr.Zero);
         nuint wBytes = (nuint)w.GetByteSize();
@@ -359,97 +412,365 @@ public unsafe sealed class WanDiT : IDisposable
             throw new ArgumentException($"Total image tokens ({totalImgTokens}) exceeds capacity ({_maxTokens}).");
         }
 
-        // 1. Timestep Embedding
+        // 1. Precompute 3D RoPE lookup table
+        Precompute3DRoPE(temporalFrames, tokenH, tokenW, _ropeCos, _ropeSin);
+
+        // 2. Timestep Embedding
         ComputeTimeEmbedding(timestep, _timeVec, _timeModAll);
 
-        // 2. Text Context Projection: [numTxtTokens, 4096] -> [numTxtTokens, 1536]
-        float* projectedTxt = stackalloc float[Math.Max(1, numTxtTokens) * HiddenDim];
-        if (numTxtTokens > 0)
+        // 3. Text Context Projection: [numTxtTokens, 4096] -> [numTxtTokens, 1536] (GELU approx)
+        int txtAllocTokens = Math.Max(1, numTxtTokens);
+        float* projectedTxt = (float*)NativeMemory.AlignedAlloc((nuint)(txtAllocTokens * HiddenDim * sizeof(float)), 64);
+
+        try
         {
-            ProjectText(textContext, numTxtTokens, projectedTxt);
-        }
-
-        // 3. Patchify & Project input latents to hidden dimension: [totalImgTokens, 64] -> [totalImgTokens, 1536]
-        PatchifyAndProject(latents, temporalFrames, latentH, latentW, _tokenBufferA);
-
-        // 4. Evaluate 30 Transformer Blocks
-        float* currentTokens = _tokenBufferA;
-        float* nextTokens = _tokenBufferB;
-
-        if (IsGpuAccelerated)
-        {
-            // Execute on NVIDIA GPU (RTX 4060)
-            EnsureGpuBuffers(totalImgTokens);
-            _gpu!.CopyToDevice(_dXDevice, (IntPtr)currentTokens, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-
-            for (int blkIdx = 0; blkIdx < NumBlocks; blkIdx++)
+            if (numTxtTokens > 0)
             {
-                var blk = _blocks[blkIdx];
-                ExecuteBlockGpu(blk, totalImgTokens, projectedTxt, numTxtTokens);
+                ProjectText(textContext, numTxtTokens, projectedTxt);
             }
 
-            _gpu.Synchronize();
-            _gpu.CopyToHost((IntPtr)currentTokens, _dXDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-        }
-        else
-        {
-            // Fallback: CPU AVX-512 SIMD execution with batched weight streaming
-            for (int blkIdx = 0; blkIdx < NumBlocks; blkIdx++)
+            // 4. Patchify & Project input latents to hidden dimension: [totalImgTokens, 64] -> [totalImgTokens, 1536]
+            PatchifyAndProject(latents, temporalFrames, latentH, latentW, _tokenBufferA);
+
+            // 5. Evaluate 30 Transformer Blocks with AdaLN Modulation, 3D RoPE, and Gating
+            float* currentTokens = _tokenBufferA;
+
+            if (IsGpuAccelerated)
             {
-                var blk = _blocks[blkIdx];
-
-                ExecuteSelfAttentionCpu(currentTokens, totalImgTokens, temporalFrames, tokenH, tokenW, blk, nextTokens);
-                float* tmp1 = currentTokens; currentTokens = nextTokens; nextTokens = tmp1;
-
+                // Execute on NVIDIA GPU (RTX 4060)
+                EnsureGpuBuffers(totalImgTokens, numTxtTokens);
+                _gpu!.CopyToDevice(_dXDevice, (IntPtr)currentTokens, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
                 if (numTxtTokens > 0)
                 {
-                    ExecuteCrossAttentionCpu(currentTokens, totalImgTokens, projectedTxt, numTxtTokens, blk, nextTokens);
-                    float* tmp2 = currentTokens; currentTokens = nextTokens; nextTokens = tmp2;
+                    _gpu.CopyToDevice(_dTxtDevice, (IntPtr)projectedTxt, (nuint)(numTxtTokens * HiddenDim * sizeof(float)));
                 }
 
-                ExecuteFFNCpu(currentTokens, totalImgTokens, blk, nextTokens);
-                float* tmp3 = currentTokens; currentTokens = nextTokens; nextTokens = tmp3;
-            }
-        }
+                for (int blkIdx = 0; blkIdx < NumBlocks; blkIdx++)
+                {
+                    var blk = _blocks[blkIdx];
+                    ExecuteBlockGpu(blk, totalImgTokens, temporalFrames, tokenH, tokenW, _ropeCos, _ropeSin, projectedTxt, numTxtTokens, _timeModAll);
+                }
 
-        // 5. Final Head Layer: AdaLN Modulate, Project [1536 -> 64], and Unpatchify to velocity field
-        UnpatchifyAndOutput(currentTokens, temporalFrames, latentH, latentW, velocityOut);
+                _gpu.Synchronize();
+                _gpu.CopyToHost((IntPtr)currentTokens, _dXDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+            }
+            else
+            {
+                // Fallback: CPU AVX-512 SIMD execution with batched weight streaming
+                for (int blkIdx = 0; blkIdx < NumBlocks; blkIdx++)
+                {
+                    var blk = _blocks[blkIdx];
+                    ExecuteBlockCpu(currentTokens, totalImgTokens, temporalFrames, tokenH, tokenW, _ropeCos, _ropeSin, projectedTxt, numTxtTokens, blk, _timeModAll);
+                }
+            }
+
+            // 6. Final Head Layer: AdaLN Modulate (head.modulation + _timeVec), Project [1536 -> 64], and Unpatchify to velocity field
+            UnpatchifyAndOutput(currentTokens, temporalFrames, latentH, latentW, velocityOut);
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(projectedTxt);
+        }
     }
 
-    private void ExecuteBlockGpu(WanBlockWeights blk, int totalImgTokens, float* projectedTxt, int numTxtTokens)
+    private void ExecuteBlockGpu(
+        WanBlockWeights blk,
+        int totalImgTokens,
+        int frames,
+        int tokenH,
+        int tokenW,
+        float* ropeCos,
+        float* ropeSin,
+        float* projectedTxt,
+        int numTxtTokens,
+        float* timeModAll)
     {
-        // 1. Self Attention QKV
-        DispatchMatMulBatchDevice(blk.D_SelfQ_W, blk.D_SelfQ_B, _dXDevice, _dQDevice, HiddenDim, HiddenDim, totalImgTokens);
-        DispatchMatMulBatchDevice(blk.D_SelfK_W, blk.D_SelfK_B, _dXDevice, _dKDevice, HiddenDim, HiddenDim, totalImgTokens);
-        DispatchMatMulBatchQ6KDevice(blk.D_SelfV_W, blk.D_SelfV_B, _dXDevice, _dVDevice, HiddenDim, HiddenDim, totalImgTokens);
+        float* modBase = (float*)_gguf.GetTensorPointer(blk.Modulation);
+        float* shift_msa   = stackalloc float[HiddenDim];
+        float* scale_msa   = stackalloc float[HiddenDim];
+        float* gate_msa    = stackalloc float[HiddenDim];
+        float* c_shift_msa = stackalloc float[HiddenDim];
+        float* c_scale_msa = stackalloc float[HiddenDim];
+        float* c_gate_msa  = stackalloc float[HiddenDim];
 
-        // 2. Bidirectional Attention across spatio-temporal tokens
+        for (int d = 0; d < HiddenDim; d++)
+        {
+            shift_msa[d]   = modBase[0 * HiddenDim + d] + timeModAll[0 * HiddenDim + d];
+            scale_msa[d]   = modBase[1 * HiddenDim + d] + timeModAll[1 * HiddenDim + d];
+            gate_msa[d]    = modBase[2 * HiddenDim + d] + timeModAll[2 * HiddenDim + d];
+            c_shift_msa[d] = modBase[3 * HiddenDim + d] + timeModAll[3 * HiddenDim + d];
+            c_scale_msa[d] = modBase[4 * HiddenDim + d] + timeModAll[4 * HiddenDim + d];
+            c_gate_msa[d]  = modBase[5 * HiddenDim + d] + timeModAll[5 * HiddenDim + d];
+        }
+
+        // Upload block modulation vectors to GPU scratch
+        _gpu!.CopyToDevice(_dShiftMsa, (IntPtr)shift_msa, (nuint)(HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dScaleMsa, (IntPtr)scale_msa, (nuint)(HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dGateMsa, (IntPtr)gate_msa, (nuint)(HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dCShiftMsa, (IntPtr)c_shift_msa, (nuint)(HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dCScaleMsa, (IntPtr)c_scale_msa, (nuint)(HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dCGateMsa, (IntPtr)c_gate_msa, (nuint)(HiddenDim * sizeof(float)));
+
+        // 1. Self-Attention
+        // 1a. AdaLN LayerNorm on GPU: _dXDevice -> _dYDevice
+        DispatchAdaLnDevice(_dXDevice, _dYDevice, _dShiftMsa, _dScaleMsa, totalImgTokens, HiddenDim);
+
+        // 1b. QKV MatMuls
+        DispatchMatMulBatchDevice(blk.D_SelfQ_W, blk.D_SelfQ_B, _dYDevice, _dQDevice, HiddenDim, HiddenDim, totalImgTokens);
+        DispatchMatMulBatchDevice(blk.D_SelfK_W, blk.D_SelfK_B, _dYDevice, _dKDevice, HiddenDim, HiddenDim, totalImgTokens);
+        DispatchMatMulBatchQ6KDevice(blk.D_SelfV_W, blk.D_SelfV_B, _dYDevice, _dVDevice, HiddenDim, HiddenDim, totalImgTokens);
+
+        // 1c. Across-heads RMSNorm on Q and K
+        DispatchRmsNormBatchDevice(_dQDevice, blk.D_SelfNormQ, _dQDevice, HiddenDim, totalImgTokens);
+        DispatchRmsNormBatchDevice(_dKDevice, blk.D_SelfNormK, _dKDevice, HiddenDim, totalImgTokens);
+
+        // 1d. 3D-RoPE rotation on Q and K
+        _gpu.CopyToHost((IntPtr)_qBuffer, _dQDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+        _gpu.CopyToHost((IntPtr)_kBuffer, _dKDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+        Apply3DRoPEToTokens(_qBuffer, totalImgTokens, ropeCos, ropeSin);
+        Apply3DRoPEToTokens(_kBuffer, totalImgTokens, ropeCos, ropeSin);
+        _gpu.CopyToDevice(_dQDevice, (IntPtr)_qBuffer, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+        _gpu.CopyToDevice(_dKDevice, (IntPtr)_kBuffer, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+
+        // 1e. Bidirectional Attention across spatio-temporal tokens
         float scale = 1.0f / MathF.Sqrt(HeadDim);
         DispatchAttentionDevice(_dQDevice, _dKDevice, _dVDevice, _dAttnOut, NumHeads, HeadDim, totalImgTokens, scale);
 
-        // 3. Self-Attention Output Projection with Residual into _dYDevice
-        DispatchMatMulBatchDevice(blk.D_SelfO_W, blk.D_SelfO_B, _dAttnOut, _dYDevice, HiddenDim, HiddenDim, totalImgTokens, dResidual: _dXDevice);
-        (IntPtr dXDevice, IntPtr dYDevice) swap1 = (_dXDevice, _dYDevice);
-        _dXDevice = swap1.dYDevice;
-        _dYDevice = swap1.dXDevice;
+        // 1f. Self-Attention Output Projection into _dYDevice
+        DispatchMatMulBatchDevice(blk.D_SelfO_W, blk.D_SelfO_B, _dAttnOut, _dYDevice, HiddenDim, HiddenDim, totalImgTokens);
 
-        // 4. Cross Attention (if text context provided)
+        // 1g. Gated Residual: _dXDevice += _dYDevice * gate_msa
+        DispatchResidualGatedDevice(_dXDevice, _dYDevice, _dGateMsa, totalImgTokens * HiddenDim, HiddenDim);
+
+        // 2. Cross-Attention (if prompt text context provided)
         if (numTxtTokens > 0)
         {
-            // Copy intermediate tokens to host for fast Cross-Attention
-            _gpu!.CopyToHost((IntPtr)_tokenBufferA, _dXDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-            ExecuteCrossAttentionCpu(_tokenBufferA, totalImgTokens, projectedTxt, numTxtTokens, blk, _tokenBufferB);
-            _gpu.CopyToDevice(_dXDevice, (IntPtr)_tokenBufferB, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+            // 2a. Affine LayerNorm: _dXDevice -> _dYDevice using blk.D_Norm3_W and blk.D_Norm3_B
+            DispatchLayerNormAffineDevice(_dXDevice, _dYDevice, blk.D_Norm3_W, blk.D_Norm3_B, totalImgTokens, HiddenDim);
+
+            // 2b. Q projection from image tokens (_dYDevice) into _dQDevice [totalImgTokens, HiddenDim]
+            DispatchMatMulBatchDevice(blk.D_CrossQ_W, blk.D_CrossQ_B, _dYDevice, _dQDevice, HiddenDim, HiddenDim, totalImgTokens);
+
+            // 2c. K projection from text tokens (_dTxtDevice) into _dKDevice [numTxtTokens, HiddenDim]
+            DispatchMatMulBatchDevice(blk.D_CrossK_W, blk.D_CrossK_B, _dTxtDevice, _dKDevice, HiddenDim, HiddenDim, numTxtTokens);
+
+            // 2d. V projection from text tokens (_dTxtDevice) into _dVDevice [numTxtTokens, HiddenDim] (Q6_K)
+            DispatchMatMulBatchQ6KDevice(blk.D_CrossV_W, blk.D_CrossV_B, _dTxtDevice, _dVDevice, HiddenDim, HiddenDim, numTxtTokens);
+
+            // 2e. Across-heads RMSNorm on Q and K
+            DispatchRmsNormBatchDevice(_dQDevice, blk.D_CrossNormQ, _dQDevice, HiddenDim, totalImgTokens);
+            DispatchRmsNormBatchDevice(_dKDevice, blk.D_CrossNormK, _dKDevice, HiddenDim, numTxtTokens);
+
+            // 2f. FlashAttention-2 Cross-Attention: Q [totalImgTokens], K [numTxtTokens], V [numTxtTokens] -> _dAttnOut [totalImgTokens]
+            DispatchAttentionCrossDevice(_dQDevice, _dKDevice, _dVDevice, _dAttnOut, NumHeads, HeadDim, totalImgTokens, numTxtTokens, scale);
+
+            // 2g. Output projection into _dYDevice
+            DispatchMatMulBatchDevice(blk.D_CrossO_W, blk.D_CrossO_B, _dAttnOut, _dYDevice, HiddenDim, HiddenDim, totalImgTokens);
+
+            // 2h. Residual addition: _dXDevice += _dYDevice
+            DispatchVecAddBatchDevice(_dXDevice, _dYDevice, totalImgTokens * HiddenDim);
         }
 
-        // 5. Feed-Forward Network: 1536 -> 8960 -> GELU -> 1536 + Residual
-        DispatchMatMulBatchDevice(blk.D_Ffn0_W, blk.D_Ffn0_B, _dXDevice, _dFfnInter, HiddenDim, FfnDim, totalImgTokens);
-        DispatchGeluDevice(_dFfnInter, totalImgTokens * FfnDim);
-        DispatchMatMulBatchQ6KDevice(blk.D_Ffn2_W, blk.D_Ffn2_B, _dFfnInter, _dYDevice, FfnDim, HiddenDim, totalImgTokens, dResidual: _dXDevice);
+        // 3. Feed-Forward Network: 1536 -> 8960 -> GELU -> 1536 + Gated Residual
+        // 3a. AdaLN LayerNorm: _dXDevice -> _dYDevice using c_shift_msa and c_scale_msa
+        DispatchAdaLnDevice(_dXDevice, _dYDevice, _dCShiftMsa, _dCScaleMsa, totalImgTokens, HiddenDim);
 
-        (IntPtr dXDevice, IntPtr dYDevice) swap2 = (_dXDevice, _dYDevice);
-        _dXDevice = swap2.dYDevice;
-        _dYDevice = swap2.dXDevice;
+        // 3b. FFN0
+        DispatchMatMulBatchDevice(blk.D_Ffn0_W, blk.D_Ffn0_B, _dYDevice, _dFfnInter, HiddenDim, FfnDim, totalImgTokens);
+        DispatchGeluDevice(_dFfnInter, totalImgTokens * FfnDim);
+
+        // 3c. FFN2 into _dYDevice
+        DispatchMatMulBatchQ6KDevice(blk.D_Ffn2_W, blk.D_Ffn2_B, _dFfnInter, _dYDevice, FfnDim, HiddenDim, totalImgTokens);
+
+        // 3d. Gated Residual: _dXDevice += _dYDevice * c_gate_msa
+        DispatchResidualGatedDevice(_dXDevice, _dYDevice, _dCGateMsa, totalImgTokens * HiddenDim, HiddenDim);
+    }
+
+    private void ExecuteBlockCpu(
+        float* currentTokens,
+        int totalImgTokens,
+        int frames,
+        int tokenH,
+        int tokenW,
+        float* ropeCos,
+        float* ropeSin,
+        float* projectedTxt,
+        int numTxtTokens,
+        WanBlockWeights blk,
+        float* timeModAll)
+    {
+        float* modBase = (float*)_gguf.GetTensorPointer(blk.Modulation);
+        float* shift_msa   = stackalloc float[HiddenDim];
+        float* scale_msa   = stackalloc float[HiddenDim];
+        float* gate_msa    = stackalloc float[HiddenDim];
+        float* c_shift_msa = stackalloc float[HiddenDim];
+        float* c_scale_msa = stackalloc float[HiddenDim];
+        float* c_gate_msa  = stackalloc float[HiddenDim];
+
+        for (int d = 0; d < HiddenDim; d++)
+        {
+            shift_msa[d]   = modBase[0 * HiddenDim + d] + timeModAll[0 * HiddenDim + d];
+            scale_msa[d]   = modBase[1 * HiddenDim + d] + timeModAll[1 * HiddenDim + d];
+            gate_msa[d]    = modBase[2 * HiddenDim + d] + timeModAll[2 * HiddenDim + d];
+            c_shift_msa[d] = modBase[3 * HiddenDim + d] + timeModAll[3 * HiddenDim + d];
+            c_scale_msa[d] = modBase[4 * HiddenDim + d] + timeModAll[4 * HiddenDim + d];
+            c_gate_msa[d]  = modBase[5 * HiddenDim + d] + timeModAll[5 * HiddenDim + d];
+        }
+
+        // 1. Self-Attention
+        // 1a. AdaLN LayerNorm: _tokenBufferB = LayerNorm(currentTokens) * (1 + scale_msa) + shift_msa
+        ApplyAdaLnCpu(currentTokens, _tokenBufferB, shift_msa, scale_msa, totalImgTokens, HiddenDim);
+
+        // 1b. Self-Attention Q, K, V Projections from _tokenBufferB -> output into _tokenBufferC
+        ExecuteSelfAttentionCpu(_tokenBufferB, totalImgTokens, blk, ropeCos, ropeSin, _tokenBufferC);
+
+        // 1c. Gated Residual: currentTokens += _tokenBufferC * gate_msa
+        ApplyGatedResidualCpu(currentTokens, _tokenBufferC, gate_msa, totalImgTokens, HiddenDim);
+
+        // 2. Cross-Attention (if prompt text context provided)
+        if (numTxtTokens > 0)
+        {
+            float* norm3W = (float*)_gguf.GetTensorPointer(blk.Norm3_W);
+            float* norm3B = (float*)_gguf.GetTensorPointer(blk.Norm3_B);
+
+            // 2a. LayerNorm with affine norm3: _tokenBufferB = LayerNorm(currentTokens) * norm3W + norm3B
+            ApplyAffineLayerNormCpu(currentTokens, _tokenBufferB, norm3W, norm3B, totalImgTokens, HiddenDim);
+
+            // 2b. Cross-Attention between _tokenBufferB and projectedTxt -> output into _tokenBufferC
+            ExecuteCrossAttentionCpu(_tokenBufferB, totalImgTokens, projectedTxt, numTxtTokens, blk, _tokenBufferC);
+
+            // 2c. Residual: currentTokens += _tokenBufferC
+            ApplyResidualCpu(currentTokens, _tokenBufferC, totalImgTokens, HiddenDim);
+        }
+
+        // 3. Feed-Forward Network
+        // 3a. AdaLN LayerNorm: _tokenBufferB = LayerNorm(currentTokens) * (1 + c_scale_msa) + c_shift_msa
+        ApplyAdaLnCpu(currentTokens, _tokenBufferB, c_shift_msa, c_scale_msa, totalImgTokens, HiddenDim);
+
+        // 3b. FFN -> output into _tokenBufferC
+        ExecuteFFNCpu(_tokenBufferB, totalImgTokens, blk, _tokenBufferC);
+
+        // 3c. Gated Residual: currentTokens += _tokenBufferC * c_gate_msa
+        ApplyGatedResidualCpu(currentTokens, _tokenBufferC, c_gate_msa, totalImgTokens, HiddenDim);
+    }
+
+    private void DispatchAdaLnDevice(IntPtr dSrc, IntPtr dDst, IntPtr dShift, IntPtr dScale, int numTokens, int dim)
+    {
+        uint blockSize = 128;
+        uint gridX = (uint)numTokens;
+
+        int localTokens = numTokens;
+        int localDim = dim;
+
+        void** pArgs = stackalloc void*[6];
+        pArgs[0] = &dSrc;
+        pArgs[1] = &dDst;
+        pArgs[2] = &dShift;
+        pArgs[3] = &dScale;
+        pArgs[4] = &localTokens;
+        pArgs[5] = &localDim;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAdaLn,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(flux_adaln_kernel)");
+    }
+
+    private void DispatchLayerNormAffineDevice(IntPtr dSrc, IntPtr dDst, IntPtr dWeight, IntPtr dBias, int numTokens, int dim)
+    {
+        uint blockSize = 128;
+        uint gridX = (uint)numTokens;
+
+        int localTokens = numTokens;
+        int localDim = dim;
+
+        void** pArgs = stackalloc void*[6];
+        pArgs[0] = &dSrc;
+        pArgs[1] = &dDst;
+        pArgs[2] = &dWeight;
+        pArgs[3] = &dBias;
+        pArgs[4] = &localTokens;
+        pArgs[5] = &localDim;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnLayerNormAffine,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(layer_norm_affine_kernel)");
+    }
+
+    private void DispatchRmsNormBatchDevice(IntPtr dX, IntPtr dWeight, IntPtr dDst, int size, int numTokens, float eps = 1e-6f)
+    {
+        uint blockSize = 256;
+        uint gridX = (uint)numTokens;
+
+        int localSize = size;
+        float localEps = eps;
+
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dX;
+        pArgs[1] = &dWeight;
+        pArgs[2] = &dDst;
+        pArgs[3] = &localSize;
+        pArgs[4] = &localEps;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRmsNormBatch,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rms_norm_batch)");
+    }
+
+    private void DispatchResidualGatedDevice(IntPtr dTarget, IntPtr dUpdate, IntPtr dGate, int totalElements, int dim)
+    {
+        uint blockSize = 256;
+        uint gridX = (uint)((totalElements + (int)blockSize - 1) / (int)blockSize);
+
+        int localCount = totalElements;
+        int localDim = dim;
+
+        void** pArgs = stackalloc void*[5];
+        pArgs[0] = &dTarget;
+        pArgs[1] = &dUpdate;
+        pArgs[2] = &dGate;
+        pArgs[3] = &localCount;
+        pArgs[4] = &localDim;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnResidualGated,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(flux_residual_gated)");
+    }
+
+    private void DispatchVecAddBatchDevice(IntPtr dTarget, IntPtr dSource, int count)
+    {
+        uint blockSize = 256;
+        uint gridX = (uint)((count + (int)blockSize - 1) / (int)blockSize);
+
+        int localCount = count;
+
+        void** pArgs = stackalloc void*[3];
+        pArgs[0] = &dTarget;
+        pArgs[1] = &dSource;
+        pArgs[2] = &localCount;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnVecAdd,
+            gridX, 1, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(vec_add_kernel)");
     }
 
     private void DispatchMatMulBatchDevice(
@@ -550,6 +871,40 @@ public unsafe sealed class WanDiT : IDisposable
             IntPtr.Zero), "LaunchKernel(attention_bidirectional_batch)");
     }
 
+    private void DispatchAttentionCrossDevice(
+        IntPtr dQ, IntPtr dK, IntPtr dV, IntPtr dAttnOut,
+        int nHeads, int headDim, int numQTokens, int numKvTokens, float attnScale)
+    {
+        uint blockSize = 128;
+        uint gridX = (uint)nHeads;
+        uint gridY = (uint)numQTokens;
+
+        int localHeads = nHeads;
+        int localHeadDim = headDim;
+        int localQTokens = numQTokens;
+        int localKvTokens = numKvTokens;
+        float localScale = attnScale;
+
+        void** pArgs = stackalloc void*[9];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dK;
+        pArgs[2] = &dV;
+        pArgs[3] = &dAttnOut;
+        pArgs[4] = &localHeads;
+        pArgs[5] = &localHeadDim;
+        pArgs[6] = &localQTokens;
+        pArgs[7] = &localKvTokens;
+        pArgs[8] = &localScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnAttnCrossBatch,
+            gridX, gridY, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(attention_cross_batch)");
+    }
+
     private void DispatchGeluDevice(IntPtr dX, int count)
     {
         uint blockSize = 256;
@@ -569,14 +924,87 @@ public unsafe sealed class WanDiT : IDisposable
             IntPtr.Zero), "LaunchKernel(flux_gelu_kernel)");
     }
 
+    private void Precompute3DRoPE(int frames, int tokenH, int tokenW, float* ropeCos, float* ropeSin)
+    {
+        for (int f = 0; f < frames; f++)
+        {
+            for (int th = 0; th < tokenH; th++)
+            {
+                for (int tw = 0; tw < tokenW; tw++)
+                {
+                    int tokIdx = f * (tokenH * tokenW) + th * tokenW + tw;
+                    float* cosT = ropeCos + tokIdx * 64;
+                    float* sinT = ropeSin + tokIdx * 64;
+
+                    // Wan 2.1 3D-RoPE: HeadDim = 128 (64 frequency pairs)
+                    // Split sizes: t_dim = 44 (22 pairs), h_dim = 42 (21 pairs), w_dim = 42 (21 pairs)
+                    // Base theta = 10000.0f
+                    // 1. Temporal: 22 pairs (t_dim = 44)
+                    for (int k = 0; k < 22; k++)
+                    {
+                        float freq = 1.0f / MathF.Pow(10000.0f, (2.0f * k) / 44.0f);
+                        float theta = f * freq;
+                        cosT[k] = MathF.Cos(theta);
+                        sinT[k] = MathF.Sin(theta);
+                    }
+
+                    // 2. Height: 21 pairs (h_dim = 42)
+                    for (int k = 0; k < 21; k++)
+                    {
+                        float freq = 1.0f / MathF.Pow(10000.0f, (2.0f * k) / 42.0f);
+                        float theta = th * freq;
+                        cosT[22 + k] = MathF.Cos(theta);
+                        sinT[22 + k] = MathF.Sin(theta);
+                    }
+
+                    // 3. Width: 21 pairs (w_dim = 42)
+                    for (int k = 0; k < 21; k++)
+                    {
+                        float freq = 1.0f / MathF.Pow(10000.0f, (2.0f * k) / 42.0f);
+                        float theta = tw * freq;
+                        cosT[43 + k] = MathF.Cos(theta);
+                        sinT[43 + k] = MathF.Sin(theta);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void Apply3DRoPEToTokens(float* qk, int totalTokens, float* ropeCos, float* ropeSin)
+    {
+        Parallel.For(0, totalTokens, t =>
+        {
+            float* cosT = ropeCos + t * 64;
+            float* sinT = ropeSin + t * 64;
+
+            for (int h = 0; h < NumHeads; h++)
+            {
+                float* head = qk + (long)t * HiddenDim + h * HeadDim;
+
+                for (int p = 0; p < 64; p++)
+                {
+                    float c = cosT[p];
+                    float s = sinT[p];
+
+                    float v0 = head[2 * p];
+                    float v1 = head[2 * p + 1];
+
+                    head[2 * p]     = v0 * c - v1 * s;
+                    head[2 * p + 1] = v0 * s + v1 * c;
+                }
+            }
+        });
+    }
+
     private void ComputeTimeEmbedding(float timestep, float* timeVec, float* timeModAll)
     {
         float* rawTime = stackalloc float[256];
         float halfDim = 128f;
+        float tVal = timestep <= 1.0f ? timestep * 1000.0f : timestep;
         for (int i = 0; i < 128; i++)
         {
             float freq = MathF.Exp(-MathF.Log(10000.0f) * i / halfDim);
-            float arg = timestep * 1000.0f * freq;
+            float arg = tVal * freq;
             rawTime[i] = MathF.Cos(arg);
             rawTime[128 + i] = MathF.Sin(arg);
         }
@@ -586,25 +1014,33 @@ public unsafe sealed class WanDiT : IDisposable
         ApplySilu(timeInt, HiddenDim);
 
         DispatchLinearVec(_timeEmbed2W, _timeEmbed2B, timeInt, timeVec);
-        ApplySilu(timeVec, HiddenDim);
 
-        DispatchLinearVec(_timeProj1W, _timeProj1B, timeVec, timeModAll);
+        float* siluTimeVec = stackalloc float[HiddenDim];
+        for (int i = 0; i < HiddenDim; i++)
+        {
+            siluTimeVec[i] = timeVec[i] / (1.0f + MathF.Exp(-timeVec[i]));
+        }
+
+        DispatchLinearVec(_timeProj1W, _timeProj1B, siluTimeVec, timeModAll);
     }
 
     private void ProjectText(ReadOnlySpan<float> textContext, int numTxtTokens, float* projectedTxt)
     {
         fixed (float* pTxt = textContext)
         {
-            float* intermediate = stackalloc float[HiddenDim];
-            for (int t = 0; t < numTxtTokens; t++)
+            nint pTxtNint = (nint)pTxt;
+            nint projTxtNint = (nint)projectedTxt;
+
+            Parallel.For(0, numTxtTokens, t =>
             {
-                float* src = pTxt + t * 4096;
-                float* dst = projectedTxt + t * HiddenDim;
+                float* intermediate = stackalloc float[HiddenDim];
+                float* src = (float*)pTxtNint + t * 4096;
+                float* dst = (float*)projTxtNint + t * HiddenDim;
 
                 DispatchLinearVec(_textEmbed0W, _textEmbed0B, src, intermediate);
-                ApplySilu(intermediate, HiddenDim);
+                ApplyGelu(intermediate, HiddenDim);
                 DispatchLinearVec(_textEmbed2W, _textEmbed2B, intermediate, dst);
-            }
+            });
         }
     }
 
@@ -672,8 +1108,96 @@ public unsafe sealed class WanDiT : IDisposable
         }
     }
 
+    private static void ApplyAdaLnCpu(
+        float* src, float* dst, float* shift, float* scale, int totalTokens, int dim)
+    {
+        Parallel.For(0, totalTokens, t =>
+        {
+            float* s = src + (long)t * dim;
+            float* d = dst + (long)t * dim;
+
+            float sum = 0f;
+            float sumSq = 0f;
+            for (int i = 0; i < dim; i++)
+            {
+                float v = s[i];
+                sum += v;
+                sumSq += v * v;
+            }
+
+            float mean = sum / dim;
+            float var = MathF.Max(0f, (sumSq / dim) - (mean * mean));
+            float invStd = 1.0f / MathF.Sqrt(var + 1e-6f);
+
+            for (int i = 0; i < dim; i++)
+            {
+                d[i] = ((s[i] - mean) * invStd) * (1.0f + scale[i]) + shift[i];
+            }
+        });
+    }
+
+    private static void ApplyAffineLayerNormCpu(
+        float* src, float* dst, float* weight, float* bias, int totalTokens, int dim)
+    {
+        Parallel.For(0, totalTokens, t =>
+        {
+            float* s = src + (long)t * dim;
+            float* d = dst + (long)t * dim;
+
+            float sum = 0f;
+            float sumSq = 0f;
+            for (int i = 0; i < dim; i++)
+            {
+                float v = s[i];
+                sum += v;
+                sumSq += v * v;
+            }
+
+            float mean = sum / dim;
+            float var = MathF.Max(0f, (sumSq / dim) - (mean * mean));
+            float invStd = 1.0f / MathF.Sqrt(var + 1e-6f);
+
+            for (int i = 0; i < dim; i++)
+            {
+                float w = weight != null ? weight[i] : 1.0f;
+                float b = bias != null ? bias[i] : 0.0f;
+                d[i] = ((s[i] - mean) * invStd) * w + b;
+            }
+        });
+    }
+
+    private static void ApplyGatedResidualCpu(
+        float* target, float* update, float* gate, int totalTokens, int dim)
+    {
+        Parallel.For(0, totalTokens, t =>
+        {
+            float* tgt = target + (long)t * dim;
+            float* upd = update + (long)t * dim;
+
+            for (int i = 0; i < dim; i++)
+            {
+                tgt[i] += upd[i] * gate[i];
+            }
+        });
+    }
+
+    private static void ApplyResidualCpu(
+        float* target, float* update, int totalTokens, int dim)
+    {
+        Parallel.For(0, totalTokens, t =>
+        {
+            float* tgt = target + (long)t * dim;
+            float* upd = update + (long)t * dim;
+
+            for (int i = 0; i < dim; i++)
+            {
+                tgt[i] += upd[i];
+            }
+        });
+    }
+
     private void ExecuteSelfAttentionCpu(
-        float* srcTokens, int totalTokens, int frames, int tokenH, int tokenW, WanBlockWeights blk, float* dstTokens)
+        float* normTokens, int totalTokens, WanBlockWeights blk, float* ropeCos, float* ropeSin, float* dstTokens)
     {
         var (qCols, qRows) = GetMatrixDims(blk.SelfQ_W);
         var (kCols, kRows) = GetMatrixDims(blk.SelfK_W);
@@ -687,13 +1211,14 @@ public unsafe sealed class WanDiT : IDisposable
         float* kB = (float*)_gguf.GetTensorPointer(blk.SelfK_B);
         float* vB = (float*)_gguf.GetTensorPointer(blk.SelfV_B);
 
-        QuantKernels.MatMulBatch(blk.SelfQ_W.Type, qW, srcTokens, _qBuffer, qCols, qRows, totalTokens);
-        QuantKernels.MatMulBatch(blk.SelfK_W.Type, kW, srcTokens, _kBuffer, kCols, kRows, totalTokens);
-        QuantKernels.MatMulBatch(blk.SelfV_W.Type, vW, srcTokens, _vBuffer, vCols, vRows, totalTokens);
+        QuantKernels.MatMulBatch(blk.SelfQ_W.Type, qW, normTokens, _qBuffer, qCols, qRows, totalTokens);
+        QuantKernels.MatMulBatch(blk.SelfK_W.Type, kW, normTokens, _kBuffer, kCols, kRows, totalTokens);
+        QuantKernels.MatMulBatch(blk.SelfV_W.Type, vW, normTokens, _vBuffer, vCols, vRows, totalTokens);
 
         float* normQScale = (float*)_gguf.GetTensorPointer(blk.SelfNormQ);
         float* normKScale = (float*)_gguf.GetTensorPointer(blk.SelfNormK);
 
+        // Across-heads RMSNorm on Q and K
         Parallel.For(0, totalTokens, t =>
         {
             float* q = _qBuffer + (long)t * HiddenDim;
@@ -704,12 +1229,26 @@ public unsafe sealed class WanDiT : IDisposable
             if (kB != null) for (int d = 0; d < HiddenDim; d++) k[d] += kB[d];
             if (vB != null) for (int d = 0; d < HiddenDim; d++) v[d] += vB[d];
 
-            for (int h = 0; h < NumHeads; h++)
+            float sumSqQ = 0f;
+            float sumSqK = 0f;
+            for (int d = 0; d < HiddenDim; d++)
             {
-                ApplyRMSNormHead(q + h * HeadDim, q + h * HeadDim, normQScale);
-                ApplyRMSNormHead(k + h * HeadDim, k + h * HeadDim, normKScale);
+                sumSqQ += q[d] * q[d];
+                sumSqK += k[d] * k[d];
+            }
+            float invRmsQ = 1.0f / MathF.Sqrt(sumSqQ / HiddenDim + 1e-6f);
+            float invRmsK = 1.0f / MathF.Sqrt(sumSqK / HiddenDim + 1e-6f);
+
+            for (int d = 0; d < HiddenDim; d++)
+            {
+                q[d] = (q[d] * invRmsQ) * normQScale[d];
+                k[d] = (k[d] * invRmsK) * normKScale[d];
             }
         });
+
+        // 3D-RoPE
+        Apply3DRoPEToTokens(_qBuffer, totalTokens, ropeCos, ropeSin);
+        Apply3DRoPEToTokens(_kBuffer, totalTokens, ropeCos, ropeSin);
 
         float scale = 1.0f / MathF.Sqrt(HeadDim);
 
@@ -755,24 +1294,23 @@ public unsafe sealed class WanDiT : IDisposable
         byte* oW = _gguf.GetTensorPointer(blk.SelfO_W);
         float* oB = (float*)_gguf.GetTensorPointer(blk.SelfO_B);
 
-        QuantKernels.MatMulBatch(blk.SelfO_W.Type, oW, dstTokens, _qBuffer, oCols, oRows, totalTokens);
+        QuantKernels.MatMulBatch(blk.SelfO_W.Type, oW, dstTokens, _tokenBufferB, oCols, oRows, totalTokens);
 
         Parallel.For(0, totalTokens, t =>
         {
             float* outFinal = dstTokens + (long)t * HiddenDim;
-            float* intermediate = _qBuffer + (long)t * HiddenDim;
-            float* residual = srcTokens + (long)t * HiddenDim;
+            float* intermediate = _tokenBufferB + (long)t * HiddenDim;
 
             for (int d = 0; d < HiddenDim; d++)
             {
                 float bVal = oB != null ? oB[d] : 0f;
-                outFinal[d] = residual[d] + intermediate[d] + bVal;
+                outFinal[d] = intermediate[d] + bVal;
             }
         });
     }
 
     private void ExecuteCrossAttentionCpu(
-        float* imgTokens, int totalImgTokens, float* txtTokens, int numTxtTokens, WanBlockWeights blk, float* dstTokens)
+        float* normTokens, int totalImgTokens, float* txtTokens, int numTxtTokens, WanBlockWeights blk, float* dstTokens)
     {
         var (qCols, qRows) = GetMatrixDims(blk.CrossQ_W);
         var (kCols, kRows) = GetMatrixDims(blk.CrossK_W);
@@ -786,23 +1324,26 @@ public unsafe sealed class WanDiT : IDisposable
         float* kB = (float*)_gguf.GetTensorPointer(blk.CrossK_B);
         float* vB = (float*)_gguf.GetTensorPointer(blk.CrossV_B);
 
-        QuantKernels.MatMulBatch(blk.CrossQ_W.Type, qW, imgTokens, _qBuffer, qCols, qRows, totalImgTokens);
+        QuantKernels.MatMulBatch(blk.CrossQ_W.Type, qW, normTokens, _qBuffer, qCols, qRows, totalImgTokens);
         QuantKernels.MatMulBatch(blk.CrossK_W.Type, kW, txtTokens, _kBuffer, kCols, kRows, numTxtTokens);
         QuantKernels.MatMulBatch(blk.CrossV_W.Type, vW, txtTokens, _vBuffer, vCols, vRows, numTxtTokens);
 
         float* normQScale = (float*)_gguf.GetTensorPointer(blk.CrossNormQ);
         float* normKScale = (float*)_gguf.GetTensorPointer(blk.CrossNormK);
 
+        // Across-heads RMSNorm on Cross-Q
         Parallel.For(0, totalImgTokens, t =>
         {
             float* q = _qBuffer + (long)t * HiddenDim;
             if (qB != null) for (int d = 0; d < HiddenDim; d++) q[d] += qB[d];
-            for (int h = 0; h < NumHeads; h++)
-            {
-                ApplyRMSNormHead(q + h * HeadDim, q + h * HeadDim, normQScale);
-            }
+
+            float sumSq = 0f;
+            for (int d = 0; d < HiddenDim; d++) sumSq += q[d] * q[d];
+            float invRms = 1.0f / MathF.Sqrt(sumSq / HiddenDim + 1e-6f);
+            for (int d = 0; d < HiddenDim; d++) q[d] = (q[d] * invRms) * normQScale[d];
         });
 
+        // Across-heads RMSNorm on Cross-K
         Parallel.For(0, numTxtTokens, t =>
         {
             float* k = _kBuffer + (long)t * HiddenDim;
@@ -810,10 +1351,10 @@ public unsafe sealed class WanDiT : IDisposable
             if (kB != null) for (int d = 0; d < HiddenDim; d++) k[d] += kB[d];
             if (vB != null) for (int d = 0; d < HiddenDim; d++) v[d] += vB[d];
 
-            for (int h = 0; h < NumHeads; h++)
-            {
-                ApplyRMSNormHead(k + h * HeadDim, k + h * HeadDim, normKScale);
-            }
+            float sumSq = 0f;
+            for (int d = 0; d < HiddenDim; d++) sumSq += k[d] * k[d];
+            float invRms = 1.0f / MathF.Sqrt(sumSq / HiddenDim + 1e-6f);
+            for (int d = 0; d < HiddenDim; d++) k[d] = (k[d] * invRms) * normKScale[d];
         });
 
         float scale = 1.0f / MathF.Sqrt(HeadDim);
@@ -859,23 +1400,22 @@ public unsafe sealed class WanDiT : IDisposable
         byte* oW = _gguf.GetTensorPointer(blk.CrossO_W);
         float* oB = (float*)_gguf.GetTensorPointer(blk.CrossO_B);
 
-        QuantKernels.MatMulBatch(blk.CrossO_W.Type, oW, dstTokens, _qBuffer, oCols, oRows, totalImgTokens);
+        QuantKernels.MatMulBatch(blk.CrossO_W.Type, oW, dstTokens, _tokenBufferB, oCols, oRows, totalImgTokens);
 
         Parallel.For(0, totalImgTokens, t =>
         {
             float* outFinal = dstTokens + (long)t * HiddenDim;
-            float* intermediate = _qBuffer + (long)t * HiddenDim;
-            float* residual = imgTokens + (long)t * HiddenDim;
+            float* intermediate = _tokenBufferB + (long)t * HiddenDim;
 
             for (int d = 0; d < HiddenDim; d++)
             {
                 float bVal = oB != null ? oB[d] : 0f;
-                outFinal[d] = residual[d] + intermediate[d] + bVal;
+                outFinal[d] = intermediate[d] + bVal;
             }
         });
     }
 
-    private void ExecuteFFNCpu(float* srcTokens, int totalTokens, WanBlockWeights blk, float* dstTokens)
+    private void ExecuteFFNCpu(float* normTokens, int totalTokens, WanBlockWeights blk, float* dstTokens)
     {
         var (f0Cols, f0Rows) = GetMatrixDims(blk.Ffn0_W);
         var (f2Cols, f2Rows) = GetMatrixDims(blk.Ffn2_W);
@@ -886,7 +1426,7 @@ public unsafe sealed class WanDiT : IDisposable
         float* f0B = (float*)_gguf.GetTensorPointer(blk.Ffn0_B);
         float* f2B = (float*)_gguf.GetTensorPointer(blk.Ffn2_B);
 
-        QuantKernels.MatMulBatch(blk.Ffn0_W.Type, f0W, srcTokens, _ffnIntermediate, f0Cols, f0Rows, totalTokens);
+        QuantKernels.MatMulBatch(blk.Ffn0_W.Type, f0W, normTokens, _ffnIntermediate, f0Cols, f0Rows, totalTokens);
 
         Parallel.For(0, totalTokens, t =>
         {
@@ -900,17 +1440,14 @@ public unsafe sealed class WanDiT : IDisposable
 
         QuantKernels.MatMulBatch(blk.Ffn2_W.Type, f2W, _ffnIntermediate, dstTokens, f2Cols, f2Rows, totalTokens);
 
-        Parallel.For(0, totalTokens, t =>
+        if (f2B != null)
         {
-            float* outToken = dstTokens + (long)t * HiddenDim;
-            float* src = srcTokens + (long)t * HiddenDim;
-
-            for (int d = 0; d < HiddenDim; d++)
+            Parallel.For(0, totalTokens, t =>
             {
-                float bVal = f2B != null ? f2B[d] : 0f;
-                outToken[d] += src[d] + bVal;
-            }
-        });
+                float* outToken = dstTokens + (long)t * HiddenDim;
+                for (int d = 0; d < HiddenDim; d++) outToken[d] += f2B[d];
+            });
+        }
     }
 
     private void UnpatchifyAndOutput(float* tokens, int frames, int H, int W, Span<float> velocityOut)
@@ -930,34 +1467,31 @@ public unsafe sealed class WanDiT : IDisposable
 
         try
         {
-            float* shift = modPtr;
-            float* scale = modPtr + HiddenDim;
+            float* headShift = stackalloc float[HiddenDim];
+            float* headScale = stackalloc float[HiddenDim];
 
-            Parallel.For(0, totalTokens, t =>
+            for (int d = 0; d < HiddenDim; d++)
             {
-                float* src = tokens + (long)t * HiddenDim;
-                float* dst = normTokens + (long)t * HiddenDim;
+                headShift[d] = modPtr[0 * HiddenDim + d] + _timeVec[d];
+                headScale[d] = modPtr[1 * HiddenDim + d] + _timeVec[d];
+            }
 
-                float sumSq = 0f;
-                for (int d = 0; d < HiddenDim; d++) sumSq += src[d] * src[d];
-                float invRms = 1.0f / MathF.Sqrt(sumSq / HiddenDim + 1e-6f);
+            // Head LayerNorm + AdaLN modulation
+            ApplyAdaLnCpu(tokens, normTokens, headShift, headScale, totalTokens, HiddenDim);
 
-                for (int d = 0; d < HiddenDim; d++)
-                {
-                    dst[d] = (src[d] * invRms) * (1.0f + scale[d]) + shift[d];
-                }
-            });
-
+            // Project 1536 -> 64
             QuantKernels.MatMulBatch(_headW.Type, wPtr, normTokens, patchBufAll, nCols, nRows, totalTokens);
+
             if (bPtr != null)
             {
                 Parallel.For(0, totalTokens, t =>
                 {
-                    float* pRow = patchBufAll + (long)t * PatchDim;
-                    for (int d = 0; d < PatchDim; d++) pRow[d] += bPtr[d];
+                    float* p = patchBufAll + (long)t * PatchDim;
+                    for (int d = 0; d < PatchDim; d++) p[d] += bPtr[d];
                 });
             }
 
+            // Unpatchify: 64 output channels are ordered (ph * PatchSize + pw) * InChannels + c
             fixed (float* pOut = velocityOut)
             {
                 int tokenIdx = 0;
@@ -970,17 +1504,18 @@ public unsafe sealed class WanDiT : IDisposable
                         for (int tw = 0; tw < tokenW; tw++)
                         {
                             float* patchBuf = patchBufAll + (long)tokenIdx * PatchDim;
-                            int pIdx = 0;
 
-                            for (int c = 0; c < InChannels; c++)
+                            for (int ph = 0; ph < PatchSize; ph++)
                             {
-                                for (int ph = 0; ph < PatchSize; ph++)
+                                for (int pw = 0; pw < PatchSize; pw++)
                                 {
-                                    for (int pw = 0; pw < PatchSize; pw++)
+                                    int y = th * PatchSize + ph;
+                                    int x = tw * PatchSize + pw;
+
+                                    for (int c = 0; c < InChannels; c++)
                                     {
-                                        int y = th * PatchSize + ph;
-                                        int x = tw * PatchSize + pw;
-                                        pOut[frameLatentOffset + c * H * W + y * W + x] = patchBuf[pIdx++];
+                                        int pIdx = (ph * PatchSize + pw) * InChannels + c;
+                                        pOut[frameLatentOffset + c * H * W + y * W + x] = patchBuf[pIdx];
                                     }
                                 }
                             }
@@ -1013,7 +1548,7 @@ public unsafe sealed class WanDiT : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void DispatchLinearVec(GgufTensorInfo w, GgufTensorInfo b, float* x, float* y)
+    private void DispatchLinearVec(GgufTensorInfo w, GgufTensorInfo? b, float* x, float* y)
     {
         byte* wPtr = _gguf.GetTensorPointer(w);
         float* bPtr = b != null ? (float*)_gguf.GetTensorPointer(b) : null;
@@ -1062,15 +1597,6 @@ public unsafe sealed class WanDiT : IDisposable
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ApplyRMSNormHead(float* src, float* dst, float* scale)
-    {
-        float sumSq = 0f;
-        for (int i = 0; i < HeadDim; i++) sumSq += src[i] * src[i];
-        float invRms = 1.0f / MathF.Sqrt(sumSq / HeadDim + 1e-6f);
-        for (int i = 0; i < HeadDim; i++) dst[i] = (src[i] * invRms) * scale[i];
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ApplySilu(float* x, int count)
     {
         for (int i = 0; i < count; i++)
@@ -1103,17 +1629,28 @@ public unsafe sealed class WanDiT : IDisposable
             FreeDevicePtr(ref _dVDevice);
             FreeDevicePtr(ref _dAttnOut);
             FreeDevicePtr(ref _dFfnInter);
+            FreeDevicePtr(ref _dTxtDevice);
+
+            FreeDevicePtr(ref _dShiftMsa);
+            FreeDevicePtr(ref _dScaleMsa);
+            FreeDevicePtr(ref _dGateMsa);
+            FreeDevicePtr(ref _dCShiftMsa);
+            FreeDevicePtr(ref _dCScaleMsa);
+            FreeDevicePtr(ref _dCGateMsa);
+
             _gpu?.Dispose();
 
             if (_timeVec != null) NativeMemory.AlignedFree(_timeVec);
             if (_timeModAll != null) NativeMemory.AlignedFree(_timeModAll);
             if (_tokenBufferA != null) NativeMemory.AlignedFree(_tokenBufferA);
             if (_tokenBufferB != null) NativeMemory.AlignedFree(_tokenBufferB);
+            if (_tokenBufferC != null) NativeMemory.AlignedFree(_tokenBufferC);
             if (_qBuffer != null) NativeMemory.AlignedFree(_qBuffer);
             if (_kBuffer != null) NativeMemory.AlignedFree(_kBuffer);
             if (_vBuffer != null) NativeMemory.AlignedFree(_vBuffer);
-            if (_attnScores != null) NativeMemory.AlignedFree(_attnScores);
             if (_ffnIntermediate != null) NativeMemory.AlignedFree(_ffnIntermediate);
+            if (_ropeCos != null) NativeMemory.AlignedFree(_ropeCos);
+            if (_ropeSin != null) NativeMemory.AlignedFree(_ropeSin);
             _gguf.Dispose();
         }
     }

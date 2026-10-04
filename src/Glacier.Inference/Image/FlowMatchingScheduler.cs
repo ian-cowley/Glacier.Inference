@@ -26,12 +26,24 @@ public sealed class FlowMatchingScheduler
         _timeShift = timeShift;
         _timesteps = new float[numSteps + 1];
 
-        // Generate monotonically decreasing timesteps from 1.0 down to 0.0
-        for (int i = 0; i <= numSteps; i++)
+        if (MathF.Abs(timeShift - 1.0f) < 1e-5f)
         {
-            float linearT = 1.0f - (float)i / numSteps;
-            // Apply empirical time-shift function (Flux / SD3 formulation)
-            _timesteps[i] = ApplyTimeShift(linearT, _timeShift);
+            // Linear equidistant schedule for models without time-shift (e.g. FLUX Schnell)
+            for (int i = 0; i <= numSteps; i++)
+            {
+                _timesteps[i] = 1.0f - (float)i / numSteps;
+            }
+        }
+        else
+        {
+            // Standard FlowMatchEulerDiscreteScheduler formulation (Wan 2.1 / SD3 / Flux Dev)
+            for (int i = 0; i < numSteps; i++)
+            {
+                float t = (numSteps == 1) ? 1000.0f : 1000.0f - (float)i * (1000.0f - 1.0f) / (numSteps - 1);
+                float sigma = t / 1000.0f;
+                _timesteps[i] = ApplyTimeShift(sigma, _timeShift);
+            }
+            _timesteps[numSteps] = 0.0f;
         }
     }
 

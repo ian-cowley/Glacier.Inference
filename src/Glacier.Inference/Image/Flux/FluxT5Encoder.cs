@@ -102,13 +102,21 @@ public sealed unsafe class FluxT5Encoder : IDisposable
 
     /// <summary>
     /// Tokenizes prompt string into T5 SentencePiece token IDs with EOS and padding.
+    /// Also returns the number of valid tokens (including EOS).
     /// </summary>
-    public int[] Tokenize(string prompt, int maxTokens = 64)
+    public (int[] Tokens, int ValidCount) Tokenize(string prompt, int maxTokens = 64)
     {
+        string cleaned = prompt.Trim();
+        if (string.IsNullOrWhiteSpace(cleaned))
+        {
+            var res = new int[maxTokens];
+            res[0] = 1; // EOS only
+            return (res, 1);
+        }
+
         var tokens = new List<int>(maxTokens);
 
         // Preprocess: trim and prepend SentencePiece space prefix (\u2581)
-        string cleaned = prompt.Trim();
         if (!cleaned.StartsWith(" ") && !cleaned.StartsWith("\u2581"))
         {
             cleaned = "\u2581" + cleaned;
@@ -175,6 +183,7 @@ public sealed unsafe class FluxT5Encoder : IDisposable
 
         // Add EOS token (1)
         tokens.Add(1);
+        int validCount = Math.Min(tokens.Count, maxTokens);
 
         // Pad to maxTokens with PAD token (0)
         var result = new int[maxTokens];
@@ -183,16 +192,32 @@ public sealed unsafe class FluxT5Encoder : IDisposable
             result[i] = i < tokens.Count ? tokens[i] : 0;
         }
 
-        return result;
+        return (result, validCount);
     }
 
     /// <summary>
-    /// Executes full 24-layer T5-XXL forward inference to produce semantic context tokens for FLUX DiT.
-    /// Shape: [seqLen, 4096].
+    /// Executes full 24-layer T5-XXL forward inference, returning only the valid semantic tokens without padding.
+    /// Shape: [validCount, 4096].
+    /// </summary>
+    public (float[] embeds, int validCount) EncodeWithCount(string prompt, int maxSeqLen = 512)
+    {
+        var (tokens, validCount) = Tokenize(prompt, maxSeqLen);
+        if (validCount <= 0) validCount = 1;
+
+        int computeLen = Math.Max(validCount, 16);
+        float[] full = Encode(prompt, seqLen: computeLen);
+        var validOnly = new float[validCount * HiddenDim];
+        Array.Copy(full, validOnly, validCount * HiddenDim);
+        return (validOnly, validCount);
+    }
+
+    /// <summary>
+    /// Executes full 24-layer T5-XXL forward inference to produce semantic context tokens for FLUX / Wan DiT.
+    /// Shape: [seqLen, 4096]. Valid tokens are preserved; pad tokens are masked and zero-padded.
     /// </summary>
     public float[] Encode(string prompt, int seqLen = 64)
     {
-        int[] tokens = Tokenize(prompt, seqLen);
+        var (tokens, validCount) = Tokenize(prompt, seqLen);
 
         // Scratch memory
         float* hidden = (float*)NativeMemory.AlignedAlloc((nuint)(seqLen * HiddenDim * sizeof(float)), 64);
@@ -264,12 +289,12 @@ public sealed unsafe class FluxT5Encoder : IDisposable
                         int headOffset = h * HeadDim;
                         float* scores = stackalloc float[seqLen];
 
-                        for (int i = 0; i < seqLen; i++)
+                        for (int i = 0; i < validCount; i++)
                         {
                             float* qRow = pQ + i * HiddenDim + headOffset;
                             float maxScore = float.NegativeInfinity;
 
-                            for (int j = 0; j < seqLen; j++)
+                            for (int j = 0; j < validCount; j++)
                             {
                                 float* kRow = pK + j * HiddenDim + headOffset;
                                 float dot = 0f;
@@ -281,9 +306,9 @@ public sealed unsafe class FluxT5Encoder : IDisposable
                                 if (sc > maxScore) maxScore = sc;
                             }
 
-                            // Softmax
+                            // Softmax over valid tokens only
                             float sumExp = 0f;
-                            for (int j = 0; j < seqLen; j++)
+                            for (int j = 0; j < validCount; j++)
                             {
                                 float exp = MathF.Exp(scores[j] - maxScore);
                                 scores[j] = exp;
@@ -295,44 +320,52 @@ public sealed unsafe class FluxT5Encoder : IDisposable
                             float* outRow = pOut + i * HiddenDim + headOffset;
                             for (int d = 0; d < HeadDim; d++) outRow[d] = 0f;
 
-                            for (int j = 0; j < seqLen; j++)
+                            for (int j = 0; j < validCount; j++)
                             {
                                 float w = scores[j] * invSum;
                                 float* vRow = pV + j * HiddenDim + headOffset;
                                 for (int d = 0; d < HeadDim; d++) outRow[d] += w * vRow[d];
                             }
                         }
+
+                        // Zero out attention output for padding positions
+                        for (int i = validCount; i < seqLen; i++)
+                        {
+                            float* outRow = pOut + i * HiddenDim + headOffset;
+                            for (int d = 0; d < HeadDim; d++) outRow[d] = 0f;
+                        }
                     });
                 }
 
                 // Attention Out Projection & Residual: [seqLen, 4096] * [4096, 4096]
-                QuantKernels.MatMulBatch(layer.AttnO.Type, _gguf.GetTensorPointer(layer.AttnO), attnOut, normBuf, HiddenDim, HiddenDim, seqLen);
-                for (int idx = 0; idx < seqLen * HiddenDim; idx++) hidden[idx] += normBuf[idx];
+                QuantKernels.MatMulBatch(layer.AttnO.Type, _gguf.GetTensorPointer(layer.AttnO), attnOut, normBuf, HiddenDim, HiddenDim, validCount);
+                for (int idx = 0; idx < validCount * HiddenDim; idx++) hidden[idx] += normBuf[idx];
 
                 // Pre-FFN RMSNorm
-                ApplyRMSNorm(hidden, normBuf, layer.FfnNorm, seqLen, HiddenDim);
+                ApplyRMSNorm(hidden, normBuf, layer.FfnNorm, validCount, HiddenDim);
 
-                // GEGLU FFN: Gate & Up [seqLen, 10240]
-                QuantKernels.MatMulBatch(layer.FfnGate.Type, _gguf.GetTensorPointer(layer.FfnGate), normBuf, ffnGate, HiddenDim, IntermediateDim, seqLen);
-                QuantKernels.MatMulBatch(layer.FfnUp.Type, _gguf.GetTensorPointer(layer.FfnUp), normBuf, ffnUp, HiddenDim, IntermediateDim, seqLen);
+                // GEGLU FFN: Gate & Up [validCount, 10240]
+                QuantKernels.MatMulBatch(layer.FfnGate.Type, _gguf.GetTensorPointer(layer.FfnGate), normBuf, ffnGate, HiddenDim, IntermediateDim, validCount);
+                QuantKernels.MatMulBatch(layer.FfnUp.Type, _gguf.GetTensorPointer(layer.FfnUp), normBuf, ffnUp, HiddenDim, IntermediateDim, validCount);
 
                 // GELU(gate) * up
-                ApplyGelu(ffnGate, seqLen * IntermediateDim);
-                for (int idx = 0; idx < seqLen * IntermediateDim; idx++)
+                ApplyGelu(ffnGate, validCount * IntermediateDim);
+                for (int idx = 0; idx < validCount * IntermediateDim; idx++)
                 {
                     ffnGate[idx] *= ffnUp[idx];
                 }
 
-                // FFN Down Projection & Residual: [seqLen, 10240] * [10240, 4096]
-                QuantKernels.MatMulBatch(layer.FfnDown.Type, _gguf.GetTensorPointer(layer.FfnDown), ffnGate, normBuf, IntermediateDim, HiddenDim, seqLen);
-                for (int idx = 0; idx < seqLen * HiddenDim; idx++) hidden[idx] += normBuf[idx];
+                // FFN Down Projection & Residual: [validCount, 10240] * [10240, 4096]
+                QuantKernels.MatMulBatch(layer.FfnDown.Type, _gguf.GetTensorPointer(layer.FfnDown), ffnGate, normBuf, IntermediateDim, HiddenDim, validCount);
+                for (int idx = 0; idx < validCount * HiddenDim; idx++) hidden[idx] += normBuf[idx];
             }
 
-            // 4. Final Output RMSNorm
+            // 4. Final Output RMSNorm on valid tokens
             var result = new float[seqLen * HiddenDim];
             fixed (float* pRes = result)
             {
-                ApplyRMSNorm(hidden, pRes, _outputNorm, seqLen, HiddenDim);
+                ApplyRMSNorm(hidden, pRes, _outputNorm, validCount, HiddenDim);
+                // Positions from validCount to seqLen remain 0.0f (exact HuggingFace / Diffusers match)
             }
             return result;
         }

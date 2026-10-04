@@ -200,9 +200,10 @@ public class DiffusionGgufTests
         if (!File.Exists(t5Path)) return;
 
         using var encoder = Glacier.Inference.Image.Flux.FluxT5Encoder.Open(t5Path);
-        int[] tokens = encoder.Tokenize("a glowing crystal orb in an enchanted autumn forest", maxTokens: 64);
+        var (tokens, validCount) = encoder.Tokenize("a glowing crystal orb in an enchanted autumn forest", maxTokens: 64);
         Assert.NotEmpty(tokens);
         Assert.Equal(64, tokens.Length);
+        Assert.True(validCount > 0);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         float[] embeddings = encoder.Encode("a glowing crystal orb in an enchanted autumn forest", seqLen: 64);

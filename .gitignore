@@ -46,6 +46,19 @@ Glacier.Inference.md
 *.wav
 *.bmp
 *.png
+*.apng
+*.gif
+*.avi
+*.mp4
+*.bin
 *.gguf
+*.safetensors
 models/
+
+# Scratch & test scripts
+tests_history.py
+generate_*.py
+scratch_*.py
+flux_tensors.txt
+latents_dump.bin
 
