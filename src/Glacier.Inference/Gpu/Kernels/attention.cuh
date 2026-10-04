@@ -771,6 +771,41 @@ __global__ void attention_cross_batch(
     attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
 }
 
+// =========================================================================
+// 14. 3D Rotary Position Embedding (3D-RoPE) In-Place in GPU VRAM
+// Eliminates all host-device PCIe ping-pong data movement.
+// Total tokens = frames * (H/2) * (W/2).
+// Grid: blockIdx.x = t (0..total_tokens - 1), blockIdx.y = h (0..n_heads - 1)
+// Block: 64 threads (threadIdx.x = p in 0..63)
+// =========================================================================
+__global__ void rope_3d_in_vram(
+    float* __restrict__ qk,
+    const float* __restrict__ rope_cos,
+    const float* __restrict__ rope_sin,
+    int total_tokens,
+    int n_heads,
+    int head_dim
+) {
+    int t = blockIdx.x;
+    int h = blockIdx.y;
+    int p = threadIdx.x; // 0..63
+
+    if (t >= total_tokens || h >= n_heads || p >= 64) return;
+
+    float c = rope_cos[(size_t)t * 64 + p];
+    float s = rope_sin[(size_t)t * 64 + p];
+
+    float2* qk2 = (float2*)qk;
+    size_t pair_idx = ((size_t)t * n_heads + h) * 64 + p;
+    float2 v = qk2[pair_idx];
+
+    float2 res;
+    res.x = v.x * c - v.y * s;
+    res.y = v.x * s + v.y * c;
+
+    qk2[pair_idx] = res;
+}
+
 } // extern "C"
 
 

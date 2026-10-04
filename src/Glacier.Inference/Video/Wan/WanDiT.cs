@@ -64,6 +64,7 @@ public unsafe sealed class WanDiT : IDisposable
     private IntPtr _fnAdaLn;
     private IntPtr _fnResidualGated;
     private IntPtr _fnVecAdd;
+    private IntPtr _fnRoPE3D;
 
     private IntPtr _dXDevice = IntPtr.Zero;
     private IntPtr _dYDevice = IntPtr.Zero;
@@ -73,6 +74,9 @@ public unsafe sealed class WanDiT : IDisposable
     private IntPtr _dAttnOut = IntPtr.Zero;
     private IntPtr _dFfnInter = IntPtr.Zero;
     private IntPtr _dTxtDevice = IntPtr.Zero;
+
+    private IntPtr _dRoPECos = IntPtr.Zero;
+    private IntPtr _dRoPESin = IntPtr.Zero;
 
     private IntPtr _dShiftMsa = IntPtr.Zero;
     private IntPtr _dScaleMsa = IntPtr.Zero;
@@ -84,6 +88,7 @@ public unsafe sealed class WanDiT : IDisposable
     private nuint _dXCapacity = 0;
     private nuint _dFfnCapacity = 0;
     private nuint _dTxtCapacity = 0;
+    private nuint _dRoPECapacity = 0;
     private bool _gpuWeightsUploaded = false;
 
     // Scratch buffers
@@ -233,6 +238,7 @@ public unsafe sealed class WanDiT : IDisposable
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAdaLn, _gpuModule, "flux_adaln_kernel"), "ModuleGetFunction(flux_adaln_kernel)");
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnResidualGated, _gpuModule, "flux_residual_gated"), "ModuleGetFunction(flux_residual_gated)");
                 CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _gpuModule, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
+                CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRoPE3D, _gpuModule, "rope_3d_in_vram"), "ModuleGetFunction(rope_3d_in_vram)");
 
                 _dShiftMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
                 _dScaleMsa = _gpu.AllocateDevice((nuint)(HiddenDim * sizeof(float)));
@@ -357,6 +363,16 @@ public unsafe sealed class WanDiT : IDisposable
                 _dTxtDevice = _gpu.AllocateDevice(_dTxtCapacity);
             }
         }
+
+        nuint ropeBytes = (nuint)((long)numTokens * 64 * sizeof(float));
+        if (ropeBytes > _dRoPECapacity)
+        {
+            FreeDevicePtr(ref _dRoPECos);
+            FreeDevicePtr(ref _dRoPESin);
+            _dRoPECapacity = ropeBytes * 12 / 10 + 256 * 1024;
+            _dRoPECos = _gpu.AllocateDevice(_dRoPECapacity);
+            _dRoPESin = _gpu.AllocateDevice(_dRoPECapacity);
+        }
     }
 
     private (IntPtr dW, IntPtr dB) UploadWeightAndBias(GgufTensorInfo w, GgufTensorInfo? b, int nRows)
@@ -440,6 +456,8 @@ public unsafe sealed class WanDiT : IDisposable
                 // Execute on NVIDIA GPU (RTX 4060)
                 EnsureGpuBuffers(totalImgTokens, numTxtTokens);
                 _gpu!.CopyToDevice(_dXDevice, (IntPtr)currentTokens, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+                _gpu.CopyToDevice(_dRoPECos, (IntPtr)_ropeCos, (nuint)(totalImgTokens * 64 * sizeof(float)));
+                _gpu.CopyToDevice(_dRoPESin, (IntPtr)_ropeSin, (nuint)(totalImgTokens * 64 * sizeof(float)));
                 if (numTxtTokens > 0)
                 {
                     _gpu.CopyToDevice(_dTxtDevice, (IntPtr)projectedTxt, (nuint)(numTxtTokens * HiddenDim * sizeof(float)));
@@ -524,13 +542,9 @@ public unsafe sealed class WanDiT : IDisposable
         DispatchRmsNormBatchDevice(_dQDevice, blk.D_SelfNormQ, _dQDevice, HiddenDim, totalImgTokens);
         DispatchRmsNormBatchDevice(_dKDevice, blk.D_SelfNormK, _dKDevice, HiddenDim, totalImgTokens);
 
-        // 1d. 3D-RoPE rotation on Q and K
-        _gpu.CopyToHost((IntPtr)_qBuffer, _dQDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-        _gpu.CopyToHost((IntPtr)_kBuffer, _dKDevice, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-        Apply3DRoPEToTokens(_qBuffer, totalImgTokens, ropeCos, ropeSin);
-        Apply3DRoPEToTokens(_kBuffer, totalImgTokens, ropeCos, ropeSin);
-        _gpu.CopyToDevice(_dQDevice, (IntPtr)_qBuffer, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
-        _gpu.CopyToDevice(_dKDevice, (IntPtr)_kBuffer, (nuint)(totalImgTokens * HiddenDim * sizeof(float)));
+        // 1d. 3D-RoPE rotation on Q and K directly in GPU VRAM (zero host PCIe round-trips)
+        DispatchRoPE3DDevice(_dQDevice, _dRoPECos, _dRoPESin, totalImgTokens, NumHeads, HeadDim);
+        DispatchRoPE3DDevice(_dKDevice, _dRoPECos, _dRoPESin, totalImgTokens, NumHeads, HeadDim);
 
         // 1e. Bidirectional Attention across spatio-temporal tokens
         float scale = 1.0f / MathF.Sqrt(HeadDim);
@@ -903,6 +917,33 @@ public unsafe sealed class WanDiT : IDisposable
             0, IntPtr.Zero,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(attention_cross_batch)");
+    }
+
+    private void DispatchRoPE3DDevice(IntPtr dQk, IntPtr dCos, IntPtr dSin, int totalTokens, int nHeads, int headDim)
+    {
+        uint blockSize = 64;
+        uint gridX = (uint)totalTokens;
+        uint gridY = (uint)nHeads;
+
+        int localTokens = totalTokens;
+        int localHeads = nHeads;
+        int localHeadDim = headDim;
+
+        void** pArgs = stackalloc void*[6];
+        pArgs[0] = &dQk;
+        pArgs[1] = &dCos;
+        pArgs[2] = &dSin;
+        pArgs[3] = &localTokens;
+        pArgs[4] = &localHeads;
+        pArgs[5] = &localHeadDim;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRoPE3D,
+            gridX, gridY, 1,
+            blockSize, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rope_3d_in_vram)");
     }
 
     private void DispatchGeluDevice(IntPtr dX, int count)
@@ -1630,6 +1671,8 @@ public unsafe sealed class WanDiT : IDisposable
             FreeDevicePtr(ref _dAttnOut);
             FreeDevicePtr(ref _dFfnInter);
             FreeDevicePtr(ref _dTxtDevice);
+            FreeDevicePtr(ref _dRoPECos);
+            FreeDevicePtr(ref _dRoPESin);
 
             FreeDevicePtr(ref _dShiftMsa);
             FreeDevicePtr(ref _dScaleMsa);

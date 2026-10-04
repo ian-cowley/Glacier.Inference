@@ -342,7 +342,13 @@ public sealed unsafe partial class Qwen2GpuModel
         uint blockSize = 128;
         uint numWarps = 4;
         uint gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
-        uint gridY = 1;
+        int tileSize = type switch
+        {
+            GgufType.Q6_K => 8,
+            GgufType.Q8_0 => 8,
+            _ => 16
+        };
+        uint gridY = (uint)((batchSize + tileSize - 1) / tileSize);
 
         void** pArgs = stackalloc void*[8];
         pArgs[0] = &dY;
@@ -368,7 +374,7 @@ public sealed unsafe partial class Qwen2GpuModel
         uint blockSize = 128;
         uint numWarps = 4;
         uint gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
-        uint gridY = 1;
+        uint gridY = (uint)((batchSize + 15) / 16);
 
         void** pArgs = stackalloc void*[7];
         pArgs[0] = &dDst;

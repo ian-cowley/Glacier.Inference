@@ -152,8 +152,9 @@ public sealed class VideoGenerationPipeline : IDisposable
         int latentChannels = _dit.LatentChannels;                          // 16
 
         // Compute keyframe latent count: for Wan 3D causal VAE, N_frames = 1 + 4 * (K - 1)
+        // Default to K=5 native keyframes (17 native frames @ 7,800 tokens for 832x480), upscaled to full duration via Catmull-Rom splines
         int spatialTokens = (latentH / 2) * (latentW / 2);
-        int maxWanKeyframes = (_wanDit != null && spatialTokens > 0) ? Math.Min(9, _wanDit.MaxTokens / spatialTokens) : 8;
+        int maxWanKeyframes = (_wanDit != null && spatialTokens > 0) ? Math.Min(5, _wanDit.MaxTokens / spatialTokens) : 5;
         int temporalLatentFrames = (_wanDit != null)
             ? Math.Clamp((numFrames - 1) / 4 + 1, 2, maxWanKeyframes)
             : Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);

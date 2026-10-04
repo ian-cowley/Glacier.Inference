@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using System.Threading.Tasks;
 using Glacier.Inference.Format;
 
@@ -540,68 +541,76 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
                     float* pDstI = (float*)attnTokAddr + (long)i * channels;
                     new Span<float>(pDstI, channels).Clear();
 
-                    float[] scoresArr = new float[spatial];
-                    fixed (float* scores = scoresArr)
+                    float m = float.NegativeInfinity;
+                    float l = 0f;
+
+                    for (int j = 0; j < spatial; j++)
                     {
-                        float maxScore = float.NegativeInfinity;
-
-                        for (int j = 0; j < spatial; j++)
+                        float* pKj = pKtok + (long)j * channels;
+                        float dot = 0f;
+                        int c = 0;
+                        if (Vector256.IsHardwareAccelerated)
                         {
-                            float* pKj = pKtok + (long)j * channels;
-                            float dot = 0f;
-                            int c = 0;
-                            if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+                            var vSum = Vector256<float>.Zero;
+                            for (; c <= channels - 8; c += 8)
                             {
-                                var vSum = System.Runtime.Intrinsics.Vector256<float>.Zero;
-                                for (; c <= channels - 8; c += 8)
-                                {
-                                    var qVec = System.Runtime.Intrinsics.Vector256.Load(pQi + c);
-                                    var kVec = System.Runtime.Intrinsics.Vector256.Load(pKj + c);
-                                    vSum = System.Runtime.Intrinsics.Vector256.FusedMultiplyAdd(qVec, kVec, vSum);
-                                }
-                                dot = System.Runtime.Intrinsics.Vector256.Sum(vSum);
+                                var qVec = Vector256.Load(pQi + c);
+                                var kVec = Vector256.Load(pKj + c);
+                                vSum = Vector256.FusedMultiplyAdd(qVec, kVec, vSum);
                             }
-                            for (; c < channels; c++)
-                            {
-                                dot += pQi[c] * pKj[c];
-                            }
-
-                            dot *= scale;
-                            scores[j] = dot;
-                            if (dot > maxScore) maxScore = dot;
+                            dot = Vector256.Sum(vSum);
+                        }
+                        for (; c < channels; c++)
+                        {
+                            dot += pQi[c] * pKj[c];
                         }
 
-                        float sumExp = 0f;
-                        for (int j = 0; j < spatial; j++)
+                        float s_j = dot * scale;
+                        float m_new = MathF.Max(m, s_j);
+                        float alpha = MathF.Exp(m - m_new);
+                        float w_j = MathF.Exp(s_j - m_new);
+
+                        float* pVj = pVtok + (long)j * channels;
+                        c = 0;
+                        if (Vector256.IsHardwareAccelerated)
                         {
-                            float exp = MathF.Exp(scores[j] - maxScore);
-                            scores[j] = exp;
-                            sumExp += exp;
+                            var vAlpha = Vector256.Create(alpha);
+                            var vW = Vector256.Create(w_j);
+                            for (; c <= channels - 8; c += 8)
+                            {
+                                var vDst = Vector256.Load(pDstI + c);
+                                var vVal = Vector256.Load(pVj + c);
+                                vDst = Vector256.Multiply(vDst, vAlpha);
+                                vDst = Vector256.FusedMultiplyAdd(vW, vVal, vDst);
+                                vDst.Store(pDstI + c);
+                            }
                         }
-                        float invSum = 1.0f / MathF.Max(sumExp, 1e-12f);
-
-                        for (int j = 0; j < spatial; j++)
+                        for (; c < channels; c++)
                         {
-                            float s = scores[j] * invSum;
-                            if (s == 0f) continue;
-                            float* pVj = pVtok + (long)j * channels;
+                            pDstI[c] = pDstI[c] * alpha + w_j * pVj[c];
+                        }
 
-                            int c = 0;
-                            if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+                        l = l * alpha + w_j;
+                        m = m_new;
+                    }
+
+                    if (l > 0f)
+                    {
+                        float invL = 1.0f / l;
+                        int c = 0;
+                        if (Vector256.IsHardwareAccelerated)
+                        {
+                            var vInvL = Vector256.Create(invL);
+                            for (; c <= channels - 8; c += 8)
                             {
-                                var vs = System.Runtime.Intrinsics.Vector256.Create(s);
-                                for (; c <= channels - 8; c += 8)
-                                {
-                                    var vDst = System.Runtime.Intrinsics.Vector256.Load(pDstI + c);
-                                    var vVal = System.Runtime.Intrinsics.Vector256.Load(pVj + c);
-                                    vDst = System.Runtime.Intrinsics.Vector256.FusedMultiplyAdd(vs, vVal, vDst);
-                                    *(System.Runtime.Intrinsics.Vector256<float>*)(pDstI + c) = vDst;
-                                }
+                                var vDst = Vector256.Load(pDstI + c);
+                                vDst = Vector256.Multiply(vDst, vInvL);
+                                vDst.Store(pDstI + c);
                             }
-                            for (; c < channels; c++)
-                            {
-                                pDstI[c] += s * pVj[c];
-                            }
+                        }
+                        for (; c < channels; c++)
+                        {
+                            pDstI[c] *= invL;
                         }
                     }
                 });
@@ -762,27 +771,149 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
     private static void WanRMSNorm(float* src, float* dst, float* gamma, int channels, int spatial, bool applySilu)
     {
         float scale = MathF.Sqrt(channels);
+        const int tileSize = 1024;
+        int numTiles = (spatial + tileSize - 1) / tileSize;
 
-        Parallel.For(0, spatial, s =>
+        Parallel.For(0, numTiles, tileIdx =>
         {
-            float sumSq = 0f;
-            for (int c = 0; c < channels; c++)
-            {
-                float v = src[(long)c * spatial + s];
-                sumSq += v * v;
-            }
-            float invRms = (1.0f / MathF.Sqrt(sumSq + 1e-12f)) * scale;
+            int sStart = tileIdx * tileSize;
+            int sEnd = Math.Min(sStart + tileSize, spatial);
+            int curTile = sEnd - sStart;
+
+            float* sumSq = stackalloc float[curTile];
+            new Span<float>(sumSq, curTile).Clear();
 
             for (int c = 0; c < channels; c++)
             {
-                float norm = src[(long)c * spatial + s] * invRms * gamma[c];
-                if (applySilu)
+                float* pSrcC = src + (long)c * spatial + sStart;
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    norm /= (1.0f + MathF.Exp(-norm));
+                    int i = 0;
+                    for (; i <= curTile - 8; i += 8)
+                    {
+                        var vSrc = Vector256.Load(pSrcC + i);
+                        var vSum = Vector256.Load(sumSq + i);
+                        vSum = Vector256.FusedMultiplyAdd(vSrc, vSrc, vSum);
+                        vSum.Store(sumSq + i);
+                    }
+                    for (; i < curTile; i++)
+                    {
+                        float v = pSrcC[i];
+                        sumSq[i] += v * v;
+                    }
                 }
-                dst[(long)c * spatial + s] = norm;
+                else
+                {
+                    for (int i = 0; i < curTile; i++)
+                    {
+                        float v = pSrcC[i];
+                        sumSq[i] += v * v;
+                    }
+                }
+            }
+
+            float* invRms = stackalloc float[curTile];
+            for (int i = 0; i < curTile; i++)
+            {
+                invRms[i] = (1.0f / MathF.Sqrt(sumSq[i] + 1e-12f)) * scale;
+            }
+
+            for (int c = 0; c < channels; c++)
+            {
+                float g = gamma[c];
+                float* pSrcC = src + (long)c * spatial + sStart;
+                float* pDstC = dst + (long)c * spatial + sStart;
+
+                if (Vector256.IsHardwareAccelerated && !applySilu)
+                {
+                    var vG = Vector256.Create(g);
+                    int i = 0;
+                    for (; i <= curTile - 8; i += 8)
+                    {
+                        var vSrc = Vector256.Load(pSrcC + i);
+                        var vInv = Vector256.Load(invRms + i);
+                        var vNorm = Vector256.Multiply(Vector256.Multiply(vSrc, vInv), vG);
+                        vNorm.Store(pDstC + i);
+                    }
+                    for (; i < curTile; i++)
+                    {
+                        pDstC[i] = pSrcC[i] * invRms[i] * g;
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < curTile; i++)
+                    {
+                        float norm = pSrcC[i] * invRms[i] * g;
+                        if (applySilu)
+                        {
+                            norm /= (1.0f + MathF.Exp(-norm));
+                        }
+                        pDstC[i] = norm;
+                    }
+                }
             }
         });
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumulateConv3x3Row(float* pSrc, float* pDstRow, float* w, int y, int H, int W)
+    {
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            int yin = y + dy;
+            if (yin < 0 || yin >= H) continue;
+
+            float* pSrcRow = pSrc + (long)yin * W;
+            float* wRow = w + (dy + 1) * 3;
+
+            float w0 = wRow[0];
+            float w1 = wRow[1];
+            float w2 = wRow[2];
+
+            if (w0 == 0f && w1 == 0f && w2 == 0f) continue;
+
+            if (Vector256.IsHardwareAccelerated && W >= 16)
+            {
+                var vW0 = Vector256.Create(w0);
+                var vW1 = Vector256.Create(w1);
+                var vW2 = Vector256.Create(w2);
+
+                pDstRow[0] += pSrcRow[0] * w1 + pSrcRow[1] * w2;
+
+                int x = 1;
+                int xEnd = W - 9;
+                for (; x <= xEnd; x += 8)
+                {
+                    var vDst = Vector256.Load(pDstRow + x);
+                    var vLeft = Vector256.Load(pSrcRow + x - 1);
+                    var vMid  = Vector256.Load(pSrcRow + x);
+                    var vRight = Vector256.Load(pSrcRow + x + 1);
+
+                    vDst = Vector256.FusedMultiplyAdd(vLeft, vW0, vDst);
+                    vDst = Vector256.FusedMultiplyAdd(vMid, vW1, vDst);
+                    vDst = Vector256.FusedMultiplyAdd(vRight, vW2, vDst);
+
+                    vDst.Store(pDstRow + x);
+                }
+
+                for (; x < W - 1; x++)
+                {
+                    pDstRow[x] += pSrcRow[x - 1] * w0 + pSrcRow[x] * w1 + pSrcRow[x + 1] * w2;
+                }
+
+                pDstRow[W - 1] += pSrcRow[W - 2] * w0 + pSrcRow[W - 1] * w1;
+            }
+            else
+            {
+                pDstRow[0] += pSrcRow[0] * w1 + (W > 1 ? pSrcRow[1] * w2 : 0f);
+                for (int x = 1; x < W - 1; x++)
+                {
+                    pDstRow[x] += pSrcRow[x - 1] * w0 + pSrcRow[x] * w1 + pSrcRow[x + 1] * w2;
+                }
+                if (W > 1) pDstRow[W - 1] += pSrcRow[W - 2] * w0 + pSrcRow[W - 1] * w1;
+            }
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -800,100 +931,39 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
 
             for (int y = 0; y < H; y++)
             {
-                int y0 = y - 1, y1 = y, y2 = y + 1;
-
-                for (int x = 0; x < W; x++)
+                float* pDstRow = pDstOc + (long)y * W;
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    int x0 = x - 1, x1 = x, x2 = x + 1;
-                    float sum = b;
+                    var vB = Vector256.Create(b);
+                    int x = 0;
+                    for (; x <= W - 8; x += 8) vB.Store(pDstRow + x);
+                    for (; x < W; x++) pDstRow[x] = b;
+                }
+                else
+                {
+                    for (int x = 0; x < W; x++) pDstRow[x] = b;
+                }
 
-                    for (int ic = 0; ic < inC; ic++)
+                for (int ic = 0; ic < inC; ic++)
+                {
+                    float* pWIc = pWOc + ic * 27;
+                    long icSpatial = (long)ic * spatial;
+
+                    float* pSrcT0 = pT0 != null ? pT0 + icSpatial : null;
+                    float* pSrcT1 = pT1 != null ? pT1 + icSpatial : null;
+                    float* pSrcT2 = pT2 + icSpatial;
+
+                    if (pSrcT0 != null)
                     {
-                        float* pWIc = pWOc + ic * 27;
-                        long icSpatial = (long)ic * spatial;
-                        float* pSrcT0 = pT0 != null ? pT0 + icSpatial : null;
-                        float* pSrcT1 = pT1 != null ? pT1 + icSpatial : null;
-                        float* pSrcT2 = pT2 + icSpatial;
-
-                        // dt = 0 (past 2 frames ago)
-                        if (pSrcT0 != null)
-                        {
-                            float* wDt = pWIc + 0;
-                            if (y0 >= 0)
-                            {
-                                long r = (long)y0 * W;
-                                if (x0 >= 0) sum += pSrcT0[r + x0] * wDt[0];
-                                sum += pSrcT0[r + x1] * wDt[1];
-                                if (x2 < W) sum += pSrcT0[r + x2] * wDt[2];
-                            }
-                            {
-                                long r = (long)y1 * W;
-                                if (x0 >= 0) sum += pSrcT0[r + x0] * wDt[3];
-                                sum += pSrcT0[r + x1] * wDt[4];
-                                if (x2 < W) sum += pSrcT0[r + x2] * wDt[5];
-                            }
-                            if (y2 < H)
-                            {
-                                long r = (long)y2 * W;
-                                if (x0 >= 0) sum += pSrcT0[r + x0] * wDt[6];
-                                sum += pSrcT0[r + x1] * wDt[7];
-                                if (x2 < W) sum += pSrcT0[r + x2] * wDt[8];
-                            }
-                        }
-
-                        // dt = 1 (past 1 frame ago)
-                        if (pSrcT1 != null)
-                        {
-                            float* wDt = pWIc + 9;
-                            if (y0 >= 0)
-                            {
-                                long r = (long)y0 * W;
-                                if (x0 >= 0) sum += pSrcT1[r + x0] * wDt[0];
-                                sum += pSrcT1[r + x1] * wDt[1];
-                                if (x2 < W) sum += pSrcT1[r + x2] * wDt[2];
-                            }
-                            {
-                                long r = (long)y1 * W;
-                                if (x0 >= 0) sum += pSrcT1[r + x0] * wDt[3];
-                                sum += pSrcT1[r + x1] * wDt[4];
-                                if (x2 < W) sum += pSrcT1[r + x2] * wDt[5];
-                            }
-                            if (y2 < H)
-                            {
-                                long r = (long)y2 * W;
-                                if (x0 >= 0) sum += pSrcT1[r + x0] * wDt[6];
-                                sum += pSrcT1[r + x1] * wDt[7];
-                                if (x2 < W) sum += pSrcT1[r + x2] * wDt[8];
-                            }
-                        }
-
-                        // dt = 2 (current frame)
-                        {
-                            float* wDt = pWIc + 18;
-                            if (y0 >= 0)
-                            {
-                                long r = (long)y0 * W;
-                                if (x0 >= 0) sum += pSrcT2[r + x0] * wDt[0];
-                                sum += pSrcT2[r + x1] * wDt[1];
-                                if (x2 < W) sum += pSrcT2[r + x2] * wDt[2];
-                            }
-                            {
-                                long r = (long)y1 * W;
-                                if (x0 >= 0) sum += pSrcT2[r + x0] * wDt[3];
-                                sum += pSrcT2[r + x1] * wDt[4];
-                                if (x2 < W) sum += pSrcT2[r + x2] * wDt[5];
-                            }
-                            if (y2 < H)
-                            {
-                                long r = (long)y2 * W;
-                                if (x0 >= 0) sum += pSrcT2[r + x0] * wDt[6];
-                                sum += pSrcT2[r + x1] * wDt[7];
-                                if (x2 < W) sum += pSrcT2[r + x2] * wDt[8];
-                            }
-                        }
+                        AccumulateConv3x3Row(pSrcT0, pDstRow, pWIc + 0, y, H, W);
                     }
-
-                    pDstOc[y * W + x] = sum;
+                    if (pSrcT1 != null)
+                    {
+                        AccumulateConv3x3Row(pSrcT1, pDstRow, pWIc + 9, y, H, W);
+                    }
+                    {
+                        AccumulateConv3x3Row(pSrcT2, pDstRow, pWIc + 18, y, H, W);
+                    }
                 }
             }
         });
@@ -912,18 +982,75 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
             float* pWOc = pW + (long)oc * inC * 3;
             float* pDstOc = pDst + (long)oc * spatial;
 
-            for (int s = 0; s < spatial; s++)
+            if (Vector256.IsHardwareAccelerated)
             {
-                float sum = b;
-                for (int ic = 0; ic < inC; ic++)
+                var vB = Vector256.Create(b);
+                int s = 0;
+                for (; s <= spatial - 8; s += 8) vB.Store(pDstOc + s);
+                for (; s < spatial; s++) pDstOc[s] = b;
+            }
+            else
+            {
+                for (int s = 0; s < spatial; s++) pDstOc[s] = b;
+            }
+
+            for (int ic = 0; ic < inC; ic++)
+            {
+                float* wIc = pWOc + ic * 3;
+                long icSpatial = (long)ic * spatial;
+
+                float w0 = wIc[0];
+                float w1 = wIc[1];
+                float w2 = wIc[2];
+
+                float* pSrcT0 = pT0 != null ? pT0 + icSpatial : null;
+                float* pSrcT1 = pT1 != null ? pT1 + icSpatial : null;
+                float* pSrcT2 = pT2 + icSpatial;
+
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    float* wIc = pWOc + ic * 3;
-                    long icSpatial = (long)ic * spatial;
-                    if (pT0 != null) sum += pT0[icSpatial + s] * wIc[0];
-                    if (pT1 != null) sum += pT1[icSpatial + s] * wIc[1];
-                    sum += pT2[icSpatial + s] * wIc[2];
+                    var vW0 = pSrcT0 != null ? Vector256.Create(w0) : Vector256<float>.Zero;
+                    var vW1 = pSrcT1 != null ? Vector256.Create(w1) : Vector256<float>.Zero;
+                    var vW2 = Vector256.Create(w2);
+
+                    int s = 0;
+                    for (; s <= spatial - 8; s += 8)
+                    {
+                        var vDst = Vector256.Load(pDstOc + s);
+                        if (pSrcT0 != null)
+                        {
+                            var v0 = Vector256.Load(pSrcT0 + s);
+                            vDst = Vector256.FusedMultiplyAdd(v0, vW0, vDst);
+                        }
+                        if (pSrcT1 != null)
+                        {
+                            var v1 = Vector256.Load(pSrcT1 + s);
+                            vDst = Vector256.FusedMultiplyAdd(v1, vW1, vDst);
+                        }
+                        var v2 = Vector256.Load(pSrcT2 + s);
+                        vDst = Vector256.FusedMultiplyAdd(v2, vW2, vDst);
+                        vDst.Store(pDstOc + s);
+                    }
+                    for (; s < spatial; s++)
+                    {
+                        float sum = 0f;
+                        if (pSrcT0 != null) sum += pSrcT0[s] * w0;
+                        if (pSrcT1 != null) sum += pSrcT1[s] * w1;
+                        sum += pSrcT2[s] * w2;
+                        pDstOc[s] += sum;
+                    }
                 }
-                pDstOc[s] = sum;
+                else
+                {
+                    for (int s = 0; s < spatial; s++)
+                    {
+                        float sum = 0f;
+                        if (pSrcT0 != null) sum += pSrcT0[s] * w0;
+                        if (pSrcT1 != null) sum += pSrcT1[s] * w1;
+                        sum += pSrcT2[s] * w2;
+                        pDstOc[s] += sum;
+                    }
+                }
             }
         });
     }
@@ -939,14 +1066,47 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
             float* pWOc = pW + (long)oc * inC;
             float* pDstOc = pDst + (long)oc * spatial;
 
-            for (int s = 0; s < spatial; s++)
+            if (Vector256.IsHardwareAccelerated)
             {
-                float sum = b;
-                for (int ic = 0; ic < inC; ic++)
+                var vB = Vector256.Create(b);
+                int s = 0;
+                for (; s <= spatial - 8; s += 8) vB.Store(pDstOc + s);
+                for (; s < spatial; s++) pDstOc[s] = b;
+            }
+            else
+            {
+                for (int s = 0; s < spatial; s++) pDstOc[s] = b;
+            }
+
+            for (int ic = 0; ic < inC; ic++)
+            {
+                float w = pWOc[ic];
+                if (w == 0f) continue;
+                float* pSrcIc = pSrc + (long)ic * spatial;
+
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    sum += pSrc[(long)ic * spatial + s] * pWOc[ic];
+                    var vW = Vector256.Create(w);
+                    int s = 0;
+                    for (; s <= spatial - 8; s += 8)
+                    {
+                        var vDst = Vector256.Load(pDstOc + s);
+                        var vSrc = Vector256.Load(pSrcIc + s);
+                        vDst = Vector256.FusedMultiplyAdd(vSrc, vW, vDst);
+                        vDst.Store(pDstOc + s);
+                    }
+                    for (; s < spatial; s++)
+                    {
+                        pDstOc[s] += pSrcIc[s] * w;
+                    }
                 }
-                pDstOc[s] = sum;
+                else
+                {
+                    for (int s = 0; s < spatial; s++)
+                    {
+                        pDstOc[s] += pSrcIc[s] * w;
+                    }
+                }
             }
         });
     }
@@ -966,41 +1126,24 @@ public unsafe sealed class Wan3DVaeDecoder : IDisposable
 
             for (int y = 0; y < H; y++)
             {
-                int y0 = y - 1, y1 = y, y2 = y + 1;
-
-                for (int x = 0; x < W; x++)
+                float* pDstRow = pDstOc + (long)y * W;
+                if (Vector256.IsHardwareAccelerated)
                 {
-                    int x0 = x - 1, x1 = x, x2 = x + 1;
-                    float sum = b;
+                    var vB = Vector256.Create(b);
+                    int x = 0;
+                    for (; x <= W - 8; x += 8) vB.Store(pDstRow + x);
+                    for (; x < W; x++) pDstRow[x] = b;
+                }
+                else
+                {
+                    for (int x = 0; x < W; x++) pDstRow[x] = b;
+                }
 
-                    for (int ic = 0; ic < inC; ic++)
-                    {
-                        float* wIc = pWOc + ic * 9;
-                        float* pSrcIc = pSrc + (long)ic * spatial;
-
-                        if (y0 >= 0)
-                        {
-                            long r = (long)y0 * W;
-                            if (x0 >= 0) sum += pSrcIc[r + x0] * wIc[0];
-                            sum += pSrcIc[r + x1] * wIc[1];
-                            if (x2 < W) sum += pSrcIc[r + x2] * wIc[2];
-                        }
-                        {
-                            long r = (long)y1 * W;
-                            if (x0 >= 0) sum += pSrcIc[r + x0] * wIc[3];
-                            sum += pSrcIc[r + x1] * wIc[4];
-                            if (x2 < W) sum += pSrcIc[r + x2] * wIc[5];
-                        }
-                        if (y2 < H)
-                        {
-                            long r = (long)y2 * W;
-                            if (x0 >= 0) sum += pSrcIc[r + x0] * wIc[6];
-                            sum += pSrcIc[r + x1] * wIc[7];
-                            if (x2 < W) sum += pSrcIc[r + x2] * wIc[8];
-                        }
-                    }
-
-                    pDstOc[y * W + x] = sum;
+                for (int ic = 0; ic < inC; ic++)
+                {
+                    float* wIc = pWOc + ic * 9;
+                    float* pSrcIc = pSrc + (long)ic * spatial;
+                    AccumulateConv3x3Row(pSrcIc, pDstRow, wIc, y, H, W);
                 }
             }
         });

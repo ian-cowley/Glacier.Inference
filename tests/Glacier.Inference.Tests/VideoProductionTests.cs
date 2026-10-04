@@ -720,8 +720,9 @@ public class VideoProductionTests
         for (int i = 0; i < count; i++) latents[i] = br.ReadSingle();
 
         using var decoder = Glacier.Inference.Video.Wan.Wan3DVaeDecoder.Open(vaePath);
-        var decoded = decoder.DecodeVideo(latents, frames, targetFrames: frames * 4 - 3, H, W);
-        Assert.Equal(17, decoded.Count);
+        int expectedFrames = frames * 4 - 3;
+        var decoded = decoder.DecodeVideo(latents, frames, targetFrames: expectedFrames, H, W);
+        Assert.Equal(expectedFrames, decoded.Count);
 
         string repoDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             "source", "repos", "PolarsPlus", "Glacier.Inference");
@@ -732,8 +733,10 @@ public class VideoProductionTests
         Glacier.Inference.Video.GifWriter.SaveGif(Path.Combine(repoDir, "walk_hd.gif"), decoded, finalW, finalH, fps: 16);
 
         Glacier.Inference.Image.PngWriter.SavePng24(Path.Combine(repoDir, "walk_hd_frame_0.png"), decoded[0], finalW, finalH);
-        Glacier.Inference.Image.PngWriter.SavePng24(Path.Combine(repoDir, "walk_hd_frame_8.png"), decoded[8], finalW, finalH);
-        Glacier.Inference.Image.PngWriter.SavePng24(Path.Combine(repoDir, "walk_hd_frame_16.png"), decoded[16], finalW, finalH);
+        if (decoded.Count > expectedFrames / 2)
+            Glacier.Inference.Image.PngWriter.SavePng24(Path.Combine(repoDir, "walk_hd_frame_8.png"), decoded[expectedFrames / 2], finalW, finalH);
+        if (decoded.Count > 1)
+            Glacier.Inference.Image.PngWriter.SavePng24(Path.Combine(repoDir, "walk_hd_frame_16.png"), decoded[^1], finalW, finalH);
     }
 
     [Fact]
