@@ -77,6 +77,9 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipDeviceTotalMem")]
     public static extern int DeviceTotalMem(out nuint bytes, int dev);
 
+    [DllImport(HipLib, EntryPoint = "hipMemGetInfo")]
+    public static extern int MemGetInfo(out nuint free, out nuint total);
+
     [DllImport(HipLib, EntryPoint = "hipCtxCreate")]
     public static extern int CtxCreate(out IntPtr pctx, uint flags, int dev);
 
@@ -97,6 +100,9 @@ public static class HipDriver
 
     [DllImport(HipLib, EntryPoint = "hipModuleLoadData")]
     public static extern int ModuleLoadData(out IntPtr module, byte[] image);
+
+    [DllImport(HipLib, EntryPoint = "hipModuleUnload")]
+    public static extern int ModuleUnload(IntPtr hmod);
 
     [DllImport(HipLib, EntryPoint = "hipModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
@@ -132,6 +138,14 @@ public static class HipDriver
     [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMemcpyDtoD")]
     public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
+
+    [SuppressGCTransition]
+    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoDAsync")]
+    public static extern int MemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount, IntPtr hStream);
+
+    [SuppressGCTransition]
+    [DllImport(HipLib, EntryPoint = "hipMemcpyHtoDAsync")]
+    public static extern int MemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, nuint byteCount, IntPtr hStream);
 
     [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMemsetD8")]
@@ -173,6 +187,10 @@ public static class HipDriver
 
     [DllImport(HipLib, EntryPoint = "hipEventDestroy")]
     public static extern int EventDestroy(IntPtr hEvent);
+
+    [SuppressGCTransition]
+    [DllImport(HipLib, EntryPoint = "hipStreamWaitEvent")]
+    public static extern int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
 
     public static string GetDeviceName(int device)
     {

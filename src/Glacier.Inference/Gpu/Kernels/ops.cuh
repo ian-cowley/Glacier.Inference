@@ -112,6 +112,21 @@ __global__ void vec_add_kernel(
 }
 
 // =========================================================================
+// 6b. Weighted Vector Add: a[i] += weight * b[i] (for MoE routing)
+// =========================================================================
+__global__ void vec_add_weighted_kernel(
+    float* __restrict__ a,
+    const float* __restrict__ b,
+    float weight,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        a[idx] += weight * b[idx];
+    }
+}
+
+// =========================================================================
 // 7. RoPE Kernel (Rotary Position Embedding, NeOX style)
 // =========================================================================
 __global__ void rope_kernel(

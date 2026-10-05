@@ -175,8 +175,16 @@ public sealed unsafe partial class Qwen2D3D12Model
         cmdList.SetComputeRootUnorderedAccessView(3, _dKeyCache[layerIdx].GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, _dValCache[layerIdx].GPUVirtualAddress);
 
-        uint total = (uint)(_nHeadsKv * _headDim);
-        cmdList.Dispatch((total + 255) / 256, 1, 1);
+        if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Fp16)
+        {
+            uint totalHalf = (uint)(_nHeadsKv * (_headDim / 2));
+            cmdList.Dispatch((totalHalf + 127) / 128, 1, 1);
+        }
+        else
+        {
+            uint total = (uint)(_nHeadsKv * _headDim);
+            cmdList.Dispatch((total + 255) / 256, 1, 1);
+        }
     }
 
     private void DispatchAttention(ID3D12GraphicsCommandList cmdList, int layerIdx, int pos)

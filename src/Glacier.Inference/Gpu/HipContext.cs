@@ -90,6 +90,15 @@ public sealed class HipContext : IDisposable
         HipDriver.CtxSetCurrent(_ctx);
     }
 
+    public (ulong FreeBytes, ulong TotalBytes) GetMemoryInfo()
+    {
+        HipDriver.CtxSetCurrent(_ctx);
+        int res = HipDriver.MemGetInfo(out nuint free, out nuint total);
+        if (res != 0)
+            throw new InvalidOperationException($"hipMemGetInfo failed: code {res}");
+        return ((ulong)free, (ulong)total);
+    }
+
     public IntPtr AllocateDevice(nuint bytes)
     {
         HipDriver.CtxSetCurrent(_ctx);

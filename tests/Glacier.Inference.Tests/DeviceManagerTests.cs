@@ -213,6 +213,9 @@ public class DeviceManagerTests
         Assert.NotNull(hip.DeviceName);
         Assert.True(hip.TotalVramBytes > 0);
 
+        var (free, total) = hip.GetMemoryInfo();
+        Assert.True(total > 0);
+
         nuint bytes = 1024;
         IntPtr dptr = hip.AllocateDevice(bytes);
         Assert.NotEqual(IntPtr.Zero, dptr);

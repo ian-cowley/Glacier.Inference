@@ -394,4 +394,58 @@ __global__ void gemm_q8_0_batch(
     }
 }
 
+// =========================================================================
+// GEMM FP32 Batch: Unquantized Batched Matrix Multiplication (Y = W * X)
+// =========================================================================
+__global__ void gemm_fp32_batch(
+    float* __restrict__ Y,
+    const float* __restrict__ X,
+    const float* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    int batch_size,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int tiles_per_row = (batch_size + 7) / 8;
+    int row = warp_id / tiles_per_row;
+    int tile_idx = warp_id % tiles_per_row;
+    int t_base = tile_idx * 8;
+
+    if (row >= m_rows) return;
+
+    const float* row_w = W + (size_t)row * k_cols;
+    float acc[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.0f;
+
+    for (int col = lane_id; col < k_cols; col += WARP_SIZE) {
+        float w_val = row_w[col];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int t = t_base + i;
+            if (t < batch_size) {
+                acc[i] += w_val * X[(size_t)t * k_cols + col];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int t = t_base + i;
+        if (t < batch_size) {
+            float sum = warp_reduce_sum(acc[i]);
+            if (lane_id == 0) {
+                size_t out_idx = (size_t)t * m_rows + row;
+                if (bias != nullptr) sum += bias[row];
+                if (residual != nullptr) residual[out_idx] += sum;
+                if (Y != nullptr) Y[out_idx] = sum;
+            }
+        }
+    }
+}
+
 } // extern "C"

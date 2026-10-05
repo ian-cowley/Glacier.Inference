@@ -125,6 +125,140 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 }
 ";
 
+    public const string GemvQ4KSwigluFused = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint row_offset;
+};
+
+ByteAddressBuffer W_gate : register(t0);
+ByteAddressBuffer W_up : register(t1);
+RWByteAddressBuffer x : register(u0);
+RWStructuredBuffer<float> dst : register(u1);
+
+groupshared float s_mem_gate[128];
+groupshared float s_mem_up[128];
+
+uint get_scale_byte_fused(uint idx, uint s0, uint s1, uint s2)
+{
+    if (idx < 4) return (s0 >> (idx * 8)) & 0xFF;
+    else if (idx < 8) return (s1 >> ((idx - 4) * 8)) & 0xFF;
+    else return (s2 >> ((idx - 8) * 8)) & 0xFF;
+}
+
+void get_scale_min_fused(uint j, uint s0, uint s1, uint s2, out float d_out, out float min_out, float d, float min_val)
+{
+    uint sc, m;
+    if (j < 4) {
+        sc = get_scale_byte_fused(j, s0, s1, s2) & 63;
+        m  = get_scale_byte_fused(j + 4, s0, s1, s2) & 63;
+    } else {
+        sc = (get_scale_byte_fused(j + 4, s0, s1, s2) & 0x0F) | ((get_scale_byte_fused(j - 4, s0, s1, s2) >> 6) << 4);
+        m  = (get_scale_byte_fused(j + 4, s0, s1, s2) >> 4)   | ((get_scale_byte_fused(j, s0, s1, s2) >> 6) << 4);
+    }
+    d_out = d * (float)sc;
+    min_out = min_val * (float)m;
+}
+
+[numthreads(32, 4, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 32 + lane_id;
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 256;
+        uint row_byte_offset = warp_id * nb * 144;
+        float sum_gate = 0.0f;
+        float sum_up = 0.0f;
+
+        uint chunk = lane_id / 8;
+        uint chunk_lane = lane_id % 8;
+        uint is_idx = chunk * 2;
+        uint x_offset1 = chunk * 64 + chunk_lane * 4;
+        uint x_offset2 = x_offset1 + 32;
+
+        for (uint b = 0; b < nb; b++)
+        {
+            uint blk_addr = row_byte_offset + b * 144;
+
+            uint2 d_hdr_g = W_gate.Load2(blk_addr);
+            float d_g = f16tof32(d_hdr_g.x & 0xFFFF);
+            float min_val_g = f16tof32(d_hdr_g.x >> 16);
+            uint s0_g = d_hdr_g.y;
+            uint s1_g = W_gate.Load(blk_addr + 8);
+            uint s2_g = W_gate.Load(blk_addr + 12);
+            float d1_g, min1_g, d2_g, min2_g;
+            get_scale_min_fused(is_idx + 0, s0_g, s1_g, s2_g, d1_g, min1_g, d_g, min_val_g);
+            get_scale_min_fused(is_idx + 1, s0_g, s1_g, s2_g, d2_g, min2_g, d_g, min_val_g);
+
+            uint2 d_hdr_u = W_up.Load2(blk_addr);
+            float d_u = f16tof32(d_hdr_u.x & 0xFFFF);
+            float min_val_u = f16tof32(d_hdr_u.x >> 16);
+            uint s0_u = d_hdr_u.y;
+            uint s1_u = W_up.Load(blk_addr + 8);
+            uint s2_u = W_up.Load(blk_addr + 12);
+            float d1_u, min1_u, d2_u, min2_u;
+            get_scale_min_fused(is_idx + 0, s0_u, s1_u, s2_u, d1_u, min1_u, d_u, min_val_u);
+            get_scale_min_fused(is_idx + 1, s0_u, s1_u, s2_u, d2_u, min2_u, d_u, min_val_u);
+
+            uint q_byte_g0 = W_gate.Load(blk_addr + 16 + chunk * 32 + chunk_lane * 4);
+            uint q_byte_u0 = W_up.Load(blk_addr + 16 + chunk * 32 + chunk_lane * 4);
+
+            uint x_base = (b * 256 + x_offset1) * 4;
+            float4 x1 = asfloat(x.Load4(x_base));
+            float4 x2 = asfloat(x.Load4(x_base + 128));
+
+            [unroll]
+            for (uint k = 0; k < 4; k++)
+            {
+                uint b_g = (q_byte_g0 >> (k * 8)) & 0xFF;
+                float w1_g = d1_g * (float)(b_g & 0x0F) - min1_g;
+                float w2_g = d2_g * (float)(b_g >> 4)   - min2_g;
+                sum_gate += (w1_g * x1[k]) + (w2_g * x2[k]);
+
+                uint b_u = (q_byte_u0 >> (k * 8)) & 0xFF;
+                float w1_u = d1_u * (float)(b_u & 0x0F) - min1_u;
+                float w2_u = d2_u * (float)(b_u >> 4)   - min2_u;
+                sum_up += (w1_u * x1[k]) + (w2_u * x2[k]);
+            }
+        }
+
+        s_mem_gate[s_idx] = sum_gate;
+        s_mem_up[s_idx] = sum_up;
+    }
+    else
+    {
+        s_mem_gate[s_idx] = 0.0f;
+        s_mem_up[s_idx] = 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 16) { s_mem_gate[s_idx] += s_mem_gate[s_idx + 16]; s_mem_up[s_idx] += s_mem_up[s_idx + 16]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8)  { s_mem_gate[s_idx] += s_mem_gate[s_idx + 8];  s_mem_up[s_idx] += s_mem_up[s_idx + 8]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4)  { s_mem_gate[s_idx] += s_mem_gate[s_idx + 4];  s_mem_up[s_idx] += s_mem_up[s_idx + 4]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2)  { s_mem_gate[s_idx] += s_mem_gate[s_idx + 2];  s_mem_up[s_idx] += s_mem_up[s_idx + 2]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1)  { s_mem_gate[s_idx] += s_mem_gate[s_idx + 1];  s_mem_up[s_idx] += s_mem_up[s_idx + 1]; }
+
+    if (lane_id == 0 && warp_id < m_rows)
+    {
+        float gate = s_mem_gate[row_in_grp * 32];
+        float up   = s_mem_up[row_in_grp * 32];
+        float silu = gate / (1.0f + exp(-gate));
+        dst[warp_id] = silu * up;
+    }
+}
+";
+
     public const string GemvQ5K = @"
 cbuffer Params : register(b0)
 {

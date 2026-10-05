@@ -243,6 +243,43 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 ";
 
+    public const string KvCacheStoreF16 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+};
+
+RWStructuredBuffer<float> k : register(u0);
+RWStructuredBuffer<float> v : register(u1);
+RWStructuredBuffer<uint> k_cache : register(u2);
+RWStructuredBuffer<uint> v_cache : register(u3);
+
+[numthreads(128, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint half_elements = n_heads_kv * (head_dim / 2);
+    uint idx = id.x;
+    if (idx >= half_elements) return;
+
+    uint h = idx / (head_dim / 2);
+    uint d_pair = idx % (head_dim / 2);
+
+    uint in_idx0 = (h * head_dim) + (d_pair * 2);
+    uint in_idx1 = in_idx0 + 1;
+
+    uint k_packed = f32tof16(k[in_idx0]) | (f32tof16(k[in_idx1]) << 16);
+    uint v_packed = f32tof16(v[in_idx0]) | (f32tof16(v[in_idx1]) << 16);
+
+    uint cache_idx = (h * max_seq_len + pos) * (head_dim / 2) + d_pair;
+
+    k_cache[cache_idx] = k_packed;
+    v_cache[cache_idx] = v_packed;
+}
+";
+
     public const string AttentionGqa = @"
 cbuffer Params : register(b0)
 {
@@ -316,6 +353,111 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     }
 
     attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+}
+";
+
+    public const string AttentionGqaF16 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+    float attn_scale;
+};
+
+RWStructuredBuffer<float> q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWStructuredBuffer<float> attn_out : register(u3);
+
+groupshared float s_red[128];
+
+[numthreads(128, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    if (h >= n_heads_q) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+
+    float q_d = q[h * head_dim + tid];
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    uint pair_idx = tid / 2;
+    uint is_odd = tid & 1;
+
+    for (uint t = 0; t <= pos; t++)
+    {
+        uint kv_offset = (h_kv * max_seq_len + t) * (head_dim / 2) + pair_idx;
+        uint k_packed = k_cache[kv_offset];
+        uint v_packed = v_cache[kv_offset];
+
+        float k_d = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
+        float v_d = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
+
+        s_red[tid] = q_d * k_d;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 64) s_red[tid] += s_red[tid + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 32) s_red[tid] += s_red[tid + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 16) s_red[tid] += s_red[tid + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 8)  s_red[tid] += s_red[tid + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 4)  s_red[tid] += s_red[tid + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 2)  s_red[tid] += s_red[tid + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        GroupMemoryBarrierWithGroupSync();
+
+        float total_dot = s_red[0];
+        float s_t = total_dot * attn_scale;
+
+        float m_new = max(m, s_t);
+        float alpha = exp(m - m_new);
+        float w_t = exp(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+}
+";
+
+    public const string RepetitionPenalty = @"
+cbuffer Params : register(b0)
+{
+    uint count;
+    float penalty;
+};
+
+StructuredBuffer<int> recent_tokens : register(t0);
+RWStructuredBuffer<float> logits : register(u0);
+
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= count) return;
+    int tid = recent_tokens[id.x];
+    if (tid >= 0)
+    {
+        float val = logits[tid];
+        logits[tid] = (val > 0.0f) ? (val / penalty) : (val * penalty);
+    }
 }
 ";
 

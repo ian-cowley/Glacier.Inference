@@ -190,8 +190,11 @@ public sealed unsafe partial class Qwen2GpuModel
         IntPtr fn = type switch
         {
             GgufType.Q4_K => _fnGemvQ4K,
+            GgufType.Q5_K => _fnGemvQ5K,
+            GgufType.Q3_K => _fnGemvQ3K,
             GgufType.Q6_K => _fnGemvQ6K,
             GgufType.Q8_0 => _fnGemvQ8_0,
+            GgufType.F32 => _fnGemvFp32,
             _ => throw new NotSupportedException($"GPU GEMV does not support type {type}")
         };
 

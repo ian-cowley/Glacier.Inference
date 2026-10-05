@@ -3,6 +3,7 @@ namespace Glacier.Inference.Pipeline;
 using System;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Hardware;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
 
@@ -34,7 +35,8 @@ public sealed class D3D12PipelineStage : IPipelineStage
         int layerCount,
         bool isFirstStage,
         bool isLastStage,
-        int maxSeqLen = 4096)
+        int maxSeqLen = 4096,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
     {
         _device = device;
         _engine = InferenceEngineType.DirectML;
@@ -45,6 +47,7 @@ public sealed class D3D12PipelineStage : IPipelineStage
             _ctx,
             weights,
             maxSeqLen: maxSeqLen,
+            kvPrecision: kvPrecision,
             startLayer: startLayer,
             layerCount: layerCount,
             isLastStage: isLastStage);

@@ -100,7 +100,8 @@ public sealed class PipelineSession : IDisposable
                         layerCount: spec.LayerCount,
                         isFirstStage: isFirst,
                         isLastStage: isLast,
-                        maxSeqLen: maxSeqLen);
+                        maxSeqLen: maxSeqLen,
+                        kvPrecision: kvPrecision);
                 }
                 else
                 {

@@ -502,4 +502,160 @@ __global__ void gemv_q8_0(
     }
 }
 
+// =========================================================================
+// GEMV Q5_K: Matrix-Vector Multiplication (y = W * x)
+// =========================================================================
+__global__ void gemv_q5_k(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const BlockQ5_K* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE; // 0..31
+
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols / QK_K;
+    const BlockQ5_K* row_w = W + (size_t)warp_id * nb;
+    float row_sum = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        const BlockQ5_K* blk = &row_w[b];
+        float d = __half2float(blk->d);
+        float min_val = __half2float(blk->dmin);
+        const float* x_blk = x + b * QK_K;
+
+        uint8_t qh_val = blk->qh[lane_id];
+
+        int is_idx = 0;
+        for (int c = 0; c < 4; c++) {
+            uint8_t sc0, m0, sc1, m1;
+            get_scale_min_k4(is_idx + 0, blk->scales, &sc0, &m0);
+            get_scale_min_k4(is_idx + 1, blk->scales, &sc1, &m1);
+
+            float d1 = d * sc0;
+            float min1 = min_val * m0;
+            float d2 = d * sc1;
+            float min2 = min_val * m1;
+
+            uint8_t q_byte = blk->qs[c * 32 + lane_id];
+            uint8_t bit0 = (qh_val >> (c * 2 + 0)) & 1;
+            uint8_t bit1 = (qh_val >> (c * 2 + 1)) & 1;
+
+            int q0 = (int)((q_byte & 0x0F) | (bit0 << 4));
+            int q1 = (int)((q_byte >> 4)   | (bit1 << 4));
+
+            float x0 = x_blk[c * 64 + lane_id];
+            float x1 = x_blk[c * 64 + 32 + lane_id];
+
+            row_sum += (d1 * (float)q0 - min1) * x0 + (d2 * (float)q1 - min2) * x1;
+            is_idx += 2;
+        }
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+// =========================================================================
+// GEMV Q3_K: Matrix-Vector Multiplication (y = W * x)
+// =========================================================================
+__global__ void gemv_q3_k(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const BlockQ3_K* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE; // 0..31
+
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols / QK_K;
+    const BlockQ3_K* row_w = W + (size_t)warp_id * nb;
+    float row_sum = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        const BlockQ3_K* blk = &row_w[b];
+        float d_all = __half2float(blk->d);
+        const float* x_blk = x + b * QK_K;
+
+        uint8_t hm_byte = blk->hmask[lane_id];
+
+        #pragma unroll
+        for (int step = 0; step < 2; step++) {
+            int n = step * 128;
+            uint8_t q_byte = blk->qs[step * 32 + lane_id];
+
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int shift = j * 2;
+                uint8_t m = 1 << (step * 4 + j);
+
+                int is_idx = step * 8 + j * 2 + ((lane_id < 16) ? 0 : 1);
+                int s = get_scale_k3(is_idx, blk->scales);
+                float dl = d_all * (float)s;
+
+                int q = (int)((q_byte >> shift) & 3) - (((hm_byte & m) != 0) ? 0 : 4);
+                float val_x = x_blk[n + j * 32 + lane_id];
+
+                row_sum += (dl * (float)q) * val_x;
+            }
+        }
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+// =========================================================================
+// GEMV FP32: Unquantized Matrix-Vector Multiplication (y = W * x)
+// =========================================================================
+__global__ void gemv_fp32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    if (warp_id >= m_rows) return;
+
+    const float* row_w = W + (size_t)warp_id * k_cols;
+    float row_sum = 0.0f;
+
+    for (int col = lane_id; col < k_cols; col += WARP_SIZE) {
+        row_sum += row_w[col] * x[col];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
 } // extern "C"

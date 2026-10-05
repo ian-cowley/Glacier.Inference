@@ -160,11 +160,13 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     public int LayerCount { get; }
     public bool IsLastStage { get; }
     public (double RecordMs, double GpuMs) LastTimings { get; private set; }
+    public Glacier.Inference.Memory.KvCachePrecision KvPrecision { get; }
 
     public Qwen2D3D12Model(
         D3D12Context ctx,
         ModelWeights weights,
         int maxSeqLen = 4096,
+        Glacier.Inference.Memory.KvCachePrecision kvPrecision = Glacier.Inference.Memory.KvCachePrecision.Auto,
         int startLayer = 0,
         int layerCount = -1,
         bool isLastStage = true)
@@ -182,6 +184,9 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         _groupSize = _nHeads / _nHeadsKv;
         _attnScale = 1.0f / MathF.Sqrt(_headDim);
         _maxSeqLen = maxSeqLen;
+        KvPrecision = kvPrecision == Glacier.Inference.Memory.KvCachePrecision.Auto
+            ? Glacier.Inference.Memory.KvCachePrecision.Fp16
+            : kvPrecision;
 
         _hX = new float[_dim];
         _dKeyCache = new ID3D12Resource[LayerCount];
@@ -262,7 +267,8 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         }
 
         // KV Cache per layer
-        ulong kvBytes = (ulong)((long)_nHeadsKv * _maxSeqLen * _headDim * sizeof(float));
+        ulong elemSize = (ulong)(KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Fp16 ? sizeof(short) : sizeof(float));
+        ulong kvBytes = (ulong)((long)_nHeadsKv * _maxSeqLen * _headDim) * elemSize;
         for (int l = 0; l < LayerCount; l++)
         {
             _dKeyCache[l] = _ctx.CreateDeviceBuffer(kvBytes);

@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
 using Vortice.Direct3D;
@@ -102,8 +103,9 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string kvShader = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.KvCacheStoreF16 : D3D12Shaders.KvCacheStore;
         _sigKvStore = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreParams));
-        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(D3D12Shaders.KvCacheStore));
+        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(kvShader));
 
         // 7. Attention GQA Root Signature: (Params b0, q u0, k_cache u1, v_cache u2, attn_out u3)
         var attnParams = new RootParameter[]
@@ -114,8 +116,9 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string attnShader = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.AttentionGqaF16 : D3D12Shaders.AttentionGqa;
         _sigAttention = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnParams));
-        _psoAttention = _ctx.CreatePipelineState(_sigAttention, _ctx.CompileShader(D3D12Shaders.AttentionGqa));
+        _psoAttention = _ctx.CreatePipelineState(_sigAttention, _ctx.CompileShader(attnShader));
 
         // 8. Argmax Root Signature: (Params b0, logits u0, best_token u1, best_logit u2)
         var argmaxParams = new RootParameter[]

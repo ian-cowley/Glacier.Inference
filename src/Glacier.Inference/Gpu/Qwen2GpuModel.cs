@@ -28,13 +28,17 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
     private IntPtr _module;
     private IntPtr _fnGemvQ4K;
+    private IntPtr _fnGemvQ5K;
+    private IntPtr _fnGemvQ3K;
     private IntPtr _fnGemvQ6K;
     private IntPtr _fnGemvQ8_0;
+    private IntPtr _fnGemvFp32;
     private IntPtr _fnSwigluFused;
     private IntPtr _fnRmsNorm;
     private IntPtr _fnSwiglu;
     private IntPtr _fnAddBias;
     private IntPtr _fnVecAdd;
+    private IntPtr _fnVecAddWeighted;
     private IntPtr _fnRope;
     private IntPtr _fnKvCacheStore;
     private IntPtr _fnKvCacheStoreF16;
@@ -180,13 +184,17 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
         // 2. Retrieve kernel function handles (using fast vectorized kernels)
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ5K, _module, "gemv_q5_k"), "ModuleGetFunction(gemv_q5_k)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ3K, _module, "gemv_q3_k"), "ModuleGetFunction(gemv_q3_k)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvFp32, _module, "gemv_fp32"), "ModuleGetFunction(gemv_fp32)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBias, _module, "add_bias_kernel"), "ModuleGetFunction(add_bias_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
+        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddWeighted, _module, "vec_add_weighted_kernel"), "ModuleGetFunction(vec_add_weighted_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRope, _module, "rope_kernel"), "ModuleGetFunction(rope_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
         CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");

@@ -74,6 +74,18 @@ public class D3D12ShaderTests
 
         var attnBatch = Compiler.Compile(D3D12Shaders.AttentionBatch, "main", "attention_batch.hlsl", "cs_5_0");
         Assert.False(attnBatch.IsEmpty);
+
+        var kvCacheF16 = Compiler.Compile(D3D12Shaders.KvCacheStoreF16, "main", "kv_store_f16.hlsl", "cs_5_0");
+        Assert.False(kvCacheF16.IsEmpty);
+
+        var attnGqaF16 = Compiler.Compile(D3D12Shaders.AttentionGqaF16, "main", "attention_gqa_f16.hlsl", "cs_5_0");
+        Assert.False(attnGqaF16.IsEmpty);
+
+        var repPenalty = Compiler.Compile(D3D12Shaders.RepetitionPenalty, "main", "repetition_penalty.hlsl", "cs_5_0");
+        Assert.False(repPenalty.IsEmpty);
+
+        var fusedSwiglu = Compiler.Compile(D3D12Shaders.GemvQ4KSwigluFused, "main", "gemv_q4_k_swiglu_fused.hlsl", "cs_5_0");
+        Assert.False(fusedSwiglu.IsEmpty);
     }
 
     [Fact]
