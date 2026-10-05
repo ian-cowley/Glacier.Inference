@@ -271,7 +271,7 @@ public sealed class VideoGenerationPipeline : IDisposable
             var latents = new float[totalLatentSize];
             var velocity = new float[totalLatentSize];
             var uncondVel = (guidanceScale > 1.0f) ? new float[totalLatentSize] : null;
-            var rnd = new Random(seed ?? 42);
+            var rnd = seed.HasValue ? new Random(seed.Value) : new Random();
             for (int i = 0; i < totalLatentSize; i++)
             {
                 double u1 = Math.Max(1e-7, rnd.NextDouble());
@@ -348,6 +348,7 @@ public sealed class VideoGenerationPipeline : IDisposable
         }
 
         // Fallback: 1. Synthesize Semantic Prompt Target Latents (z_0) for each keyframe with continuous camera motion
+        int effectiveSeed = seed ?? Random.Shared.Next();
         var targetLatents = new float[totalLatentSize];
         for (int k = 0; k < temporalLatentFrames; k++)
         {
@@ -361,7 +362,7 @@ public sealed class VideoGenerationPipeline : IDisposable
                 latentH,
                 latentW,
                 latentChannels,
-                seed ?? 42,
+                effectiveSeed,
                 offX,
                 offY,
                 zoom);
@@ -372,7 +373,7 @@ public sealed class VideoGenerationPipeline : IDisposable
         var fallbackVelocity = new float[totalLatentSize];
         var ditVelocity = new float[totalLatentSize];
 
-        var rndFallback = new Random(seed ?? 42);
+        var rndFallback = new Random(effectiveSeed);
         for (int i = 0; i < totalLatentSize; i++)
         {
             double u1 = Math.Max(1e-7, rndFallback.NextDouble());

@@ -314,7 +314,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
         }
 
         var keyframeLatents = new List<float[]>(keyframeCount);
-        var rng = seed.HasValue ? new Random(seed.Value) : new Random(42);
+        var rng = seed.HasValue ? new Random(seed.Value) : new Random();
 
         var baseNoise = new float[frameLatentSize];
         for (int i = 0; i < frameLatentSize; i += 2)

@@ -7,7 +7,6 @@
     <LangVersion>preview</LangVersion>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <TieredPGO>true</TieredPGO>
-    <ServerGarbageCollection>true</ServerGarbageCollection>
     <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
 
     <!-- NuGet Package Properties -->

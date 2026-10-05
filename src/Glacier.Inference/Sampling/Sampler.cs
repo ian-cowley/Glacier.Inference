@@ -2,6 +2,7 @@ namespace Glacier.Inference.Sampling;
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 /// <summary>
 /// Configurable sampling parameters for autoregressive generation.
@@ -170,7 +171,13 @@ public sealed class Sampler
         }
 
         // Sort descending: highest logit first
-        heap.Sort((a, b) => b.Logit.CompareTo(a.Logit));
+        heap.Sort(default(LogitDescendingComparer));
+    }
+
+    private readonly struct LogitDescendingComparer : IComparer<(int Id, float Logit)>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int Compare((int Id, float Logit) x, (int Id, float Logit) y) => y.Logit.CompareTo(x.Logit);
     }
 
     private static void SiftDown(Span<(int Id, float Logit)> heap, int i, int n)

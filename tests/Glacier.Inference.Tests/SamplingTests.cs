@@ -80,6 +80,22 @@ public class SamplingTests
     }
 
     [Fact]
+    public void TopK_SelectsWithinTopKCandidates()
+    {
+        var sampler = new Sampler(seed: 123);
+        // Candidate 0: 100, Candidate 1: 90, others much lower
+        float[] logits = [100f, 90f, 0f, -10f, -50f];
+        var options = new SamplingOptions { Temperature = 0.5f, TopK = 2, TopP = 1.0f };
+
+        for (int i = 0; i < 50; i++)
+        {
+            float[] copy = (float[])logits.Clone();
+            int selected = sampler.Sample(copy, options);
+            Assert.True(selected == 0 || selected == 1, $"Expected token 0 or 1, but got {selected}");
+        }
+    }
+
+    [Fact]
     public void EmptyLogits_Throws()
     {
         var sampler = new Sampler();

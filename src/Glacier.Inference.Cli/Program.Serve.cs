@@ -4,12 +4,14 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -24,6 +26,8 @@ using Glacier.Inference.Sampling;
 
 public static partial class Program
 {
+    private static readonly SemaphoreSlim s_inferenceLock = new(1, 1);
+
     private static async Task<int> RunServeAsync(string[] args)
     {
         if (args.Length == 0 || HasHelpFlag(args))
@@ -34,7 +38,8 @@ public static partial class Program
 
         string? modelPath = null;
         int port = 11434;
-        string host = "0.0.0.0";
+        string host = "127.0.0.1";
+        string? apiKey = Environment.GetEnvironmentVariable("GLACIER_API_KEY");
         string? device = null;
         string? engineStr = null;
         string? kvPrecisionStr = null;
@@ -45,10 +50,21 @@ public static partial class Program
         {
             if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
                 modelPath = args[++i];
-            else if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[++i], out int p))
+            else if (args[i] == "--port" && i + 1 < args.Length)
+            {
+                if (!int.TryParse(args[++i], out int p) || p < 1 || p > 65535)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: --port must be a valid port number between 1 and 65535.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 port = p;
+            }
             else if (args[i] == "--host" && i + 1 < args.Length)
                 host = args[++i];
+            else if (args[i] == "--api-key" && i + 1 < args.Length)
+                apiKey = args[++i];
             else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
@@ -57,8 +73,17 @@ public static partial class Program
                 kvPrecisionStr = args[++i];
             else if (args[i] == "--split" && i + 1 < args.Length)
                 split = args[++i];
-            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length)
+            {
+                if (!int.TryParse(args[++i], out int cLen) || cLen <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: Context length must be a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 maxSeqLen = cLen;
+            }
             else if (!args[i].StartsWith("-") && modelPath == null)
                 modelPath = args[i];
         }
@@ -74,15 +99,37 @@ public static partial class Program
         }
 
         InferenceEngineType engine = InferenceEngineType.Auto;
-        if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
+        if (!string.IsNullOrWhiteSpace(engineStr))
         {
+            if (!Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error: Unknown engine '{engineStr}'. Valid values: Auto, Cpu, BareMetal, DirectML.");
+                Console.ResetColor();
+                return 1;
+            }
             engine = parsedEngine;
         }
 
         KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+        if (!string.IsNullOrWhiteSpace(kvPrecisionStr))
         {
+            if (!Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error: Unknown KV precision '{kvPrecisionStr}'. Valid values: Auto, Fp32, Fp16, Q8_0, Q4_0.");
+                Console.ResetColor();
+                return 1;
+            }
             kvPrecision = parsedPrecision;
+        }
+
+        if (host == "0.0.0.0" || host == "::")
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("WARNING: Server bound to all network interfaces without authentication.");
+            Console.WriteLine("         Ensure firewall rules protect this port from untrusted traffic.");
+            Console.ResetColor();
         }
 
         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -104,9 +151,63 @@ public static partial class Program
         Console.WriteLine($">> Model ready on {session.ActiveDevice}\n");
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
+        // Calculate actual parameter count and quantization level from tensors
+        ulong totalParams = 0;
+        foreach (var t in session.Gguf.TensorList)
+        {
+            totalParams += t.ElementCount;
+        }
+        string paramSize = totalParams >= 1_000_000_000
+            ? $"{totalParams / 1_000_000_000.0:F1}B"
+            : totalParams >= 1_000_000
+                ? $"{totalParams / 1_000_000.0:F1}M"
+                : $"{totalParams}";
+
+        string quantLevel = "F16";
+        if (session.Gguf.TensorList.Count > 0)
+        {
+            var dominant = session.Gguf.TensorList
+                .GroupBy(t => t.Type)
+                .OrderByDescending(g => g.Count())
+                .FirstOrDefault()?.Key;
+            if (dominant.HasValue)
+                quantLevel = dominant.Value.ToString();
+        }
+
         var appBuilder = WebApplication.CreateBuilder();
         var app = appBuilder.Build();
         app.Urls.Add($"http://{host}:{port}");
+
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            Console.WriteLine("API Auth:     Enabled (Bearer / x-api-key)");
+            app.Use(async (context, next) =>
+            {
+                string? authHeader = context.Request.Headers.Authorization.FirstOrDefault();
+                string? xApiKey = context.Request.Headers["x-api-key"].FirstOrDefault();
+
+                bool authorized = false;
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                {
+                    string token = authHeader.Substring(7).Trim();
+                    if (string.Equals(token, apiKey, StringComparison.Ordinal))
+                        authorized = true;
+                }
+                else if (!string.IsNullOrEmpty(xApiKey) && string.Equals(xApiKey, apiKey, StringComparison.Ordinal))
+                {
+                    authorized = true;
+                }
+
+                if (!authorized)
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsync("Unauthorized: Invalid or missing API key.", context.RequestAborted);
+                    return;
+                }
+
+                await next();
+            });
+        }
 
         // 1. GET /api/tags (Ollama compatible tags list)
         app.MapGet("/api/tags", () => Results.Json(new
@@ -123,8 +224,8 @@ public static partial class Program
                     {
                         format = "gguf",
                         family = session.Gguf.Architecture,
-                        parameter_size = $"{session.Gguf.TensorCount / 40.0:F1}B",
-                        quantization_level = "Q4_K_M"
+                        parameter_size = paramSize,
+                        quantization_level = quantLevel
                     }
                 }
             }
@@ -133,106 +234,253 @@ public static partial class Program
         // 2. POST /api/generate (Ollama streaming & non-streaming)
         app.MapPost("/api/generate", async (HttpContext ctx) =>
         {
-            var req = await ctx.Request.ReadFromJsonAsync<JsonElement>();
-            string prompt = req.TryGetProperty("prompt", out var p) ? p.GetString() ?? "" : "";
-            bool stream = !req.TryGetProperty("stream", out var s) || s.GetBoolean();
+            JsonElement req;
+            try
+            {
+                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
+            }
+            catch
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
+                return;
+            }
+
+            string prompt = req.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() ?? "" : "";
+            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False && (s.ValueKind != JsonValueKind.True || s.GetBoolean());
 
             if (string.IsNullOrEmpty(prompt))
             {
                 ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsync("Prompt is required.");
+                await ctx.Response.WriteAsync("Prompt is required.", ctx.RequestAborted);
                 return;
             }
 
-            var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f };
+            var options = ParseSamplingOptions(req);
 
-            if (!stream)
+            await s_inferenceLock.WaitAsync(ctx.RequestAborted);
+            try
             {
-                var result = await session.GenerateAsync(prompt, options, formatChat: true);
-                var respObj = new
+                if (!stream)
+                {
+                    var result = await session.GenerateAsync(prompt, options, formatChat: true, ct: ctx.RequestAborted);
+                    var respObj = new
+                    {
+                        model = modelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        response = result.Text,
+                        done = true,
+                        total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
+                        prompt_eval_count = result.Metrics.PromptTokens,
+                        prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
+                        eval_count = result.Metrics.GeneratedTokens,
+                        eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    };
+                    await ctx.Response.WriteAsJsonAsync(respObj, ctx.RequestAborted);
+                    return;
+                }
+
+                ctx.Response.ContentType = "application/x-ndjson";
+                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var genTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        return await session.GenerateAsync(
+                            prompt,
+                            options,
+                            formatChat: true,
+                            onToken: token => channel.Writer.TryWrite(token),
+                            ct: ctx.RequestAborted);
+                    }
+                    finally
+                    {
+                        channel.Writer.Complete();
+                    }
+                }, ctx.RequestAborted);
+
+                await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
+                {
+                    var chunk = new
+                    {
+                        model = modelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        response = token,
+                        done = false
+                    };
+                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk) + "\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+
+                var genResult = await genTask;
+                var finalChunk = new
                 {
                     model = modelName,
                     created_at = DateTime.UtcNow.ToString("o"),
-                    response = result.Text,
+                    response = "",
                     done = true,
-                    total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
-                    prompt_eval_count = result.Metrics.PromptTokens,
-                    prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
-                    eval_count = result.Metrics.GeneratedTokens,
-                    eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
+                    eval_count = genResult.Metrics.GeneratedTokens,
+                    eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
                 };
-                await ctx.Response.WriteAsJsonAsync(respObj);
-                return;
+                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
-
-            ctx.Response.ContentType = "application/x-ndjson";
-            var genResult = await session.GenerateAsync(prompt, options, formatChat: true, onToken: token =>
+            finally
             {
-                var chunk = new
-                {
-                    model = modelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    response = token,
-                    done = false
-                };
-                string line = JsonSerializer.Serialize(chunk) + "\n";
-                ctx.Response.WriteAsync(line).GetAwaiter().GetResult();
-            });
-
-            var finalChunk = new
-            {
-                model = modelName,
-                created_at = DateTime.UtcNow.ToString("o"),
-                response = "",
-                done = true,
-                total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
-                eval_count = genResult.Metrics.GeneratedTokens,
-                eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
-            };
-            await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n");
+                s_inferenceLock.Release();
+            }
         });
 
         // 3. POST /v1/chat/completions (OpenAI compatible)
         app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
         {
-            var req = await ctx.Request.ReadFromJsonAsync<JsonElement>();
-            var messages = req.GetProperty("messages");
-            var sb = new StringBuilder();
-            foreach (var m in messages.EnumerateArray())
+            JsonElement req;
+            try
             {
-                string role = m.GetProperty("role").GetString() ?? "user";
-                string content = m.GetProperty("content").GetString() ?? "";
-                sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
+                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
             }
-            sb.Append("<|im_start|>assistant\n");
-
-            var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f };
-            var result = await session.GenerateAsync(sb.ToString(), options, formatChat: false);
-
-            var resp = new
+            catch
             {
-                id = $"chatcmpl-{Guid.NewGuid():N}",
-                @object = "chat.completion",
-                created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                model = modelName,
-                choices = new[]
-                {
-                    new
-                    {
-                        index = 0,
-                        message = new { role = "assistant", content = result.Text },
-                        finish_reason = result.FinishReason
-                    }
-                },
-                usage = new
-                {
-                    prompt_tokens = result.Metrics.PromptTokens,
-                    completion_tokens = result.Metrics.GeneratedTokens,
-                    total_tokens = result.Metrics.PromptTokens + result.Metrics.GeneratedTokens
-                }
-            };
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
+                return;
+            }
 
-            await ctx.Response.WriteAsJsonAsync(resp);
+            var messages = ParseMessages(req);
+            if (messages.Count == 0)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Messages array required.", ctx.RequestAborted);
+                return;
+            }
+
+            bool stream = req.TryGetProperty("stream", out var s) && s.ValueKind != JsonValueKind.False && (s.ValueKind == JsonValueKind.True || s.GetBoolean());
+            var options = ParseSamplingOptions(req);
+            string formattedPrompt = session.Tokenizer.FormatChat(messages);
+            string completionId = $"chatcmpl-{Guid.NewGuid():N}";
+            long createdTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            await s_inferenceLock.WaitAsync(ctx.RequestAborted);
+            try
+            {
+                if (!stream)
+                {
+                    var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
+                    var resp = new
+                    {
+                        id = completionId,
+                        @object = "chat.completion",
+                        created = createdTimestamp,
+                        model = modelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                message = new { role = "assistant", content = result.Text },
+                                finish_reason = result.FinishReason
+                            }
+                        },
+                        usage = new
+                        {
+                            prompt_tokens = result.Metrics.PromptTokens,
+                            completion_tokens = result.Metrics.GeneratedTokens,
+                            total_tokens = result.Metrics.PromptTokens + result.Metrics.GeneratedTokens
+                        }
+                    };
+                    await ctx.Response.WriteAsJsonAsync(resp, ctx.RequestAborted);
+                    return;
+                }
+
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers.CacheControl = "no-cache";
+
+                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var genTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        return await session.GenerateAsync(
+                            formattedPrompt,
+                            options,
+                            formatChat: false,
+                            onToken: token => channel.Writer.TryWrite(token),
+                            ct: ctx.RequestAborted);
+                    }
+                    finally
+                    {
+                        channel.Writer.Complete();
+                    }
+                }, ctx.RequestAborted);
+
+                // Initial chunk with assistant role
+                var initialChunk = new
+                {
+                    id = completionId,
+                    @object = "chat.completion.chunk",
+                    created = createdTimestamp,
+                    model = modelName,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { role = "assistant", content = "" },
+                            finish_reason = (string?)null
+                        }
+                    }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(initialChunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+                await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
+                {
+                    var chunk = new
+                    {
+                        id = completionId,
+                        @object = "chat.completion.chunk",
+                        created = createdTimestamp,
+                        model = modelName,
+                        choices = new[]
+                        {
+                            new
+                            {
+                                index = 0,
+                                delta = new { content = token },
+                                finish_reason = (string?)null
+                            }
+                        }
+                    };
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+
+                var genResult = await genTask;
+                var finalChunk = new
+                {
+                    id = completionId,
+                    @object = "chat.completion.chunk",
+                    created = createdTimestamp,
+                    model = modelName,
+                    choices = new[]
+                    {
+                        new
+                        {
+                            index = 0,
+                            delta = new { },
+                            finish_reason = genResult.FinishReason
+                        }
+                    }
+                };
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            }
+            finally
+            {
+                s_inferenceLock.Release();
+            }
         });
 
         // 4. GET /v1/models (OpenAI models endpoint)
@@ -254,70 +502,102 @@ public static partial class Program
         // 5. POST /api/chat (Ollama chat endpoint)
         app.MapPost("/api/chat", async (HttpContext ctx) =>
         {
-            var req = await ctx.Request.ReadFromJsonAsync<JsonElement>();
-            if (!req.TryGetProperty("messages", out var messages))
+            JsonElement req;
+            try
+            {
+                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
+            }
+            catch
             {
                 ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsync("Messages array required.");
+                await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
                 return;
             }
 
-            bool stream = !req.TryGetProperty("stream", out var s) || s.GetBoolean();
-            var sb = new StringBuilder();
-            foreach (var m in messages.EnumerateArray())
+            var messages = ParseMessages(req);
+            if (messages.Count == 0)
             {
-                string role = m.TryGetProperty("role", out var r) ? r.GetString() ?? "user" : "user";
-                string content = m.TryGetProperty("content", out var c) ? c.GetString() ?? "" : "";
-                sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Messages array required.", ctx.RequestAborted);
+                return;
             }
-            sb.Append("<|im_start|>assistant\n");
 
-            var options = new SamplingOptions { MaxTokens = 512, Temperature = 0.7f };
+            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False && (s.ValueKind != JsonValueKind.True || s.GetBoolean());
+            var options = ParseSamplingOptions(req);
+            string formattedPrompt = session.Tokenizer.FormatChat(messages);
 
-            if (!stream)
+            await s_inferenceLock.WaitAsync(ctx.RequestAborted);
+            try
             {
-                var result = await session.GenerateAsync(sb.ToString(), options, formatChat: false);
-                var respObj = new
+                if (!stream)
+                {
+                    var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
+                    var respObj = new
+                    {
+                        model = modelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new { role = "assistant", content = result.Text },
+                        done = true,
+                        total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
+                        prompt_eval_count = result.Metrics.PromptTokens,
+                        prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
+                        eval_count = result.Metrics.GeneratedTokens,
+                        eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    };
+                    await ctx.Response.WriteAsJsonAsync(respObj, ctx.RequestAborted);
+                    return;
+                }
+
+                ctx.Response.ContentType = "application/x-ndjson";
+                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var genTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        return await session.GenerateAsync(
+                            formattedPrompt,
+                            options,
+                            formatChat: false,
+                            onToken: token => channel.Writer.TryWrite(token),
+                            ct: ctx.RequestAborted);
+                    }
+                    finally
+                    {
+                        channel.Writer.Complete();
+                    }
+                }, ctx.RequestAborted);
+
+                await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
+                {
+                    var chunk = new
+                    {
+                        model = modelName,
+                        created_at = DateTime.UtcNow.ToString("o"),
+                        message = new { role = "assistant", content = token },
+                        done = false
+                    };
+                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk) + "\n", ctx.RequestAborted);
+                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                }
+
+                var genResult = await genTask;
+                var finalChunk = new
                 {
                     model = modelName,
                     created_at = DateTime.UtcNow.ToString("o"),
-                    message = new { role = "assistant", content = result.Text },
+                    message = new { role = "assistant", content = "" },
                     done = true,
-                    total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
-                    prompt_eval_count = result.Metrics.PromptTokens,
-                    prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
-                    eval_count = result.Metrics.GeneratedTokens,
-                    eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
+                    eval_count = genResult.Metrics.GeneratedTokens,
+                    eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
                 };
-                await ctx.Response.WriteAsJsonAsync(respObj);
-                return;
+                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n", ctx.RequestAborted);
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
-
-            ctx.Response.ContentType = "application/x-ndjson";
-            var genResult = await session.GenerateAsync(sb.ToString(), options, formatChat: false, onToken: token =>
+            finally
             {
-                var chunk = new
-                {
-                    model = modelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    message = new { role = "assistant", content = token },
-                    done = false
-                };
-                string line = JsonSerializer.Serialize(chunk) + "\n";
-                ctx.Response.WriteAsync(line).GetAwaiter().GetResult();
-            });
-
-            var finalChunk = new
-            {
-                model = modelName,
-                created_at = DateTime.UtcNow.ToString("o"),
-                message = new { role = "assistant", content = "" },
-                done = true,
-                total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
-                eval_count = genResult.Metrics.GeneratedTokens,
-                eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
-            };
-            await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n");
+                s_inferenceLock.Release();
+            }
         });
 
         Console.ForegroundColor = ConsoleColor.Green;
@@ -329,7 +609,72 @@ public static partial class Program
         return 0;
     }
 
-    // =========================================================================
-    // 5. DEVICES COMMAND
-    // =========================================================================
+    private static SamplingOptions ParseSamplingOptions(JsonElement req)
+    {
+        var options = new SamplingOptions();
+        if (req.TryGetProperty("temperature", out var tempProp) && tempProp.TryGetSingle(out float temp))
+            options.Temperature = temp;
+        if (req.TryGetProperty("top_p", out var topPProp) && topPProp.TryGetSingle(out float topP))
+            options.TopP = topP;
+        if (req.TryGetProperty("top_k", out var topKProp) && topKProp.TryGetInt32(out int topK))
+            options.TopK = topK;
+        if (req.TryGetProperty("max_tokens", out var maxTokProp) && maxTokProp.TryGetInt32(out int maxTok))
+            options.MaxTokens = maxTok;
+        else if (req.TryGetProperty("max_completion_tokens", out var maxCompProp) && maxCompProp.TryGetInt32(out int maxComp))
+            options.MaxTokens = maxComp;
+        if (req.TryGetProperty("repetition_penalty", out var repProp) && repProp.TryGetSingle(out float rep))
+            options.RepetitionPenalty = rep;
+
+        // Check nested Ollama "options" object
+        if (req.TryGetProperty("options", out var subOpt) && subOpt.ValueKind == JsonValueKind.Object)
+        {
+            if (subOpt.TryGetProperty("temperature", out var subTemp) && subTemp.TryGetSingle(out float st))
+                options.Temperature = st;
+            if (subOpt.TryGetProperty("top_p", out var subTopP) && subTopP.TryGetSingle(out float sp))
+                options.TopP = sp;
+            if (subOpt.TryGetProperty("top_k", out var subTopK) && subTopK.TryGetInt32(out int sk))
+                options.TopK = sk;
+            if (subOpt.TryGetProperty("num_predict", out var subNum) && subNum.TryGetInt32(out int np))
+                options.MaxTokens = np;
+            if (subOpt.TryGetProperty("repeat_penalty", out var subRep) && subRep.TryGetSingle(out float sr))
+                options.RepetitionPenalty = sr;
+        }
+        return options;
+    }
+
+    private static List<(string Role, string Content)> ParseMessages(JsonElement req)
+    {
+        var list = new List<(string Role, string Content)>();
+        if (!req.TryGetProperty("messages", out var messages) || messages.ValueKind != JsonValueKind.Array)
+            return list;
+
+        foreach (var m in messages.EnumerateArray())
+        {
+            string role = m.TryGetProperty("role", out var r) ? r.GetString() ?? "user" : "user";
+            string content = "";
+            if (m.TryGetProperty("content", out var c))
+            {
+                if (c.ValueKind == JsonValueKind.String)
+                {
+                    content = c.GetString() ?? "";
+                }
+                else if (c.ValueKind == JsonValueKind.Array)
+                {
+                    var sb = new StringBuilder();
+                    foreach (var part in c.EnumerateArray())
+                    {
+                        if (part.TryGetProperty("type", out var typeProp) &&
+                            typeProp.GetString() == "text" &&
+                            part.TryGetProperty("text", out var textProp))
+                        {
+                            sb.Append(textProp.GetString());
+                        }
+                    }
+                    content = sb.ToString();
+                }
+            }
+            list.Add((role, content));
+        }
+        return list;
+    }
 }

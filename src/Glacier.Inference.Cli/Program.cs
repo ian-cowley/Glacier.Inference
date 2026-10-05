@@ -423,7 +423,8 @@ public static partial class Program
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
         Console.WriteLine("  --port <port>                        Listening port (default: 11434)");
-        Console.WriteLine("  --host <host>                        Listening host IP (default: 0.0.0.0)");
+        Console.WriteLine("  --host <host>                        Listening host IP (default: 127.0.0.1)");
+        Console.WriteLine("  --api-key <key>                      Optional API Key / Bearer token (or GLACIER_API_KEY env)");
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");

@@ -323,6 +323,125 @@ public sealed partial class BpeTokenizer
     }
 
     /// <summary>
+    /// Formats a sequence of chat messages into the model's native chat template (e.g. ChatML, LLaMA-3, Gemma, DeepSeek, Mistral, Phi).
+    /// </summary>
+    public string FormatChat(IEnumerable<(string Role, string Content)> messages)
+    {
+        // 0. Gemma
+        if (_specialTokens.ContainsKey("<start_of_turn>"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            foreach (var (role, content) in messages)
+            {
+                string r = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? "model" : role;
+                sb.Append($"<start_of_turn>{r}\n{content}<end_of_turn>\n");
+            }
+            sb.Append("<start_of_turn>model\n");
+            return sb.ToString();
+        }
+
+        if (_specialTokens.ContainsKey("<|turn>"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            foreach (var (role, content) in messages)
+            {
+                string r = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? "model" : role;
+                sb.Append($"<|turn>{r}\n{content}<turn|>\n");
+            }
+            sb.Append("<|turn>model\n");
+            return sb.ToString();
+        }
+
+        // 1. LLaMA 3
+        if (_specialTokens.ContainsKey("<|start_header_id|>"))
+        {
+            var sb = new StringBuilder();
+            if (_specialTokens.ContainsKey("<|begin_of_text|>"))
+            {
+                sb.Append("<|begin_of_text|>");
+            }
+            foreach (var (role, content) in messages)
+            {
+                sb.Append($"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>");
+            }
+            sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            return sb.ToString();
+        }
+
+        // 2. Microsoft Phi-3 / Phi-4
+        if (_specialTokens.ContainsKey("<|im_sep|>"))
+        {
+            var sb = new StringBuilder();
+            foreach (var (role, content) in messages)
+            {
+                sb.Append($"<|im_start|>{role}<|im_sep|>{content}<|im_end|>");
+            }
+            sb.Append("<|im_start|>assistant<|im_sep|>");
+            return sb.ToString();
+        }
+
+        // 3. DeepSeek
+        if (_architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) || _chatTemplate.Contains("User: "))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            foreach (var (role, content) in messages)
+            {
+                if (role.Equals("system", StringComparison.OrdinalIgnoreCase))
+                    sb.Append(content).Append("\n\n");
+                else if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
+                    sb.Append("User: ").Append(content).Append("\n\n");
+                else
+                    sb.Append("Assistant: ").Append(content).Append("\n\n");
+            }
+            sb.Append("Assistant:");
+            return sb.ToString();
+        }
+
+        // 4. Mistral
+        if (_specialTokens.ContainsKey("[INST]"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
+            {
+                sb.Append(_idToToken[BosTokenId]);
+            }
+            foreach (var (role, content) in messages)
+            {
+                if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
+                    sb.Append("[INST] ").Append(content).Append(" [/INST]");
+                else if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+                    sb.Append(' ').Append(content).Append(' ');
+                else
+                    sb.Append(content).Append("\n\n");
+            }
+            return sb.ToString();
+        }
+
+        // 5. Standard ChatML fallback
+        {
+            var sb = new StringBuilder();
+            foreach (var (role, content) in messages)
+            {
+                sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
+            }
+            sb.Append("<|im_start|>assistant\n");
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
     /// Encodes a text prompt into an array of token IDs.
     /// Handles ChatML special tokens and byte-level BPE merges.
     /// </summary>
