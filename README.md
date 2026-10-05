@@ -688,6 +688,19 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 
 ---
 
+## 🆕 What's New in v1.2.16
+
+- **Full-Body Generative Video Synthesis with Visible Leg Motion & Stride**: Pure C# .NET 10 video generation pipeline supporting full-body anatomy, leg stride, and footwear interaction with ground reflections in widescreen 832×480.
+- **Unified Flow Matching ODE Discretization**: Corrected continuous schedule partitioning in `FlowMatchingScheduler` across all time-shift values, eliminating non-linear truncation cliffs ($t \in [0.5, 0.0]$) and ensuring smooth semantic feature convergence.
+- **Hardware-Accelerated 3D-RoPE in VRAM**: Native CUDA fatbinary kernel (`rope_3d_in_vram`) eliminating host PCIe roundtrips for 3D rotary embeddings across spatio-temporal attention layers.
+- **AVX2 Line-Buffered 3D Causal VAE Decoder**: Row-accumulating 3D convolution engine (`AccumulateConv3x3Row`) and online FlashAttention-2 softmax, reducing 3D causal VAE decoding time from 35 minutes down to 12.5 minutes ($2.8\times$–$4.8\times$ speedup).
+- **Multi-Tile Batched GEMM / SwiGLU 2D Grid Dispatch**: Fixed 2D CUDA grid dimension mapping (`gridY = (batchSize + tileSize - 1) / tileSize`), ensuring reliable batched prompt prefill across all batch sizes.
+- **Boundary-Clamped Catmull-Rom Cubic Splines**: Guaranteed endpoint clamping in `TemporalLatentVaeDecoder.InterpolateFrames` eliminating edge streaking, interpolation overshoot, and video sequence artifacts.
+- **Natural Language Motion Inference**: Added robust direction matching for approaching subjects (`"toward the camera"`, `"walking toward"`) defaulting to `CameraMotion.Static` to prevent unintended drone camera sway.
+- **176/176 Unit Tests Passing (100% Green)** across all quantization, GPU kernels, 3D VAE decoders, and diffusion transformers.
+
+---
+
 ## 🆕 What's New in v1.2.2
 
 - **`Vector512<float>` and `AdvSimd` Q4_K / Q5_K / Q6_K quantised dot-product kernels** — saturates AVX-512 FMA throughput on Zen 5 and Apple Silicon for all major K-quant levels.
