@@ -39,8 +39,9 @@ Thumbs.db
 # Scratch / working directories
 brain/
 scratch/
-PROJECT_SOURCE.md
+PROJECT*.md
 Glacier.Inference.md
+[Tt]est[Rr]esults/
 
 # Media output artifacts
 *.wav

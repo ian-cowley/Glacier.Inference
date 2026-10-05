@@ -33,4 +33,56 @@ public class SamplingTests
         // Token 1 logit was penalized from 5.0 to 2.5, so token 0 or 2 will be chosen instead
         Assert.NotEqual(1, sampled);
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void TopKDisabled_DoesNotThrow_AndReturnsValidToken(int topK)
+    {
+        var sampler = new Sampler(seed: 1);
+        float[] logits = [0.1f, 2.0f, 1.0f, -3.0f];
+        var options = new SamplingOptions { Temperature = 1.0f, TopK = topK, TopP = 1.0f, RepetitionPenalty = 1.0f };
+
+        int sampled = sampler.Sample(logits, options);
+        Assert.InRange(sampled, 0, logits.Length - 1);
+    }
+
+    [Fact]
+    public void NaNLogits_AreNeverChosenWhenGreedy()
+    {
+        var sampler = new Sampler();
+        float[] logits = [float.NaN, 1f, 3f, float.NaN];
+        Assert.Equal(2, sampler.Sample(logits, SamplingOptions.Greedy));
+    }
+
+    [Fact]
+    public void TopPZero_KeepsBestToken()
+    {
+        var sampler = new Sampler(seed: 7);
+        float[] logits = [0f, 5f, 1f];
+        var options = new SamplingOptions { Temperature = 1.0f, TopK = 3, TopP = 0f, RepetitionPenalty = 1.0f };
+        for (int i = 0; i < 20; i++)
+        {
+            float[] copy = (float[])logits.Clone();
+            Assert.Equal(1, sampler.Sample(copy, options));
+        }
+    }
+
+    [Fact]
+    public void SameSeed_IsDeterministic()
+    {
+        float[] logits = [1f, 1.1f, 0.9f, 1.05f, 0.95f];
+        var options = new SamplingOptions { Temperature = 1.0f, TopK = 5, TopP = 1.0f, RepetitionPenalty = 1.0f };
+        var a = new Sampler(seed: 42);
+        var b = new Sampler(seed: 42);
+        for (int i = 0; i < 50; i++)
+            Assert.Equal(a.Sample((float[])logits.Clone(), options), b.Sample((float[])logits.Clone(), options));
+    }
+
+    [Fact]
+    public void EmptyLogits_Throws()
+    {
+        var sampler = new Sampler();
+        Assert.Throws<ArgumentException>(() => sampler.Sample(Span<float>.Empty, SamplingOptions.Greedy));
+    }
 }

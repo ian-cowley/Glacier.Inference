@@ -1,6 +1,7 @@
 namespace Glacier.Inference.Memory;
 
 using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -32,6 +33,11 @@ public sealed unsafe class KVCache : IDisposable
 
     public KVCache(int layers, int nHeadsKv, int headDim, int maxSeqLen = 4096, int vHeadDim = -1)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layers);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(nHeadsKv);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSeqLen);
+
         _layers = layers;
         _nHeadsKv = nHeadsKv;
         _headDim = headDim;
@@ -55,6 +61,8 @@ public sealed unsafe class KVCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
+        Debug.Assert(_kBuffer != null, "KVCache disposed");
+        Debug.Assert((uint)layer < (uint)_layers && (uint)headKv < (uint)_nHeadsKv && (uint)pos < (uint)_maxSeqLen);
         long offset = (long)layer * _layerStrideK + (long)headKv * _headStrideK + (long)pos * _headDim;
         return _kBuffer + offset;
     }
@@ -62,6 +70,8 @@ public sealed unsafe class KVCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetValuePtr(int layer, int headKv, int pos)
     {
+        Debug.Assert(_vBuffer != null, "KVCache disposed");
+        Debug.Assert((uint)layer < (uint)_layers && (uint)headKv < (uint)_nHeadsKv && (uint)pos < (uint)_maxSeqLen);
         long offset = (long)layer * _layerStrideV + (long)headKv * _headStrideV + (long)pos * _vHeadDim;
         return _vBuffer + offset;
     }
@@ -72,6 +82,12 @@ public sealed unsafe class KVCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Store(int layer, int pos, float* kSrc, float* vSrc)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)layer >= (uint)_layers)
+            throw new ArgumentOutOfRangeException(nameof(layer));
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position exceeds KV cache capacity ({_maxSeqLen}).");
+
         for (int h = 0; h < _nHeadsKv; h++)
         {
             float* kDst = GetKeyPtr(layer, h, pos);
@@ -87,6 +103,7 @@ public sealed unsafe class KVCache : IDisposable
     /// </summary>
     public void Reset()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         long totalBytesK = (long)_layers * _layerStrideK * sizeof(float);
         long totalBytesV = (long)_layers * _layerStrideV * sizeof(float);
         NativeMemory.Clear(_kBuffer, (nuint)totalBytesK);

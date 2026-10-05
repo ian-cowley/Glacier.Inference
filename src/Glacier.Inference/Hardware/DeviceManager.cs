@@ -243,7 +243,7 @@ public static class DeviceManager
                                 IsDisplayDevice = false,
                                 SupportedEngines = engines,
                                 RecommendedEngine = InferenceEngineType.BareMetal,
-                                SafetyNotes = "NVIDIA CUDA Bare-Metal SASS engine via libcuda.so."
+                                SafetyNotes = $"NVIDIA CUDA Bare-Metal driver engine via {(OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so")}."
                             });
                         }
                     }
@@ -399,7 +399,7 @@ public static class DeviceManager
                                 supportedEngines.Add(InferenceEngineType.DirectML);
                                 supportedEngines.Add(InferenceEngineType.Cpu);
                                 recommendedEngine = bareMetalAvail ? InferenceEngineType.BareMetal : (VulkanDriver.IsAvailable() ? InferenceEngineType.Vulkan : InferenceEngineType.DirectML);
-                                safetyNotes = "Pure C# Native SASS driver engine. Bypasses CUDA Toolkit & cudart64.dll runtime. Vulkan & DirectML also supported.";
+                                safetyNotes = "Bare-metal GPU driver engine. Bypasses CUDA Toolkit & cudart64.dll runtime. Direct3D 12, Vulkan & DirectML also supported.";
                             }
                             else if (vendor == GpuVendor.Amd)
                             {

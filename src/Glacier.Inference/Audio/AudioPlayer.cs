@@ -5,8 +5,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 
 /// <summary>
-/// Pure C# low-latency audio playback controller using native OS audio pipelines.
-/// On Windows, streams directly via Win32 waveOut / winmm with zero external dependencies.
+/// Pure C# low-latency audio playback controller using Win32 Audio.
+/// On Windows, streams directly via Win32 winmm.dll PlaySoundW with zero external dependencies.
 /// </summary>
 public static partial class AudioPlayer
 {

@@ -3,6 +3,7 @@ namespace Glacier.Inference.Gpu.D3D12;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
@@ -459,8 +460,7 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
 
     private void UploadWeights()
     {
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($">> Uploading model weights to {_ctx.DeviceName} via Direct3D 12 Compute (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
+        GlacierDiagnostics.LogInformation($">> Uploading model weights to {_ctx.DeviceName} via Direct3D 12 Compute (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
         var sw = Stopwatch.StartNew();
 
         if (IsLastStage)
@@ -613,8 +613,7 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         }
 
         sw.Stop();
-        Console.WriteLine($"   Weights uploaded to Direct3D 12 GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
-        Console.ResetColor();
+        GlacierDiagnostics.LogInformation($"   Weights uploaded to Direct3D 12 GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
     }
     public void Dispose()
     {

@@ -2,6 +2,7 @@ namespace Glacier.Inference.Image.Gguf;
 
 using System;
 using System.Diagnostics;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Image;
 using Glacier.Inference.Model;
@@ -26,6 +27,8 @@ public sealed class DiffusionGgufPipeline : IDisposable
     public Glacier.Inference.Image.Flux.FluxVaeDecoder? NeuralVae => _neuralVae;
     public Glacier.Inference.Image.Flux.FluxDiT? FluxDiT => _fluxDit;
     public Glacier.Inference.Image.Flux.FluxT5Encoder? T5Encoder => _t5Encoder;
+    public string ActiveBackend => "Cpu";
+    public Exception? FallbackException { get; private set; }
 
     public DiffusionGgufPipeline(
         DiffusionGgufModel model,
@@ -52,9 +55,11 @@ public sealed class DiffusionGgufPipeline : IDisposable
             {
                 _neuralVae = Glacier.Inference.Image.Flux.FluxVaeDecoder.Open(vaePath);
             }
-            catch
+            catch (Exception ex)
             {
+                GlacierDiagnostics.LogWarning($"Neural VAE load failed: {ex.GetType().FullName}: {ex.Message}", ex);
                 _neuralVae = null;
+                FallbackException ??= ex;
             }
         }
 
@@ -72,9 +77,11 @@ public sealed class DiffusionGgufPipeline : IDisposable
             {
                 _clipEncoder = Glacier.Inference.Image.Flux.FluxClipEncoder.Open(clipPath);
             }
-            catch
+            catch (Exception ex)
             {
+                GlacierDiagnostics.LogWarning($"CLIP encoder load failed: {ex.GetType().FullName}: {ex.Message}", ex);
                 _clipEncoder = null;
+                FallbackException ??= ex;
             }
         }
 
@@ -92,9 +99,11 @@ public sealed class DiffusionGgufPipeline : IDisposable
             {
                 _t5Encoder = Glacier.Inference.Image.Flux.FluxT5Encoder.Open(t5Path);
             }
-            catch
+            catch (Exception ex)
             {
+                GlacierDiagnostics.LogWarning($"T5 encoder load failed: {ex.GetType().FullName}: {ex.Message}", ex);
                 _t5Encoder = null;
+                FallbackException ??= ex;
             }
         }
 
@@ -104,9 +113,11 @@ public sealed class DiffusionGgufPipeline : IDisposable
             {
                 _fluxDit = Glacier.Inference.Image.Flux.FluxDiT.Open(_model.Gguf.FilePath);
             }
-            catch
+            catch (Exception ex)
             {
+                GlacierDiagnostics.LogWarning($"Flux DiT load failed: {ex.GetType().FullName}: {ex.Message}", ex);
                 _fluxDit = null;
+                FallbackException ??= ex;
             }
         }
     }
@@ -197,9 +208,9 @@ public sealed class DiffusionGgufPipeline : IDisposable
 
                 _fluxDit.PredictVelocity(latents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
                 FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-                Console.WriteLine($"[PIPELINE TIMING] Step {step + 1}/{steps}: {swS.ElapsedMilliseconds} ms (Flow velocity + Euler step)");
+                GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Step {step + 1}/{steps}: {swS.ElapsedMilliseconds} ms (Flow velocity + Euler step)");
             }
-            Console.WriteLine($"[PIPELINE TIMING] Total DiT Latent Trajectory ({steps} steps): {swStep.ElapsedMilliseconds} ms");
+            GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Total DiT Latent Trajectory ({steps} steps): {swStep.ElapsedMilliseconds} ms");
         }
         else if (_model.RecommendedSchedule == "FlowMatching")
         {
@@ -244,7 +255,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
         {
             _fallbackVae.Decode(latents, latentH, latentW, rgbPixels);
         }
-        Console.WriteLine($"[PIPELINE TIMING] VAE Latent Decode ({latentW}x{latentH} -> {targetW}x{targetH}): {swVae.ElapsedMilliseconds} ms");
+        GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] VAE Latent Decode ({latentW}x{latentH} -> {targetW}x{targetH}): {swVae.ElapsedMilliseconds} ms");
 
         sw.Stop();
         float pxPerSec = (targetW * targetH) / (float)sw.Elapsed.TotalSeconds;
@@ -318,7 +329,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
         for (int k = 0; k < keyframeCount; k++)
         {
             float u = (keyframeCount <= 1) ? 0.0f : (float)k / (keyframeCount - 1);
-            Console.WriteLine($"[NEURAL VIDEO] Denoising Keyframe {k + 1}/{keyframeCount} (progression={u:F2})...");
+            GlacierDiagnostics.LogInformation($"[NEURAL VIDEO] Denoising Keyframe {k + 1}/{keyframeCount} (progression={u:F2})...");
 
             var currentLatents = new float[frameLatentSize];
             float correlation = MathF.Cos(u * 0.40f);

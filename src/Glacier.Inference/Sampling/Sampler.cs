@@ -25,9 +25,13 @@ public sealed class SamplingOptions
 
 /// <summary>
 /// High-performance token sampler supporting Greedy, Temperature, Top-K, Top-P, and Repetition Penalty.
+/// Instances are NOT thread-safe (they own a <see cref="Random"/>); use one sampler per generation stream.
 /// </summary>
 public sealed class Sampler
 {
+    /// <summary>Temperatures at or below this value are treated as greedy decoding.</summary>
+    public const float GreedyTemperatureThreshold = 0.001f;
+
     private readonly Random _random;
 
     public Sampler(int? seed = null)
@@ -37,9 +41,13 @@ public sealed class Sampler
 
     /// <summary>
     /// Samples a next token from raw logits.
+    /// NOTE: when a repetition penalty applies, <paramref name="logits"/> is modified in place.
+    /// A <c>TopK</c> of 0 or less disables top-K filtering.
     /// </summary>
     public int Sample(Span<float> logits, SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        if (logits.IsEmpty) throw new ArgumentException("Logits must not be empty.", nameof(logits));
         int vocabSize = logits.Length;
 
         // Apply repetition penalty
@@ -59,13 +67,14 @@ public sealed class Sampler
             }
         }
 
-        // Greedy sampling if temperature <= 0 or TopK == 1
-        if (options.Temperature <= 0.001f || options.TopK == 1)
+        // Greedy sampling if temperature is (near) zero or TopK == 1
+        if (options.Temperature <= GreedyTemperatureThreshold || options.TopK == 1)
         {
             int bestId = 0;
-            float bestLogit = logits[0];
-            for (int i = 1; i < vocabSize; i++)
+            float bestLogit = float.NegativeInfinity;
+            for (int i = 0; i < vocabSize; i++)
             {
+                // NaN compares false, so NaN logits are never selected.
                 if (logits[i] > bestLogit)
                 {
                     bestLogit = logits[i];
@@ -75,8 +84,8 @@ public sealed class Sampler
             return bestId;
         }
 
-        // Find top-K candidates using zero-allocation min-heap
-        int k = Math.Min(options.TopK, vocabSize);
+        // TopK <= 0 means "disabled": consider the full vocabulary.
+        int k = options.TopK <= 0 ? vocabSize : Math.Min(options.TopK, vocabSize);
         Span<(int Id, float Logit)> candidates = k <= 128
             ? stackalloc (int, float)[k]
             : new (int, float)[k];
@@ -100,7 +109,11 @@ public sealed class Sampler
             sumExp += exp;
         }
 
-        // Top-P filtering
+        // Degenerate distribution (NaN/Inf logits): fall back to the best candidate.
+        if (!(sumExp > 0f) || !float.IsFinite(sumExp))
+            return candidates[0].Id;
+
+        // Top-P filtering (always keeps at least one token)
         float invSum = 1.0f / sumExp;
         float cumProb = 0f;
         int activeCount = 0;

@@ -622,6 +622,13 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 ";
 
+    /// <summary>
+    /// Batched KV Cache Store kernel for 32-bit floating point (FP32) buffers.
+    /// Operates with a 4-byte buffer stride (<c>RWStructuredBuffer&lt;float&gt;</c>).
+    /// When executing batch prefill with this shader, the backing KV cache buffers
+    /// must be allocated with 4 bytes per element to avoid buffer stride mismatch and memory overrun.
+    /// For 2-byte FP16 KV cache allocations, use <see cref="KvCacheStoreBatchF16"/>.
+    /// </summary>
     public const string KvCacheStoreBatch = @"
 cbuffer Params : register(b0)
 {
@@ -657,6 +664,59 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 ";
 
+    /// <summary>
+    /// Batched KV Cache Store kernel for 16-bit half precision (FP16) buffers.
+    /// Operates with a 2-byte effective element stride by packing pairs of 16-bit floats into <c>RWStructuredBuffer&lt;uint&gt;</c>.
+    /// Resolves buffer stride mismatch hazard when batch prefill runs against FP16-allocated KV cache buffers.
+    /// </summary>
+    public const string KvCacheStoreBatchF16 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint start_pos;
+    uint batch_size;
+};
+
+RWStructuredBuffer<float> k : register(u0);
+RWStructuredBuffer<float> v : register(u1);
+RWStructuredBuffer<uint> k_cache : register(u2);
+RWStructuredBuffer<uint> v_cache : register(u3);
+
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint half_dim = head_dim / 2;
+    uint total_per_token = n_heads_kv * half_dim;
+    uint total = batch_size * total_per_token;
+    if (id.x >= total) return;
+
+    uint t = id.x / total_per_token;
+    uint local_id = id.x % total_per_token;
+    uint pos = start_pos + t;
+
+    uint h = local_id / half_dim;
+    uint d_pair = local_id % half_dim;
+
+    uint in_idx0 = t * (n_heads_kv * head_dim) + (h * head_dim) + (d_pair * 2);
+    uint in_idx1 = in_idx0 + 1;
+
+    uint k_packed = f32tof16(k[in_idx0]) | (f32tof16(k[in_idx1]) << 16);
+    uint v_packed = f32tof16(v[in_idx0]) | (f32tof16(v[in_idx1]) << 16);
+
+    uint cache_idx = (h * max_seq_len + pos) * half_dim + d_pair;
+
+    k_cache[cache_idx] = k_packed;
+    v_cache[cache_idx] = v_packed;
+}
+";
+
+    /// <summary>
+    /// Batched multi-head attention GQA kernel for 32-bit floating point (FP32) KV cache buffers.
+    /// Operates with a 4-byte buffer stride (<c>RWStructuredBuffer&lt;float&gt;</c>).
+    /// For 2-byte FP16 KV cache buffers, use <see cref="AttentionBatchF16"/>.
+    /// </summary>
     public const string AttentionBatch = @"
 cbuffer Params : register(b0)
 {
@@ -700,6 +760,98 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         uint kv_offset = (h_kv * max_seq_len + p) * head_dim + tid;
         float k_d = k_cache[kv_offset];
         float v_d = v_cache[kv_offset];
+
+        s_red[tid] = q_d * k_d;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 64) s_red[tid] += s_red[tid + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 32) s_red[tid] += s_red[tid + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 16) s_red[tid] += s_red[tid + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 8)  s_red[tid] += s_red[tid + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 4)  s_red[tid] += s_red[tid + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 2)  s_red[tid] += s_red[tid + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        GroupMemoryBarrierWithGroupSync();
+
+        float total_dot = s_red[0];
+        float s_p = total_dot * attn_scale;
+
+        float m_new = max(m, s_p);
+        float alpha = exp(m - m_new);
+        float w_p = exp(s_p - m_new);
+
+        acc = acc * alpha + w_p * v_d;
+        l = l * alpha + w_p;
+        m = m_new;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    uint out_offset = (t * n_heads_q + h) * head_dim + tid;
+    attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
+}
+";
+
+    /// <summary>
+    /// Batched multi-head attention GQA kernel for 16-bit half precision (FP16) KV cache buffers.
+    /// Operates with a 2-byte effective element stride by unpacking pairs of half floats from <c>RWStructuredBuffer&lt;uint&gt;</c>.
+    /// Resolves buffer stride mismatch hazard when batch prefill runs against FP16-allocated KV cache buffers.
+    /// </summary>
+    public const string AttentionBatchF16 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint start_pos;
+    float attn_scale;
+    uint batch_size;
+};
+
+RWStructuredBuffer<float> q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWStructuredBuffer<float> attn_out : register(u3);
+
+groupshared float s_red[128];
+
+[numthreads(128, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    uint t = gid.y;
+    if (h >= n_heads_q || t >= batch_size) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+    uint pos_t = start_pos + t;
+
+    uint q_offset = (t * n_heads_q + h) * head_dim + tid;
+    float q_d = q[q_offset];
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    uint pair_idx = tid / 2;
+    uint is_odd = tid & 1;
+
+    for (uint p = 0; p <= pos_t; p++)
+    {
+        uint kv_offset = (h_kv * max_seq_len + p) * (head_dim / 2) + pair_idx;
+        uint k_packed = k_cache[kv_offset];
+        uint v_packed = v_cache[kv_offset];
+
+        float k_d = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
+        float v_d = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
 
         s_red[tid] = q_d * k_d;
         GroupMemoryBarrierWithGroupSync();

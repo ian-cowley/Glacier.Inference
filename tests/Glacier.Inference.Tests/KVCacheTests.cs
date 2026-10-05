@@ -105,4 +105,42 @@ public unsafe class KVCacheTests
             Assert.Equal(vIn[128 + i], vOut1[i]);
         }
     }
+
+    private static void StoreOnce(KVCache cache, int layer, int pos)
+    {
+        float[] data = [1f, 2f, 3f, 4f];
+        fixed (float* p = data)
+        {
+            cache.Store(layer, pos, p, p);
+        }
+    }
+
+    [Fact]
+    public void KVCache_Store_OutOfRangePosition_Throws()
+    {
+        using var cache = new KVCache(layers: 1, nHeadsKv: 1, headDim: 4, maxSeqLen: 4);
+        Assert.Throws<ArgumentOutOfRangeException>(() => StoreOnce(cache, 0, 4));
+        Assert.Throws<ArgumentOutOfRangeException>(() => StoreOnce(cache, 0, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => StoreOnce(cache, 1, 0));
+    }
+
+    [Fact]
+    public void KVCache_AfterDispose_StoreAndResetThrow()
+    {
+        var cache = new KVCache(layers: 1, nHeadsKv: 1, headDim: 4, maxSeqLen: 4);
+        cache.Dispose();
+        cache.Dispose(); // idempotent
+        Assert.Throws<ObjectDisposedException>(() => StoreOnce(cache, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() => cache.Reset());
+    }
+
+    [Theory]
+    [InlineData(0, 1, 1, 1)]
+    [InlineData(1, 0, 1, 1)]
+    [InlineData(1, 1, 0, 1)]
+    [InlineData(1, 1, 1, 0)]
+    public void KVCache_InvalidConstructorArgs_Throw(int layers, int heads, int dim, int seq)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KVCache(layers, heads, dim, seq));
+    }
 }

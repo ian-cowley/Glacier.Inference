@@ -3,6 +3,7 @@ namespace Glacier.Inference.Gpu.D3D12;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
@@ -354,7 +355,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         {
             if (l % 5 == 0 || l == _weights.BlockCount - 1)
             {
-                Console.WriteLine($"[D3D12 GPU] Uploading weights: layer {l + 1}/{_weights.BlockCount}...");
+                GlacierDiagnostics.LogInformation($"[D3D12 GPU] Uploading weights: layer {l + 1}/{_weights.BlockCount}...");
             }
             var lw = _weights.Layers[l];
             bool isSwa = lw.IsSwa;

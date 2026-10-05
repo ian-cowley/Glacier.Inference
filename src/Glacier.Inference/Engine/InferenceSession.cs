@@ -9,6 +9,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Config;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Gpu.D3D12;
@@ -81,9 +82,18 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public ModelWeights Weights => _weights;
     public BpeTokenizer Tokenizer => _tokenizer;
     public KVCache? KVCache => _kvCache;
-    public DeviceInfo Device { get; }
-    public InferenceEngineType Engine { get; }
-    public string ActiveDevice { get; }
+    public DeviceInfo Device { get; private set; }
+    public InferenceEngineType Engine { get; private set; }
+    public string ActiveDevice { get; private set; }
+    public string ActiveBackend =>
+        _gpuModel != null ? "Cuda" :
+        _d3d12Model != null ? "Direct3D12" :
+        (_pipelineSession != null && _pipelineSession.Stages.Count > 0
+            ? (_pipelineSession.Stages[0].Engine == InferenceEngineType.BareMetal ? "Cuda"
+               : _pipelineSession.Stages[0].Engine == InferenceEngineType.DirectML ? "Direct3D12"
+               : "Cpu")
+            : "Cpu");
+    public Exception? FallbackException { get; private set; }
     public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null || _pipelineSession != null;
     public bool IsPipelineAccelerated => _pipelineSession != null;
     public PipelineSession? PipelineSession => _pipelineSession;
@@ -144,6 +154,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
                 catch (Exception ex)
                 {
+                    GlacierDiagnostics.LogWarning($"GPU init failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                    FallbackException = ex;
                     var settings = GlacierSettings.Load();
                     if (!settings.FallbackToCpu)
                         throw new InvalidOperationException($"Failed to initialize Bare-Metal SASS inference on {targetDevice.Name}: {ex.Message}", ex);
@@ -153,7 +165,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpuModel = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
-                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
+                    Device = DeviceManager.ResolveDevice("cpu");
+                    Engine = InferenceEngineType.Cpu;
+                    ActiveDevice = $"{Device.Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
             else if (!_weights.IsMla && (_weights.IsHybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
@@ -181,7 +195,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"[D3D12 Warning]: Direct3D 12 initialization failed on {targetDevice.Name}: {ex}");
+                    GlacierDiagnostics.LogWarning($"GPU init failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                    FallbackException = ex;
                     var settings = GlacierSettings.Load();
                     if (!settings.FallbackToCpu)
                         throw new InvalidOperationException($"Failed to initialize Direct3D 12 Compute inference on {targetDevice.Name}: {ex.Message}", ex);
@@ -190,7 +205,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _d3d12Model = null;
                     _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                     _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
-                    ActiveDevice = $"{DeviceManager.ResolveDevice("cpu").Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
+                    Device = DeviceManager.ResolveDevice("cpu");
+                    Engine = InferenceEngineType.Cpu;
+                    ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
             else
@@ -216,7 +233,13 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
                 _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
                 _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
-                string cpuDeviceName = DeviceManager.ResolveDevice("cpu").Name;
+                var cpuDevice = DeviceManager.ResolveDevice("cpu");
+                if (targetDevice.Vendor != GpuVendor.Cpu || targetEngine != InferenceEngineType.Cpu)
+                {
+                    Device = cpuDevice;
+                    Engine = InferenceEngineType.Cpu;
+                }
+                string cpuDeviceName = cpuDevice.Name;
                 string prefix = targetDevice.Vendor != GpuVendor.Cpu
                     ? $"{cpuDeviceName} [Fallback from {targetDevice.Name} | "
                     : $"{targetDevice.Name} [";

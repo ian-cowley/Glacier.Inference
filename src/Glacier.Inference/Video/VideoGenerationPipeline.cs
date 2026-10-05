@@ -3,6 +3,7 @@ namespace Glacier.Inference.Video;
 using System;
 using System.Diagnostics;
 using System.IO;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Image;
 using Glacier.Inference.Video.Wan;
 using Glacier.Inference.Image.Flux;
@@ -24,6 +25,8 @@ public sealed class VideoGenerationPipeline : IDisposable
     public FluxT5Encoder? T5Encoder => _t5Encoder;
     public SpatioTemporalDiT DiT => _dit;
     public TemporalLatentVaeDecoder VAE => _vae;
+    public string ActiveBackend => (_wanDit != null && _wanDit.IsGpuAccelerated) ? "Cuda" : "Cpu";
+    public Exception? FallbackException { get; private set; }
 
     public VideoGenerationPipeline(
         string? modelPath = null,
@@ -43,11 +46,12 @@ public sealed class VideoGenerationPipeline : IDisposable
             try
             {
                 wanVae = Wan3DVaeDecoder.Open(resolvedWanVae, enableGpu: true);
-                Console.WriteLine($"[GLACIER VIDEO] Loaded Wan 2.1 3D Causal VAE Decoder: {Path.GetFileName(resolvedWanVae)}");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Loaded Wan 2.1 3D Causal VAE Decoder: {Path.GetFileName(resolvedWanVae)}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GLACIER VIDEO] Wan 3D VAE load failed: {ex.Message}");
+                GlacierDiagnostics.LogWarning($"[GLACIER VIDEO] Wan 3D VAE load failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                FallbackException ??= ex;
                 wanVae = null;
             }
         }
@@ -59,11 +63,12 @@ public sealed class VideoGenerationPipeline : IDisposable
             try
             {
                 neuralVae = FluxVaeDecoder.Open(resolvedFluxVae, enableGpu: true);
-                Console.WriteLine($"[GLACIER VIDEO] Loaded Neural VAE Decoder: {Path.GetFileName(resolvedFluxVae)} on GPU");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Loaded Neural VAE Decoder: {Path.GetFileName(resolvedFluxVae)} on GPU");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GLACIER VIDEO] Neural VAE load failed: {ex.Message}");
+                GlacierDiagnostics.LogWarning($"[GLACIER VIDEO] Neural VAE load failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                FallbackException ??= ex;
             }
         }
         _vae = new TemporalLatentVaeDecoder(latentChannels, neuralVae, wanVae);
@@ -75,11 +80,12 @@ public sealed class VideoGenerationPipeline : IDisposable
             {
                 _wanDit = WanDiT.Open(resolvedModel, enableGpu: true);
                 string mode = _wanDit.IsGpuAccelerated ? "NVIDIA RTX 4060 GPU" : "CPU AVX-512";
-                Console.WriteLine($"[GLACIER VIDEO] Loaded pre-trained Video DiT: {Path.GetFileName(resolvedModel)} (30 blocks, 1.3B params) on {mode}");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Loaded pre-trained Video DiT: {Path.GetFileName(resolvedModel)} (30 blocks, 1.3B params) on {mode}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GLACIER VIDEO] WanDiT load failed: {ex.Message}");
+                GlacierDiagnostics.LogWarning($"[GLACIER VIDEO] WanDiT load failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                FallbackException ??= ex;
                 _wanDit = null;
             }
         }
@@ -90,11 +96,12 @@ public sealed class VideoGenerationPipeline : IDisposable
             try
             {
                 _t5Encoder = FluxT5Encoder.Open(resolvedT5);
-                Console.WriteLine($"[GLACIER VIDEO] Loaded T5-XXL text encoder: {Path.GetFileName(resolvedT5)}");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Loaded T5-XXL text encoder: {Path.GetFileName(resolvedT5)}");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GLACIER VIDEO] T5 load failed: {ex.Message}");
+                GlacierDiagnostics.LogWarning($"[GLACIER VIDEO] T5 load failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                FallbackException ??= ex;
                 _t5Encoder = null;
             }
         }
@@ -212,7 +219,7 @@ public sealed class VideoGenerationPipeline : IDisposable
 
             if (autoEmbedFile != null && File.Exists(autoEmbedFile))
             {
-                Console.WriteLine($"[GLACIER VIDEO] Ingesting high-precision UMT5 text embeddings from {Path.GetFileName(autoEmbedFile)}...");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Ingesting high-precision UMT5 text embeddings from {Path.GetFileName(autoEmbedFile)}...");
                 using var br = new BinaryReader(File.OpenRead(autoEmbedFile));
                 int seq = br.ReadInt32();
                 int dim = br.ReadInt32();
@@ -228,11 +235,11 @@ public sealed class VideoGenerationPipeline : IDisposable
                     for (int i = 0; i < uncondTxt.Length; i++) uncondTxt[i] = brNeg.ReadSingle();
                     uncondCount = seq;
                 }
-                Console.WriteLine($"[GLACIER VIDEO] Text context loaded ({contextCount} tokens, dim={dim}, CFG enabled={uncondTxt != null}).");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Text context loaded ({contextCount} tokens, dim={dim}, CFG enabled={uncondTxt != null}).");
             }
             else if (_t5Encoder != null)
             {
-                Console.WriteLine($"[GLACIER VIDEO] Encoding prompt text context via pure C# T5-XXL (padded to {textSeqLen} tokens)...");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Encoding prompt text context via pure C# T5-XXL (padded to {textSeqLen} tokens)...");
                 var (promptEmbeds, validCount) = _t5Encoder.EncodeWithCount(prompt, maxSeqLen: textSeqLen);
                 contextTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
                 Array.Copy(promptEmbeds, contextTxt, promptEmbeds.Length);
@@ -244,7 +251,7 @@ public sealed class VideoGenerationPipeline : IDisposable
                     uncondTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
                     Array.Copy(negEmbeds, uncondTxt, negEmbeds.Length);
                 }
-                Console.WriteLine($"[GLACIER VIDEO] Text context encoded successfully ({validCount} valid prompt tokens padded to {textSeqLen}, uncond={textSeqLen} tokens).");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Text context encoded successfully ({validCount} valid prompt tokens padded to {textSeqLen}, uncond={textSeqLen} tokens).");
             }
             else
             {
@@ -276,7 +283,7 @@ public sealed class VideoGenerationPipeline : IDisposable
             var scheduler = new FlowMatchingScheduler(numSteps, timeShift: 3.0f);
             var timesteps = scheduler.Timesteps;
 
-            Console.WriteLine($"[GLACIER VIDEO] Starting Flow Matching Euler Solver ({numSteps} steps, guidance={guidanceScale:F1}, tokens={temporalLatentFrames * (latentH / 2) * (latentW / 2)})...");
+            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Starting Flow Matching Euler Solver ({numSteps} steps, guidance={guidanceScale:F1}, tokens={temporalLatentFrames * (latentH / 2) * (latentW / 2)})...");
             for (int step = 0; step < numSteps; step++)
             {
                 float currentT = timesteps[step];
@@ -313,7 +320,7 @@ public sealed class VideoGenerationPipeline : IDisposable
                 float vMean = vSum / latents.Length;
                 float lMean = lSum / latents.Length;
 
-                Console.WriteLine($"[GLACIER VIDEO] Step {step + 1}/{numSteps} (t={currentT:F3} -> {nextT:F3}): {stepSw.ElapsedMilliseconds} ms | Vel[min={vMin:F2}, max={vMax:F2}, mean={vMean:F3}] | Lat[min={lMin:F2}, max={lMax:F2}, mean={lMean:F3}]");
+                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Step {step + 1}/{numSteps} (t={currentT:F3} -> {nextT:F3}): {stepSw.ElapsedMilliseconds} ms | Vel[min={vMin:F2}, max={vMax:F2}, mean={vMean:F3}] | Lat[min={lMin:F2}, max={lMax:F2}, mean={lMean:F3}]");
             }
 
             // Dump latents to disk for precision validation
@@ -325,9 +332,9 @@ public sealed class VideoGenerationPipeline : IDisposable
                 for (int i = 0; i < latents.Length; i++) bw.Write(latents[i]);
             }
 
-            Console.WriteLine($"[GLACIER VIDEO] Decoding {temporalLatentFrames} latent keyframes into {numFrames} RGB frames via 3D Causal VAE...");
+            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Decoding {temporalLatentFrames} latent keyframes into {numFrames} RGB frames via 3D Causal VAE...");
             var frames = _vae.DecodeVideo(latents, temporalLatentFrames, numFrames, latentH, latentW);
-            Console.WriteLine($"[GLACIER VIDEO] 3D VAE decoding complete ({frames.Count} frames).");
+            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] 3D VAE decoding complete ({frames.Count} frames).");
             sw.Stop();
 
             return new VideoGenerationResult(

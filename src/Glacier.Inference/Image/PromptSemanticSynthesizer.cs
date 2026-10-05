@@ -210,7 +210,7 @@ public static class PromptSemanticSynthesizer
                     float valleyTrans = Math.Clamp((wy - 0.56f) / 0.06f, 0f, 1f);
                     if (valleyTrans > 0f)
                     {
-                        // Natural curving glacial valley trough (no square boxes!)
+                        // Natural curving glacial valley trough
                         float valleyMeander = MathF.Sin(wy * 3.8f + 0.6f) * 0.12f;
                         float centerDist = MathF.Abs(wxFg - 0.50f - valleyMeander);
 
@@ -254,7 +254,7 @@ public static class PromptSemanticSynthesizer
                 }
                 else if (isCyberpunk)
                 {
-                    // Ambient night city illumination (smooth, zero procedural grid or billboard boxes)
+                    // Ambient night city illumination
                     float skyT = Math.Clamp(wy / 0.65f, 0f, 1f);
                     lum = 0.08f + skyT * 0.12f;
                     ch1_cyan = 0.15f * (1.0f - skyT);

@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
@@ -295,8 +296,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
         // 4. Upload model weights into GPU VRAM
         double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
+        GlacierDiagnostics.LogInformation($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
         var sw = Stopwatch.StartNew();
 
         if (IsLastStage)
@@ -415,8 +415,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         }
 
         sw.Stop();
-        Console.WriteLine($"   Weights uploaded to GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
-        Console.ResetColor();
+        GlacierDiagnostics.LogInformation($"   Weights uploaded to GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
     }
 
     public void Dispose()

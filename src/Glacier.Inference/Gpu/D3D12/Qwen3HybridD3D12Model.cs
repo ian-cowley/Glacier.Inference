@@ -1,4 +1,4 @@
-namespace Glacier.Inference.Gpu.D3D12;
+﻿namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
 using System.Collections.Generic;
@@ -9,9 +9,9 @@ using Glacier.Inference.Quant;
 using Vortice.Direct3D12;
 
 /// <summary>
-/// World-class Direct3D 12 GPU inference runtime for Qwen 3.5 / 3.6 Hybrid models.
+/// Direct3D 12 GPU inference runtime for hybrid SSM / attention models.
 /// Accelerates Gated DeltaNet (linear attention SSM with recurrent associative memory)
-/// interleaved with full quadratic multi-head attention (3:1 ratio) on AMD Radeon / Windows GPUs.
+/// interleaved with full quadratic multi-head attention on Direct3D 12 hardware.
 /// </summary>
 public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
 {
@@ -152,7 +152,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         _ssmInnerSize = weights.SsmInnerSize > 0 ? weights.SsmInnerSize : 4096;
         _gdnConvChannels = (_ssmGroupCount * 2 + _ssmHeads) * _ssmStateDim;
 
-        Console.WriteLine($"[Qwen 3.5 D3D12] Arch: '{weights.Gguf.Architecture}', Heads: {_nHeads}/{_headsKv}, HeadDim: {_headDim}, RopeDim: {_ropeDim}, SsmHeads: {_ssmHeads}, ConvChannels: {_gdnConvChannels}");
+        string archLabel = !string.IsNullOrWhiteSpace(weights.Gguf.Architecture) ? weights.Gguf.Architecture : weights.ArchitectureFamily.ToString();
+        Glacier.Inference.Diagnostics.GlacierDiagnostics.LogInformation($"[Direct3D 12 {archLabel}] Arch: '{weights.Gguf.Architecture}', Heads: {_nHeads}/{_headsKv}, HeadDim: {_headDim}, RopeDim: {_ropeDim}, SsmHeads: {_ssmHeads}, ConvChannels: {_gdnConvChannels}");
 
         _dConvState = new ID3D12Resource[weights.BlockCount];
         _dSsmState = new ID3D12Resource[weights.BlockCount];
@@ -400,7 +401,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         {
             if (l % 8 == 0 || l == _weights.BlockCount - 1)
             {
-                Console.WriteLine($"[D3D12 GPU] Uploading Qwen 3.5 weights: layer {l + 1}/{_weights.BlockCount}...");
+                string archLabel = !string.IsNullOrWhiteSpace(_weights.Gguf.Architecture) ? _weights.Gguf.Architecture : _weights.ArchitectureFamily.ToString();
+                Glacier.Inference.Diagnostics.GlacierDiagnostics.LogInformation($"[D3D12 GPU] Uploading {archLabel} weights: layer {l + 1}/{_weights.BlockCount}...");
             }
 
             var lw = _weights.Layers[l];

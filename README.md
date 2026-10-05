@@ -554,7 +554,7 @@ var options = new SamplingOptions
     Temperature = 0.7f,
     TopP = 0.95f,
     TopK = 40,
-    RepeatPenalty = 1.1f
+    RepetitionPenalty = 1.1f
 };
 
 var result = await session.GenerateAsync(
@@ -638,6 +638,26 @@ var (userPrompt, responseText, responseAudio) = pipeline.ConversationalTurn(
 | `bm_daniel` | **Daniel** | British | Male | 110 Hz | Deep, resonant British classical orator with rich chest timbre |
 | `bm_fable` | **Fable** | British | Male | 132 Hz | Conversational, modern London gentleman with expressive cadence |
 
+### 6. Pluggable Diagnostic Logging
+
+Glacier.Inference includes an ambient, zero-dependency diagnostic logging subsystem:
+
+```csharp
+using Glacier.Inference.Diagnostics;
+
+// Forward diagnostic logs to the terminal:
+GlacierDiagnostics.Logger = new ConsoleGlacierLogger();
+
+// Or direct logs to a custom delegate (e.g. Microsoft.Extensions.Logging or a test harness):
+GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, message, ex) =>
+{
+    myLogger.Log(MapLogLevel(level), ex, "{Message}", message);
+});
+
+// Reset back to silent default:
+GlacierDiagnostics.Reset();
+```
+
 ---
 
 ## Architecture
@@ -703,6 +723,17 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Foundational strided tensor engine with Autograd, hardware GEMM dispatch, and PEFT layers.
 - **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Columnar memory backend for zero-copy feature feeds.
 - **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT deep learning inference microservices.
+
+---
+
+## 🆕 What's New in v1.2.17
+
+- **Pluggable Zero-Dependency Diagnostic Logging**: Pure C# ambient logging subsystem (`GlacierDiagnostics`, `IGlacierLogger`, `ConsoleGlacierLogger`, `DelegateGlacierLogger`, `NullGlacierLogger`), eradicating hardcoded console writes from the core engine while allowing custom host integration.
+- **Robust GPU Fallback & Active Backend Reporting**: Structured error diagnostics preserving original exception details on GPU-to-CPU fallback, with real-time `session.ActiveBackend` telemetry.
+- **Safe & Hardened Sampling**: `Sampler` safely handles `TopK <= 0` as disabled, filters NaN/Inf logit corruptions, guards greedy edge cases, and handles zero Top-P safely.
+- **Defensive Unmanaged KV Cache**: `KVCache` fortified with argument validation, boundary guards against sequence overruns, and explicit disposed state checking.
+- **Direct3D 12 Prefill Stride Fix & KV Precision Wiring**: Resolved batch prefill stride hazard and wired `KvCachePrecision` support.
+- **High-Performance Partial Decompositions**: Modularized monolithic engine files (`FluxDiT`, `WanDiT`, `FluxVaeDecoder`, `Wan3DVaeDecoder`, `QuantKernels.VecDot`, and `Program.cs`) into cohesive partial classes under 800 lines with zero breaking API changes.
 
 ---
 
