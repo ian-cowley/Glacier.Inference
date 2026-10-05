@@ -19,6 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\..\src\Glacier.Inference\Glacier.Inference.csproj" />
+    <ProjectReference Include="..\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" />
   </ItemGroup>
 </Project>

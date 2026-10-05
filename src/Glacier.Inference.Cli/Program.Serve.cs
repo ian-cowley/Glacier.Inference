@@ -148,7 +148,41 @@ public static partial class Program
 
         Console.WriteLine(">> Initializing inference session...");
         var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
-        Console.WriteLine($">> Model ready on {session.ActiveDevice}\n");
+        var app = CreateServeApp(session, modelPath, apiKey, host, port);
+
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"\n>>> Glacier.Inference server running on http://{host}:{port}");
+        Console.WriteLine("    Compatible with Ollama CLI, LangChain, AutoGen, and OpenAI SDKs!");
+        Console.ResetColor();
+
+        await app.RunAsync();
+        return 0;
+    }
+
+    public static WebApplication CreateServeApp(
+        InferenceSession session,
+        string modelPath,
+        string? apiKey = null,
+        string host = "127.0.0.1",
+        int port = 11434)
+    {
+        var appBuilder = WebApplication.CreateBuilder();
+        var app = appBuilder.Build();
+        if (port >= 0)
+        {
+            app.Urls.Add($"http://{host}:{port}");
+        }
+
+        ConfigureServeEndpoints(app, session, modelPath, apiKey);
+        return app;
+    }
+
+    public static void ConfigureServeEndpoints(
+        WebApplication app,
+        InferenceSession session,
+        string modelPath,
+        string? apiKey = null)
+    {
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
         // Calculate actual parameter count and quantization level from tensors
@@ -173,10 +207,6 @@ public static partial class Program
             if (dominant.HasValue)
                 quantLevel = dominant.Value.ToString();
         }
-
-        var appBuilder = WebApplication.CreateBuilder();
-        var app = appBuilder.Build();
-        app.Urls.Add($"http://{host}:{port}");
 
         if (!string.IsNullOrEmpty(apiKey))
         {
@@ -599,14 +629,6 @@ public static partial class Program
                 s_inferenceLock.Release();
             }
         });
-
-        Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"\n>>> Glacier.Inference server running on http://{host}:{port}");
-        Console.WriteLine("    Compatible with Ollama CLI, LangChain, AutoGen, and OpenAI SDKs!");
-        Console.ResetColor();
-
-        await app.RunAsync();
-        return 0;
     }
 
     private static SamplingOptions ParseSamplingOptions(JsonElement req)
