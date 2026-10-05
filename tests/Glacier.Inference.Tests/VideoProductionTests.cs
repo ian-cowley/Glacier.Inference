@@ -60,21 +60,27 @@ public class VideoProductionTests
 
         using var t5 = Glacier.Inference.Image.Flux.FluxT5Encoder.Open(t5Path);
         var (embeds, validCount) = t5.EncodeWithCount("A man walking along a city street");
-        Console.WriteLine($"[T5 Test] Valid count: {validCount}, Embeds length: {embeds.Length}");
-        float min = float.MaxValue, max = float.MinValue, sum = 0f;
-        for (int i = 0; i < embeds.Length; i++)
+        string binPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "source", "repos", "PolarsPlus", "Glacier.Inference", "woman_prompt_embeds.bin");
+        if (File.Exists(binPath))
         {
-            float v = embeds[i];
-            if (v < min) min = v;
-            if (v > max) max = v;
-            sum += v;
+            using var br = new BinaryReader(File.OpenRead(binPath));
+            int seq = br.ReadInt32();
+            int dim = br.ReadInt32();
+            float[] binEmbeds = new float[seq * dim];
+            for (int i = 0; i < binEmbeds.Length; i++) binEmbeds[i] = br.ReadSingle();
+            float bMin = float.MaxValue, bMax = float.MinValue, bSum = 0f;
+            for (int i = 0; i < binEmbeds.Length; i++)
+            {
+                float v = binEmbeds[i];
+                if (v < bMin) bMin = v;
+                if (v > bMax) bMax = v;
+                bSum += v;
+            }
+            float bMean = bSum / binEmbeds.Length;
+            Console.WriteLine($"[BIN Test] seq: {seq}, dim: {dim}, Min: {bMin:F4}, Max: {bMax:F4}, Mean: {bMean:F4}");
+            Console.WriteLine($"[BIN Test] First 10 floats: {string.Join(", ", binEmbeds.Take(10).Select(x => x.ToString("F3")))}");
         }
-        float mean = sum / embeds.Length;
-        float var = 0f;
-        for (int i = 0; i < embeds.Length; i++) var += MathF.Pow(embeds[i] - mean, 2);
-        float std = MathF.Sqrt(var / embeds.Length);
-        Console.WriteLine($"[T5 Test] Min: {min:F4}, Max: {max:F4}, Mean: {mean:F4}, Std: {std:F4}");
-        Console.WriteLine($"[T5 Test] First 10 floats: {string.Join(", ", embeds.Take(10).Select(x => x.ToString("F3")))}");
     }
 
     [Fact]

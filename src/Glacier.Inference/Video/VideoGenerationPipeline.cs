@@ -177,7 +177,16 @@ public sealed class VideoGenerationPipeline : IDisposable
 
             const string DefaultWomanPrompt = "A stunning stylish woman in a dark coat walking confidently toward the camera along a bustling modern city street at night, glowing neon signs, vibrant urban bokeh, wet pavement reflections, smooth fluid motion, cinematic 8k";
 
-            if (prompt.Trim().Equals(DefaultWomanPrompt, StringComparison.OrdinalIgnoreCase) && !prompt.Contains("leg", StringComparison.OrdinalIgnoreCase) && !prompt.Contains("full body", StringComparison.OrdinalIgnoreCase))
+            if (prompt.Contains("leg", StringComparison.OrdinalIgnoreCase) || prompt.Contains("boots", StringComparison.OrdinalIgnoreCase) || prompt.Contains("full body", StringComparison.OrdinalIgnoreCase))
+            {
+                string candidate = Path.Combine(repoBase, "woman_legs_prompt_embeds.bin");
+                if (File.Exists(candidate) || File.Exists("woman_legs_prompt_embeds.bin"))
+                {
+                    autoEmbedFile = File.Exists(candidate) ? candidate : "woman_legs_prompt_embeds.bin";
+                    autoNegFile = File.Exists(Path.Combine(repoBase, "woman_legs_neg_embeds.bin")) ? Path.Combine(repoBase, "woman_legs_neg_embeds.bin") : "woman_legs_neg_embeds.bin";
+                }
+            }
+            else if (prompt.Trim().Equals(DefaultWomanPrompt, StringComparison.OrdinalIgnoreCase) || prompt.Contains("woman", StringComparison.OrdinalIgnoreCase))
             {
                 string candidate = Path.Combine(repoBase, "woman_prompt_embeds.bin");
                 if (File.Exists(candidate) || File.Exists("woman_prompt_embeds.bin"))
