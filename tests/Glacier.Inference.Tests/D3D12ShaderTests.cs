@@ -86,6 +86,53 @@ public class D3D12ShaderTests
 
         var fusedSwiglu = Compiler.Compile(D3D12Shaders.GemvQ4KSwigluFused, "main", "gemv_q4_k_swiglu_fused.hlsl", "cs_5_0");
         Assert.False(fusedSwiglu.IsEmpty);
+
+        // Gemma 4 Compute Shaders
+        var gemmaGelu = Compiler.Compile(D3D12Shaders.Gemma4GeluGLU, "main", "gemma4_gelu_glu.hlsl", "cs_5_0");
+        Assert.False(gemmaGelu.IsEmpty);
+
+        var gemmaSoftcap = Compiler.Compile(D3D12Shaders.Gemma4SoftcapLogits, "main", "gemma4_softcap.hlsl", "cs_5_0");
+        Assert.False(gemmaSoftcap.IsEmpty);
+
+        var gemmaScaleMul = Compiler.Compile(D3D12Shaders.Gemma4ScaleAndMul, "main", "gemma4_scale_mul.hlsl", "cs_5_0");
+        Assert.False(gemmaScaleMul.IsEmpty);
+
+        var gemmaSwa = Compiler.Compile(D3D12Shaders.Gemma4SwaAttention, "main", "gemma4_swa_attn.hlsl", "cs_5_0");
+        Assert.False(gemmaSwa.IsEmpty);
+
+        var gemmaKvStore = Compiler.Compile(D3D12Shaders.Gemma4KvCacheStore, "main", "gemma4_kv_store.hlsl", "cs_5_0");
+        Assert.False(gemmaKvStore.IsEmpty);
+
+        var gemmaOutScale = Compiler.Compile(D3D12Shaders.Gemma4LayerOutputScale, "main", "gemma4_out_scale.hlsl", "cs_5_0");
+        Assert.False(gemmaOutScale.IsEmpty);
+
+        // Qwen 3 SSM / Gated DeltaNet Compute Shaders
+        var qwenConv1d = Compiler.Compile(D3D12Shaders.Qwen3SsmConv1d, "main", "qwen3_conv1d.hlsl", "cs_5_0");
+        Assert.False(qwenConv1d.IsEmpty);
+
+        var qwenL2Norm = Compiler.Compile(D3D12Shaders.Qwen3L2NormQK, "main", "qwen3_l2norm.hlsl", "cs_5_0");
+        Assert.False(qwenL2Norm.IsEmpty);
+
+        var qwenDeltaNet = Compiler.Compile(D3D12Shaders.Qwen3DeltaNetUpdate, "main", "qwen3_deltanet.hlsl", "cs_5_0");
+        Assert.False(qwenDeltaNet.IsEmpty);
+
+        var qwenGateSilu = Compiler.Compile(D3D12Shaders.Qwen3SsmGateSilu, "main", "qwen3_gate_silu.hlsl", "cs_5_0");
+        Assert.False(qwenGateSilu.IsEmpty);
+
+        var qwenQGate = Compiler.Compile(D3D12Shaders.Qwen3QGateSplit, "main", "qwen3_qgate_split.hlsl", "cs_5_0");
+        Assert.False(qwenQGate.IsEmpty);
+
+        var qwenNormHeads = Compiler.Compile(D3D12Shaders.Qwen3RmsNormHeads, "main", "qwen3_norm_heads.hlsl", "cs_5_0");
+        Assert.False(qwenNormHeads.IsEmpty);
+
+        var qwenRope = Compiler.Compile(D3D12Shaders.Qwen3RoPE, "main", "qwen3_rope.hlsl", "cs_5_0");
+        Assert.False(qwenRope.IsEmpty);
+
+        var qwenAttn = Compiler.Compile(D3D12Shaders.Qwen3Attention, "main", "qwen3_attention.hlsl", "cs_5_0");
+        Assert.False(qwenAttn.IsEmpty);
+
+        var qwenAttnGate = Compiler.Compile(D3D12Shaders.Qwen3AttnOutGate, "main", "qwen3_attn_gate.hlsl", "cs_5_0");
+        Assert.False(qwenAttnGate.IsEmpty);
     }
 
     [Fact]

@@ -647,7 +647,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         var cmd = _ctx.CommandList;
 
         // Copy embedding into _dX
+        cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
         cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
+        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
         cmd.ResourceBarrierUnorderedAccessView(null!);
 
         // 3. Execute Transformer Layers
@@ -677,7 +679,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             }
             else
             {
-                cmd.CopyBufferRegion(_dV, 0, _dK, 0, (ulong)(totalKvDim * sizeof(float)));
+                DispatchVecAddWeighted(cmd, _dK, _dV, 1.0f, totalKvDim, accumulate: 0);
             }
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
@@ -739,7 +741,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // Residual connection: _dAttnOutResidual = _dX + _dAttnProjOut
-            cmd.CopyBufferRegion(_dAttnOutResidual, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+            DispatchVecAddWeighted(cmd, _dX, _dAttnOutResidual, 1.0f, _dim, accumulate: 0);
             cmd.ResourceBarrierUnorderedAccessView(null!);
             DispatchVecAdd(cmd, _dAttnProjOut, _dAttnOutResidual, _dim);
             cmd.ResourceBarrierUnorderedAccessView(null!);
@@ -792,7 +794,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
                 cmd.ResourceBarrierUnorderedAccessView(null!);
 
                 // Readback router logits to CPU host to select Top-K
+                cmd.ResourceBarrierTransition(_dRouterLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                 cmd.CopyBufferRegion(_readbackRouterLogits, 0, _dRouterLogits, 0, (ulong)(_expertCount * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dRouterLogits, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
                 _ctx.EndCommandsAndExecute();
                 _ctx.Synchronize();
 
@@ -841,14 +845,14 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
                 // -----------------------------------------------------------------
                 // Dual FFN: Part 3 - Combine Shared MLP + Sparse MoE
                 // -----------------------------------------------------------------
-                cmd.CopyBufferRegion(_dCombinedFfn, 0, _dMlpOut, 0, (ulong)(_dim * sizeof(float)));
+                DispatchVecAddWeighted(cmd, _dMlpOut, _dCombinedFfn, 1.0f, _dim, accumulate: 0);
                 cmd.ResourceBarrierUnorderedAccessView(null!);
                 DispatchVecAdd(cmd, _dMoeOut, _dCombinedFfn, _dim);
                 cmd.ResourceBarrierUnorderedAccessView(null!);
             }
             else
             {
-                cmd.CopyBufferRegion(_dCombinedFfn, 0, _dMlpOut, 0, (ulong)(_dim * sizeof(float)));
+                DispatchVecAddWeighted(cmd, _dMlpOut, _dCombinedFfn, 1.0f, _dim, accumulate: 0);
                 cmd.ResourceBarrierUnorderedAccessView(null!);
             }
 
@@ -857,7 +861,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // Residual add: _dX = _dAttnOutResidual + _dCombinedFfn
-            cmd.CopyBufferRegion(_dX, 0, _dAttnOutResidual, 0, (ulong)(_dim * sizeof(float)));
+            DispatchVecAddWeighted(cmd, _dAttnOutResidual, _dX, 1.0f, _dim, accumulate: 0);
             cmd.ResourceBarrierUnorderedAccessView(null!);
             DispatchVecAdd(cmd, _dCombinedFfn, _dX, _dim);
             cmd.ResourceBarrierUnorderedAccessView(null!);
@@ -901,7 +905,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             }
 
             // Readback logits to host
+            cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
             cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
+            cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
             _ctx.EndCommandsAndExecute();
             _ctx.Synchronize();
 

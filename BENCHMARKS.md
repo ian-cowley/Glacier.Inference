@@ -267,3 +267,51 @@ Measured using autocorrelation pitch tracking, DC bias integration, and sample-l
 | **BmGeorge (UK Male Documentary)** | 6.43 s | 0.9603 | 0.1419 | 6.77 | +0.00118 | 110.6 Hz | 0 (100% Clean) |
 | **AfBella (US Female Conversational)** | 5.68 s | 0.9966 | 0.1679 | 5.94 | +0.00072 | 240.0 Hz | 0 (100% Clean) |
 
+---
+
+## 8. CPU Quantized SIMD Kernels & Microbenchmarking Suite
+
+Glacier.Inference includes a dedicated high-resolution micro-benchmarking project (`Glacier.Inference.Benchmarks`) built on BenchmarkDotNet to profile low-level SIMD kernels, matrix-vector multiplication (GEMV), and token sampling.
+
+### 1. Vector Dot Product Micro-Benchmarks (`SimdDotBenchmarks`)
+Evaluates scalar and quantized vector dot product implementations across AVX-512 / AVX2 / ARM NEON SIMD vector units for hidden dimensions `Dim = 3584` and `Dim = 4096`:
+
+| Benchmark Kernel | Format | Elements / Block | Bytes / Block | Effective Bits/Weight | Memory Bandwidth Relative to FP32 | Allocations |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`VecDotF32`** (Baseline) | Full FP32 | 1 | 4 | 32.0 bits | 1.0x (14.3 KB / dot) | 0 B |
+| **`VecDotQ8_0`** | Symmetric Int8 | 32 | 34 | 8.5 bits | **3.76x less bandwidth** (3.8 KB / dot) | 0 B |
+| **`VecDotQ6_K`** | K-Quant Super-Block | 256 | 210 | 6.56 bits | **4.87x less bandwidth** (2.9 KB / dot) | 0 B |
+| **`VecDotQ4_K`** | K-Quant Super-Block | 256 | 144 | 4.5 bits | **7.11x less bandwidth** (2.0 KB / dot) | 0 B |
+| **`VecDotIQ4_XS`** | Non-Linear 4-Bit | 256 | 136 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 0 B |
+| **`VecDotMXFP4`** | Microscaling FP4 | 32 | 17 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 0 B |
+| **`RMSNorm`** | Fused Square-Sum | 256 | — | — | Vectorized reduction & scale | 0 B |
+
+### 2. Multithreaded GEMV & Batched GEMM (`GemvBenchmarks`)
+Evaluates row-parallel matrix-vector multiplication (`QuantKernels.MatVecMul`) and batched weight-reuse multiplication (`QuantKernels.MatMulBatch`) across all available CPU threads for a `3584 x 3584` projection matrix:
+- **`MatVecMul_Q4_K`**: Parallelized across all CPU cores with precomputed 32-element chunk sums (`ComputeBlockSums32`).
+- **`MatVecMul_Q8_0`**: Parallelized across all CPU cores with signed integer dot products.
+- **`MatMulBatch_Q4_K_Batch8`**: Weights streamed from memory once and shared across 8 tokens simultaneously.
+- **`MatMulBatch_Q4_K_Batch32`**: Weights streamed once and shared across 32 tokens simultaneously (prefill acceleration).
+
+### 3. Zero-Allocation Token Sampler Profiling (`SamplerBenchmarks`)
+Profiles the autoregressive sampling loop across standard frontier vocabulary sizes (`32,000` for Llama / Mistral and `151,936` for Qwen):
+- **Greedy Argmax**: Zero allocation, single-pass scan with non-NaN comparison.
+- **Top-K + Top-P + Temperature**: `stackalloc` candidate buffer for $K \le 128$, in-place min-heap sift-down, and zero-allocation struct comparer (`LogitDescendingComparer`).
+- **Repetition Penalty**: In-place multiplicative logit adjustment over rolling recent token history.
+- **Allocation Profile**: **0 B allocated on GC heap per generated token** across all sampling modes.
+
+### 4. Running the Benchmark Suite
+To execute the microbenchmark suite with BenchmarkDotNet:
+
+```bash
+# Run SIMD dot product micro-benchmarks
+dotnet run -c Release --project benchmarks/Glacier.Inference.Benchmarks -- --filter "*SimdDotBenchmarks*"
+
+# Run multithreaded GEMV and Batched GEMM benchmarks
+dotnet run -c Release --project benchmarks/Glacier.Inference.Benchmarks -- --filter "*GemvBenchmarks*"
+
+# Run zero-allocation token sampler benchmarks
+dotnet run -c Release --project benchmarks/Glacier.Inference.Benchmarks -- --filter "*SamplerBenchmarks*"
+```
+
+

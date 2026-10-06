@@ -196,6 +196,104 @@ public class SpeculativeDecodingTests
         Assert.Equal(0.0, result.SpeculativeMetrics.AcceptanceRate);
     }
 
+    [Fact]
+    public void ModelDraftProvider_DraftsConsecutiveTokens_WithoutDuplicatingLastToken()
+    {
+        var vocab = new[] { "<|im_start|>", "<|im_end|>", "<|endoftext|>", "Prompt", "A", "B", "C", "D", "E" };
+        var tokenizer = new BpeTokenizer(vocab, eosTokenId: 2);
+        using var draftTarget = new MockSpeculativeTarget(tokenizer);
+
+        // Queue sampled draft tokens: 5 ("B"), 6 ("C"), 7 ("D")
+        draftTarget.EnqueueSample(5);
+        draftTarget.EnqueueSample(6);
+        draftTarget.EnqueueSample(7);
+
+        using var provider = new ModelDraftProvider(draftTarget);
+
+        int[] context = [3, 4]; // "Prompt", "A" (Length = 2, last token is 4 at pos 1)
+        int[] draftBuf = new int[3];
+
+        int drafted = provider.Draft(context.AsSpan(), maxDraftTokens: 3, draftBuf.AsSpan());
+
+        Assert.Equal(3, drafted);
+        Assert.Equal(5, draftBuf[0]);
+        Assert.Equal(6, draftBuf[1]);
+        Assert.Equal(7, draftBuf[2]);
+
+        // Prefill was called with [3, 4]
+        Assert.Equal([3, 4], draftTarget.PrefilledTokens);
+
+        // Verify that token 4 was NOT forwarded again at pos 2!
+        // The first ForwardToken should be token 5 at pos 2, and token 6 at pos 3, and token 7 at pos 4!
+        Assert.Equal(3, draftTarget.ForwardedTokens.Count);
+        Assert.Equal((5, 2), draftTarget.ForwardedTokens[0]);
+        Assert.Equal((6, 3), draftTarget.ForwardedTokens[1]);
+        Assert.Equal((7, 4), draftTarget.ForwardedTokens[2]);
+    }
+
+    [Fact]
+    public void ModelDraftProvider_ResyncsViaPrefill_WhenContextDivergesOrRewinds()
+    {
+        var vocab = new[] { "<|im_start|>", "<|im_end|>", "<|endoftext|>", "Prompt", "A", "B", "C", "D", "E" };
+        var tokenizer = new BpeTokenizer(vocab, eosTokenId: 2);
+        using var draftTarget = new MockSpeculativeTarget(tokenizer);
+
+        draftTarget.EnqueueSample(5);
+        draftTarget.EnqueueSample(6);
+
+        using var provider = new ModelDraftProvider(draftTarget);
+
+        int[] context1 = [3, 4];
+        int[] draftBuf = new int[2];
+        provider.Draft(context1.AsSpan(), 2, draftBuf.AsSpan());
+        Assert.Equal([3, 4], draftTarget.PrefilledTokens);
+
+        // Now simulate target model rejecting token 5 and correcting it to token 8 ("E")
+        // New context: [3, 4, 8]
+        draftTarget.EnqueueSample(5);
+        int[] context2 = [3, 4, 8];
+        int[] draftBuf2 = new int[1];
+        provider.Draft(context2.AsSpan(), 1, draftBuf2.AsSpan());
+
+        // Must have re-prefilled with context2!
+        Assert.Equal([3, 4, 8], draftTarget.PrefilledTokens);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task SpeculativeEngine_WithModelDraftProvider_ExecutesEndToEnd()
+    {
+        var vocab = new[] { "<|im_start|>", "<|im_end|>", "<|endoftext|>", "Prompt", "A", "B", "C", "D", "E" };
+        var tokenizer = new BpeTokenizer(vocab, eosTokenId: 2);
+        using var target = new MockSpeculativeTarget(tokenizer);
+        using var draftTarget = new MockSpeculativeTarget(tokenizer);
+
+        // Target emits token 4 ("A") from prompt prefill
+        target.EnqueueSample(4);
+
+        // Draft target emits [5, 6] ("B", "C")
+        draftTarget.EnqueueSample(5);
+        draftTarget.EnqueueSample(6);
+
+        // Target verification matches 5, matches 6, and bonus is EOS 2
+        target.SetVerifyHandler((tokens, pos, preds) =>
+        {
+            preds[0] = 5;
+            preds[1] = 6;
+            preds[2] = 2; // EOS bonus token
+        });
+
+        using var draftProvider = new ModelDraftProvider(draftTarget);
+        using var engine = new SpeculativeEngine(target, draftProvider);
+
+        var options = new SpeculativeOptions { MaxDraftTokens = 2, MaxTokens = 10 };
+        var result = await engine.GenerateAsync("Prompt", options, formatChat: false);
+
+        Assert.Equal("stop", result.FinishReason);
+        Assert.Equal(2, result.SpeculativeMetrics.DraftTokensAccepted);
+        Assert.Equal(2, result.SpeculativeMetrics.DraftTokensProposed);
+        Assert.Equal(1.0, result.SpeculativeMetrics.AcceptanceRate);
+    }
+
     private sealed class FixedDraftProvider : IDraftProvider
     {
         private readonly int[] _tokens;
@@ -221,6 +319,8 @@ public class SpeculativeDecodingTests
     {
         public int MaxSeqLen => 1024;
         public BpeTokenizer Tokenizer { get; }
+        public List<int> PrefilledTokens { get; } = new();
+        public List<(int Token, int Pos)> ForwardedTokens { get; } = new();
 
         private readonly Queue<int> _sampleQueue = new();
         private Action<ReadOnlySpan<int>, int, Span<int>>? _verifyHandler;
@@ -239,7 +339,14 @@ public class SpeculativeDecodingTests
 
         public void ResetKvCache() { }
 
-        public void Prefill(ReadOnlySpan<int> promptTokens) { }
+        public void Prefill(ReadOnlySpan<int> promptTokens)
+        {
+            PrefilledTokens.Clear();
+            for (int i = 0; i < promptTokens.Length; i++)
+            {
+                PrefilledTokens.Add(promptTokens[i]);
+            }
+        }
 
         public int SampleNextToken(SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
         {
@@ -261,7 +368,10 @@ public class SpeculativeDecodingTests
             }
         }
 
-        public void ForwardToken(int token, int pos, bool computeLogits) { }
+        public void ForwardToken(int token, int pos, bool computeLogits)
+        {
+            ForwardedTokens.Add((token, pos));
+        }
 
         public void Dispose() { }
     }

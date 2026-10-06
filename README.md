@@ -391,6 +391,7 @@ Glacier embeds a single, self-contained universal fatbinary containing dedicated
 - **Architecture Coverage**: `sm_75` (Turing), `sm_80` (Ampere A100), `sm_86` (Ampere RTX 3060), `sm_89` (Ada Lovelace RTX 4060/4090), `sm_90` (Hopper), with `compute_75` forward-compatible PTX fallback for future architectures (Blackwell / Rubin).
 - **Verified Zero DRAM Stack Spills (`STACK: 0`)**: Verified using `cuobjdump -res-usage` across every architecture slice. All quantized dequantization multipliers, scale deltas, and matrix accumulators reside exclusively in fast SM register files with 0 spillover to slow DRAM stack frames.
 - **Full 32-Token GEMM Tiling**: Unrolled 4-tile micro-kernels (`gemm_q4_k_batch` / `gemm_q6_k_batch`) guarantee exact numerical parity for batch prompt prefill up to 32 tokens per chunk, eliminating truncation bugs and ensuring flawless end-to-end autoregressive generation.
+- **Reproducible Kernel Build Toolchain**: Automated compilation scripts (`src/Glacier.Inference/Gpu/Kernels/build_kernels.bat` and `build_kernels.sh`) build and assemble `kernels.cubin` from `.cu` and `.cuh` sources via `nvcc` targeting `sm_75` through `sm_90` plus forward-compatible `compute_75` PTX.
 
 #### 7. Full Hardware & Routine Equivalence: NVIDIA (CUDA / SASS) vs. AMD (ROCm / HIP & Direct3D 12)
 Glacier enforces strict architectural and routine equivalence across hardware backends. Every core computational routine, memory representation, and driver interaction on NVIDIA hardware has an identical, mathematically equivalent counterpart on AMD hardware:
@@ -723,6 +724,15 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Foundational strided tensor engine with Autograd, hardware GEMM dispatch, and PEFT layers.
 - **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Columnar memory backend for zero-copy feature feeds.
 - **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT deep learning inference microservices.
+
+---
+
+## 🆕 What's New in v1.2.18
+
+- **CPU Quantized SIMD Micro-Benchmarking Suite**: Comprehensive BenchmarkDotNet suite (`Glacier.Inference.Benchmarks`) measuring vector dot products across all supported quantizations (`VecDotQ4_K`, `VecDotQ6_K`, `VecDotQ8_0`, `VecDotIQ4_XS`, `VecDotMXFP4`, `VecDotF32`), multithreaded GEMV (`QuantKernels.MatVecMul` and batched `MatMulBatch` with chunk-sum reuse), and zero-allocation token sampling (`SamplerBenchmarks`).
+- **Direct3D 12 Compute Pipeline Hardening**: Resolved resource barrier transitions between UAV read/write states and eliminated copy-queue sync stalls by leveraging in-queue compute copy commands (`CopyBufferRegion`) in `Gemma4D3D12Model` and `Qwen2D3D12Model.Forward`. Added automated compile validation for Gemma 4 ISWA and Qwen 3 GDN/SSM compute shaders.
+- **Auditable & Reproducible CUDA Fatbinary**: Added automated cross-platform build scripts (`build_kernels.bat` and `build_kernels.sh`) compiling `kernels.cubin` for `sm_75` through `sm_90` with `compute_75` PTX fallback directly from `.cu` and `.cuh` sources.
+- **Speculative Decoding Engine Decoupling & Bug Fix**: Refactored `ModelDraftProvider` to accept `ISpeculativeTarget` instead of concrete `InferenceSession`, corrected position tracking and resolved draft token repetition in verification sequences. 220/220 unit tests passing (100% green).
 
 ---
 

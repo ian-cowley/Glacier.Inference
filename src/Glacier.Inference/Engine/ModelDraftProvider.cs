@@ -9,13 +9,14 @@ using Glacier.Inference.Sampling;
 /// </summary>
 public sealed class ModelDraftProvider : IDraftProvider
 {
-    private readonly InferenceSession _session;
+    private readonly ISpeculativeTarget _session;
     private readonly bool _ownsSession;
     private int _lastContextLen;
+    private int _lastContextToken = -1;
 
-    public InferenceSession Session => _session;
+    public ISpeculativeTarget Session => _session;
 
-    public ModelDraftProvider(InferenceSession session, bool ownsSession = false)
+    public ModelDraftProvider(ISpeculativeTarget session, bool ownsSession = false)
     {
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _ownsSession = ownsSession;
@@ -31,26 +32,32 @@ public sealed class ModelDraftProvider : IDraftProvider
 
         int count = Math.Min(maxDraftTokens, draftTokens.Length);
 
-        // If context changed or rewound, sync draft session
-        if (_lastContextLen != tokens.Length - 1)
+        // If context changed, length diverged, or last token differs, resync draft session via Prefill
+        if (_lastContextLen != tokens.Length || _lastContextToken != tokens[^1])
         {
             _session.Prefill(tokens);
             _lastContextLen = tokens.Length;
+            _lastContextToken = tokens[^1];
         }
 
-        int currentToken = tokens[^1];
         int pos = tokens.Length;
 
-        for (int i = 0; i < count; i++)
+        // The first draft token is sampled from the logits already computed for tokens[^1] during Prefill/Forward
+        int nextToken = _session.SampleNextToken(SamplingOptions.Greedy);
+        draftTokens[0] = nextToken;
+
+        for (int i = 1; i < count; i++)
         {
-            _session.ForwardToken(currentToken, pos, computeLogits: true);
-            int nextToken = _session.SampleNextToken(SamplingOptions.Greedy);
-            draftTokens[i] = nextToken;
-            currentToken = nextToken;
+            _session.ForwardToken(nextToken, pos, computeLogits: true);
             pos++;
+            nextToken = _session.SampleNextToken(SamplingOptions.Greedy);
+            draftTokens[i] = nextToken;
         }
 
-        _lastContextLen = pos;
+        // Forward the final drafted token so the draft model's KV cache and logits are ready
+        _session.ForwardToken(nextToken, pos, computeLogits: true);
+        _lastContextLen = pos + 1;
+        _lastContextToken = nextToken;
         return count;
     }
 

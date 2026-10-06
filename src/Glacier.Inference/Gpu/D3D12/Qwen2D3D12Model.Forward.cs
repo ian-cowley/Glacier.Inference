@@ -281,7 +281,7 @@ public sealed unsafe partial class Qwen2D3D12Model
             // Intermediate stage: copy _dX to _readbackActivation
             if (!outputX.IsEmpty && _readbackActivation != null)
             {
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopySource);
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                 cmd.CopyBufferRegion(_readbackActivation, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
                 cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
             }
@@ -500,9 +500,11 @@ public sealed unsafe partial class Qwen2D3D12Model
                 {
                     // Copy the final token's hidden state into _dX for LM Head evaluation
                     ulong lastTokenOffset = (ulong)((chunkSize - 1) * _dim * sizeof(float));
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
                     cmd.CopyBufferRegion(_dX, 0, _dXBatch, lastTokenOffset, (ulong)(_dim * sizeof(float)));
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
 
                     // Final RMSNorm on final token
                     DispatchRmsNorm(cmd, _dX, _dOutNormWeight!, _dNormX, _dim, _weights.RmsNormEps);
@@ -524,7 +526,7 @@ public sealed unsafe partial class Qwen2D3D12Model
             {
                 if (!outputXBatch.IsEmpty && _readbackActivationBatch != null)
                 {
-                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                     cmd.CopyBufferRegion(_readbackActivationBatch, 0, _dXBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
                     cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
                 }
