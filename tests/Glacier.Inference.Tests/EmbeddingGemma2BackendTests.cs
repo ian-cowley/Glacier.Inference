@@ -18,10 +18,15 @@ public class EmbeddingGemma2BackendTests
 
     private static EmbeddingGemma2Model? TryLoad(EmbeddingDevice dev, int adapter)
     {
+        if (dev == EmbeddingDevice.D3D12 && !OperatingSystem.IsWindows()) return null;
         try
         {
             return EmbeddingGemma2Model.Load(EmbeddingGemma2ModelLocator.Path!,
                 new EmbeddingGemma2Options { Device = dev, AdapterIndex = adapter });
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return null;
         }
         catch (InvalidOperationException e) when (dev == EmbeddingDevice.D3D12 && e.Message.Contains("No hardware DirectX 12"))
         {

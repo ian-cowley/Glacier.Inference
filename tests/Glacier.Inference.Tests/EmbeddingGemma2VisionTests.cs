@@ -131,8 +131,10 @@ public class EmbeddingGemma2VisionTests
     [InlineData(1)]
     public void ImageEmbedding_MatchesReference_OnEachGpu(int adapter)
     {
+        if (!OperatingSystem.IsWindows()) return;
         if (EmbeddingGemma2ModelLocator.Path is null || EmbeddingGemma2MmprojLocator.Path is null) return;
         try { CheckImageEmbedding(EmbeddingDevice.D3D12, adapter); }
+        catch (PlatformNotSupportedException) { }
         catch (InvalidOperationException e) when (e.Message.Contains("No hardware DirectX 12")) { }
     }
 

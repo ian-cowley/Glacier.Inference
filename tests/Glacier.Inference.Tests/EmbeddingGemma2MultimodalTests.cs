@@ -138,6 +138,7 @@ public class EmbeddingGemma2MultimodalTests
     [InlineData(1)]
     public void Audio_Embedding_MatchesReference_OnEachGpu(int adapter)
     {
+        if (!OperatingSystem.IsWindows()) return;
         if (EmbeddingGemma2ModelLocator.Path is null || EmbeddingGemma2MmprojLocator.Path is null) return;
         try
         {
@@ -154,6 +155,7 @@ public class EmbeddingGemma2MultimodalTests
             Assert.InRange(emb.Sum(x => x * x), 0.999f, 1.001f);
             Assert.True(cos > 0.985f, $"Audio cosine on GPU {cos} < 0.985");
         }
+        catch (PlatformNotSupportedException) { }
         catch (InvalidOperationException e) when (e.Message.Contains("No hardware DirectX 12")) { }
     }
 
@@ -192,6 +194,7 @@ public class EmbeddingGemma2MultimodalTests
     [InlineData(1)]
     public void Video_Embedding_MatchesReference_OnEachGpu(int adapter)
     {
+        if (!OperatingSystem.IsWindows()) return;
         if (EmbeddingGemma2ModelLocator.Path is null || EmbeddingGemma2MmprojLocator.Path is null) return;
         try
         {
@@ -217,6 +220,7 @@ public class EmbeddingGemma2MultimodalTests
             Assert.InRange(emb.Sum(x => x * x), 0.999f, 1.001f);
             Assert.True(cos > 0.99f, $"Video cosine on GPU {cos} < 0.99");
         }
+        catch (PlatformNotSupportedException) { }
         catch (InvalidOperationException e) when (e.Message.Contains("No hardware DirectX 12")) { }
     }
 
