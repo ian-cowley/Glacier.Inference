@@ -65,7 +65,6 @@ public static unsafe class VulkanDriver
                 return (NativeLibrary.TryLoad("libvulkan.so", out IntPtr handle) ||
                         NativeLibrary.TryLoad("libvulkan.so.1", out handle)) && handle != IntPtr.Zero;
             }
-            return false;
         }
         catch
         {
