@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0;net10.0-android</TargetFrameworks>
+    <SupportedOSPlatformVersion Condition="$(TargetFramework.Contains('-android'))">24</SupportedOSPlatformVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -30,8 +31,20 @@
     <EmbeddedResource Include="Gpu\Kernels\kernels.cubin" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="!$(TargetFramework.Contains('-android'))">
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
   </ItemGroup>
+
+  <ItemGroup Condition="$(TargetFramework.Contains('-android'))">
+    <Compile Remove="Gpu\D3D12\**" />
+    <Compile Include="Gpu\D3D12\ID3D12Model.cs" />
+    <Compile Remove="Pipeline\D3D12PipelineStage.cs" />
+    <Compile Remove="Embedding\Gemma2D3D12Backend.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Glacier.Inference.Tests" />
+  </ItemGroup>
 </Project>
+

@@ -26,6 +26,9 @@ public sealed unsafe class VulkanContext : IDisposable
     public bool HasCooperativeMatrix { get; }
     public IntPtr DeviceHandle => _device;
     public IntPtr InstanceHandle => _instance;
+    public IntPtr ComputeQueueHandle => _computeQueue;
+    public IntPtr CommandBufferHandle => _commandBuffer;
+    public IntPtr CommandPoolHandle => _commandPool;
 
     public static bool IsSupported
     {
@@ -37,7 +40,7 @@ public sealed unsafe class VulkanContext : IDisposable
                 var appInfo = new VulkanDriver.VkApplicationInfo
                 {
                     sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-                    apiVersion = VulkanDriver.MakeVersion(1, 2, 0)
+                    apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
                 };
                 var createInfo = new VulkanDriver.VkInstanceCreateInfo
                 {
@@ -62,7 +65,7 @@ public sealed unsafe class VulkanContext : IDisposable
     public VulkanContext(int deviceOrdinal = 0)
     {
         if (!VulkanDriver.IsAvailable())
-            throw new PlatformNotSupportedException("Vulkan driver (vulkan-1.dll / libvulkan.so.1) is not installed.");
+            throw new PlatformNotSupportedException("Vulkan driver (vulkan-1.dll / libvulkan.so) is not installed.");
 
         // 1. Create Vulkan Instance
         var appInfo = new VulkanDriver.VkApplicationInfo
@@ -72,7 +75,7 @@ public sealed unsafe class VulkanContext : IDisposable
             applicationVersion = VulkanDriver.MakeVersion(1, 0, 0),
             pEngineName = Marshal.StringToHGlobalAnsi("GlacierEngine"),
             engineVersion = VulkanDriver.MakeVersion(1, 0, 0),
-            apiVersion = VulkanDriver.MakeVersion(1, 2, 0)
+            apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
         };
 
         var createInfo = new VulkanDriver.VkInstanceCreateInfo

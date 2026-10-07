@@ -39,6 +39,14 @@ public static unsafe class VulkanDriver
     public const uint VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002;
     public const uint VK_MEMORY_PROPERTY_HOST_COHERENT_BIT = 0x00000004;
 
+    public const uint VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020;
+    public const int VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
+    public const int VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6;
+    public const int VK_PIPELINE_BIND_POINT_COMPUTE = 1;
+    public const uint VK_ACCESS_SHADER_READ_BIT = 0x00000020;
+    public const uint VK_ACCESS_SHADER_WRITE_BIT = 0x00000040;
+    public const uint VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800;
+
     static VulkanDriver()
     {
         NativeDriverResolver.EnsureRegistered();
@@ -52,10 +60,10 @@ public static unsafe class VulkanDriver
             {
                 return NativeLibrary.TryLoad("vulkan-1.dll", out IntPtr handle) && handle != IntPtr.Zero;
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            else
             {
-                return (NativeLibrary.TryLoad("libvulkan.so.1", out IntPtr handle) ||
-                        NativeLibrary.TryLoad("libvulkan.so", out handle)) && handle != IntPtr.Zero;
+                return (NativeLibrary.TryLoad("libvulkan.so", out IntPtr handle) ||
+                        NativeLibrary.TryLoad("libvulkan.so.1", out handle)) && handle != IntPtr.Zero;
             }
             return false;
         }
@@ -431,6 +439,194 @@ public static unsafe class VulkanDriver
 
     [DllImport(VulkanLib, EntryPoint = "vkEndCommandBuffer")]
     public static extern int EndCommandBuffer(IntPtr commandBuffer);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkShaderModuleCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public nuint codeSize;
+        public uint* pCode;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorSetLayoutBinding
+    {
+        public uint binding;
+        public int descriptorType;
+        public uint descriptorCount;
+        public uint stageFlags;
+        public IntPtr pImmutableSamplers;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorSetLayoutCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public uint bindingCount;
+        public IntPtr pBindings;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPushConstantRange
+    {
+        public uint stageFlags;
+        public uint offset;
+        public uint size;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPipelineLayoutCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public uint setLayoutCount;
+        public IntPtr pSetLayouts;
+        public uint pushConstantRangeCount;
+        public IntPtr pPushConstantRanges;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPipelineShaderStageCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public uint stage;
+        public IntPtr module;
+        public IntPtr pName;
+        public IntPtr pSpecializationInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkComputePipelineCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public VkPipelineShaderStageCreateInfo stage;
+        public IntPtr layout;
+        public IntPtr basePipelineHandle;
+        public int basePipelineIndex;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorPoolSize
+    {
+        public int type;
+        public uint descriptorCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorPoolCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+        public uint maxSets;
+        public uint poolSizeCount;
+        public IntPtr pPoolSizes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorSetAllocateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public IntPtr descriptorPool;
+        public uint descriptorSetCount;
+        public IntPtr pSetLayouts;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkDescriptorBufferInfo
+    {
+        public IntPtr buffer;
+        public ulong offset;
+        public ulong range;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkWriteDescriptorSet
+    {
+        public int sType;
+        public IntPtr pNext;
+        public IntPtr dstSet;
+        public uint dstBinding;
+        public uint dstArrayElement;
+        public uint descriptorCount;
+        public int descriptorType;
+        public IntPtr pImageInfo;
+        public IntPtr pBufferInfo;
+        public IntPtr pTexelBufferView;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkMemoryBarrier
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint srcAccessMask;
+        public uint dstAccessMask;
+    }
+
+    [DllImport(VulkanLib, EntryPoint = "vkCreateShaderModule")]
+    public static extern int CreateShaderModule(IntPtr device, ref VkShaderModuleCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pShaderModule);
+
+    [DllImport(VulkanLib, EntryPoint = "vkDestroyShaderModule")]
+    public static extern void DestroyShaderModule(IntPtr device, IntPtr shaderModule, IntPtr pAllocator);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCreateDescriptorSetLayout")]
+    public static extern int CreateDescriptorSetLayout(IntPtr device, ref VkDescriptorSetLayoutCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pSetLayout);
+
+    [DllImport(VulkanLib, EntryPoint = "vkDestroyDescriptorSetLayout")]
+    public static extern void DestroyDescriptorSetLayout(IntPtr device, IntPtr descriptorSetLayout, IntPtr pAllocator);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCreatePipelineLayout")]
+    public static extern int CreatePipelineLayout(IntPtr device, ref VkPipelineLayoutCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pPipelineLayout);
+
+    [DllImport(VulkanLib, EntryPoint = "vkDestroyPipelineLayout")]
+    public static extern void DestroyPipelineLayout(IntPtr device, IntPtr pipelineLayout, IntPtr pAllocator);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCreateDescriptorPool")]
+    public static extern int CreateDescriptorPool(IntPtr device, ref VkDescriptorPoolCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pDescriptorPool);
+
+    [DllImport(VulkanLib, EntryPoint = "vkDestroyDescriptorPool")]
+    public static extern void DestroyDescriptorPool(IntPtr device, IntPtr descriptorPool, IntPtr pAllocator);
+
+    [DllImport(VulkanLib, EntryPoint = "vkAllocateDescriptorSets")]
+    public static extern int AllocateDescriptorSets(IntPtr device, ref VkDescriptorSetAllocateInfo pAllocateInfo, IntPtr* pDescriptorSets);
+
+    [DllImport(VulkanLib, EntryPoint = "vkUpdateDescriptorSets")]
+    public static extern void UpdateDescriptorSets(IntPtr device, uint descriptorWriteCount, VkWriteDescriptorSet* pDescriptorWrites, uint descriptorCopyCount, IntPtr pDescriptorCopies);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCreateComputePipelines")]
+    public static extern int CreateComputePipelines(IntPtr device, IntPtr pipelineCache, uint createInfoCount, VkComputePipelineCreateInfo* pCreateInfos, IntPtr pAllocator, IntPtr* pPipelines);
+
+    [DllImport(VulkanLib, EntryPoint = "vkDestroyPipeline")]
+    public static extern void DestroyPipeline(IntPtr device, IntPtr pipeline, IntPtr pAllocator);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdBindPipeline")]
+    public static extern void CmdBindPipeline(IntPtr commandBuffer, int pipelineBindPoint, IntPtr pipeline);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdBindDescriptorSets")]
+    public static extern void CmdBindDescriptorSets(IntPtr commandBuffer, int pipelineBindPoint, IntPtr layout, uint firstSet, uint descriptorSetCount, IntPtr* pDescriptorSets, uint dynamicOffsetCount, uint* pDynamicOffsets);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdPushConstants")]
+    public static extern void CmdPushConstants(IntPtr commandBuffer, IntPtr layout, uint stageFlags, uint offset, uint size, void* pValues);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdDispatch")]
+    public static extern void CmdDispatch(IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdPipelineBarrier")]
+    public static extern void CmdPipelineBarrier(IntPtr commandBuffer, uint srcStageMask, uint dstStageMask, uint dependencyFlags, uint memoryBarrierCount, VkMemoryBarrier* pMemoryBarriers, uint bufferMemoryBarrierCount, IntPtr pBufferMemoryBarriers, uint imageMemoryBarrierCount, IntPtr pImageMemoryBarriers);
+
+    [DllImport(VulkanLib, EntryPoint = "vkResetCommandBuffer")]
+    public static extern int ResetCommandBuffer(IntPtr commandBuffer, uint flags);
 
     [DllImport(VulkanLib, EntryPoint = "vkQueueSubmit")]
     public static extern int QueueSubmit(IntPtr queue, uint submitCount, ref VkSubmitInfo pSubmits, IntPtr fence);

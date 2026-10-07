@@ -61,17 +61,33 @@ public static class NativeDriverResolver
                     return handle;
             }
         }
-        else if (libraryName == "vulkan-1.dll")
+        else if (libraryName == "vulkan-1.dll" || libraryName == "libvulkan.so")
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 if (NativeLibrary.TryLoad("vulkan-1.dll", assembly, searchPath, out IntPtr handle))
                     return handle;
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            else
             {
-                if (NativeLibrary.TryLoad("libvulkan.so.1", assembly, searchPath, out IntPtr handle) ||
-                    NativeLibrary.TryLoad("libvulkan.so", assembly, searchPath, out handle))
+                if (NativeLibrary.TryLoad("libvulkan.so", assembly, searchPath, out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libvulkan.so.1", assembly, searchPath, out handle))
+                    return handle;
+            }
+        }
+        else if (libraryName == "libOpenCL.so" || libraryName == "OpenCL.dll")
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                if (NativeLibrary.TryLoad("OpenCL.dll", assembly, searchPath, out IntPtr handle))
+                    return handle;
+            }
+            else
+            {
+                if (NativeLibrary.TryLoad("libOpenCL.so", assembly, searchPath, out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libOpenCL.so.1", assembly, searchPath, out handle) ||
+                    NativeLibrary.TryLoad("/vendor/lib64/libOpenCL.so", assembly, searchPath, out handle) ||
+                    NativeLibrary.TryLoad("/system/vendor/lib64/libOpenCL.so", assembly, searchPath, out handle))
                     return handle;
             }
         }

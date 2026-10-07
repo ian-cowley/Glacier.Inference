@@ -113,6 +113,12 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         string? split = null)
     {
         _gguf = GgufFile.Open(modelPath);
+        if (Embedding.EmbeddingGemma2Model.IsSupported(_gguf))
+        {
+            _gguf.Dispose();
+            throw new NotSupportedException(
+                "'gemma-embedding2' is an encoder-only embedding model. Use Glacier.Inference.Embedding.EmbeddingGemma2Model instead of InferenceSession.");
+        }
         _weights = new ModelWeights(_gguf);
         _maxSeqLen = maxSeqLen;
         _tokenizer = new BpeTokenizer(_gguf);
@@ -170,6 +176,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
+#if !ANDROID
             else if (!_weights.IsMla && (_weights.IsHybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      (targetDevice.Vendor == GpuVendor.Amd || targetDevice.Vendor == GpuVendor.Nvidia || targetDevice.Vendor == GpuVendor.Intel) && OperatingSystem.IsWindows())
             {
@@ -210,6 +217,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
+#endif
             else
             {
                 var settings = GlacierSettings.Load();

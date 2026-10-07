@@ -89,6 +89,7 @@ public sealed class PipelineSession : IDisposable
                         maxSeqLen: maxSeqLen,
                         kvPrecision: kvPrecision);
                 }
+#if !ANDROID
                 else if ((spec.Engine == InferenceEngineType.DirectML || spec.Engine == InferenceEngineType.BareMetal) &&
                          (spec.Device.Vendor == GpuVendor.Amd || spec.Device.Vendor == GpuVendor.Intel) &&
                          OperatingSystem.IsWindows())
@@ -103,6 +104,7 @@ public sealed class PipelineSession : IDisposable
                         maxSeqLen: maxSeqLen,
                         kvPrecision: kvPrecision);
                 }
+#endif
                 else
                 {
                     stages[i] = new CpuPipelineStage(

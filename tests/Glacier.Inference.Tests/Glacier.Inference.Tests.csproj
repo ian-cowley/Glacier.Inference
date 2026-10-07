@@ -23,4 +23,8 @@
     <ProjectReference Include="..\..\src\Glacier.Inference\Glacier.Inference.csproj" />
     <ProjectReference Include="..\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
