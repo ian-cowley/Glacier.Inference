@@ -1,6 +1,7 @@
 namespace Glacier.Inference.Sampling;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 
@@ -49,21 +50,56 @@ public sealed class Sampler
     {
         ArgumentNullException.ThrowIfNull(options);
         if (logits.IsEmpty) throw new ArgumentException("Logits must not be empty.", nameof(logits));
+        if (options.Temperature < 0f || float.IsNaN(options.Temperature))
+            throw new ArgumentOutOfRangeException(nameof(options), options.Temperature, "Temperature must be non-negative.");
+        if (options.TopP < 0f || options.TopP > 1f || float.IsNaN(options.TopP))
+            throw new ArgumentOutOfRangeException(nameof(options), options.TopP, "TopP must be between 0.0 and 1.0.");
+        if (options.RepetitionPenalty <= 0f || float.IsNaN(options.RepetitionPenalty))
+            throw new ArgumentOutOfRangeException(nameof(options), options.RepetitionPenalty, "RepetitionPenalty must be greater than zero.");
+
         int vocabSize = logits.Length;
 
-        // Apply repetition penalty
+        // Apply repetition penalty (each token in recentTokens is penalized at most once)
         if (options.RepetitionPenalty != 1.0f && !recentTokens.IsEmpty)
         {
             float penalty = options.RepetitionPenalty;
-            for (int i = 0; i < recentTokens.Length; i++)
+            if (recentTokens.Length <= 128)
             {
-                int tid = recentTokens[i];
-                if (tid >= 0 && tid < vocabSize)
+                for (int i = 0; i < recentTokens.Length; i++)
                 {
+                    int tid = recentTokens[i];
+                    if ((uint)tid >= (uint)vocabSize) continue;
+
+                    bool seen = false;
+                    for (int j = 0; j < i; j++)
+                    {
+                        if (recentTokens[j] == tid)
+                        {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (seen) continue;
+
                     if (logits[tid] > 0)
                         logits[tid] /= penalty;
                     else
                         logits[tid] *= penalty;
+                }
+            }
+            else
+            {
+                var seen = new HashSet<int>(recentTokens.Length);
+                for (int i = 0; i < recentTokens.Length; i++)
+                {
+                    int tid = recentTokens[i];
+                    if ((uint)tid < (uint)vocabSize && seen.Add(tid))
+                    {
+                        if (logits[tid] > 0)
+                            logits[tid] /= penalty;
+                        else
+                            logits[tid] *= penalty;
+                    }
                 }
             }
         }
@@ -87,60 +123,71 @@ public sealed class Sampler
 
         // TopK <= 0 means "disabled": consider the full vocabulary.
         int k = options.TopK <= 0 ? vocabSize : Math.Min(options.TopK, vocabSize);
+        (int Id, float Logit)[]? rented = null;
         Span<(int Id, float Logit)> candidates = k <= 128
             ? stackalloc (int, float)[k]
-            : new (int, float)[k];
+            : (rented = ArrayPool<(int Id, float Logit)>.Shared.Rent(k)).AsSpan(0, k);
 
-        SelectTopK(logits, k, candidates);
-
-        // Apply temperature only to top-K candidates
-        float invTemp = 1.0f / options.Temperature;
-        for (int i = 0; i < k; i++)
+        try
         {
-            candidates[i].Logit *= invTemp;
-        }
+            SelectTopK(logits, k, candidates);
 
-        // Softmax over top-K candidates (candidates[0] is maxLogit)
-        float maxLogit = candidates[0].Logit;
-        float sumExp = 0f;
-        for (int i = 0; i < k; i++)
-        {
-            float exp = MathF.Exp(candidates[i].Logit - maxLogit);
-            candidates[i].Logit = exp;
-            sumExp += exp;
-        }
-
-        // Degenerate distribution (NaN/Inf logits): fall back to the best candidate.
-        if (!(sumExp > 0f) || !float.IsFinite(sumExp))
-            return candidates[0].Id;
-
-        // Top-P filtering (always keeps at least one token)
-        float invSum = 1.0f / sumExp;
-        float cumProb = 0f;
-        int activeCount = 0;
-
-        for (int i = 0; i < k; i++)
-        {
-            float prob = candidates[i].Logit * invSum;
-            candidates[i].Logit = prob;
-            cumProb += prob;
-            activeCount++;
-            if (cumProb >= options.TopP) break;
-        }
-
-        // Random categorical sampling
-        float r = (float)_random.NextDouble() * cumProb;
-        float acc = 0f;
-        for (int i = 0; i < activeCount; i++)
-        {
-            acc += candidates[i].Logit;
-            if (r <= acc)
+            // Apply temperature only to top-K candidates
+            float invTemp = 1.0f / options.Temperature;
+            for (int i = 0; i < k; i++)
             {
-                return candidates[i].Id;
+                candidates[i].Logit *= invTemp;
+            }
+
+            // Softmax over top-K candidates (candidates[0] is maxLogit)
+            float maxLogit = candidates[0].Logit;
+            float sumExp = 0f;
+            for (int i = 0; i < k; i++)
+            {
+                float exp = MathF.Exp(candidates[i].Logit - maxLogit);
+                candidates[i].Logit = exp;
+                sumExp += exp;
+            }
+
+            // Degenerate distribution (NaN/Inf logits): fall back to the best candidate.
+            if (!(sumExp > 0f) || !float.IsFinite(sumExp))
+                return candidates[0].Id;
+
+            // Top-P filtering (always keeps at least one token)
+            float invSum = 1.0f / sumExp;
+            float cumProb = 0f;
+            int activeCount = 0;
+
+            for (int i = 0; i < k; i++)
+            {
+                float prob = candidates[i].Logit * invSum;
+                candidates[i].Logit = prob;
+                cumProb += prob;
+                activeCount++;
+                if (cumProb >= options.TopP) break;
+            }
+
+            // Random categorical sampling
+            float r = (float)_random.NextDouble() * cumProb;
+            float acc = 0f;
+            for (int i = 0; i < activeCount; i++)
+            {
+                acc += candidates[i].Logit;
+                if (r <= acc)
+                {
+                    return candidates[i].Id;
+                }
+            }
+
+            return candidates[0].Id;
+        }
+        finally
+        {
+            if (rented != null)
+            {
+                ArrayPool<(int Id, float Logit)>.Shared.Return(rented);
             }
         }
-
-        return candidates[0].Id;
     }
 
     private static void SelectTopK(ReadOnlySpan<float> logits, int k, Span<(int Id, float Logit)> heap)

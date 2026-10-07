@@ -1,13 +1,14 @@
 namespace Glacier.Inference.Memory;
 
 using System;
-using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 /// <summary>
 /// Contiguous unmanaged Key-Value Cache for autoregressive Transformer inference.
 /// Zero-allocation ring/linear buffer supporting Grouped Query Attention (GQA).
+/// Instances are NOT thread-safe; single-thread access per generation stream is required.
 /// </summary>
 public sealed unsafe class KVCache : IDisposable
 {
@@ -44,25 +45,36 @@ public sealed unsafe class KVCache : IDisposable
         _vHeadDim = vHeadDim > 0 ? vHeadDim : headDim;
         _maxSeqLen = maxSeqLen;
 
-        _headStrideK = (long)_maxSeqLen * _headDim;
-        _layerStrideK = (long)_nHeadsKv * _headStrideK;
-        long totalElementsK = (long)_layers * _layerStrideK;
-        long totalBytesK = totalElementsK * sizeof(float);
+        checked
+        {
+            _headStrideK = (long)_maxSeqLen * _headDim;
+            _layerStrideK = (long)_nHeadsKv * _headStrideK;
+            long totalElementsK = (long)_layers * _layerStrideK;
+            long totalBytesK = totalElementsK * sizeof(float);
 
-        _headStrideV = (long)_maxSeqLen * _vHeadDim;
-        _layerStrideV = (long)_nHeadsKv * _headStrideV;
-        long totalElementsV = (long)_layers * _layerStrideV;
-        long totalBytesV = totalElementsV * sizeof(float);
+            _headStrideV = (long)_maxSeqLen * _vHeadDim;
+            _layerStrideV = (long)_nHeadsKv * _headStrideV;
+            long totalElementsV = (long)_layers * _layerStrideV;
+            long totalBytesV = totalElementsV * sizeof(float);
 
-        _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesK);
-        _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesV);
+            if (sizeof(nuint) == 4 && (totalBytesK > (long)uint.MaxValue || totalBytesV > (long)uint.MaxValue))
+            {
+                throw new OutOfMemoryException("Requested KV cache size exceeds addressable memory limit.");
+            }
+
+            _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesK);
+            _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytesV);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
-        Debug.Assert(_kBuffer != null, "KVCache disposed");
-        Debug.Assert((uint)layer < (uint)_layers && (uint)headKv < (uint)_nHeadsKv && (uint)pos < (uint)_maxSeqLen);
+        if (_disposed)
+            ThrowDisposed();
+        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv || (uint)pos >= (uint)_maxSeqLen)
+            ThrowOutOfRange(layer, headKv, pos);
+
         long offset = (long)layer * _layerStrideK + (long)headKv * _headStrideK + (long)pos * _headDim;
         return _kBuffer + offset;
     }
@@ -70,10 +82,26 @@ public sealed unsafe class KVCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetValuePtr(int layer, int headKv, int pos)
     {
-        Debug.Assert(_vBuffer != null, "KVCache disposed");
-        Debug.Assert((uint)layer < (uint)_layers && (uint)headKv < (uint)_nHeadsKv && (uint)pos < (uint)_maxSeqLen);
+        if (_disposed)
+            ThrowDisposed();
+        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv || (uint)pos >= (uint)_maxSeqLen)
+            ThrowOutOfRange(layer, headKv, pos);
+
         long offset = (long)layer * _layerStrideV + (long)headKv * _headStrideV + (long)pos * _vHeadDim;
         return _vBuffer + offset;
+    }
+
+    [DoesNotReturn]
+    private static void ThrowDisposed() => throw new ObjectDisposedException(nameof(KVCache));
+
+    [DoesNotReturn]
+    private void ThrowOutOfRange(int layer, int headKv, int pos)
+    {
+        if ((uint)layer >= (uint)_layers)
+            throw new ArgumentOutOfRangeException(nameof(layer), layer, $"Layer must be between 0 and {_layers - 1}.");
+        if ((uint)headKv >= (uint)_nHeadsKv)
+            throw new ArgumentOutOfRangeException(nameof(headKv), headKv, $"HeadKv must be between 0 and {_nHeadsKv - 1}.");
+        throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position must be between 0 and {_maxSeqLen - 1}.");
     }
 
     /// <summary>

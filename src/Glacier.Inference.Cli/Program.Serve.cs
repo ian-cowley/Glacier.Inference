@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -64,7 +65,13 @@ public static partial class Program
             else if (args[i] == "--host" && i + 1 < args.Length)
                 host = args[++i];
             else if (args[i] == "--api-key" && i + 1 < args.Length)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("WARNING: Specifying --api-key on the command line is deprecated for security reasons.");
+                Console.WriteLine("         Set the GLACIER_API_KEY environment variable instead.");
+                Console.ResetColor();
                 apiKey = args[++i];
+            }
             else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
                 device = args[++i];
             else if (args[i] == "--engine" && i + 1 < args.Length)
@@ -124,7 +131,7 @@ public static partial class Program
             kvPrecision = parsedPrecision;
         }
 
-        if (host == "0.0.0.0" || host == "::")
+        if ((host == "0.0.0.0" || host == "::") && string.IsNullOrEmpty(apiKey))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
             Console.WriteLine("WARNING: Server bound to all network interfaces without authentication.");
@@ -220,12 +227,15 @@ public static partial class Program
                 if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
                 {
                     string token = authHeader.Substring(7).Trim();
-                    if (string.Equals(token, apiKey, StringComparison.Ordinal))
-                        authorized = true;
+                    authorized = CryptographicOperations.FixedTimeEquals(
+                        Encoding.UTF8.GetBytes(token),
+                        Encoding.UTF8.GetBytes(apiKey));
                 }
-                else if (!string.IsNullOrEmpty(xApiKey) && string.Equals(xApiKey, apiKey, StringComparison.Ordinal))
+                else if (!string.IsNullOrEmpty(xApiKey))
                 {
-                    authorized = true;
+                    authorized = CryptographicOperations.FixedTimeEquals(
+                        Encoding.UTF8.GetBytes(xApiKey),
+                        Encoding.UTF8.GetBytes(apiKey));
                 }
 
                 if (!authorized)
@@ -277,7 +287,7 @@ public static partial class Program
             }
 
             string prompt = req.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() ?? "" : "";
-            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False && (s.ValueKind != JsonValueKind.True || s.GetBoolean());
+            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False;
 
             if (string.IsNullOrEmpty(prompt))
             {
@@ -327,7 +337,7 @@ public static partial class Program
                     {
                         channel.Writer.Complete();
                     }
-                }, ctx.RequestAborted);
+                });
 
                 await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
                 {
@@ -385,7 +395,7 @@ public static partial class Program
                 return;
             }
 
-            bool stream = req.TryGetProperty("stream", out var s) && s.ValueKind != JsonValueKind.False && (s.ValueKind == JsonValueKind.True || s.GetBoolean());
+            bool stream = req.TryGetProperty("stream", out var s) && (s.ValueKind == JsonValueKind.True || (s.ValueKind != JsonValueKind.False && s.GetBoolean()));
             var options = ParseSamplingOptions(req);
             string formattedPrompt = session.Tokenizer.FormatChat(messages);
             string completionId = $"chatcmpl-{Guid.NewGuid():N}";
@@ -442,7 +452,7 @@ public static partial class Program
                     {
                         channel.Writer.Complete();
                     }
-                }, ctx.RequestAborted);
+                });
 
                 // Initial chunk with assistant role
                 var initialChunk = new
@@ -552,7 +562,7 @@ public static partial class Program
                 return;
             }
 
-            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False && (s.ValueKind != JsonValueKind.True || s.GetBoolean());
+            bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False;
             var options = ParseSamplingOptions(req);
             string formattedPrompt = session.Tokenizer.FormatChat(messages);
 
@@ -595,7 +605,7 @@ public static partial class Program
                     {
                         channel.Writer.Complete();
                     }
-                }, ctx.RequestAborted);
+                });
 
                 await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
                 {

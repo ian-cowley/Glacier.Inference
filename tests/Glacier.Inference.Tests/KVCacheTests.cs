@@ -143,4 +143,25 @@ public unsafe class KVCacheTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new KVCache(layers, heads, dim, seq));
     }
+
+    [Fact]
+    public void KVCache_GetPtr_OutOfRange_Throws()
+    {
+        using var cache = new KVCache(layers: 2, nHeadsKv: 2, headDim: 4, maxSeqLen: 8);
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetKeyPtr(2, 0, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetKeyPtr(0, 2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetKeyPtr(0, 0, 8));
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetValuePtr(2, 0, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetValuePtr(0, 2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => cache.GetValuePtr(0, 0, 8));
+    }
+
+    [Fact]
+    public void KVCache_GetPtr_AfterDispose_Throws()
+    {
+        var cache = new KVCache(layers: 1, nHeadsKv: 1, headDim: 4, maxSeqLen: 4);
+        cache.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => cache.GetKeyPtr(0, 0, 0));
+        Assert.Throws<ObjectDisposedException>(() => cache.GetValuePtr(0, 0, 0));
+    }
 }

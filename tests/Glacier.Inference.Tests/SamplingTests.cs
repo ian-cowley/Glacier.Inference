@@ -101,4 +101,72 @@ public class SamplingTests
         var sampler = new Sampler();
         Assert.Throws<ArgumentException>(() => sampler.Sample(Span<float>.Empty, SamplingOptions.Greedy));
     }
+
+    [Fact]
+    public void RepetitionPenalty_DuplicateTokens_AppliesPenaltyOnlyOnce()
+    {
+        var sampler = new Sampler();
+        float[] logits = [4.0f, 10.0f, 4.0f];
+        // Token 1 appears multiple times in recent history
+        int[] recentWithDuplicates = [1, 1, 1, 1];
+
+        var options = new SamplingOptions
+        {
+            Temperature = 0.0f,
+            RepetitionPenalty = 2.0f
+        };
+
+        sampler.Sample(logits.AsSpan(), options, recentWithDuplicates);
+        // If penalized once: 10.0 / 2.0 = 5.0. If penalized multiple times: 10 / 2^4 = 0.625
+        Assert.Equal(5.0f, logits[1]);
+    }
+
+    [Theory]
+    [InlineData(-0.1f)]
+    [InlineData(float.NaN)]
+    public void InvalidTemperature_Throws(float temp)
+    {
+        var sampler = new Sampler();
+        float[] logits = [1.0f, 2.0f];
+        var opt = new SamplingOptions { Temperature = temp };
+        Assert.Throws<ArgumentOutOfRangeException>(() => sampler.Sample(logits, opt));
+    }
+
+    [Theory]
+    [InlineData(-0.1f)]
+    [InlineData(1.1f)]
+    [InlineData(float.NaN)]
+    public void InvalidTopP_Throws(float topP)
+    {
+        var sampler = new Sampler();
+        float[] logits = [1.0f, 2.0f];
+        var opt = new SamplingOptions { TopP = topP };
+        Assert.Throws<ArgumentOutOfRangeException>(() => sampler.Sample(logits, opt));
+    }
+
+    [Theory]
+    [InlineData(0.0f)]
+    [InlineData(-1.5f)]
+    [InlineData(float.NaN)]
+    public void InvalidRepetitionPenalty_Throws(float rep)
+    {
+        var sampler = new Sampler();
+        float[] logits = [1.0f, 2.0f];
+        var opt = new SamplingOptions { RepetitionPenalty = rep };
+        Assert.Throws<ArgumentOutOfRangeException>(() => sampler.Sample(logits, opt));
+    }
+
+    [Fact]
+    public void LargeK_UsesArrayPool_AndSamplesSuccessfully()
+    {
+        var sampler = new Sampler(seed: 99);
+        // Create 300 candidates (k > 128)
+        float[] logits = new float[300];
+        for (int i = 0; i < logits.Length; i++)
+            logits[i] = (float)i;
+
+        var opt = new SamplingOptions { Temperature = 1.0f, TopK = 200, TopP = 0.95f };
+        int token = sampler.Sample(logits, opt);
+        Assert.InRange(token, 0, 299);
+    }
 }
