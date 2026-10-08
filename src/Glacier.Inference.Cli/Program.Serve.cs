@@ -16,6 +16,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Glacier.Inference.Config;
 using Glacier.Inference.Diagnostics;
@@ -134,8 +135,11 @@ public static partial class Program
         if ((host == "0.0.0.0" || host == "::") && string.IsNullOrEmpty(apiKey))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("WARNING: Server bound to all network interfaces without authentication.");
-            Console.WriteLine("         Ensure firewall rules protect this port from untrusted traffic.");
+            Console.WriteLine("╔═════════════════════════════════════════════════════════════════════════╗");
+            Console.WriteLine("║ ⚠️  SECURITY NOTICE: SERVER IS BOUND TO ALL NETWORK INTERFACES WITHOUT  ║");
+            Console.WriteLine("║     AUTHENTICATION! ANYONE WITH NETWORK ACCESS CAN RUN INFERENCE.       ║");
+            Console.WriteLine("║     TO PROTECT THIS ENDPOINT: Provide --api-key or set GLACIER_API_KEY.  ║");
+            Console.WriteLine("╚═════════════════════════════════════════════════════════════════════════╝");
             Console.ResetColor();
         }
 
@@ -174,6 +178,10 @@ public static partial class Program
         int port = 11434)
     {
         var appBuilder = WebApplication.CreateBuilder();
+        appBuilder.Services.Configure<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions>(options =>
+        {
+            options.Limits.MaxRequestBodySize = 32 * 1024 * 1024; // 32 MB request body limit
+        });
         var app = appBuilder.Build();
         if (port >= 0)
         {
@@ -279,10 +287,16 @@ public static partial class Program
             {
                 req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
             }
-            catch
+            catch (JsonException)
             {
                 ctx.Response.StatusCode = 400;
                 await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
+                return;
+            }
+            catch (BadHttpRequestException)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Bad request or body size limit exceeded.", ctx.RequestAborted);
                 return;
             }
 
@@ -321,7 +335,12 @@ public static partial class Program
                 }
 
                 ctx.Response.ContentType = "application/x-ndjson";
-                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(128)
+                {
+                    SingleWriter = true,
+                    SingleReader = true,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
                 var genTask = Task.Run(async () =>
                 {
                     try
@@ -380,10 +399,16 @@ public static partial class Program
             {
                 req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
             }
-            catch
+            catch (JsonException)
             {
                 ctx.Response.StatusCode = 400;
                 await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
+                return;
+            }
+            catch (BadHttpRequestException)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Bad request or body size limit exceeded.", ctx.RequestAborted);
                 return;
             }
 
@@ -436,7 +461,12 @@ public static partial class Program
                 ctx.Response.ContentType = "text/event-stream";
                 ctx.Response.Headers.CacheControl = "no-cache";
 
-                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(128)
+                {
+                    SingleWriter = true,
+                    SingleReader = true,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
                 var genTask = Task.Run(async () =>
                 {
                     try
@@ -547,10 +577,16 @@ public static partial class Program
             {
                 req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
             }
-            catch
+            catch (JsonException)
             {
                 ctx.Response.StatusCode = 400;
                 await ctx.Response.WriteAsync("Invalid JSON payload.", ctx.RequestAborted);
+                return;
+            }
+            catch (BadHttpRequestException)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("Bad request or body size limit exceeded.", ctx.RequestAborted);
                 return;
             }
 
@@ -589,7 +625,12 @@ public static partial class Program
                 }
 
                 ctx.Response.ContentType = "application/x-ndjson";
-                var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
+                var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(128)
+                {
+                    SingleWriter = true,
+                    SingleReader = true,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
                 var genTask = Task.Run(async () =>
                 {
                     try

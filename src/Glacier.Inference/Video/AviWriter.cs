@@ -1,8 +1,10 @@
 namespace Glacier.Inference.Video;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using Glacier.Inference.Media;
 
 /// <summary>
 /// Pure C# .NET 10 Audio Video Interleave (AVI) Container Serializer.
@@ -26,16 +28,16 @@ public static class AviWriter
         uint microSecPerFrame = (uint)(1_000_000 / Math.Clamp(fps, 1, 120));
 
         // 1. RIFF Header placeholder
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("RIFF"));
+        bw.Write("RIFF"u8);
         long riffLengthPos = fs.Position;
         bw.Write((uint)0); // Will update later
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("AVI "));
+        bw.Write("AVI "u8);
 
         // 2. Main Header LIST 'hdrl'
-        WriteList(bw, "hdrl", () =>
+        using (RiffScope.StartList(fs, bw, "hdrl"u8))
         {
             // 'avih' chunk (Main AVI Header - 56 bytes)
-            WriteChunk(bw, "avih", () =>
+            using (RiffScope.StartChunk(fs, bw, "avih"u8))
             {
                 bw.Write(microSecPerFrame);                       // dwMicroSecPerFrame
                 bw.Write((uint)(frameDataSize * fps));             // dwMaxBytesPerSec
@@ -49,16 +51,16 @@ public static class AviWriter
                 bw.Write((uint)height);                            // dwHeight
                 bw.Write((uint)0); bw.Write((uint)0);              // dwReserved
                 bw.Write((uint)0); bw.Write((uint)0);
-            });
+            }
 
             // 'strl' LIST (Video Stream)
-            WriteList(bw, "strl", () =>
+            using (RiffScope.StartList(fs, bw, "strl"u8))
             {
                 // 'strh' (Stream Header - 56 bytes)
-                WriteChunk(bw, "strh", () =>
+                using (RiffScope.StartChunk(fs, bw, "strh"u8))
                 {
-                    bw.Write(System.Text.Encoding.ASCII.GetBytes("vids")); // fccType
-                    bw.Write(System.Text.Encoding.ASCII.GetBytes("DIB ")); // fccHandler
+                    bw.Write("vids"u8);                                    // fccType
+                    bw.Write("DIB "u8);                                    // fccHandler
                     bw.Write((uint)0);                                     // dwFlags
                     bw.Write((ushort)0);                                   // wPriority
                     bw.Write((ushort)0);                                   // wLanguage
@@ -72,10 +74,10 @@ public static class AviWriter
                     bw.Write((uint)0);                                     // dwSampleSize
                     bw.Write((short)0); bw.Write((short)0);                // rcFrame left, top
                     bw.Write((short)width); bw.Write((short)height);       // rcFrame right, bottom
-                });
+                }
 
                 // 'strf' (Stream Format: BITMAPINFOHEADER - 40 bytes)
-                WriteChunk(bw, "strf", () =>
+                using (RiffScope.StartChunk(fs, bw, "strf"u8))
                 {
                     bw.Write((uint)40);              // biSize
                     bw.Write((int)width);            // biWidth
@@ -86,72 +88,62 @@ public static class AviWriter
                     bw.Write((uint)frameDataSize);   // biSizeImage
                     bw.Write((int)0); bw.Write((int)0); // biXPelsPerMeter, biYPelsPerMeter
                     bw.Write((uint)0); bw.Write((uint)0); // biClrUsed, biClrImportant
-                });
-            });
-        });
+                }
+            }
+        }
 
         // 3. 'movi' LIST (Video Frame Data)
-        var indexEntries = new List<(uint offset, uint size)>(frames.Count);
-        long moviBasePos = 0;
-
-        WriteList(bw, "movi", () =>
+        var indexEntries = ArrayPool<(uint offset, uint size)>.Shared.Rent(frames.Count);
+        try
         {
-            moviBasePos = fs.Position; // Offset reference for idx1
-
-            byte[] dibRow = new byte[rowStride];
-
-            for (int f = 0; f < frames.Count; f++)
+            long moviBasePos;
+            using (RiffScope.StartList(fs, bw, "movi"u8))
             {
-                long chunkStart = fs.Position;
-                uint relativeOffset = (uint)(chunkStart - moviBasePos);
+                moviBasePos = fs.Position; // Offset reference for idx1
 
-                bw.Write(System.Text.Encoding.ASCII.GetBytes("00dc"));
-                bw.Write((uint)frameDataSize);
-
-                byte[] rgb = frames[f];
-
-                // Write bottom-up BGR scanlines
-                for (int y = height - 1; y >= 0; y--)
+                byte[] rentedFrame = ArrayPool<byte>.Shared.Rent(frameDataSize);
+                try
                 {
-                    int srcRow = y * width * 3;
-                    for (int x = 0; x < width; x++)
+                    Span<byte> frameSpan = rentedFrame.AsSpan(0, frameDataSize);
+
+                    for (int f = 0; f < frames.Count; f++)
                     {
-                        byte r = rgb[srcRow + x * 3 + 0];
-                        byte g = rgb[srcRow + x * 3 + 1];
-                        byte b = rgb[srcRow + x * 3 + 2];
+                        long chunkStart = fs.Position;
+                        uint relativeOffset = (uint)(chunkStart - moviBasePos);
 
-                        dibRow[x * 3 + 0] = b; // Blue
-                        dibRow[x * 3 + 1] = g; // Green
-                        dibRow[x * 3 + 2] = r; // Red
+                        bw.Write("00dc"u8);
+                        bw.Write((uint)frameDataSize);
+
+                        MediaKernels.ConvertFrameBottomUp(frames[f], frameSpan, width, height, rowStride);
+                        fs.Write(frameSpan);
+
+                        indexEntries[f] = (relativeOffset, (uint)frameDataSize);
                     }
-
-                    // Pad remaining bytes to 4-byte boundary
-                    for (int p = width * 3; p < rowStride; p++)
-                    {
-                        dibRow[p] = 0;
-                    }
-
-                    bw.Write(dibRow, 0, rowStride);
                 }
-
-                indexEntries.Add((relativeOffset, (uint)frameDataSize));
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rentedFrame);
+                }
             }
-        });
 
-        // 4. 'idx1' Chunk (AVI Index)
-        WriteChunk(bw, "idx1", () =>
-        {
-            byte[] ckid = System.Text.Encoding.ASCII.GetBytes("00dc");
-            uint flags = 0x10; // AVIIF_KEYFRAME
-
-            foreach (var (offset, size) in indexEntries)
+            // 4. 'idx1' Chunk (AVI Index)
+            using (RiffScope.StartChunk(fs, bw, "idx1"u8))
             {
-                bw.Write(ckid);
-                bw.Write(flags);
-                bw.Write(offset);
-                bw.Write(size);
+                uint flags = 0x10; // AVIIF_KEYFRAME
+
+                for (int f = 0; f < frames.Count; f++)
+                {
+                    bw.Write("00dc"u8);
+                    bw.Write(flags);
+                    bw.Write(indexEntries[f].offset);
+                    bw.Write(indexEntries[f].size);
+                }
             }
-        });
+        }
+        finally
+        {
+            ArrayPool<(uint offset, uint size)>.Shared.Return(indexEntries);
+        }
 
         // 5. Update RIFF File Length
         long totalLength = fs.Length;
@@ -159,42 +151,57 @@ public static class AviWriter
         bw.Write((uint)(totalLength - 8));
     }
 
-    private static void WriteList(BinaryWriter bw, string fourCC, Action writeContents)
+    private ref struct RiffScope
     {
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("LIST"));
-        long sizePos = bw.BaseStream.Position;
-        bw.Write((uint)0); // Placeholder
-        bw.Write(System.Text.Encoding.ASCII.GetBytes(fourCC));
+        private readonly Stream _stream;
+        private readonly BinaryWriter _bw;
+        private readonly long _sizePosition;
+        private readonly long _contentStartPosition;
+        private readonly bool _isList;
 
-        long contentStart = bw.BaseStream.Position;
-        writeContents();
-        long contentEnd = bw.BaseStream.Position;
-
-        long listLength = contentEnd - contentStart + 4; // Including fourCC
-        bw.BaseStream.Seek(sizePos, SeekOrigin.Begin);
-        bw.Write((uint)listLength);
-        bw.BaseStream.Seek(contentEnd, SeekOrigin.Begin);
-    }
-
-    private static void WriteChunk(BinaryWriter bw, string fourCC, Action writeContents)
-    {
-        bw.Write(System.Text.Encoding.ASCII.GetBytes(fourCC));
-        long sizePos = bw.BaseStream.Position;
-        bw.Write((uint)0); // Placeholder
-
-        long contentStart = bw.BaseStream.Position;
-        writeContents();
-        long contentEnd = bw.BaseStream.Position;
-
-        long chunkLength = contentEnd - contentStart;
-        bw.BaseStream.Seek(sizePos, SeekOrigin.Begin);
-        bw.Write((uint)chunkLength);
-        bw.BaseStream.Seek(contentEnd, SeekOrigin.Begin);
-
-        // Word alignment padding (if odd byte count)
-        if (chunkLength % 2 != 0)
+        public static RiffScope StartList(Stream stream, BinaryWriter bw, ReadOnlySpan<byte> listType)
         {
-            bw.Write((byte)0);
+            bw.Write("LIST"u8);
+            long sizePos = stream.Position;
+            bw.Write((uint)0); // Placeholder
+            bw.Write(listType);
+            return new RiffScope(stream, bw, sizePos, stream.Position, isList: true);
+        }
+
+        public static RiffScope StartChunk(Stream stream, BinaryWriter bw, ReadOnlySpan<byte> chunkType)
+        {
+            bw.Write(chunkType);
+            long sizePos = stream.Position;
+            bw.Write((uint)0); // Placeholder
+            return new RiffScope(stream, bw, sizePos, stream.Position, isList: false);
+        }
+
+        private RiffScope(Stream stream, BinaryWriter bw, long sizePosition, long contentStartPosition, bool isList)
+        {
+            _stream = stream;
+            _bw = bw;
+            _sizePosition = sizePosition;
+            _contentStartPosition = contentStartPosition;
+            _isList = isList;
+        }
+
+        public void Dispose()
+        {
+            long contentEnd = _stream.Position;
+            long length = contentEnd - _contentStartPosition;
+            if (_isList)
+            {
+                length += 4; // list length includes the 4-byte list type
+            }
+
+            _stream.Seek(_sizePosition, SeekOrigin.Begin);
+            _bw.Write((uint)length);
+            _stream.Seek(contentEnd, SeekOrigin.Begin);
+
+            if (!_isList && (length % 2 != 0))
+            {
+                _bw.Write((byte)0);
+            }
         }
     }
 }

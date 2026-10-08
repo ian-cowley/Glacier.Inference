@@ -208,8 +208,9 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         // 5. Recurrent DeltaNet associative state update across all heads
         int headsPerGroup = _ssmHeads / _ssmGroupCount;
         int dState = _ssmStateDim;
+        float* delta = stackalloc float[dState];
 
-        Parallel.For(0, _ssmHeads, h =>
+        for (int h = 0; h < _ssmHeads; h++)
         {
             int g = h / headsPerGroup;
             float* qHead = qPtr + g * dState;
@@ -227,7 +228,6 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             float beta = 1.0f / (1.0f + MathF.Exp(-bVal));
 
             // Step 1 & 2: Decay recurrent state and retrieve memory: kvMem = (decay * S_{t-1}) * k
-            float* delta = stackalloc float[dState];
             for (int i = 0; i < dState; i++)
             {
                 float kvMem = 0f;
@@ -262,7 +262,7 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
             {
                 QuantKernels.RMSNorm(yHead, layer.SsmNormWeight, yHead, dState, _weights.RmsNormEps);
             }
-        });
+        }
 
         // 6. Gating with SiLU on z: y = y * silu(z)
         for (int i = 0; i < _ssmInnerSize; i++)

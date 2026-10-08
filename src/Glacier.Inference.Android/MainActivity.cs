@@ -54,7 +54,7 @@ public class MainActivity : global::Android.App.Activity
         string vkStatus = VulkanContext.IsSupported ? " | Adreno 660 Vulkan 1.1 GPU Ready" : "";
         var sub = new TextView(this)
         {
-            Text = $"{Build.Manufacturer.ToUpper()} {Build.Model}\nSoC: {Build.Hardware} | {neonStatus}{dotProdStatus}{vkStatus}\nVector128 HW Accelerated: {Vector128.IsHardwareAccelerated}",
+            Text = $"{Build.Manufacturer?.ToUpper() ?? "UNKNOWN"} {Build.Model}\nSoC: {Build.Hardware} | {neonStatus}{dotProdStatus}{vkStatus}\nVector128 HW Accelerated: {Vector128.IsHardwareAccelerated}",
             TextSize = 13
         };
         sub.SetTextColor(Color.Rgb(160, 170, 185));

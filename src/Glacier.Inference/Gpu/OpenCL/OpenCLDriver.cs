@@ -46,11 +46,33 @@ public static unsafe class OpenCLDriver
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                return NativeLibrary.TryLoad("OpenCL.dll", out IntPtr handle) && handle != IntPtr.Zero;
+                if (NativeLibrary.TryLoad("OpenCL.dll", out IntPtr handle) && handle != IntPtr.Zero)
+                {
+                    NativeLibrary.Free(handle);
+                    return true;
+                }
+                return false;
             }
-            return (NativeLibrary.TryLoad("libOpenCL.so", out IntPtr h) ||
-                    NativeLibrary.TryLoad("/vendor/lib64/libOpenCL.so", out h) ||
-                    NativeLibrary.TryLoad("/system/vendor/lib64/libOpenCL.so", out h)) && h != IntPtr.Zero;
+
+            if (NativeLibrary.TryLoad("libOpenCL.so", out IntPtr h) && h != IntPtr.Zero)
+            {
+                NativeLibrary.Free(h);
+                return true;
+            }
+
+            if (NativeLibrary.TryLoad("/vendor/lib64/libOpenCL.so", out h) && h != IntPtr.Zero)
+            {
+                NativeLibrary.Free(h);
+                return true;
+            }
+
+            if (NativeLibrary.TryLoad("/system/vendor/lib64/libOpenCL.so", out h) && h != IntPtr.Zero)
+            {
+                NativeLibrary.Free(h);
+                return true;
+            }
+
+            return false;
         }
         catch
         {

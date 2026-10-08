@@ -135,7 +135,23 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         int qkvDim = qDim + 2 * kvDim;
         _qkvFused = (float*)NativeMemory.AllocZeroed((nuint)(qkvDim * sizeof(float)));
         _qkvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * qkvDim * sizeof(float)));
+
+        _chunkAction = ExecuteAttentionChunk;
     }
+
+    private struct AttentionContext
+    {
+        public int StageLayer;
+        public int ModelLayer;
+        public int Pos;
+        public float* QHeadBase;
+        public float* OutHeadBase;
+        public KVCache KvCache;
+        public int ChunkSize;
+    }
+
+    private AttentionContext _attContext;
+    private readonly Action<int> _chunkAction;
 
     private const int ParallelAttentionSeqThreshold = 256;
 
@@ -152,18 +168,44 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         }
 
         int numChunks = Math.Min(Environment.ProcessorCount, 4);
-        int chunkSize = (_nHeads + numChunks - 1) / numChunks;
-
-        Parallel.For(0, numChunks, chunkIdx =>
+        if (numChunks <= 1)
         {
-            int startHead = chunkIdx * chunkSize;
-            int endHead = Math.Min(startHead + chunkSize, _nHeads);
-
-            for (int h = startHead; h < endHead; h++)
+            for (int h = 0; h < _nHeads; h++)
             {
                 EvaluateSingleHeadAttention(stageLayer, modelLayer, pos, qHeadBase, outHeadBase, kvCache, h);
             }
-        });
+            return;
+        }
+
+        int chunkSize = (_nHeads + numChunks - 1) / numChunks;
+
+        _attContext.StageLayer = stageLayer;
+        _attContext.ModelLayer = modelLayer;
+        _attContext.Pos = pos;
+        _attContext.QHeadBase = qHeadBase;
+        _attContext.OutHeadBase = outHeadBase;
+        _attContext.KvCache = kvCache;
+        _attContext.ChunkSize = chunkSize;
+
+        Parallel.For(0, numChunks, _chunkAction);
+    }
+
+    private void ExecuteAttentionChunk(int chunkIdx)
+    {
+        int startHead = chunkIdx * _attContext.ChunkSize;
+        int endHead = Math.Min(startHead + _attContext.ChunkSize, _nHeads);
+
+        for (int h = startHead; h < endHead; h++)
+        {
+            EvaluateSingleHeadAttention(
+                _attContext.StageLayer,
+                _attContext.ModelLayer,
+                _attContext.Pos,
+                _attContext.QHeadBase,
+                _attContext.OutHeadBase,
+                _attContext.KvCache,
+                h);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]

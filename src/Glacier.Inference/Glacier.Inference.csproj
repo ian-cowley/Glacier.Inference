@@ -11,7 +11,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.2.18</Version>
+    <Version>1.2.19</Version>
 
 
     <Authors>Ian Cowley</Authors>
@@ -30,7 +30,7 @@
     <EmbeddedResource Include="Gpu\Kernels\kernels.cubin" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('windows')) and '$(TargetPlatformIdentifier)' != 'android'">
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
   </ItemGroup>

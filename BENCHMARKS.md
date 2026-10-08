@@ -313,15 +313,17 @@ Glacier.Inference includes a dedicated high-resolution micro-benchmarking projec
 ### 1. Vector Dot Product Micro-Benchmarks (`SimdDotBenchmarks`)
 Evaluates scalar and quantized vector dot product implementations across AVX-512 / AVX2 / ARM NEON SIMD vector units for hidden dimensions `Dim = 3584` and `Dim = 4096`:
 
-| Benchmark Kernel | Format | Elements / Block | Bytes / Block | Effective Bits/Weight | Memory Bandwidth Relative to FP32 | Allocations |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`VecDotF32`** (Baseline) | Full FP32 | 1 | 4 | 32.0 bits | 1.0x (14.3 KB / dot) | 0 B |
-| **`VecDotQ8_0`** | Symmetric Int8 | 32 | 34 | 8.5 bits | **3.76x less bandwidth** (3.8 KB / dot) | 0 B |
-| **`VecDotQ6_K`** | K-Quant Super-Block | 256 | 210 | 6.56 bits | **4.87x less bandwidth** (2.9 KB / dot) | 0 B |
-| **`VecDotQ4_K`** | K-Quant Super-Block | 256 | 144 | 4.5 bits | **7.11x less bandwidth** (2.0 KB / dot) | 0 B |
-| **`VecDotIQ4_XS`** | Non-Linear 4-Bit | 256 | 136 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 0 B |
-| **`VecDotMXFP4`** | Microscaling FP4 | 32 | 17 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 0 B |
-| **`RMSNorm`** | Fused Square-Sum | 256 | — | — | Vectorized reduction & scale | 0 B |
+| Benchmark Kernel | Format | Elements / Block | Bytes / Block | Effective Bits/Weight | Memory Bandwidth Relative to FP32 | Dim=3584 Latency | Dim=4096 Latency | Allocations |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`VecDotF32`** (Baseline) | Full FP32 | 1 | 4 | 32.0 bits | 1.0x (14.3 KB / dot) | 137.0 ns | 157.7 ns | **0 B** |
+| **`VecDotF16`** | Half-Precision FP16 | 1 | 2 | 16.0 bits | 2.0x less bandwidth | 4,644.4 ns | 5,356.5 ns | **0 B** |
+| **`VecDotQ8_0`** | Symmetric Int8 | 32 | 34 | 8.5 bits | **3.76x less bandwidth** (3.8 KB / dot) | 1,034.2 ns | 1,188.6 ns | **0 B** |
+| **`VecDotQ6_K`** | K-Quant Super-Block | 256 | 210 | 6.56 bits | **4.87x less bandwidth** (2.9 KB / dot) | 1,698.3 ns | 1,960.3 ns | **0 B** |
+| **`VecDotQ4_K`** | K-Quant Super-Block | 256 | 144 | 4.5 bits | **7.11x less bandwidth** (2.0 KB / dot) | 1,040.5 ns | 1,176.3 ns | **0 B** |
+| **`VecDotQ4_0`** | Symmetric Int4 | 32 | 18 | 4.5 bits | **7.11x less bandwidth** (2.0 KB / dot) | 1,104.7 ns | 1,261.2 ns | **0 B** |
+| **`VecDotIQ4_XS`** | Non-Linear 4-Bit | 256 | 136 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 1,035.6 ns | 1,178.9 ns | **0 B** |
+| **`VecDotMXFP4`** | Microscaling FP4 | 32 | 17 | 4.25 bits | **7.53x less bandwidth** (1.9 KB / dot) | 1,074.3 ns | 1,216.0 ns | **0 B** |
+| **`RMSNorm`** | Fused Square-Sum | 256 | — | — | Vectorized reduction & scale | 439.9 ns | 544.1 ns | **0 B** |
 
 ### 2. Multithreaded GEMV & Batched GEMM (`GemvBenchmarks`)
 Evaluates row-parallel matrix-vector multiplication (`QuantKernels.MatVecMul`) and batched weight-reuse multiplication (`QuantKernels.MatMulBatch`) across all available CPU threads for a `3584 x 3584` projection matrix:
@@ -336,6 +338,17 @@ Profiles the autoregressive sampling loop across standard frontier vocabulary si
 - **Top-K + Top-P + Temperature**: `stackalloc` candidate buffer for $K \le 128$, in-place min-heap sift-down, and zero-allocation struct comparer (`LogitDescendingComparer`).
 - **Repetition Penalty**: In-place multiplicative logit adjustment over rolling recent token history.
 - **Allocation Profile**: **0 B allocated on GC heap per generated token** across all sampling modes.
+
+| Sampling Configuration | Vocabulary Size | Median Latency | Mean Latency | GC Allocations (Gen 0 / Gen 1 / Heap) |
+| :--- | :---: | :---: | :---: | :---: |
+| **`Sample_Greedy`** | 32,000 | **13.20 μs** | 13.80 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_TopK40_TopP`** | 32,000 | **62.70 μs** | 72.13 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_TopK100_TopP`** | 32,000 | **80.50 μs** | 80.73 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_RepetitionPenalty_TopK40`** | 32,000 | **53.20 μs** | 68.50 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_Greedy`** | 151,936 | **44.85 μs** | 44.65 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_TopK40_TopP`** | 151,936 | **88.80 μs** | 108.97 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_TopK100_TopP`** | 151,936 | **127.80 μs** | 135.80 μs | **0 B** (0.00 / 0.00 / 0.00) |
+| **`Sample_RepetitionPenalty_TopK40`** | 151,936 | **107.60 μs** | 115.67 μs | **0 B** (0.00 / 0.00 / 0.00) |
 
 ### 4. Running the Benchmark Suite
 To execute the microbenchmark suite with BenchmarkDotNet:

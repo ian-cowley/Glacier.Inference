@@ -22,6 +22,8 @@ public unsafe class SimdDotBenchmarks : IDisposable
 
     private byte[] _q4kBytes = null!;
     private byte[] _q80Bytes = null!;
+    private byte[] _q40Bytes = null!;
+    private Half[] _weightF16 = null!;
     private byte[] _q6kBytes = null!;
     private byte[] _iq4xsBytes = null!;
     private byte[] _mxfp4Bytes = null!;
@@ -71,6 +73,26 @@ public unsafe class SimdDotBenchmarks : IDisposable
                 pB[i].Delta = (Half)0.5f;
                 for (int q = 0; q < 32; q++) pB[i].Qs[q] = (sbyte)((q % 7) - 3);
             }
+        }
+
+        // Q4_0: Dim / 32 blocks (18 bytes each: 2-byte Half Delta + 16 bytes nibbles)
+        int nbQ40 = Dim / 32;
+        _q40Bytes = new byte[nbQ40 * sizeof(BlockQ4_0)];
+        fixed (byte* p = _q40Bytes)
+        {
+            var pB = (BlockQ4_0*)p;
+            for (int i = 0; i < nbQ40; i++)
+            {
+                pB[i].Delta = (Half)0.25f;
+                for (int q = 0; q < 16; q++) pB[i].Qs[q] = (byte)(0x21 + (q % 5));
+            }
+        }
+
+        // F16: Dim Half floats
+        _weightF16 = new Half[Dim];
+        for (int i = 0; i < Dim; i++)
+        {
+            _weightF16[i] = (Half)_weightF32[i];
         }
 
         // Q6_K: Dim / 256 super-blocks (210 bytes each)
@@ -143,6 +165,26 @@ public unsafe class SimdDotBenchmarks : IDisposable
         fixed (float* pX = _x)
         {
             return QuantKernels.VecDotQ8_0((BlockQ8_0*)pW, pX, Dim);
+        }
+    }
+
+    [Benchmark]
+    public float VecDotQ4_0()
+    {
+        fixed (byte* pW = _q40Bytes)
+        fixed (float* pX = _x)
+        {
+            return QuantKernels.VecDotQ4_0((BlockQ4_0*)pW, pX, Dim);
+        }
+    }
+
+    [Benchmark]
+    public float VecDotF16()
+    {
+        fixed (Half* pW = _weightF16)
+        fixed (float* pX = _x)
+        {
+            return QuantKernels.VecDotF16(pW, pX, Dim);
         }
     }
 

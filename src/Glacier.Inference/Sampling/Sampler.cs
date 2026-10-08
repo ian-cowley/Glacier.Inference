@@ -62,46 +62,7 @@ public sealed class Sampler
         // Apply repetition penalty (each token in recentTokens is penalized at most once)
         if (options.RepetitionPenalty != 1.0f && !recentTokens.IsEmpty)
         {
-            float penalty = options.RepetitionPenalty;
-            if (recentTokens.Length <= 128)
-            {
-                for (int i = 0; i < recentTokens.Length; i++)
-                {
-                    int tid = recentTokens[i];
-                    if ((uint)tid >= (uint)vocabSize) continue;
-
-                    bool seen = false;
-                    for (int j = 0; j < i; j++)
-                    {
-                        if (recentTokens[j] == tid)
-                        {
-                            seen = true;
-                            break;
-                        }
-                    }
-                    if (seen) continue;
-
-                    if (logits[tid] > 0)
-                        logits[tid] /= penalty;
-                    else
-                        logits[tid] *= penalty;
-                }
-            }
-            else
-            {
-                var seen = new HashSet<int>(recentTokens.Length);
-                for (int i = 0; i < recentTokens.Length; i++)
-                {
-                    int tid = recentTokens[i];
-                    if ((uint)tid < (uint)vocabSize && seen.Add(tid))
-                    {
-                        if (logits[tid] > 0)
-                            logits[tid] /= penalty;
-                        else
-                            logits[tid] *= penalty;
-                    }
-                }
-            }
+            ApplyRepetitionPenalty(logits, recentTokens, options.RepetitionPenalty);
         }
 
         // Greedy sampling if temperature is (near) zero or TopK == 1
@@ -250,6 +211,82 @@ public sealed class Sampler
             else
             {
                 break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies repetition penalty to logits in place with zero heap allocations.
+    /// Each unique token ID in <paramref name="recentTokens"/> is penalized at most once.
+    /// Uses stackalloc or pooled bitsets to eliminate dynamic HashSet allocations on hot decoding loops.
+    /// </summary>
+    public static void ApplyRepetitionPenalty(Span<float> logits, ReadOnlySpan<int> recentTokens, float penalty)
+    {
+        if (penalty == 1.0f || recentTokens.IsEmpty || logits.IsEmpty)
+            return;
+
+        int vocabSize = logits.Length;
+        if (recentTokens.Length <= 128)
+        {
+            for (int i = 0; i < recentTokens.Length; i++)
+            {
+                int tid = recentTokens[i];
+                if ((uint)tid >= (uint)vocabSize) continue;
+
+                bool seen = false;
+                for (int j = 0; j < i; j++)
+                {
+                    if (recentTokens[j] == tid)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) continue;
+
+                if (logits[tid] > 0)
+                    logits[tid] /= penalty;
+                else
+                    logits[tid] *= penalty;
+            }
+        }
+        else
+        {
+            int bitSetWords = (vocabSize + 63) / 64;
+            ulong[]? rentedBitSet = null;
+            Span<ulong> bitSet = bitSetWords <= 512
+                ? stackalloc ulong[bitSetWords]
+                : (rentedBitSet = ArrayPool<ulong>.Shared.Rent(bitSetWords)).AsSpan(0, bitSetWords);
+
+            bitSet.Clear();
+
+            try
+            {
+                for (int i = 0; i < recentTokens.Length; i++)
+                {
+                    int tid = recentTokens[i];
+                    if ((uint)tid >= (uint)vocabSize) continue;
+
+                    int wordIdx = tid >> 6;
+                    ulong bitMask = 1UL << (tid & 63);
+
+                    if ((bitSet[wordIdx] & bitMask) == 0)
+                    {
+                        bitSet[wordIdx] |= bitMask;
+
+                        if (logits[tid] > 0)
+                            logits[tid] /= penalty;
+                        else
+                            logits[tid] *= penalty;
+                    }
+                }
+            }
+            finally
+            {
+                if (rentedBitSet != null)
+                {
+                    ArrayPool<ulong>.Shared.Return(rentedBitSet);
+                }
             }
         }
     }

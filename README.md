@@ -729,6 +729,17 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 
 ---
 
+## 🆕 What's New in v1.2.19
+
+- **Vectorized SIMD Dot Products (`Q4_0` & `F16`)**: Multi-tiered `Vector512` / `AdvSimd` / `Vector256` SIMD dot product implementation for `VecDotQ4_0` delivering $>3.8\times$ throughput speedup (1.26 μs on Dim=4096), alongside unrolled 256-bit FMA vectorization for `VecDotF16`.
+- **Zero-Allocation Token Sampling & Bitsets**: Eradicated heap-allocated `HashSet` in `Sampler.cs` for repetition penalty, switching to stack-allocated and `ArrayPool`-backed rolling bitsets with `stackalloc` scratch candidate buffers, achieving empirical **0 B GC heap allocations per generated token** across 32K and 152K vocabularies.
+- **GPU Inference Pipeline Optimization & Synchronization Pruning**: Eliminated per-layer `vkDeviceWaitIdle` CPU-GPU execution stalls across Vulkan inference pipelines (`Gemma2VulkanBackend`), unified 256-byte aligned constant buffer uploading in Direct3D 12 (`D3D12TensorAlign.UploadAlignedTensor`), and replaced runtime `Stopwatch` object allocations on hot dispatch paths with allocation-free `Stopwatch.GetTimestamp()`.
+- **Vectorized Media Serializers & Frame Buffer Pooling**: Accelerated raw 24-bit RGB-to-BGR bottom-up scanline conversion with hardware SIMD shuffle intrinsics (`Vector128.Shuffle`) in `MediaKernels.cs` and eliminated per-frame heap allocations across `AviWriter`, `BmpWriter`, `GifWriter`, `PngWriter`, and `ApngWriter` via pooled scratch memory.
+- **State Cache Resilience & Sliding Window Attention**: Added ring-buffer physical indexing for sliding window attention in `KVCache.cs`, checkpointing (`SaveState`/`RestoreState`) in `SsmStateCache.cs` for rolling recurrent state integrity, and pruned unreferenced Vortice desktop assemblies from Android mobile targets.
+- **Security Hardening & GGUF Parser Verification**: Enforced `DllImportSearchPath.System32` on Windows native driver resolvers to protect against binary planting, capped memory allocation boundaries and tensor extents in `GgufFile.cs`, and added bounded streaming channels and 32MB payload caps to Kestrel serving endpoints.
+
+---
+
 ## 🆕 What's New in v1.2.18
 
 - **CPU Quantized SIMD Micro-Benchmarking Suite**: Comprehensive BenchmarkDotNet suite (`Glacier.Inference.Benchmarks`) measuring vector dot products across all supported quantizations (`VecDotQ4_K`, `VecDotQ6_K`, `VecDotQ8_0`, `VecDotIQ4_XS`, `VecDotMXFP4`, `VecDotF32`), multithreaded GEMV (`QuantKernels.MatVecMul` and batched `MatMulBatch` with chunk-sum reuse), and zero-allocation token sampling (`SamplerBenchmarks`).

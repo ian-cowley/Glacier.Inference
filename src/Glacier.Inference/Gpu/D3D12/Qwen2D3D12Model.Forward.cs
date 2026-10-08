@@ -77,7 +77,7 @@ public sealed unsafe partial class Qwen2D3D12Model
         int kvDim = _nHeadsKv * _headDim;
 
         // 2. Record full transformer graph into command list
-        var swRec = Stopwatch.StartNew();
+        long startRec = Stopwatch.GetTimestamp();
         _ctx.BeginCommands();
         var cmd = _ctx.CommandList;
 
@@ -102,7 +102,7 @@ public sealed unsafe partial class Qwen2D3D12Model
                 cmd.ResourceBarrierTransition(_dEmbdCache, ResourceStates.CopyDest, ResourceStates.Common);
             }
         }
-        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
 
         int maxTopK = _weights.ExpertUsedCount > 0 ? _weights.ExpertUsedCount : 1;
         int* selectedIndices = stackalloc int[maxTopK];
@@ -275,6 +275,7 @@ public sealed unsafe partial class Qwen2D3D12Model
                     cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
                 }
             }
+            cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
         }
         else
         {
@@ -285,15 +286,19 @@ public sealed unsafe partial class Qwen2D3D12Model
                 cmd.CopyBufferRegion(_readbackActivation, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
                 cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
             }
+            else
+            {
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
+            }
         }
-        swRec.Stop();
+        double recMs = Stopwatch.GetElapsedTime(startRec).TotalMilliseconds;
 
-        var swGpu = Stopwatch.StartNew();
+        long startGpu = Stopwatch.GetTimestamp();
         _ctx.EndCommandsAndExecute();
         _ctx.Synchronize();
-        swGpu.Stop();
+        double gpuMs = Stopwatch.GetElapsedTime(startGpu).TotalMilliseconds;
 
-        LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
+        LastTimings = (recMs, gpuMs);
 
         // 3. Read back logits if last stage, or activation if intermediate stage
         if (IsLastStage)
@@ -408,14 +413,14 @@ public sealed unsafe partial class Qwen2D3D12Model
                 }
             }
 
-            var swRec = Stopwatch.StartNew();
+            long startRec = Stopwatch.GetTimestamp();
             _ctx.BeginCommands();
             var cmd = _ctx.CommandList;
 
             // Copy entire chunk of embeddings/activations into _dXBatch
             cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.Common, ResourceStates.CopyDest);
             cmd.CopyBufferRegion(_dXBatch, 0, _uploadEmbeddingBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
-            cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.Common);
+            cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
 
             if (StartLayer == 0 && _dEmbdCache != null && _embdTokenToSlot != null && _embdCacheTokens != null)
             {
@@ -503,7 +508,7 @@ public sealed unsafe partial class Qwen2D3D12Model
                     cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
                     cmd.CopyBufferRegion(_dX, 0, _dXBatch, lastTokenOffset, (ulong)(_dim * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
                     cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
 
                     // Final RMSNorm on final token
@@ -520,6 +525,11 @@ public sealed unsafe partial class Qwen2D3D12Model
                         cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
                         cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
                     }
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.Common);
                 }
             }
             else
@@ -530,14 +540,18 @@ public sealed unsafe partial class Qwen2D3D12Model
                     cmd.CopyBufferRegion(_readbackActivationBatch, 0, _dXBatch, 0, (ulong)(chunkSize * _dim * sizeof(float)));
                     cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
                 }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.Common);
+                }
             }
 
-            swRec.Stop();
-            var swGpu = Stopwatch.StartNew();
+            double recMs = Stopwatch.GetElapsedTime(startRec).TotalMilliseconds;
+            long startGpu = Stopwatch.GetTimestamp();
             _ctx.EndCommandsAndExecute();
             _ctx.Synchronize();
-            swGpu.Stop();
-            LastTimings = (swRec.Elapsed.TotalMilliseconds, swGpu.Elapsed.TotalMilliseconds);
+            double gpuMs = Stopwatch.GetElapsedTime(startGpu).TotalMilliseconds;
+            LastTimings = (recMs, gpuMs);
 
             if (IsLastStage)
             {

@@ -173,6 +173,7 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
 
     private IntPtr _descPool;
     private IntPtr _setOutputNorm, _setMean;
+    private IntPtr _fence;
 
     private int _capacity;
     private VulkanBuffer? _x0, _x, _normed, _tmp, _q, _k, _v, _attnOut, _ffnGate, _ffnUp, _pleIn, _pleG, _pooled;
@@ -192,6 +193,13 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
 
         try
         {
+            var fenceInfo = new VkFenceCreateInfo
+            {
+                sType = 8, // VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+                flags = 0
+            };
+            CreateFence(_ctx.DeviceHandle, ref fenceInfo, IntPtr.Zero, out _fence);
+
             InitPipelines();
             _dummyBuf = Track(_arena.CreateBuffer(256));
 
@@ -566,7 +574,27 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
         Barrier();
     }
 
-    private void Flush()
+    [StructLayout(LayoutKind.Sequential)]
+    private struct VkFenceCreateInfo
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint flags;
+    }
+
+    [DllImport("vulkan-1.dll", EntryPoint = "vkCreateFence")]
+    private static extern int CreateFence(IntPtr device, ref VkFenceCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pFence);
+
+    [DllImport("vulkan-1.dll", EntryPoint = "vkWaitForFences")]
+    private static extern int WaitForFences(IntPtr device, uint fenceCount, IntPtr* pFences, uint waitAll, ulong timeout);
+
+    [DllImport("vulkan-1.dll", EntryPoint = "vkResetFences")]
+    private static extern int ResetFences(IntPtr device, uint fenceCount, IntPtr* pFences);
+
+    [DllImport("vulkan-1.dll", EntryPoint = "vkDestroyFence")]
+    private static extern void DestroyFence(IntPtr device, IntPtr fence, IntPtr pAllocator);
+
+    private void SubmitAndWait()
     {
         VulkanDriver.EndCommandBuffer(Cmd);
         IntPtr cb = Cmd;
@@ -576,14 +604,19 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
             commandBufferCount = 1,
             pCommandBuffers = (IntPtr)(&cb)
         };
-        VulkanDriver.QueueSubmit(_ctx.ComputeQueueHandle, 1, ref submitInfo, IntPtr.Zero);
-        _ctx.Synchronize();
 
-        var beginInfo = new VulkanDriver.VkCommandBufferBeginInfo
+        if (_fence != IntPtr.Zero)
         {
-            sType = VulkanDriver.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
-        };
-        VulkanDriver.BeginCommandBuffer(Cmd, ref beginInfo);
+            IntPtr f = _fence;
+            ResetFences(_ctx.DeviceHandle, 1, &f);
+            VulkanDriver.QueueSubmit(_ctx.ComputeQueueHandle, 1, ref submitInfo, _fence);
+            WaitForFences(_ctx.DeviceHandle, 1, &f, 1, ulong.MaxValue);
+        }
+        else
+        {
+            VulkanDriver.QueueSubmit(_ctx.ComputeQueueHandle, 1, ref submitInfo, IntPtr.Zero);
+            _ctx.Synchronize();
+        }
     }
 
     // ------------------------------------------------------------------------------ forward
@@ -609,6 +642,7 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
 
             int H = _cfg.Hidden, P = _cfg.PleDim, F = _cfg.FfnDim, heads = _cfg.Heads;
 
+            VulkanDriver.ResetCommandBuffer(Cmd, 0);
             var beginInfo = new VulkanDriver.VkCommandBufferBeginInfo
             {
                 sType = VulkanDriver.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
@@ -648,7 +682,6 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
                 for (uint b0 = 0; b0 < blocks; b0 += chunk)
                 {
                     Dispatch(_pipAttn, _layoutAttn, L.SetAttn, [(uint)n, (uint)heads, (uint)kv, (uint)hd, unchecked((uint)window), b0], Math.Min(chunk, blocks - b0), (uint)heads);
-                    if (blocks > chunk) Flush();
                 }
 
                 // 6. Out Projection + Post-Attn AddNorm
@@ -673,8 +706,6 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
                 { var (gx, gy) = Grid1D((long)n * P); Dispatch(_pipGeluMul, _layoutGeluMul, L.SetGeluMul2, [(uint)((long)n * P)], gx, gy); }
                 Dispatch(_pipGemmQ8, _layoutGemmQ8, L.SetPleProj, [(uint)n, (uint)P, (uint)H, 0u], ogx, qgy);
                 Dispatch(_pipAddNorm, _layoutAddNorm, L.SetPleAddNorm, [(uint)H, (uint)n, AsUint(_cfg.Eps), AsUint(L.OutScale)], (uint)n);
-
-                Flush(); // Short submission per layer for guaranteed OS watchdog / TDR safety
             }
 
             // Output Norm
@@ -684,32 +715,14 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
             if (pooled)
             {
                 Dispatch(_pipMean, _layoutMean, _setMean, [(uint)H, (uint)n], (uint)((H + 255) / 256));
-                VulkanDriver.EndCommandBuffer(Cmd);
-                IntPtr cb = Cmd;
-                var submitInfo = new VulkanDriver.VkSubmitInfo
-                {
-                    sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    commandBufferCount = 1,
-                    pCommandBuffers = (IntPtr)(&cb)
-                };
-                VulkanDriver.QueueSubmit(_ctx.ComputeQueueHandle, 1, ref submitInfo, IntPtr.Zero);
-                _ctx.Synchronize();
+                SubmitAndWait();
 
                 result = new float[H];
                 fixed (float* pr = result) Buffer.MemoryCopy((void*)_pooled!.Mapped, pr, (ulong)H * 4, (ulong)H * 4);
             }
             else
             {
-                VulkanDriver.EndCommandBuffer(Cmd);
-                IntPtr cb = Cmd;
-                var submitInfo = new VulkanDriver.VkSubmitInfo
-                {
-                    sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    commandBufferCount = 1,
-                    pCommandBuffers = (IntPtr)(&cb)
-                };
-                VulkanDriver.QueueSubmit(_ctx.ComputeQueueHandle, 1, ref submitInfo, IntPtr.Zero);
-                _ctx.Synchronize();
+                SubmitAndWait();
 
                 result = new float[(long)n * H];
                 fixed (float* pr = result) Buffer.MemoryCopy((void*)_x!.Mapped, pr, (ulong)result.Length * 4, (ulong)result.Length * 4);
@@ -725,6 +738,12 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
         {
             _disposed = true;
             FreeActivations();
+
+            if (_fence != IntPtr.Zero)
+            {
+                DestroyFence(_ctx.DeviceHandle, _fence, IntPtr.Zero);
+                _fence = IntPtr.Zero;
+            }
 
             if (_descPool != IntPtr.Zero)
             {
@@ -750,7 +769,14 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
 
             for (int i = _owned.Count - 1; i >= 0; i--)
             {
-                try { _owned[i].Dispose(); } catch { }
+                try
+                {
+                    _owned[i].Dispose();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[VulkanBackend] Resource dispose error: {ex.Message}");
+                }
             }
             _owned.Clear();
         }

@@ -1,6 +1,7 @@
 namespace Glacier.Inference.Quant;
 
 using System;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -23,6 +24,7 @@ public static unsafe partial class QuantKernels
     /// </summary>
     public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows, float* xSums)
     {
+        Debug.Assert(nCols > 0 && (nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (type == GgufType.Q4_K && xSums == null && nCols >= 32)
         {
             int nChunks = nCols / 32;
@@ -72,6 +74,7 @@ public static unsafe partial class QuantKernels
         int batchSize,
         float* xSumsBatch = null)
     {
+        Debug.Assert(nCols > 0 && (nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (batchSize == 1)
         {
             MatVecMul(type, weightData, xBatch, yBatch, nCols, nRows, xSumsBatch);

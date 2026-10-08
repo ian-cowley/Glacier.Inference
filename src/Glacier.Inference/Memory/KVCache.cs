@@ -22,6 +22,8 @@ public sealed unsafe class KVCache : IDisposable
     private readonly long _headStrideK;
     private readonly long _headStrideV;
 
+    private int _slidingWindow;
+    private bool _isRingBuffer;
     private float* _kBuffer;
     private float* _vBuffer;
     private bool _disposed;
@@ -32,18 +34,48 @@ public sealed unsafe class KVCache : IDisposable
     public int HeadDim => _headDim;
     public int ValueHeadDim => _vHeadDim;
 
-    public KVCache(int layers, int nHeadsKv, int headDim, int maxSeqLen = 4096, int vHeadDim = -1)
+    public bool IsRingBuffer
+    {
+        get => _isRingBuffer;
+        set => _isRingBuffer = value;
+    }
+
+    public int SlidingWindow
+    {
+        get => _slidingWindow;
+        set
+        {
+            if (value < 0 || value > _maxSeqLen)
+                throw new ArgumentOutOfRangeException(nameof(value), value, $"Sliding window must be between 0 and {_maxSeqLen}.");
+            _slidingWindow = value;
+        }
+    }
+
+    public int EffectiveWindowSize => _slidingWindow > 0 ? _slidingWindow : _maxSeqLen;
+
+    public KVCache(
+        int layers,
+        int nHeadsKv,
+        int headDim,
+        int maxSeqLen = 4096,
+        int vHeadDim = -1,
+        int slidingWindow = 0,
+        bool isRingBuffer = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layers);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(nHeadsKv);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxSeqLen);
+        if (slidingWindow < 0 || slidingWindow > maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(slidingWindow), slidingWindow, $"Sliding window must be between 0 and {maxSeqLen}.");
 
         _layers = layers;
         _nHeadsKv = nHeadsKv;
         _headDim = headDim;
         _vHeadDim = vHeadDim > 0 ? vHeadDim : headDim;
         _maxSeqLen = maxSeqLen;
+        _slidingWindow = slidingWindow;
+        _isRingBuffer = isRingBuffer;
 
         checked
         {
@@ -67,15 +99,37 @@ public sealed unsafe class KVCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// Translates a logical token sequence position to its physical buffer slot.
+    /// In linear mode, positions beyond capacity throw. In ring/sliding-window mode, positions wrap modulo window size.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int GetPhysicalSlot(int pos)
+    {
+        if (pos < 0)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, "Position must be non-negative.");
+
+        if (_isRingBuffer || _slidingWindow > 0)
+        {
+            return pos % EffectiveWindowSize;
+        }
+
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position must be between 0 and {_maxSeqLen - 1}.");
+
+        return pos;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
         if (_disposed)
             ThrowDisposed();
-        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv || (uint)pos >= (uint)_maxSeqLen)
+        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        long offset = (long)layer * _layerStrideK + (long)headKv * _headStrideK + (long)pos * _headDim;
+        int slot = GetPhysicalSlot(pos);
+        long offset = (long)layer * _layerStrideK + (long)headKv * _headStrideK + (long)slot * _headDim;
         return _kBuffer + offset;
     }
 
@@ -84,10 +138,11 @@ public sealed unsafe class KVCache : IDisposable
     {
         if (_disposed)
             ThrowDisposed();
-        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv || (uint)pos >= (uint)_maxSeqLen)
+        if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        long offset = (long)layer * _layerStrideV + (long)headKv * _headStrideV + (long)pos * _vHeadDim;
+        int slot = GetPhysicalSlot(pos);
+        long offset = (long)layer * _layerStrideV + (long)headKv * _headStrideV + (long)slot * _vHeadDim;
         return _vBuffer + offset;
     }
 
@@ -112,14 +167,14 @@ public sealed unsafe class KVCache : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if ((uint)layer >= (uint)_layers)
-            throw new ArgumentOutOfRangeException(nameof(layer));
-        if ((uint)pos >= (uint)_maxSeqLen)
-            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position exceeds KV cache capacity ({_maxSeqLen}).");
+            throw new ArgumentOutOfRangeException(nameof(layer), layer, $"Layer must be between 0 and {_layers - 1}.");
+
+        int slot = GetPhysicalSlot(pos);
 
         for (int h = 0; h < _nHeadsKv; h++)
         {
-            float* kDst = GetKeyPtr(layer, h, pos);
-            float* vDst = GetValuePtr(layer, h, pos);
+            float* kDst = _kBuffer + (long)layer * _layerStrideK + (long)h * _headStrideK + (long)slot * _headDim;
+            float* vDst = _vBuffer + (long)layer * _layerStrideV + (long)h * _headStrideV + (long)slot * _vHeadDim;
 
             Buffer.MemoryCopy(kSrc + h * _headDim, kDst, _headDim * sizeof(float), _headDim * sizeof(float));
             Buffer.MemoryCopy(vSrc + h * _vHeadDim, vDst, _vHeadDim * sizeof(float), _vHeadDim * sizeof(float));

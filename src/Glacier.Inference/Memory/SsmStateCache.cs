@@ -30,6 +30,12 @@ public sealed unsafe class SsmStateCache : IDisposable
 
     public SsmStateCache(int layerCount, int convKernel, int convChannels, int heads, int stateDim)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layerCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(convKernel);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(convChannels);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(heads);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(stateDim);
+
         _layerCount = layerCount;
         _convKernel = convKernel;
         _convChannels = convChannels;
@@ -56,6 +62,10 @@ public sealed unsafe class SsmStateCache : IDisposable
     /// </summary>
     public float* GetConvState(int layerIndex)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)layerIndex >= (uint)_layerCount)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex, $"Layer index must be between 0 and {_layerCount - 1}.");
+
         long perLayerTotal = _layerConvBytes + _layerRecurrentBytes;
         byte* layerPtr = _buffer + (layerIndex * perLayerTotal);
         return (float*)layerPtr;
@@ -67,6 +77,12 @@ public sealed unsafe class SsmStateCache : IDisposable
     /// </summary>
     public float* GetRecurrentState(int layerIndex, int headIndex)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)layerIndex >= (uint)_layerCount)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex, $"Layer index must be between 0 and {_layerCount - 1}.");
+        if ((uint)headIndex >= (uint)_heads)
+            throw new ArgumentOutOfRangeException(nameof(headIndex), headIndex, $"Head index must be between 0 and {_heads - 1}.");
+
         long perLayerTotal = _layerConvBytes + _layerRecurrentBytes;
         byte* layerPtr = _buffer + (layerIndex * perLayerTotal) + _layerConvBytes;
         long headOffset = (long)headIndex * _stateDim * _stateDim * sizeof(float);
@@ -74,11 +90,48 @@ public sealed unsafe class SsmStateCache : IDisposable
     }
 
     /// <summary>
+    /// Copies the entire unmanaged recurrent and conv state buffer into the specified destination span.
+    /// Supports state checkpointing during speculative decoding or conversation branching.
+    /// </summary>
+    public void SaveState(Span<byte> destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((long)destination.Length < _totalBytes)
+        {
+            throw new ArgumentException($"Destination buffer size ({destination.Length}) is smaller than SSM state cache size ({_totalBytes}).", nameof(destination));
+        }
+
+        fixed (byte* dstPtr = destination)
+        {
+            Buffer.MemoryCopy(_buffer, dstPtr, destination.Length, _totalBytes);
+        }
+    }
+
+    /// <summary>
+    /// Restores the entire unmanaged recurrent and conv state buffer from the specified source span.
+    /// Supports recurrent state rollback when speculative decoding draft tokens are rejected.
+    /// </summary>
+    public void RestoreState(ReadOnlySpan<byte> source)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((long)source.Length < _totalBytes)
+        {
+            throw new ArgumentException($"Source buffer size ({source.Length}) is smaller than SSM state cache size ({_totalBytes}).", nameof(source));
+        }
+
+        fixed (byte* srcPtr = source)
+        {
+            Buffer.MemoryCopy(srcPtr, _buffer, _totalBytes, _totalBytes);
+        }
+    }
+
+    /// <summary>
     /// Clears all historical states for a fresh prompt/conversation.
     /// </summary>
     public void Reset()
     {
-        if (_buffer != null && !_disposed)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_buffer != null)
         {
             NativeMemory.Clear(_buffer, (nuint)_totalBytes);
         }
@@ -95,5 +148,11 @@ public sealed unsafe class SsmStateCache : IDisposable
             }
             _disposed = true;
         }
+        GC.SuppressFinalize(this);
+    }
+
+    ~SsmStateCache()
+    {
+        Dispose();
     }
 }

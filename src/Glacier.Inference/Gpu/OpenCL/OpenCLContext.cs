@@ -13,6 +13,9 @@ public sealed unsafe class OpenCLContext : IDisposable
     private IntPtr _device;
     private IntPtr _context;
     private IntPtr _queue;
+    private readonly List<IntPtr> _buffers = new();
+    private readonly List<IntPtr> _kernels = new();
+    private readonly object _lock = new();
     private bool _disposed;
 
     public string PlatformName { get; }
@@ -102,15 +105,35 @@ public sealed unsafe class OpenCLContext : IDisposable
 
     public IntPtr CreateBuffer(nuint byteSize, ulong flags = OpenCLDriver.CL_MEM_READ_WRITE)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         int err = 0;
         IntPtr buf = OpenCLDriver.clCreateBuffer(_context, flags, byteSize, null, &err);
         if (err != OpenCLDriver.CL_SUCCESS || buf == IntPtr.Zero)
             throw new InvalidOperationException($"Failed to allocate {byteSize} bytes on OpenCL GPU: error {err}");
+        lock (_lock)
+        {
+            _buffers.Add(buf);
+        }
         return buf;
+    }
+
+    public void ReleaseBuffer(IntPtr buffer)
+    {
+        if (buffer == IntPtr.Zero) return;
+        bool removed;
+        lock (_lock)
+        {
+            removed = _buffers.Remove(buffer);
+        }
+        if (removed)
+        {
+            OpenCLDriver.clReleaseMemObject(buffer);
+        }
     }
 
     public void WriteBuffer(IntPtr buffer, ReadOnlySpan<byte> hostBytes)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         fixed (byte* p = hostBytes)
         {
             int err = OpenCLDriver.clEnqueueWriteBuffer(_queue, buffer, OpenCLDriver.CL_TRUE, 0, (nuint)hostBytes.Length, p, 0, null, null);
@@ -121,6 +144,7 @@ public sealed unsafe class OpenCLContext : IDisposable
 
     public void ReadBuffer(IntPtr buffer, Span<byte> hostBytes)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         fixed (byte* p = hostBytes)
         {
             int err = OpenCLDriver.clEnqueueReadBuffer(_queue, buffer, OpenCLDriver.CL_TRUE, 0, (nuint)hostBytes.Length, p, 0, null, null);
@@ -131,6 +155,7 @@ public sealed unsafe class OpenCLContext : IDisposable
 
     public IntPtr CompileKernel(string source, string kernelName)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         byte[] srcBytes = Encoding.UTF8.GetBytes(source + "\0");
         fixed (byte* pSrc = srcBytes)
         {
@@ -167,21 +192,80 @@ public sealed unsafe class OpenCLContext : IDisposable
                     OpenCLDriver.clReleaseProgram(prog); // refcount held by kernel
                     if (kErr != OpenCLDriver.CL_SUCCESS)
                         throw new InvalidOperationException($"clCreateKernel '{kernelName}' failed: error {kErr}");
+                    lock (_lock)
+                    {
+                        _kernels.Add(kernel);
+                    }
                     return kernel;
                 }
             }
         }
     }
 
+    public void ReleaseKernel(IntPtr kernel)
+    {
+        if (kernel == IntPtr.Zero) return;
+        bool removed;
+        lock (_lock)
+        {
+            removed = _kernels.Remove(kernel);
+        }
+        if (removed)
+        {
+            OpenCLDriver.clReleaseKernel(kernel);
+        }
+    }
+
     public void Finish() => OpenCLDriver.clFinish(_queue);
 
+    ~OpenCLContext()
+    {
+        Dispose(false);
+    }
+
     public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
     {
         if (!_disposed)
         {
             _disposed = true;
-            if (_queue != IntPtr.Zero) OpenCLDriver.clReleaseCommandQueue(_queue);
-            if (_context != IntPtr.Zero) OpenCLDriver.clReleaseContext(_context);
+
+            lock (_lock)
+            {
+                foreach (var kernel in _kernels)
+                {
+                    if (kernel != IntPtr.Zero)
+                    {
+                        OpenCLDriver.clReleaseKernel(kernel);
+                    }
+                }
+                _kernels.Clear();
+
+                foreach (var buffer in _buffers)
+                {
+                    if (buffer != IntPtr.Zero)
+                    {
+                        OpenCLDriver.clReleaseMemObject(buffer);
+                    }
+                }
+                _buffers.Clear();
+            }
+
+            if (_queue != IntPtr.Zero)
+            {
+                OpenCLDriver.clReleaseCommandQueue(_queue);
+                _queue = IntPtr.Zero;
+            }
+            if (_context != IntPtr.Zero)
+            {
+                OpenCLDriver.clReleaseContext(_context);
+                _context = IntPtr.Zero;
+            }
         }
     }
 }

@@ -1,16 +1,29 @@
 namespace Glacier.Inference.Video;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.Intrinsics;
+using System.Threading.Tasks;
 
 /// <summary>
 /// Pure C# .NET 10 Animated GIF89a Serializer.
 /// Features Netscape 2.0 looping, adaptive Median-Cut 256-color palette quantization,
-/// Floyd-Steinberg error diffusion dithering, and standard LZW variable-length compression.
+/// Floyd-Steinberg error diffusion dithering, SIMD 15-bit color table generation,
+/// and zero-allocation open-addressing LZW variable-length compression.
 /// </summary>
 public static class GifWriter
 {
+    private const int LzwTableSize = 5003;
+
+    private static readonly IComparer<(byte r, byte g, byte b)> SortByR =
+        Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.r.CompareTo(b.r));
+    private static readonly IComparer<(byte r, byte g, byte b)> SortByG =
+        Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.g.CompareTo(b.g));
+    private static readonly IComparer<(byte r, byte g, byte b)> SortByB =
+        Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.b.CompareTo(b.b));
+
     /// <summary>
     /// Saves a sequence of 24-bit RGB frames as an Animated GIF89a file.
     /// </summary>
@@ -25,7 +38,7 @@ public static class GifWriter
         using var bw = new BinaryWriter(fs);
 
         // 1. GIF89a Header
-        bw.Write(new byte[] { (byte)'G', (byte)'I', (byte)'F', (byte)'8', (byte)'9', (byte)'a' });
+        bw.Write("GIF89a"u8);
 
         // 2. Logical Screen Descriptor (10 bytes)
         bw.Write((ushort)width);
@@ -43,7 +56,7 @@ public static class GifWriter
         bw.Write((byte)0x21); // Extension Introducer
         bw.Write((byte)0xFF); // Application Extension Label
         bw.Write((byte)0x0B); // Block Size (11 bytes)
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("NETSCAPE2.0"));
+        bw.Write("NETSCAPE2.0"u8);
         bw.Write((byte)0x03); // Sub-block Length
         bw.Write((byte)0x01); // Loop sub-block ID
         bw.Write((ushort)0);  // Loop count (0 = infinite)
@@ -52,7 +65,18 @@ public static class GifWriter
         // Calculate inter-frame delay in hundredths of a second (100 / fps)
         ushort delayTime = (ushort)Math.Max(1, (int)MathF.Round(100.0f / Math.Clamp(fps, 1, 100)));
 
-        // Pre-build full 15-bit color lookup table for fast lock-free Floyd-Steinberg dithering
+        // Transpose 256 RGB colors into contiguous int arrays for SoA SIMD vectorization
+        int[] palR = new int[256];
+        int[] palG = new int[256];
+        int[] palB = new int[256];
+        for (int c = 0; c < 256; c++)
+        {
+            palR[c] = globalPalette[c * 3 + 0];
+            palG[c] = globalPalette[c * 3 + 1];
+            palB[c] = globalPalette[c * 3 + 2];
+        }
+
+        // Pre-build full 15-bit color lookup table for fast lock-free Floyd-Steinberg dithering using SIMD
         var colorLookup = new byte[32768];
         Parallel.For(0, 32768, idx =>
         {
@@ -62,21 +86,97 @@ public static class GifWriter
 
             int bestIdx = 0;
             int bestDist = int.MaxValue;
-            for (int c = 0; c < 256; c++)
+
+            if (Vector256.IsHardwareAccelerated)
             {
-                int pr = globalPalette[c * 3 + 0];
-                int pg = globalPalette[c * 3 + 1];
-                int pb = globalPalette[c * 3 + 2];
-                int dr = r - pr;
-                int dg = g - pg;
-                int db = b - pb;
-                int dist = dr * dr * 3 + dg * dg * 4 + db * db * 2;
-                if (dist < bestDist)
+                var vr = Vector256.Create(r);
+                var vg = Vector256.Create(g);
+                var vb = Vector256.Create(b);
+                var wR = Vector256.Create(3);
+                var wG = Vector256.Create(4);
+                var wB = Vector256.Create(2);
+
+                for (int c = 0; c < 256; c += 8)
                 {
-                    bestDist = dist;
-                    bestIdx = c;
+                    var pr = Vector256.LoadUnsafe(ref palR[c]);
+                    var pg = Vector256.LoadUnsafe(ref palG[c]);
+                    var pb = Vector256.LoadUnsafe(ref palB[c]);
+
+                    var dr = vr - pr;
+                    var dg = vg - pg;
+                    var db = vb - pb;
+
+                    var dist = dr * dr * wR + dg * dg * wG + db * db * wB;
+
+                    if (Vector256.LessThanAny(dist, Vector256.Create(bestDist)))
+                    {
+                        for (int i = 0; i < 8; i++)
+                        {
+                            int d = dist.GetElement(i);
+                            if (d < bestDist)
+                            {
+                                bestDist = d;
+                                bestIdx = c + i;
+                                if (d == 0) goto Found;
+                            }
+                        }
+                    }
                 }
             }
+            else if (Vector128.IsHardwareAccelerated)
+            {
+                var vr = Vector128.Create(r);
+                var vg = Vector128.Create(g);
+                var vb = Vector128.Create(b);
+                var wR = Vector128.Create(3);
+                var wG = Vector128.Create(4);
+                var wB = Vector128.Create(2);
+
+                for (int c = 0; c < 256; c += 4)
+                {
+                    var pr = Vector128.LoadUnsafe(ref palR[c]);
+                    var pg = Vector128.LoadUnsafe(ref palG[c]);
+                    var pb = Vector128.LoadUnsafe(ref palB[c]);
+
+                    var dr = vr - pr;
+                    var dg = vg - pg;
+                    var db = vb - pb;
+
+                    var dist = dr * dr * wR + dg * dg * wG + db * db * wB;
+
+                    if (Vector128.LessThanAny(dist, Vector128.Create(bestDist)))
+                    {
+                        for (int i = 0; i < 4; i++)
+                        {
+                            int d = dist.GetElement(i);
+                            if (d < bestDist)
+                            {
+                                bestDist = d;
+                                bestIdx = c + i;
+                                if (d == 0) goto Found;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for (int c = 0; c < 256; c++)
+                {
+                    int dr = r - palR[c];
+                    int dg = g - palG[c];
+                    int db = b - palB[c];
+                    int dist = dr * dr * 3 + dg * dg * 4 + db * db * 2;
+                    if (dist < bestDist)
+                    {
+                        bestDist = dist;
+                        bestIdx = c;
+                        if (dist == 0) break;
+                    }
+                }
+            }
+
+        Found:
             colorLookup[idx] = (byte)bestIdx;
         });
 
@@ -172,11 +272,11 @@ public static class GifWriter
 
             // Sort samples within this box along the longest axis
             if (axis == 0)
-                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.r.CompareTo(b.r)));
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, SortByR);
             else if (axis == 1)
-                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.g.CompareTo(b.g)));
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, SortByG);
             else
-                samples.Sort(boxToSplit.Start, boxToSplit.Count, Comparer<(byte r, byte g, byte b)>.Create((a, b) => a.b.CompareTo(b.b)));
+                samples.Sort(boxToSplit.Start, boxToSplit.Count, SortByB);
 
             // Split at median
             int half = boxToSplit.Count / 2;
@@ -306,30 +406,6 @@ public static class GifWriter
                 int key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
                 byte palIdx = colorLookup[key];
 
-                if (palIdx == 0xFF)
-                {
-                    // Compute nearest color by squared Euclidean distance
-                    int bestIdx = 0;
-                    int bestDist = int.MaxValue;
-
-                    for (int p = 0; p < 256; p++)
-                    {
-                        int dr = r - palette[p * 3 + 0];
-                        int dg = g - palette[p * 3 + 1];
-                        int db = b - palette[p * 3 + 2];
-                        int dist = dr * dr + dg * dg + db * db;
-                        if (dist < bestDist)
-                        {
-                            bestDist = dist;
-                            bestIdx = p;
-                            if (dist == 0) break;
-                        }
-                    }
-
-                    palIdx = (byte)bestIdx;
-                    colorLookup[key] = palIdx;
-                }
-
                 indices[y * width + x] = palIdx;
 
                 // Quantization error
@@ -377,99 +453,148 @@ public static class GifWriter
         int codeSize = initCodeSize + 1;   // 9 bits initially
         int codeLimit = 1 << codeSize;
 
-        using var bitStream = new MemoryStream();
-        uint bitAccumulator = 0;
-        int bitsInAccumulator = 0;
+        var bitWriter = new LzwBitWriter(bw, stackalloc byte[256]);
 
-        void WriteBits(int code, int size)
+        int[] hashKeys = ArrayPool<int>.Shared.Rent(LzwTableSize);
+        int[] hashCodes = ArrayPool<int>.Shared.Rent(LzwTableSize);
+        hashKeys.AsSpan(0, LzwTableSize).Fill(-1);
+
+        try
         {
-            bitAccumulator |= (uint)(code << bitsInAccumulator);
-            bitsInAccumulator += size;
-            while (bitsInAccumulator >= 8)
+            // Send Clear Code
+            bitWriter.WriteBits(clearCode, codeSize);
+
+            int curPrefix = -1;
+
+            for (int i = 0; i < indexedPixels.Length; i++)
             {
-                bitStream.WriteByte((byte)(bitAccumulator & 0xFF));
-                bitAccumulator >>= 8;
-                bitsInAccumulator -= 8;
-            }
-        }
+                byte k = indexedPixels[i];
 
-        // LZW Prefix Tree / Hash Map
-        var dictionary = new Dictionary<int, int>(4096);
-
-        // Send Clear Code
-        WriteBits(clearCode, codeSize);
-
-        int curPrefix = -1;
-
-        for (int i = 0; i < indexedPixels.Length; i++)
-        {
-            byte k = indexedPixels[i];
-
-            if (curPrefix == -1)
-            {
-                curPrefix = k;
-                continue;
-            }
-
-            int key = (curPrefix << 8) | k;
-
-            if (dictionary.TryGetValue(key, out int foundCode))
-            {
-                curPrefix = foundCode;
-            }
-            else
-            {
-                WriteBits(curPrefix, codeSize);
-
-                if (nextCode < 4096)
+                if (curPrefix == -1)
                 {
-                    dictionary[key] = nextCode++;
-                    if (nextCode > codeLimit && codeSize < 12)
+                    curPrefix = k;
+                    continue;
+                }
+
+                int key = (curPrefix << 8) | k;
+                int h = (int)((uint)key % LzwTableSize);
+                bool found = false;
+
+                while (hashKeys[h] != -1)
+                {
+                    if (hashKeys[h] == key)
                     {
-                        codeSize++;
-                        codeLimit = 1 << codeSize;
+                        curPrefix = hashCodes[h];
+                        found = true;
+                        break;
                     }
-                }
-                else
-                {
-                    // Reset dictionary
-                    WriteBits(clearCode, codeSize);
-                    dictionary.Clear();
-                    codeSize = initCodeSize + 1;
-                    codeLimit = 1 << codeSize;
-                    nextCode = eoiCode + 1;
+                    h++;
+                    if (h >= LzwTableSize) h = 0;
                 }
 
-                curPrefix = k;
+                if (!found)
+                {
+                    bitWriter.WriteBits(curPrefix, codeSize);
+
+                    if (nextCode < 4096)
+                    {
+                        hashKeys[h] = key;
+                        hashCodes[h] = nextCode++;
+                        if (nextCode > codeLimit && codeSize < 12)
+                        {
+                            codeSize++;
+                            codeLimit = 1 << codeSize;
+                        }
+                    }
+                    else
+                    {
+                        // Reset dictionary
+                        bitWriter.WriteBits(clearCode, codeSize);
+                        hashKeys.AsSpan(0, LzwTableSize).Fill(-1);
+                        codeSize = initCodeSize + 1;
+                        codeLimit = 1 << codeSize;
+                        nextCode = eoiCode + 1;
+                    }
+
+                    curPrefix = k;
+                }
+            }
+
+            if (curPrefix != -1)
+            {
+                bitWriter.WriteBits(curPrefix, codeSize);
+            }
+
+            // Send End of Information code
+            bitWriter.WriteBits(eoiCode, codeSize);
+
+            // Flush remaining bits and sub-block
+            bitWriter.Flush();
+
+            // Block Terminator
+            bw.Write((byte)0x00);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(hashKeys);
+            ArrayPool<int>.Shared.Return(hashCodes);
+        }
+    }
+
+    private ref struct LzwBitWriter
+    {
+        private readonly BinaryWriter _bw;
+        private readonly Span<byte> _subBlock;
+        private int _subBlockLen;
+        private uint _bitAccumulator;
+        private int _bitsInAccumulator;
+
+        public LzwBitWriter(BinaryWriter bw, Span<byte> subBlock)
+        {
+            _bw = bw;
+            _subBlock = subBlock;
+            _subBlockLen = 0;
+            _bitAccumulator = 0;
+            _bitsInAccumulator = 0;
+        }
+
+        public void WriteBits(int code, int size)
+        {
+            _bitAccumulator |= (uint)(code << _bitsInAccumulator);
+            _bitsInAccumulator += size;
+            while (_bitsInAccumulator >= 8)
+            {
+                _subBlock[1 + _subBlockLen++] = (byte)(_bitAccumulator & 0xFF);
+                if (_subBlockLen == 255)
+                {
+                    _subBlock[0] = 255;
+                    _bw.Write(_subBlock);
+                    _subBlockLen = 0;
+                }
+                _bitAccumulator >>= 8;
+                _bitsInAccumulator -= 8;
             }
         }
 
-        if (curPrefix != -1)
+        public void Flush()
         {
-            WriteBits(curPrefix, codeSize);
+            if (_bitsInAccumulator > 0)
+            {
+                _subBlock[1 + _subBlockLen++] = (byte)(_bitAccumulator & 0xFF);
+                if (_subBlockLen == 255)
+                {
+                    _subBlock[0] = 255;
+                    _bw.Write(_subBlock);
+                    _subBlockLen = 0;
+                }
+            }
+
+            if (_subBlockLen > 0)
+            {
+                _subBlock[0] = (byte)_subBlockLen;
+                _bw.Write(_subBlock.Slice(0, 1 + _subBlockLen));
+                _subBlockLen = 0;
+            }
         }
-
-        // Send End of Information code
-        WriteBits(eoiCode, codeSize);
-
-        // Flush remaining bits
-        if (bitsInAccumulator > 0)
-        {
-            bitStream.WriteByte((byte)(bitAccumulator & 0xFF));
-        }
-
-        // Package output into sub-blocks of up to 255 bytes
-        byte[] compressedBytes = bitStream.ToArray();
-        int offset = 0;
-        while (offset < compressedBytes.Length)
-        {
-            int blockSize = Math.Min(255, compressedBytes.Length - offset);
-            bw.Write((byte)blockSize);
-            bw.Write(compressedBytes, offset, blockSize);
-            offset += blockSize;
-        }
-
-        // Block Terminator
-        bw.Write((byte)0x00);
     }
 }

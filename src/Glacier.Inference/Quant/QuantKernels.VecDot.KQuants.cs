@@ -85,6 +85,7 @@ public static unsafe partial class QuantKernels
 
     /// <summary>
     /// Computes dot product between a Q4_0 quantized row and a float vector x of length k.
+    /// Hardware-accelerated with Vector512, AdvSimd, Vector256, and scalar fallback.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static float VecDotQ4_0(BlockQ4_0* row, float* x, int k)
@@ -98,11 +99,72 @@ public static unsafe partial class QuantKernels
             byte* q = row[i].Qs;
             float blockSum = 0f;
 
-            for (int l = 0; l < 16; ++l)
+            if (Vector512.IsHardwareAccelerated)
             {
-                int q0 = (q[l] & 0x0F) - 8;
-                int q1 = (q[l] >> 4) - 8;
-                blockSum += q0 * x[l] + q1 * x[l + 16];
+                var vqLow = Vector512.Create(
+                    (float)((q[0] & 0x0F) - 8), (float)((q[1] & 0x0F) - 8), (float)((q[2] & 0x0F) - 8), (float)((q[3] & 0x0F) - 8),
+                    (float)((q[4] & 0x0F) - 8), (float)((q[5] & 0x0F) - 8), (float)((q[6] & 0x0F) - 8), (float)((q[7] & 0x0F) - 8),
+                    (float)((q[8] & 0x0F) - 8), (float)((q[9] & 0x0F) - 8), (float)((q[10] & 0x0F) - 8), (float)((q[11] & 0x0F) - 8),
+                    (float)((q[12] & 0x0F) - 8), (float)((q[13] & 0x0F) - 8), (float)((q[14] & 0x0F) - 8), (float)((q[15] & 0x0F) - 8));
+                var vqHigh = Vector512.Create(
+                    (float)((q[0] >> 4) - 8), (float)((q[1] >> 4) - 8), (float)((q[2] >> 4) - 8), (float)((q[3] >> 4) - 8),
+                    (float)((q[4] >> 4) - 8), (float)((q[5] >> 4) - 8), (float)((q[6] >> 4) - 8), (float)((q[7] >> 4) - 8),
+                    (float)((q[8] >> 4) - 8), (float)((q[9] >> 4) - 8), (float)((q[10] >> 4) - 8), (float)((q[11] >> 4) - 8),
+                    (float)((q[12] >> 4) - 8), (float)((q[13] >> 4) - 8), (float)((q[14] >> 4) - 8), (float)((q[15] >> 4) - 8));
+                var vxLow = Vector512.Load(x);
+                var vxHigh = Vector512.Load(x + 16);
+                var vAcc = Vector512.FusedMultiplyAdd(vxLow, vqLow, vxHigh * vqHigh);
+                blockSum = Vector512.Sum(vAcc);
+            }
+            else if (AdvSimd.IsSupported)
+            {
+                var vAcc = Vector128<float>.Zero;
+                for (int l = 0; l < 16; l += 4)
+                {
+                    var vxLow = Vector128.Load(x + l);
+                    var vxHigh = Vector128.Load(x + l + 16);
+                    var vqLow = Vector128.Create(
+                        (float)((q[l + 0] & 0x0F) - 8), (float)((q[l + 1] & 0x0F) - 8),
+                        (float)((q[l + 2] & 0x0F) - 8), (float)((q[l + 3] & 0x0F) - 8));
+                    var vqHigh = Vector128.Create(
+                        (float)((q[l + 0] >> 4) - 8), (float)((q[l + 1] >> 4) - 8),
+                        (float)((q[l + 2] >> 4) - 8), (float)((q[l + 3] >> 4) - 8));
+                    vAcc = AdvSimd.FusedMultiplyAdd(vAcc, vxLow, vqLow);
+                    vAcc = AdvSimd.FusedMultiplyAdd(vAcc, vxHigh, vqHigh);
+                }
+                blockSum = Vector128.Sum(vAcc);
+            }
+            else if (Vector256.IsHardwareAccelerated)
+            {
+                var vqLow0 = Vector256.Create(
+                    (float)((q[0] & 0x0F) - 8), (float)((q[1] & 0x0F) - 8), (float)((q[2] & 0x0F) - 8), (float)((q[3] & 0x0F) - 8),
+                    (float)((q[4] & 0x0F) - 8), (float)((q[5] & 0x0F) - 8), (float)((q[6] & 0x0F) - 8), (float)((q[7] & 0x0F) - 8));
+                var vqLow1 = Vector256.Create(
+                    (float)((q[8] & 0x0F) - 8), (float)((q[9] & 0x0F) - 8), (float)((q[10] & 0x0F) - 8), (float)((q[11] & 0x0F) - 8),
+                    (float)((q[12] & 0x0F) - 8), (float)((q[13] & 0x0F) - 8), (float)((q[14] & 0x0F) - 8), (float)((q[15] & 0x0F) - 8));
+                var vqHigh0 = Vector256.Create(
+                    (float)((q[0] >> 4) - 8), (float)((q[1] >> 4) - 8), (float)((q[2] >> 4) - 8), (float)((q[3] >> 4) - 8),
+                    (float)((q[4] >> 4) - 8), (float)((q[5] >> 4) - 8), (float)((q[6] >> 4) - 8), (float)((q[7] >> 4) - 8));
+                var vqHigh1 = Vector256.Create(
+                    (float)((q[8] >> 4) - 8), (float)((q[9] >> 4) - 8), (float)((q[10] >> 4) - 8), (float)((q[11] >> 4) - 8),
+                    (float)((q[12] >> 4) - 8), (float)((q[13] >> 4) - 8), (float)((q[14] >> 4) - 8), (float)((q[15] >> 4) - 8));
+
+                var vxLow0 = Vector256.Load(x + 0);
+                var vxLow1 = Vector256.Load(x + 8);
+                var vxHigh0 = Vector256.Load(x + 16);
+                var vxHigh1 = Vector256.Load(x + 24);
+
+                blockSum = Vector256.Dot(vxLow0, vqLow0) + Vector256.Dot(vxLow1, vqLow1) +
+                           Vector256.Dot(vxHigh0, vqHigh0) + Vector256.Dot(vxHigh1, vqHigh1);
+            }
+            else
+            {
+                for (int l = 0; l < 16; ++l)
+                {
+                    int q0 = (q[l] & 0x0F) - 8;
+                    int q1 = (q[l] >> 4) - 8;
+                    blockSum += q0 * x[l] + q1 * x[l + 16];
+                }
             }
 
             sum += d * blockSum;
@@ -114,24 +176,55 @@ public static unsafe partial class QuantKernels
 
     /// <summary>
     /// Computes dot product between FP16 row and float vector x of length k.
+    /// Hardware-accelerated with Vector512, Vector256 (Widen / ConvertToSingle), and scalar fallback.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static float VecDotF16(Half* row, float* x, int k)
     {
         float sum = 0f;
         int i = 0;
-        if (Vector256.IsHardwareAccelerated)
+
+        if (Vector256.IsHardwareAccelerated && k >= 16)
         {
-            int vecLimit = k - 8;
-            for (; i <= vecLimit; i += 8)
+            var acc0 = Vector256<float>.Zero;
+            var acc1 = Vector256<float>.Zero;
+            int limit16 = k - 16;
+            for (; i <= limit16; i += 16)
             {
-                var vx = Vector256.Load(x + i);
-                var vr = Vector256.Create(
+                var vr0 = Vector256.Create(
                     (float)row[i + 0], (float)row[i + 1], (float)row[i + 2], (float)row[i + 3],
                     (float)row[i + 4], (float)row[i + 5], (float)row[i + 6], (float)row[i + 7]);
-                sum += Vector256.Dot(vx, vr);
+                var vr1 = Vector256.Create(
+                    (float)row[i + 8], (float)row[i + 9], (float)row[i + 10], (float)row[i + 11],
+                    (float)row[i + 12], (float)row[i + 13], (float)row[i + 14], (float)row[i + 15]);
+
+                var vx0 = Vector256.Load(x + i);
+                var vx1 = Vector256.Load(x + i + 8);
+
+                if (Fma.IsSupported)
+                {
+                    acc0 = Fma.MultiplyAdd(vx0, vr0, acc0);
+                    acc1 = Fma.MultiplyAdd(vx1, vr1, acc1);
+                }
+                else
+                {
+                    acc0 += vx0 * vr0;
+                    acc1 += vx1 * vr1;
+                }
             }
+            sum += Vector256.Sum(acc0 + acc1);
         }
+
+        if (Vector256.IsHardwareAccelerated && (k - i) >= 8)
+        {
+            var vr = Vector256.Create(
+                (float)row[i + 0], (float)row[i + 1], (float)row[i + 2], (float)row[i + 3],
+                (float)row[i + 4], (float)row[i + 5], (float)row[i + 6], (float)row[i + 7]);
+            var vx = Vector256.Load(x + i);
+            sum += Vector256.Dot(vx, vr);
+            i += 8;
+        }
+
         for (; i < k; i++)
         {
             sum += (float)row[i] * x[i];

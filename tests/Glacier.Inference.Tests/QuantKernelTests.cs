@@ -455,5 +455,69 @@ public unsafe class QuantKernelTests
             Assert.Equal(41.0f, dot, 1e-4f);
         }
     }
+
+    [Fact]
+    public void VecDotQ4_0_MatchesExpected_And_Dequantized()
+    {
+        const int k = 64; // 2 blocks of 32
+        BlockQ4_0[] blocks = new BlockQ4_0[2];
+        blocks[0].Delta = (Half)1.5f;
+        blocks[1].Delta = (Half)2.0f;
+
+        for (int l = 0; l < 16; l++)
+        {
+            blocks[0].Qs[l] = (byte)((l & 0x0F) | (((15 - l) & 0x0F) << 4));
+            blocks[1].Qs[l] = (byte)(((l * 3) & 0x0F) | (((l * 7) & 0x0F) << 4));
+        }
+
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 5) - 2.0f;
+
+        // Compute expected scalar dot
+        float expectedDot = 0f;
+        for (int b = 0; b < 2; b++)
+        {
+            float d = (float)blocks[b].Delta;
+            float blockSum = 0f;
+            for (int l = 0; l < 16; l++)
+            {
+                int q0 = (blocks[b].Qs[l] & 0x0F) - 8;
+                int q1 = (blocks[b].Qs[l] >> 4) - 8;
+                blockSum += q0 * x[b * 32 + l] + q1 * x[b * 32 + l + 16];
+            }
+            expectedDot += d * blockSum;
+        }
+
+        fixed (BlockQ4_0* pB = blocks)
+        fixed (float* pX = x)
+        {
+            float actualDot = QuantKernels.VecDotQ4_0(pB, pX, k);
+            Assert.Equal(expectedDot, actualDot, 1e-3f);
+        }
+    }
+
+    [Fact]
+    public void VecDotF16_MatchesReference()
+    {
+        const int k = 64;
+        Half[] h = new Half[k];
+        float[] x = new float[k];
+        float expectedDot = 0f;
+
+        for (int i = 0; i < k; i++)
+        {
+            float f = (i * 0.25f) - 4.0f;
+            h[i] = (Half)f;
+            x[i] = (i % 7) * 0.5f;
+            expectedDot += (float)h[i] * x[i];
+        }
+
+        fixed (Half* pH = h)
+        fixed (float* pX = x)
+        {
+            float actualDot = QuantKernels.VecDotF16(pH, pX, k);
+            Assert.Equal(expectedDot, actualDot, 1e-3f);
+        }
+    }
 }
 

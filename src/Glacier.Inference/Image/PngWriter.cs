@@ -1,12 +1,15 @@
 namespace Glacier.Inference.Image;
 
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
 using System.IO.Compression;
+using System.Runtime.CompilerServices;
 
 /// <summary>
 /// Pure C# .NET 10 Portable Network Graphics (PNG) 24-bit RGB serializer.
-/// Implements standard W3C PNG specification with zero external dependencies.
+/// Implements standard W3C PNG specification with zero external dependencies and zero-allocation chunk streaming.
 /// </summary>
 public static class PngWriter
 {
@@ -18,90 +21,90 @@ public static class PngWriter
         using var bw = new BinaryWriter(fs);
 
         // 1. Standard PNG Signature (8 bytes)
-        bw.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A });
+        ReadOnlySpan<byte> pngSignature = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        bw.Write(pngSignature);
 
         // 2. IHDR Chunk (Image Header)
-        byte[] ihdrData = new byte[13];
-        WriteBigEndian(ihdrData, 0, (uint)width);
-        WriteBigEndian(ihdrData, 4, (uint)height);
+        Span<byte> ihdrData = stackalloc byte[13];
+        BinaryPrimitives.WriteUInt32BigEndian(ihdrData.Slice(0, 4), (uint)width);
+        BinaryPrimitives.WriteUInt32BigEndian(ihdrData.Slice(4, 4), (uint)height);
         ihdrData[8] = 8; // Bit depth: 8 bits per channel
         ihdrData[9] = 2; // Color type: 2 (RGB truecolor)
         ihdrData[10] = 0; // Compression method: 0 (deflate)
         ihdrData[11] = 0; // Filter method: 0 (standard adaptive)
         ihdrData[12] = 0; // Interlace method: 0 (non-interlaced)
-        WriteChunk(bw, "IHDR", ihdrData);
+        WriteChunk(bw, "IHDR"u8, ihdrData);
 
         // 3. IDAT Chunk (ZLib Compressed Scanlines with filter byte 0)
-        using (var compressedMs = new MemoryStream())
+        int rowLength = width * 3;
+        int filteredRowLen = 1 + rowLength;
+        byte[] rentedRow = ArrayPool<byte>.Shared.Rent(filteredRowLen);
+        try
         {
+            Span<byte> filteredRow = rentedRow.AsSpan(0, filteredRowLen);
+            filteredRow[0] = 0; // Filter type: None
+
+            using var compressedMs = new MemoryStream();
             using (var zlib = new ZLibStream(compressedMs, CompressionLevel.Optimal, leaveOpen: true))
             {
-                int rowLength = width * 3;
-                byte[] filteredRow = new byte[1 + rowLength];
-                filteredRow[0] = 0; // Filter type: None
-
                 for (int y = 0; y < height; y++)
                 {
                     int srcOffset = y * rowLength;
-                    rgbPixels.Slice(srcOffset, rowLength).CopyTo(filteredRow.AsSpan(1));
-                    zlib.Write(filteredRow, 0, filteredRow.Length);
+                    rgbPixels.Slice(srcOffset, rowLength).CopyTo(filteredRow.Slice(1));
+                    zlib.Write(filteredRow);
                 }
             }
 
-            WriteChunk(bw, "IDAT", compressedMs.ToArray());
+            ReadOnlySpan<byte> compressedSpan = compressedMs.TryGetBuffer(out ArraySegment<byte> seg)
+                ? seg.AsSpan()
+                : compressedMs.ToArray();
+
+            WriteChunk(bw, "IDAT"u8, compressedSpan);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rentedRow);
         }
 
         // 4. IEND Chunk (Image End)
-        WriteChunk(bw, "IEND", Array.Empty<byte>());
+        WriteChunk(bw, "IEND"u8, ReadOnlySpan<byte>.Empty);
     }
 
-    private static void WriteChunk(BinaryWriter bw, string typeStr, byte[] data)
+    private static void WriteChunk(BinaryWriter bw, ReadOnlySpan<byte> type, ReadOnlySpan<byte> data)
     {
         uint length = (uint)data.Length;
-        byte[] typeBytes = System.Text.Encoding.ASCII.GetBytes(typeStr);
+        Span<byte> lenBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(lenBytes, length);
+        bw.Write(lenBytes);
 
-        // Write length (big-endian)
-        bw.Write(SwapEndian(length));
+        bw.Write(type);
 
-        // Write type
-        bw.Write(typeBytes);
-
-        // Write data
-        if (data.Length > 0)
+        if (!data.IsEmpty)
         {
             bw.Write(data);
         }
 
-        // Calculate CRC32 over type + data
         uint crc = 0xFFFFFFFF;
-        for (int i = 0; i < typeBytes.Length; i++)
+        crc = UpdateCrc(crc, type);
+        if (!data.IsEmpty)
         {
-            crc = (crc >> 8) ^ CrcTable[(crc ^ typeBytes[i]) & 0xFF];
+            crc = UpdateCrc(crc, data);
         }
+        crc ^= 0xFFFFFFFF;
+
+        Span<byte> crcBytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(crcBytes, crc);
+        bw.Write(crcBytes);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint UpdateCrc(uint crc, ReadOnlySpan<byte> data)
+    {
         for (int i = 0; i < data.Length; i++)
         {
             crc = (crc >> 8) ^ CrcTable[(crc ^ data[i]) & 0xFF];
         }
-        crc ^= 0xFFFFFFFF;
-
-        // Write CRC (big-endian)
-        bw.Write(SwapEndian(crc));
-    }
-
-    private static void WriteBigEndian(byte[] buffer, int offset, uint value)
-    {
-        buffer[offset]     = (byte)((value >> 24) & 0xFF);
-        buffer[offset + 1] = (byte)((value >> 16) & 0xFF);
-        buffer[offset + 2] = (byte)((value >> 8) & 0xFF);
-        buffer[offset + 3] = (byte)(value & 0xFF);
-    }
-
-    private static uint SwapEndian(uint value)
-    {
-        return ((value & 0x000000FF) << 24) |
-               ((value & 0x0000FF00) << 8) |
-               ((value & 0x00FF0000) >> 8) |
-               ((value & 0xFF000000) >> 24);
+        return crc;
     }
 
     private static uint[] InitializeCrcTable()
