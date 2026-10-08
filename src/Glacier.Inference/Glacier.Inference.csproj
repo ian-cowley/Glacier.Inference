@@ -30,7 +30,7 @@
     <EmbeddedResource Include="Gpu\Kernels\kernels.cubin" />
   </ItemGroup>
 
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('windows')) and '$(TargetPlatformIdentifier)' != 'android'">
+  <ItemGroup>
     <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
     <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
   </ItemGroup>
