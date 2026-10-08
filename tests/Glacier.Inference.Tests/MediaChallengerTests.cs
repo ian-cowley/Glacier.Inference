@@ -229,8 +229,9 @@ public class MediaChallengerTests
             GifWriter.SaveGif(tmpFile, [complexFrame], w, h, fps: 8);
             Assert.True(File.Exists(tmpFile));
 
-            using (var img = System.Drawing.Image.FromFile(tmpFile))
+            if (OperatingSystem.IsWindows())
             {
+                using var img = System.Drawing.Image.FromFile(tmpFile);
                 Assert.Equal(w, img.Width);
                 Assert.Equal(h, img.Height);
                 using var bmp = new System.Drawing.Bitmap(img);
@@ -357,17 +358,20 @@ public class MediaChallengerTests
             GifWriter.SaveGif(tmpFile, [frame], w, h, fps: 10);
             Assert.True(File.Exists(tmpFile));
 
-            using var img = System.Drawing.Image.FromFile(tmpFile);
-            Assert.Equal(w, img.Width);
-            Assert.Equal(h, img.Height);
-
-            using var bmp = new System.Drawing.Bitmap(img);
-            for (int y = 0; y < h; y++)
+            if (OperatingSystem.IsWindows())
             {
-                for (int x = 0; x < w; x++)
+                using var img = System.Drawing.Image.FromFile(tmpFile);
+                Assert.Equal(w, img.Width);
+                Assert.Equal(h, img.Height);
+
+                using var bmp = new System.Drawing.Bitmap(img);
+                for (int y = 0; y < h; y++)
                 {
-                    var p = bmp.GetPixel(x, y);
-                    Assert.True(p.A > 0);
+                    for (int x = 0; x < w; x++)
+                    {
+                        var p = bmp.GetPixel(x, y);
+                        Assert.True(p.A > 0);
+                    }
                 }
             }
         }
@@ -380,6 +384,8 @@ public class MediaChallengerTests
     [Fact]
     public void GifWriter_GdiPlus_17x31_VerifyAllPixels()
     {
+        if (!OperatingSystem.IsWindows()) return;
+
         int w = 17, h = 31;
         byte[] frame = GenerateTestPattern(w, h);
         string tmpFile = Path.Combine(Path.GetTempPath(), $"glacier_gdi_1731_{Guid.NewGuid():N}.gif");
@@ -423,20 +429,23 @@ public class MediaChallengerTests
             GifWriter.SaveGif(tmpFile, frames, w, h, fps: 12);
             Assert.True(File.Exists(tmpFile));
 
-            using var img = System.Drawing.Image.FromFile(tmpFile);
-            Assert.Equal(w, img.Width);
-            Assert.Equal(h, img.Height);
-
-            var dimension = new System.Drawing.Imaging.FrameDimension(img.FrameDimensionsList[0]);
-            int frameCount = img.GetFrameCount(dimension);
-            Assert.Equal(numFrames, frameCount);
-
-            for (int f = 0; f < frameCount; f++)
+            if (OperatingSystem.IsWindows())
             {
-                img.SelectActiveFrame(dimension, f);
-                using var bmp = new System.Drawing.Bitmap(img);
-                var p = bmp.GetPixel(0, 0);
-                Assert.True(p.A > 0);
+                using var img = System.Drawing.Image.FromFile(tmpFile);
+                Assert.Equal(w, img.Width);
+                Assert.Equal(h, img.Height);
+
+                var dimension = new System.Drawing.Imaging.FrameDimension(img.FrameDimensionsList[0]);
+                int frameCount = img.GetFrameCount(dimension);
+                Assert.Equal(numFrames, frameCount);
+
+                for (int f = 0; f < frameCount; f++)
+                {
+                    img.SelectActiveFrame(dimension, f);
+                    using var bmp = new System.Drawing.Bitmap(img);
+                    var p = bmp.GetPixel(0, 0);
+                    Assert.True(p.A > 0);
+                }
             }
         }
         finally
@@ -448,6 +457,8 @@ public class MediaChallengerTests
     [Fact]
     public void GifWriter_SystemDrawingGdiPlus_CanDecodeGif()
     {
+        if (!OperatingSystem.IsWindows()) return;
+
         int w = 64;
         int h = 64;
         var frames = new List<byte[]> { GenerateTestPattern(w, h, 1), GenerateTestPattern(w, h, 2) };
@@ -471,6 +482,8 @@ public class MediaChallengerTests
     [Fact]
     public void GifWriter_SystemDrawingGdiPlus_LargeImage512x512()
     {
+        if (!OperatingSystem.IsWindows()) return;
+
         int w = 512;
         int h = 512;
         byte[] complexFrame = new byte[w * h * 3];
@@ -553,8 +566,9 @@ public class MediaChallengerTests
                     // 3. GIF
                     GifWriter.SaveGif(gifPath, apngFrames, w, h, fps: 10);
                     Assert.True(File.Exists(gifPath));
-                    using (var img = System.Drawing.Image.FromFile(gifPath))
+                    if (OperatingSystem.IsWindows())
                     {
+                        using var img = System.Drawing.Image.FromFile(gifPath);
                         Assert.Equal(w, img.Width);
                         Assert.Equal(h, img.Height);
                         var dimension = new System.Drawing.Imaging.FrameDimension(img.FrameDimensionsList[0]);

@@ -362,22 +362,25 @@ public class MediaCornerCaseChallengerTests
             GifWriter.SaveGif(tmpFile, frames, width, height, fps: 10);
             Assert.True(File.Exists(tmpFile));
 
-            // Standard Windows GDI+ GIF decoder test
-            using var img = Image.FromFile(tmpFile);
-            Assert.Equal(width, img.Width);
-            Assert.Equal(height, img.Height);
-
-            var dimension = new FrameDimension(img.FrameDimensionsList[0]);
-            int frameCount = img.GetFrameCount(dimension);
-            Assert.Equal(numFrames, frameCount);
-
-            // Select and verify each frame in GDI+
-            for (int f = 0; f < numFrames; f++)
+            if (OperatingSystem.IsWindows())
             {
-                img.SelectActiveFrame(dimension, f);
-                using var bmp = new Bitmap(img);
-                Assert.Equal(width, bmp.Width);
-                Assert.Equal(height, bmp.Height);
+                // Standard Windows GDI+ GIF decoder test
+                using var img = Image.FromFile(tmpFile);
+                Assert.Equal(width, img.Width);
+                Assert.Equal(height, img.Height);
+
+                var dimension = new FrameDimension(img.FrameDimensionsList[0]);
+                int frameCount = img.GetFrameCount(dimension);
+                Assert.Equal(numFrames, frameCount);
+
+                // Select and verify each frame in GDI+
+                for (int f = 0; f < numFrames; f++)
+                {
+                    img.SelectActiveFrame(dimension, f);
+                    using var bmp = new Bitmap(img);
+                    Assert.Equal(width, bmp.Width);
+                    Assert.Equal(height, bmp.Height);
+                }
             }
         }
         finally
