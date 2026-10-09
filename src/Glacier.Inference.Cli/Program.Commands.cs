@@ -12,6 +12,7 @@ using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Audio;
+using Glacier.Inference.Audio.Kitten;
 using Glacier.Inference.Config;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Engine;
@@ -191,9 +192,39 @@ public static partial class Program
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("=========================================================================================================");
-            Console.WriteLine("                     GLACIER.INFERENCE: KOKORO TTS VOICE ROSTER (USA & BRITISH)                          ");
+            Console.WriteLine("                GLACIER.INFERENCE: KITTENTTS NEURAL VOICES & KOKORO ROSTER                               ");
             Console.WriteLine("=========================================================================================================");
             Console.ResetColor();
+
+            try
+            {
+                using var kitten = KittenTtsEngine.CreateDefault();
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine(">> KittenTTS / StyleTTS 2 Distilled Neural Voices (24kHz CD Quality):");
+                Console.ResetColor();
+                Console.WriteLine($"{"Voice ID",-14} | {"Display Name",-22} | {"Gender",-8} | {"Description",-40}");
+                Console.WriteLine(new string('-', 90));
+                var kittenMeta = new Dictionary<string, (string Name, string Gender, string Desc)>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["bella"] = ("Bella", "Female", "Warm, clear, natural American female voice"),
+                    ["bruno"] = ("Bruno", "Male", "Deep, grounded, authoritative American male voice"),
+                    ["hugo"] = ("Hugo", "Male", "Classical, articulate British male orator"),
+                    ["jasper"] = ("Jasper", "Male", "Conversational, engaging American male baritone"),
+                    ["kiki"] = ("Kiki", "Female", "Youthful, expressive, bright female voice"),
+                    ["leo"] = ("Leo", "Male", "Smooth, refined, conversational British male voice"),
+                    ["luna"] = ("Luna", "Female", "Gentle, melodious, clear storytelling female voice"),
+                    ["rosie"] = ("Rosie", "Female", "Articulate, friendly British female voice")
+                };
+                foreach (var v in kitten.AvailableVoices)
+                {
+                    (string Name, string Gender, string Desc) meta = kittenMeta.TryGetValue(v, out var m) ? m : (v, "Unknown", "Custom neural voice profile");
+                    Console.WriteLine($"{v,-14} | {meta.Name,-22} | {meta.Gender,-8} | {meta.Desc}");
+                }
+                Console.WriteLine(new string('-', 90));
+                Console.WriteLine();
+            }
+            catch { }
+
             Console.WriteLine($"{"Voice ID",-14} | {"Display Name",-22} | {"Accent",-10} | {"Gender",-8} | {"Base F0",-8} | {"Description",-32}");
             Console.WriteLine(new string('-', 105));
 
@@ -220,7 +251,8 @@ public static partial class Program
 
             string text = args[1];
             string outPath = "speech.wav";
-            KokoroVoice voice = KokoroVoice.AfHeart;
+            string rawVoice = "bella";
+            string engine = "auto";
             float speed = 1.0f;
             bool play = false;
 
@@ -236,41 +268,82 @@ public static partial class Program
                 }
                 else if (args[i] is "--voice" or "-v" && i + 1 < args.Length)
                 {
-                    string v = args[++i].ToLowerInvariant();
-                    voice = v switch
-                    {
-                        // USA Female
-                        "af_heart" or "heart" => KokoroVoice.AfHeart,
-                        "af_bella" or "bella" => KokoroVoice.AfBella,
-                        "af_sarah" or "sarah" => KokoroVoice.AfSarah,
-                        "af_sky" or "sky" => KokoroVoice.AfSky,
-
-                        // USA Male
-                        "am_adam" or "adam" => KokoroVoice.AmAdam,
-                        "am_michael" or "michael" => KokoroVoice.AmMichael,
-                        "am_echo" or "echo" => KokoroVoice.AmEcho,
-                        "am_eric" or "eric" => KokoroVoice.AmEric,
-
-                        // British Female
-                        "bf_emma" or "emma" => KokoroVoice.BfEmma,
-                        "bf_isabella" or "isabella" => KokoroVoice.BfIsabella,
-                        "bf_alice" or "alice" => KokoroVoice.BfAlice,
-                        "bf_lily" or "lily" => KokoroVoice.BfLily,
-
-                        // British Male
-                        "bm_george" or "george" => KokoroVoice.BmGeorge,
-                        "bm_lewis" or "lewis" => KokoroVoice.BmLewis,
-                        "bm_daniel" or "daniel" => KokoroVoice.BmDaniel,
-                        "bm_fable" or "fable" => KokoroVoice.BmFable,
-
-                        _ => KokoroVoice.AfHeart
-                    };
+                    rawVoice = args[++i].ToLowerInvariant();
+                }
+                else if (args[i] is "--engine" or "-e" && i + 1 < args.Length)
+                {
+                    engine = args[++i].ToLowerInvariant();
                 }
                 else if (args[i] is "--speed" or "-s" && i + 1 < args.Length)
                 {
                     if (float.TryParse(args[++i], out var s)) speed = s;
                 }
             }
+
+            // Check if KittenTTS neural engine is available
+            KittenTtsEngine? kittenEngine = null;
+            try
+            {
+                kittenEngine = KittenTtsEngine.CreateDefault();
+            }
+            catch { }
+
+            string voiceStr = rawVoice.ToLowerInvariant();
+            bool isKittenVoice = kittenEngine != null && (kittenEngine.AvailableVoices.Contains(voiceStr) || voiceStr is "bella" or "bruno" or "jasper" or "hugo" or "kiki" or "leo" or "luna" or "rosie" || engine == "kitten");
+
+            if (kittenEngine != null && (isKittenVoice || engine != "kokoro"))
+            {
+                if (!kittenEngine.AvailableVoices.Contains(voiceStr)) voiceStr = "bella";
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"[KittenTTS Neural Engine] Synthesizing '{text}'");
+                Console.ResetColor();
+                Console.WriteLine($"   Architecture: StyleTTS 2 Distilled (100% Pure C# .NET 10 SIMD)");
+                Console.WriteLine($"   Voice:        {voiceStr} (24kHz CD Quality)");
+                Console.WriteLine($"   Cadence:      {speed:F2}x Speed");
+
+                var swKitten = Stopwatch.StartNew();
+                float[] kSamples = kittenEngine.Synthesize(text, voiceStr, speed);
+                swKitten.Stop();
+
+                float durSec = (float)kSamples.Length / kittenEngine.SampleRate;
+                float kRtf = durSec / (float)swKitten.Elapsed.TotalSeconds;
+
+                WavWriter.WritePcm16(outPath, kSamples, kittenEngine.SampleRate, 1);
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"[Success] Synthesized {durSec:F2}s of 24kHz neural audio in {swKitten.ElapsedMilliseconds}ms ({kRtf:F1}x Real-Time) -> '{outPath}'");
+                Console.ResetColor();
+
+                if (play)
+                {
+                    Console.WriteLine("[Audio] Playing audio through speakers...");
+                    AudioPlayer.PlayFile(outPath, wait: true);
+                }
+                kittenEngine.Dispose();
+                return 0;
+            }
+
+            // Fallback to legacy Kokoro formant engine
+            KokoroVoice voice = rawVoice switch
+            {
+                "af_heart" or "heart" => KokoroVoice.AfHeart,
+                "af_bella" or "bella" => KokoroVoice.AfBella,
+                "af_sarah" or "sarah" => KokoroVoice.AfSarah,
+                "af_sky" or "sky" => KokoroVoice.AfSky,
+                "am_adam" or "adam" => KokoroVoice.AmAdam,
+                "am_michael" or "michael" => KokoroVoice.AmMichael,
+                "am_echo" or "echo" => KokoroVoice.AmEcho,
+                "am_eric" or "eric" => KokoroVoice.AmEric,
+                "bf_emma" or "emma" => KokoroVoice.BfEmma,
+                "bf_isabella" or "isabella" => KokoroVoice.BfIsabella,
+                "bf_alice" or "alice" => KokoroVoice.BfAlice,
+                "bf_lily" or "lily" => KokoroVoice.BfLily,
+                "bm_george" or "george" => KokoroVoice.BmGeorge,
+                "bm_lewis" or "lewis" => KokoroVoice.BmLewis,
+                "bm_daniel" or "daniel" => KokoroVoice.BmDaniel,
+                "bm_fable" or "fable" => KokoroVoice.BmFable,
+                _ => KokoroVoice.AfHeart
+            };
 
             using var tts = new KokoroTtsEngine();
             var profile = tts.GetVoiceProfile(voice);

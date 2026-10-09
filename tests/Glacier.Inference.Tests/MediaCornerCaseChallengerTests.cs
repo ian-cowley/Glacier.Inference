@@ -136,7 +136,7 @@ public class MediaCornerCaseChallengerTests
         byte[] dstBgr = new byte[frameSize];
 
         // Warm up JIT and tiering
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 50; i++)
         {
             MediaKernels.ConvertFrameBottomUp(srcRgb, dstBgr, width, height, rowStride);
         }

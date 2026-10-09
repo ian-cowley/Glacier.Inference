@@ -3,6 +3,7 @@ namespace Glacier.Inference.Tests;
 using System;
 using System.IO;
 using Glacier.Inference.Audio;
+using Glacier.Inference.Audio.Kitten;
 using Xunit;
 
 public class AudioTests
@@ -253,5 +254,57 @@ public class AudioTests
         Assert.True(MathF.Abs(dcOffset) < 0.05f, $"DC offset too high: {dcOffset}");
         Assert.True(rms > 0.05f, $"Signal energy too low: RMS={rms}");
         Assert.True(peak > 0.3f, $"Signal peak too quiet: Peak={peak}");
+    }
+
+    [Fact]
+    public void KittenPhonemizer_NormalizesAndPhonemizesCorrectly()
+    {
+        string text = "Hello world! This is 100% pure C# neural speech.";
+        string ipa = KittenPhonemizer.Phonemize(text);
+        Assert.NotEmpty(ipa);
+
+        int[] tokenIds = KittenPhonemeMap.Map(ipa);
+        Assert.NotEmpty(tokenIds);
+        Assert.Equal(0, tokenIds[0]); // Starts with 0 ($)
+        Assert.Equal(0, tokenIds[^1]); // Ends with 0 ($)
+        Assert.Equal(10, tokenIds[^2]); // Ends with 10 (…)
+    }
+
+    [Fact]
+    public void KittenTtsEngine_SynthesizesSpeechIfModelPresent()
+    {
+        string[] searchDirs =
+        [
+            Path.Combine(AppContext.BaseDirectory, "models", "kitten"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "models", "kitten"),
+            Path.GetFullPath("models/kitten"),
+            Path.GetFullPath("../models/kitten")
+        ];
+
+        string? modelPath = null;
+        string? voicesPath = null;
+
+        foreach (var dir in searchDirs)
+        {
+            string m = Path.Combine(dir, "kitten-nano.safetensors");
+            string v = Path.Combine(dir, "kitten-voices.safetensors");
+            if (File.Exists(m) && File.Exists(v))
+            {
+                modelPath = m;
+                voicesPath = v;
+                break;
+            }
+        }
+
+        if (modelPath != null && voicesPath != null)
+        {
+            using var engine = new KittenTtsEngine(modelPath, voicesPath);
+            Assert.Contains("bella", engine.AvailableVoices);
+            Assert.Contains("jasper", engine.AvailableVoices);
+
+            float[] audio = engine.Synthesize("Hello world, this is a neural voice test.", "bella");
+            Assert.NotEmpty(audio);
+            Assert.True(audio.Length > 1000);
+        }
     }
 }
