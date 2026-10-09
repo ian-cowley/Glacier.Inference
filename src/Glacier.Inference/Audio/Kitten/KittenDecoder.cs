@@ -453,18 +453,18 @@ public sealed class KittenDecoder
             // 6. STFT Inverse Synthesis -> 24kHz Audio
             float[] rawWaveform = StftInverseSynthesis(stftOut, tUps1Padded);
 
-            // 7. Tanh clamp and trim 5000 samples
+            // 7. Tanh clamp and apply smooth 10ms (240 sample) fade-out at end to prevent digital pops
             for (int i = 0; i < rawWaveform.Length; i++)
             {
                 rawWaveform[i] = MathF.Tanh(rawWaveform[i]);
             }
 
-            int trimLen = Math.Max(0, rawWaveform.Length - 5000);
-            if (trimLen > 0)
+            int fadeLen = Math.Min(240, rawWaveform.Length);
+            for (int i = 0; i < fadeLen; i++)
             {
-                float[] finalWave = new float[trimLen];
-                Array.Copy(rawWaveform, finalWave, trimLen);
-                return finalWave;
+                int idx = rawWaveform.Length - fadeLen + i;
+                float fade = 0.5f * (1.0f + MathF.Cos(MathF.PI * (i + 1) / fadeLen));
+                rawWaveform[idx] *= fade;
             }
 
             return rawWaveform;
