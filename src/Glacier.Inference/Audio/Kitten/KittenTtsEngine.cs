@@ -116,8 +116,8 @@ public sealed class KittenTtsEngine : IDisposable
         if (string.IsNullOrWhiteSpace(text))
             return Array.Empty<float>();
 
-        // 1. Text normalization
-        string normalized = KittenTextPreprocess.Normalize(text);
+        // 1. Text normalization & ensure terminal punctuation
+        string normalized = KittenTextPreprocess.Normalize(EnsurePunctuation(text));
 
         // 2. G2P conversion (English -> IPA phonemes)
         string phonemes = KittenPhonemizer.Phonemize(normalized);
@@ -127,8 +127,8 @@ public sealed class KittenTtsEngine : IDisposable
         if (tokenIds.Length == 0)
             return Array.Empty<float>();
 
-        // 4. Retrieve voice style vector [256]
-        var style = _voiceStore.GetStyle(voice, tokenIds.Length);
+        // 4. Retrieve voice style vector [256] using text length (matching reference implementation)
+        var style = _voiceStore.GetStyle(voice, normalized.Length);
 
         // 5. ALBERT Transformer forward pass -> [seqLen, 128]
         float[] bertOut = _albert.Forward(tokenIds);
@@ -136,8 +136,9 @@ public sealed class KittenTtsEngine : IDisposable
         // 6. Text Encoder forward pass -> (lstmFeatures [seqLen, 256], cnnFeatures [128, seqLen])
         var (lstmFeatures, cnnFeatures) = _textEncoder.Forward(bertOut, tokenIds, style);
 
-        // 7. Predictor forward pass -> (durations, sharedLstmOut, f0, nAmp)
-        var (durations, sharedLstmOut, f0, nAmp) = _predictor.Forward(lstmFeatures, style, speed);
+        // 7. Predictor forward pass -> (durations, sharedLstmOut, f0, nAmp) with calibrated speed prior
+        float effectiveSpeed = speed * _config.GetSpeedPrior(voice);
+        var (durations, sharedLstmOut, f0, nAmp) = _predictor.Forward(lstmFeatures, style, effectiveSpeed);
 
         // 8. Duration expansion for CNN features: [128, seqLen] -> [128, totalFrames]
         int totalFrames = 0;
@@ -213,6 +214,18 @@ public sealed class KittenTtsEngine : IDisposable
             }
         }
         return ms.ToArray();
+    }
+
+    private static string EnsurePunctuation(string text)
+    {
+        string trimmed = text.Trim();
+        if (trimmed.Length == 0) return trimmed;
+        char last = trimmed[^1];
+        if (last != '.' && last != '!' && last != '?' && last != ',' && last != ';' && last != ':')
+        {
+            return trimmed + ".";
+        }
+        return trimmed;
     }
 
     public void Dispose()

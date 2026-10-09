@@ -59,6 +59,16 @@ public sealed class KittenConfig
             if (root.TryGetProperty("bert_hidden", out var bh)) cfg.BertHiddenDim = bh.GetInt32();
             if (root.TryGetProperty("bert_heads", out var bheads)) cfg.BertNHeads = bheads.GetInt32();
             if (root.TryGetProperty("max_duration", out var md)) cfg.MaxDuration = md.GetInt32();
+            if (root.TryGetProperty("speed_priors", out var spElem) && spElem.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in spElem.EnumerateObject())
+                {
+                    if (prop.Value.TryGetSingle(out float val))
+                    {
+                        cfg.SpeedPriors[prop.Name] = val;
+                    }
+                }
+            }
 
             return cfg;
         }
@@ -66,5 +76,24 @@ public sealed class KittenConfig
         {
             return CreateNano();
         }
+    }
+
+    public Dictionary<string, float> SpeedPriors { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["bella"] = 0.8f,
+        ["jasper"] = 0.8f,
+        ["luna"] = 0.8f,
+        ["bruno"] = 0.8f,
+        ["rosie"] = 0.8f,
+        ["hugo"] = 0.9f,
+        ["kiki"] = 0.8f,
+        ["leo"] = 0.8f
+    };
+
+    public float GetSpeedPrior(string voice)
+    {
+        if (SpeedPriors.TryGetValue(voice, out float prior))
+            return prior;
+        return 0.8f; // Default KittenTTS speed prior
     }
 }

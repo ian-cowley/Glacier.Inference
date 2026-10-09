@@ -267,7 +267,7 @@ public class AudioTests
         Assert.NotEmpty(tokenIds);
         Assert.Equal(0, tokenIds[0]); // Starts with 0 ($)
         Assert.Equal(0, tokenIds[^1]); // Ends with 0 ($)
-        Assert.Equal(10, tokenIds[^2]); // Ends with 10 (…)
+        Assert.Equal(4, tokenIds[^2]); // Terminal punctuation '.' (4) before pad ($)
     }
 
     [Fact]
@@ -302,7 +302,7 @@ public class AudioTests
             Assert.Contains("bella", engine.AvailableVoices);
             Assert.Contains("jasper", engine.AvailableVoices);
 
-            float[] audio = engine.Synthesize("Hello world, this is a neural voice test.", "bella");
+            float[] audio = engine.Synthesize("The quick brown fox jumps over the lazy dog.", "jasper");
             Assert.NotEmpty(audio);
             Assert.True(audio.Length > 1000);
         }

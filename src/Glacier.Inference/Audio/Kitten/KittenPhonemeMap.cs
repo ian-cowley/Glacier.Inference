@@ -180,7 +180,6 @@ public static class KittenPhonemeMap
             }
         }
 
-        ids.Add(10); // End punctuation token '…' (10)
         ids.Add(0);  // End padding '$' (0)
         return ids.ToArray();
     }

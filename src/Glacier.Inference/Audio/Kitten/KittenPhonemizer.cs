@@ -124,6 +124,7 @@ public static class KittenPhonemizer
 
             if (punct != '\0')
             {
+                sb.Append(' ');
                 sb.Append(punct);
             }
 
