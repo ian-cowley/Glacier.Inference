@@ -2,73 +2,88 @@ namespace Glacier.Inference.Audio.Kitten;
 
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using System.Text;
 
 /// <summary>
 /// Grapheme-to-Phoneme (G2P) converter that maps English words to International Phonetic Alphabet (IPA) strings
 /// compatible with StyleTTS 2 / KittenTTS.
+/// Backed by CMUDict (115,000+ words) and an advanced phonetic rule-based transcriber.
 /// </summary>
 public static class KittenPhonemizer
 {
-    private static readonly Dictionary<string, string> EnglishIpaLexicon = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly Dictionary<string, string> CmuDict = LoadCmuDict();
+
+    private static readonly Dictionary<string, string> SpecialTokens = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["hello"] = "həlˈəʊ",
-        ["world"] = "wˈɜːld",
-        ["from"] = "fɹəm",
-        ["glacier"] = "ɡlˈeɪʃə",
-        ["high"] = "hˈaɪ",
-        ["performance"] = "pəfˈɔːməns",
-        ["audio"] = "ˈɔːdɪˌəʊ",
-        ["voice"] = "vˈɔɪs",
-        ["system"] = "sˈɪstəm",
-        ["welcome"] = "wˈɛlkəm",
-        ["to"] = "tə",
-        ["the"] = "ðə",
-        ["this"] = "ðˈɪs",
-        ["is"] = "ˈɪz",
-        ["a"] = "ə",
-        ["an"] = "ən",
-        ["test"] = "tˈɛst",
-        ["of"] = "əv",
-        ["text"] = "tˈɛkst",
-        ["speech"] = "spˈiːtʃ",
-        ["synthesis"] = "sˈɪnθəsɪs",
-        ["engine"] = "ˈɛndʒɪn",
-        ["pure"] = "pjˈʊə",
-        ["c#"] = "sˈiː ʃˈɑːp",
-        ["neural"] = "njˈʊəɹəl",
-        ["running"] = "ɹˈʌnɪŋ",
-        ["fast"] = "fˈɑːst",
-        ["and"] = "ænd",
-        ["clear"] = "klˈɪə",
-        ["human"] = "hjˈuːmən",
-        ["quality"] = "kwˈɒlɪti",
-        ["sound"] = "sˈaʊnd",
-        ["sounds"] = "sˈaʊndz",
-        ["great"] = "ɡɹˈeɪt",
-        ["natural"] = "nˈætʃɹəl",
+        ["c#"] = "sˈiː ʃˈɑːɹp",
+        ["c-sharp"] = "sˈiː ʃˈɑːɹp",
+        ["f#"] = "ˈɛf ʃˈɑːɹp",
+        ["f-sharp"] = "ˈɛf ʃˈɑːɹp",
+        ["glacier"] = "ɡlˈeɪʃɚ",
         ["ai"] = "ˈeɪ ˈaɪ",
-        ["model"] = "mˈɒdəl",
-        ["deep"] = "dˈiːp",
-        ["learning"] = "lˈɜːnɪŋ",
-        ["today"] = "tədˈeɪ",
-        ["good"] = "ɡˈʊd",
-        ["morning"] = "mˈɔːnɪŋ",
-        ["afternoon"] = "ˌɑːftənˈuːn",
-        ["evening"] = "ˈiːvnɪŋ",
-        ["night"] = "nˈaɪt",
-        ["how"] = "hˈaʊ",
-        ["are"] = "ɑː",
-        ["you"] = "jˈuː",
-        ["doing"] = "dˈuːɪŋ",
-        ["i"] = "ˈaɪ",
-        ["am"] = "æm",
-        ["ready"] = "ɹˈɛdi",
-        ["for"] = "fɔː",
-        ["action"] = "ˈækʃən",
-        ["generation"] = "ˌdʒɛnəɹˈeɪʃən",
-        ["intelligence"] = "ɪntˈɛlɪdʒəns",
+        ["api"] = "ˈeɪ pˈiː ˈaɪ",
+        ["ui"] = "jˈuː ˈaɪ",
+        ["cli"] = "sˈiː ˈɛl ˈaɪ",
+        ["simd"] = "sˈɪmd",
+        ["avx"] = "ˌeɪ vˈiː ˈɛks",
+        ["tts"] = "tˈiː tˈiː ˈɛs",
+        ["stt"] = "ˈɛs tˈiː tˈiː",
+        ["gpu"] = "dʒˈiː pˈiː jˈuː",
+        ["cpu"] = "sˈiː pˈiː jˈuː"
     };
+
+    private static Dictionary<string, string> LoadCmuDict()
+    {
+        var dict = new Dictionary<string, string>(120000, StringComparer.OrdinalIgnoreCase);
+
+        string[] searchPaths =
+        [
+            Path.Combine(AppContext.BaseDirectory, "models", "kitten", "cmudict.bin.gz"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "models", "kitten", "cmudict.bin.gz"),
+            Path.GetFullPath("models/kitten/cmudict.bin.gz"),
+            Path.GetFullPath("../models/kitten/cmudict.bin.gz")
+        ];
+
+        string? foundPath = null;
+        foreach (var p in searchPaths)
+        {
+            if (File.Exists(p))
+            {
+                foundPath = p;
+                break;
+            }
+        }
+
+        if (foundPath != null)
+        {
+            try
+            {
+                using var fs = File.OpenRead(foundPath);
+                using var gz = new GZipStream(fs, CompressionMode.Decompress);
+                using var reader = new StreamReader(gz, Encoding.UTF8);
+
+                string? line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    int tabIdx = line.IndexOf('\t');
+                    if (tabIdx > 0)
+                    {
+                        string word = line.Substring(0, tabIdx);
+                        string ipa = line.Substring(tabIdx + 1);
+                        dict.TryAdd(word, ipa);
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback will supply pronunciations if dictionary file cannot be decompressed
+            }
+        }
+
+        return dict;
+    }
 
     public static string Phonemize(string text) => TextToIpa(text);
 
@@ -92,14 +107,19 @@ public static class KittenPhonemizer
                 w = w[..^1];
             }
 
-            if (EnglishIpaLexicon.TryGetValue(w, out string? ipa))
+            string clean = w.Trim().ToLowerInvariant();
+
+            if (SpecialTokens.TryGetValue(clean, out string? specialIpa))
             {
-                sb.Append(ipa);
+                sb.Append(specialIpa);
+            }
+            else if (CmuDict.TryGetValue(clean, out string? cmuIpa))
+            {
+                sb.Append(cmuIpa);
             }
             else
             {
-                // Fallback to phonetic rule-based transliteration
-                sb.Append(RuleBasedG2p(w));
+                sb.Append(RuleBasedG2p(clean));
             }
 
             if (punct != '\0')
@@ -116,52 +136,210 @@ public static class KittenPhonemizer
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Advanced English phonetic rule-based G2P with syllabification, silent 'e', and vowel diphthong modeling.
+    /// </summary>
     private static string RuleBasedG2p(string word)
     {
         var sb = new StringBuilder();
-        string lower = word.ToLowerInvariant();
+        int len = word.Length;
+        int i = 0;
 
-        for (int i = 0; i < lower.Length; i++)
+        // Mark primary stress at beginning of word
+        sb.Append('ˈ');
+
+        while (i < len)
         {
-            char c = lower[i];
-            if (i == 0) sb.Append('ˈ'); // Mark primary stress on first syllable by default
-
-            if (i + 1 < lower.Length)
+            // Suffix rules
+            if (i == len - 4 && word.EndsWith("tion"))
             {
-                string pair = lower.Substring(i, 2);
-                switch (pair)
+                sb.Append("ʃən");
+                break;
+            }
+            if (i == len - 4 && word.EndsWith("sion"))
+            {
+                sb.Append("ʒən");
+                break;
+            }
+            if (i == len - 3 && word.EndsWith("ing"))
+            {
+                sb.Append("ɪŋ");
+                break;
+            }
+            if (i == len - 4 && word.EndsWith("ment"))
+            {
+                sb.Append("mənt");
+                break;
+            }
+            if (i == len - 4 && word.EndsWith("able"))
+            {
+                sb.Append("əbəl");
+                break;
+            }
+            if (i == len - 4 && word.EndsWith("ible"))
+            {
+                sb.Append("ɪbəl");
+                break;
+            }
+
+            // Digraph rules
+            if (i + 1 < len)
+            {
+                string two = word.Substring(i, 2);
+                switch (two)
                 {
-                    case "th": sb.Append('θ'); i++; continue;
-                    case "sh": sb.Append('ʃ'); i++; continue;
-                    case "ch": sb.Append("tʃ"); i++; continue;
-                    case "ph": sb.Append('f'); i++; continue;
-                    case "ee": sb.Append("iː"); i++; continue;
-                    case "oo": sb.Append("uː"); i++; continue;
-                    case "ou": sb.Append("aʊ"); i++; continue;
-                    case "ai": case "ay": sb.Append("eɪ"); i++; continue;
-                    case "ea": sb.Append("iː"); i++; continue;
-                    case "oa": sb.Append("əʊ"); i++; continue;
-                    case "er": sb.Append('ɜ'); i++; continue;
-                    case "ng": sb.Append('ŋ'); i++; continue;
-                    case "ck": sb.Append('k'); i++; continue;
+                    case "th":
+                        sb.Append(i == 0 && len <= 4 ? 'ð' : 'θ');
+                        i += 2;
+                        continue;
+                    case "sh":
+                        sb.Append('ʃ');
+                        i += 2;
+                        continue;
+                    case "ch":
+                        sb.Append("tʃ");
+                        i += 2;
+                        continue;
+                    case "ph":
+                        sb.Append('f');
+                        i += 2;
+                        continue;
+                    case "wh":
+                        sb.Append('w');
+                        i += 2;
+                        continue;
+                    case "ee":
+                    case "ea":
+                        sb.Append("iː");
+                        i += 2;
+                        continue;
+                    case "oo":
+                        sb.Append("uː");
+                        i += 2;
+                        continue;
+                    case "ai":
+                    case "ay":
+                        sb.Append("eɪ");
+                        i += 2;
+                        continue;
+                    case "oa":
+                        sb.Append("oʊ");
+                        i += 2;
+                        continue;
+                    case "oi":
+                    case "oy":
+                        sb.Append("ɔɪ");
+                        i += 2;
+                        continue;
+                    case "ou":
+                    case "ow":
+                        sb.Append("aʊ");
+                        i += 2;
+                        continue;
+                    case "au":
+                    case "aw":
+                        sb.Append("ɔː");
+                        i += 2;
+                        continue;
+                    case "ck":
+                        sb.Append('k');
+                        i += 2;
+                        continue;
+                    case "ng":
+                        sb.Append('ŋ');
+                        i += 2;
+                        continue;
+                    case "qu":
+                        sb.Append("kw");
+                        i += 2;
+                        continue;
                 }
+            }
+
+            char c = word[i];
+
+            // Silent 'e' at end of word
+            if (c == 'e' && i == len - 1 && i > 1)
+            {
+                i++;
+                continue;
             }
 
             switch (c)
             {
-                case 'a': sb.Append('æ'); break;
-                case 'e': sb.Append('ɛ'); break;
-                case 'i': sb.Append('ɪ'); break;
-                case 'o': sb.Append('ɒ'); break;
-                case 'u': sb.Append('ʌ'); break;
-                case 'r': sb.Append('ɹ'); break;
-                case 'j': sb.Append("dʒ"); break;
+                case 'a':
+                    // Magic 'e' pattern (e.g. bare, care, make)
+                    if (i + 2 < len && !IsVowel(word[i + 1]) && word[i + 2] == 'e' && i + 2 == len - 1)
+                    {
+                        if (word[i + 1] == 'r') sb.Append('ɛ');
+                        else sb.Append("eɪ");
+                    }
+                    else
+                    {
+                        sb.Append('æ');
+                    }
+                    break;
+                case 'e':
+                    sb.Append('ɛ');
+                    break;
+                case 'i':
+                    if (i + 2 < len && !IsVowel(word[i + 1]) && word[i + 2] == 'e' && i + 2 == len - 1)
+                        sb.Append("aɪ");
+                    else
+                        sb.Append('ɪ');
+                    break;
+                case 'o':
+                    if (i + 2 < len && !IsVowel(word[i + 1]) && word[i + 2] == 'e' && i + 2 == len - 1)
+                        sb.Append("oʊ");
+                    else
+                        sb.Append("ɑː");
+                    break;
+                case 'u':
+                    if (i + 2 < len && !IsVowel(word[i + 1]) && word[i + 2] == 'e' && i + 2 == len - 1)
+                        sb.Append("uː");
+                    else
+                        sb.Append('ʌ');
+                    break;
+                case 'y':
+                    if (i == 0) sb.Append('j');
+                    else sb.Append('i');
+                    break;
+                case 'r':
+                    sb.Append('ɹ');
+                    break;
+                case 'j':
+                    sb.Append("dʒ");
+                    break;
+                case 'g':
+                    if (i + 1 < len && (word[i + 1] == 'e' || word[i + 1] == 'i' || word[i + 1] == 'y'))
+                        sb.Append("dʒ");
+                    else
+                        sb.Append('ɡ');
+                    break;
+                case 'c':
+                    if (i + 1 < len && (word[i + 1] == 'e' || word[i + 1] == 'i' || word[i + 1] == 'y'))
+                        sb.Append('s');
+                    else
+                        sb.Append('k');
+                    break;
+                case 's':
+                    if (i == len - 1 && i > 0 && (IsVowel(word[i - 1]) || word[i - 1] == 'd' || word[i - 1] == 'g' || word[i - 1] == 'm' || word[i - 1] == 'n'))
+                        sb.Append('z');
+                    else
+                        sb.Append('s');
+                    break;
+                case 'x':
+                    sb.Append("ks");
+                    break;
                 default:
                     if (c >= 'a' && c <= 'z') sb.Append(c);
                     break;
             }
+            i++;
         }
 
         return sb.ToString();
     }
+
+    private static bool IsVowel(char c) => c is 'a' or 'e' or 'i' or 'o' or 'u' or 'y';
 }

@@ -159,8 +159,8 @@ public sealed class KittenTtsEngine : IDisposable
             }
         }
 
-        // 9. Decoder forward pass -> 24kHz audio waveform
-        return _decoder.Forward(sharedLstmOut, expandedCnn, f0, nAmp, style);
+        // 9. Decoder forward pass -> 24kHz audio waveform (expandedCnn feeds both encode and asr_res)
+        return _decoder.Forward(expandedCnn, expandedCnn, f0, nAmp, style);
     }
 
     /// <summary>
