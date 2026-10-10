@@ -56,6 +56,11 @@ await foreach (var token in session.GenerateStreamAsync("What is the capital of 
 }
 ```
 
+### 🌐 Distributed Multi-Node Cluster Execution (57B & 141B MoE)
+
+To run models that exceed single-machine memory (such as **Qwen2-57B-A14B** or **Mixtral-8x22B 141B**) partitioned across multiple PCs, GPUs, APUs, and Linux/Windows nodes on your local area network, see **[`Glacier.Inference.Distributed`](https://github.com/ian-cowley/Glacier.Inference.Distributed)**.
+It provides turnkey pipeline parallelism, zero-copy activation streaming over `System.IO.Pipelines`, and dynamic layer allocation across heterogeneous hardware fleets.
+
 ---
 
 ## Features
