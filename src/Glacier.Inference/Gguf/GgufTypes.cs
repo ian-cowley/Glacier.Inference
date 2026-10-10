@@ -73,7 +73,15 @@ public static class GgufTypes
         GgufType.Q6_K => ((long)count / 256) * 210,
         GgufType.Q3_K => ((long)count / 256) * 110,
         GgufType.Q5_K => ((long)count / 256) * 176,
+        GgufType.Q2_K => ((long)count / 256) * 84,
+        GgufType.IQ1_S => ((long)count / 256) * 48,
+        GgufType.IQ2_XXS => ((long)count / 256) * 66,
+        GgufType.IQ2_XS => ((long)count / 256) * 74,
+        GgufType.IQ2_S => ((long)count / 256) * 82,
+        GgufType.IQ3_XXS => ((long)count / 256) * 98,
+        GgufType.IQ3_S => ((long)count / 256) * 110,
         GgufType.IQ4_XS => ((long)count / 256) * 136,
+        GgufType.IQ4_NL => ((long)count / 32) * 18,
         GgufType.MXFP4 => ((long)count / 32) * 17,
         _ => (long)count * 2
     };
@@ -114,7 +122,15 @@ public sealed class GgufTensorInfo
             GgufType.Q6_K => (count / 256) * 210, // 256 elements in 210 bytes
             GgufType.Q3_K => (count / 256) * 110, // 256 elements in 110 bytes
             GgufType.Q5_K => (count / 256) * 176, // 256 elements in 176 bytes
+            GgufType.Q2_K => (count / 256) * 84,  // 256 elements in 84 bytes
+            GgufType.IQ1_S => (count / 256) * 48, // 256 elements in 48 bytes
+            GgufType.IQ2_XXS => (count / 256) * 66, // 256 elements in 66 bytes (2.0625 b/w)
+            GgufType.IQ2_XS => (count / 256) * 74, // 256 elements in 74 bytes (2.3125 b/w)
+            GgufType.IQ2_S => (count / 256) * 82,  // 256 elements in 82 bytes (2.5625 b/w)
+            GgufType.IQ3_XXS => (count / 256) * 98, // 256 elements in 98 bytes (3.0625 b/w)
+            GgufType.IQ3_S => (count / 256) * 110, // 256 elements in 110 bytes (3.4375 b/w)
             GgufType.IQ4_XS => (count / 256) * 136, // 256 elements in 136 bytes
+            GgufType.IQ4_NL => (count / 32) * 18,  // 32 elements in 18 bytes
             GgufType.MXFP4 => (count / 32) * 17,  // 32 elements in 17 bytes (E8M0 + 32x E2M1 FP4)
             _ => count * 2 // conservative fallback
         };

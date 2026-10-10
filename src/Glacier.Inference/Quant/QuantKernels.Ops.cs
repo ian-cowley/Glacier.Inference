@@ -469,4 +469,71 @@ public static unsafe partial class QuantKernels
         }
     }
 
+    /// <summary>
+    /// Vectorized fused multiply-add: dst[i] += src[i] * weight using AVX-512 / AVX2 / SIMD.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void VecAddWeighted(float* src, float* dst, float weight, int size)
+    {
+        int i = 0;
+        if (Vector512.IsHardwareAccelerated)
+        {
+            var vW = Vector512.Create(weight);
+            int vecLimit = size - 16;
+            for (; i <= vecLimit; i += 16)
+            {
+                var vs = Vector512.Load(src + i);
+                var vd = Vector512.Load(dst + i);
+                (vd + vs * vW).Store(dst + i);
+            }
+        }
+        else if (Vector256.IsHardwareAccelerated)
+        {
+            var vW = Vector256.Create(weight);
+            int vecLimit = size - 8;
+            for (; i <= vecLimit; i += 8)
+            {
+                var vs = Vector256.Load(src + i);
+                var vd = Vector256.Load(dst + i);
+                (vd + vs * vW).Store(dst + i);
+            }
+        }
+        for (; i < size; i++)
+        {
+            dst[i] += src[i] * weight;
+        }
+    }
+
+    /// <summary>
+    /// Vectorized vector addition: dst[i] += src[i] using AVX-512 / AVX2 / SIMD.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void VecAdd(float* src, float* dst, int size)
+    {
+        int i = 0;
+        if (Vector512.IsHardwareAccelerated)
+        {
+            int vecLimit = size - 16;
+            for (; i <= vecLimit; i += 16)
+            {
+                var vs = Vector512.Load(src + i);
+                var vd = Vector512.Load(dst + i);
+                (vd + vs).Store(dst + i);
+            }
+        }
+        else if (Vector256.IsHardwareAccelerated)
+        {
+            int vecLimit = size - 8;
+            for (; i <= vecLimit; i += 8)
+            {
+                var vs = Vector256.Load(src + i);
+                var vd = Vector256.Load(dst + i);
+                (vd + vs).Store(dst + i);
+            }
+        }
+        for (; i < size; i++)
+        {
+            dst[i] += src[i];
+        }
+    }
 }

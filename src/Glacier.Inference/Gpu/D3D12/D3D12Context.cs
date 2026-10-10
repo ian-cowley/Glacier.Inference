@@ -37,6 +37,11 @@ public sealed unsafe class D3D12Context : IDisposable
     public ID3D12GraphicsCommandList CommandList => _cmdList;
     public string DeviceName => _deviceName;
     public ID3D12Resource DummyBuffer => _dummyBuffer;
+    private ulong _dedicatedVideoMemory;
+    private ulong _sharedSystemMemory;
+    public ulong DedicatedVideoMemory => _dedicatedVideoMemory;
+    public ulong SharedSystemMemory => _sharedSystemMemory;
+    public IDXGIAdapter1? Adapter => _adapter;
 
     public D3D12Context(int adapterIndex = -1)
     {
@@ -72,20 +77,22 @@ public sealed unsafe class D3D12Context : IDisposable
                 continue;
             }
 
-            // Prefer AMD Radeon adapter, otherwise first hardware adapter
-            if (desc.Description.Contains("Radeon", StringComparison.OrdinalIgnoreCase))
-            {
-                chosenAdapter = a;
-                break;
-            }
-
+            // If adapter not explicitly specified, pick hardware adapter with highest dedicated video memory
             if (chosenAdapter == null)
             {
                 chosenAdapter = a;
             }
             else
             {
-                a.Dispose();
+                if ((ulong)desc.DedicatedVideoMemory > (ulong)chosenAdapter.Description1.DedicatedVideoMemory)
+                {
+                    chosenAdapter.Dispose();
+                    chosenAdapter = a;
+                }
+                else
+                {
+                    a.Dispose();
+                }
             }
         }
 
@@ -93,7 +100,10 @@ public sealed unsafe class D3D12Context : IDisposable
             throw new InvalidOperationException("No hardware DirectX 12 compute adapters found.");
 
         _adapter = chosenAdapter;
-        _deviceName = _adapter.Description1.Description;
+        var desc1 = _adapter.Description1;
+        _deviceName = desc1.Description;
+        _dedicatedVideoMemory = (ulong)desc1.DedicatedVideoMemory;
+        _sharedSystemMemory = (ulong)desc1.SharedSystemMemory;
 
         var hr = D3D12.D3D12CreateDevice(_adapter, FeatureLevel.Level_11_0, out _device!);
         if (!hr.Success || _device == null)

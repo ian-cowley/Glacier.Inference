@@ -195,8 +195,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     }
                     else
                     {
-                        _d3d12Model = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
-                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{(_weights.IsMoe ? " MoE" : "")}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                        var qwenD3d = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                        _d3d12Model = qwenD3d;
+                        string moeSuffix = _weights.IsMoe ? (qwenD3d.TieredMoe ? " Tiered MoE (GPU+CPU)" : " MoE") : "";
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{moeSuffix}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
                     }
                     _kvCache = null; // GPU maintains all KV states in device VRAM
                 }

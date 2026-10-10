@@ -109,6 +109,35 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     private ID3D12Resource? _dShexpUp;
     private ID3D12Resource? _dShexpAct;
 
+    // Heterogeneous Tiered MoE Buffers & CPU SIMD Workspace
+    private readonly bool _tieredMoe;
+    private ID3D12Resource? _readbackNormX;
+    private float* _pReadbackNormX;
+    private ID3D12Resource? _uploadExpertOut;
+    private float* _pUploadExpertOut;
+    private float[]? _normXSums;
+    private ExpertCpuWorkspace[]? _expertWorkspaces;
+
+    public bool TieredMoe => _tieredMoe;
+
+    internal sealed class ExpertCpuWorkspace
+    {
+        public readonly float[] Gate;
+        public readonly float[] Up;
+        public readonly float[] Act;
+        public readonly float[] ActSums;
+        public readonly float[] DownOut;
+
+        public ExpertCpuWorkspace(int expertFfnDim, int dim)
+        {
+            Gate = new float[expertFfnDim];
+            Up = new float[expertFfnDim];
+            Act = new float[expertFfnDim];
+            ActSums = new float[(expertFfnDim + 31) / 32];
+            DownOut = new float[dim];
+        }
+    }
+
     // Batched GPU Scratch Buffers
     private ID3D12Resource _dXBatch = null!;
     private ID3D12Resource _dNormXBatch = null!;
@@ -170,7 +199,8 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         Glacier.Inference.Memory.KvCachePrecision kvPrecision = Glacier.Inference.Memory.KvCachePrecision.Auto,
         int startLayer = 0,
         int layerCount = -1,
-        bool isLastStage = true)
+        bool isLastStage = true,
+        bool? tieredMoe = null)
     {
         _ctx = ctx;
         _weights = weights;
@@ -188,6 +218,40 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         KvPrecision = kvPrecision == Glacier.Inference.Memory.KvCachePrecision.Auto
             ? Glacier.Inference.Memory.KvCachePrecision.Fp16
             : kvPrecision;
+
+        if (tieredMoe.HasValue)
+        {
+            _tieredMoe = tieredMoe.Value && weights.IsMoe;
+        }
+        else if (weights.IsMoe)
+        {
+            int expertFfnDim = weights.ExpertFeedForwardLength;
+            int numExperts = weights.ExpertCount;
+            long gateSlice = (long)expertFfnDim * GgufTypes.GetRowBytes(weights.Layers[0].FfnGateExpsType, _dim);
+            long upSlice = (long)expertFfnDim * GgufTypes.GetRowBytes(weights.Layers[0].FfnUpExpsType, _dim);
+            long downSlice = (long)_dim * GgufTypes.GetRowBytes(weights.Layers[0].FfnDownExpsType, expertFfnDim);
+            ulong totalExpertBytes = (ulong)(LayerCount * (long)numExperts * (gateSlice + upSlice + downSlice));
+
+            ulong vram = ctx.DedicatedVideoMemory;
+            // If routed experts take more than 60% of dedicated VRAM, or if total expert bytes exceeds dedicated VRAM
+            if (vram > 0 && (totalExpertBytes > vram * 6 / 10 || totalExpertBytes + 2_500_000_000UL > vram))
+            {
+                _tieredMoe = true;
+            }
+            else
+            {
+                _tieredMoe = false;
+            }
+        }
+        else
+        {
+            _tieredMoe = false;
+        }
+
+        if (_tieredMoe)
+        {
+            GlacierDiagnostics.LogInformation($"[TieredMoE] Heterogeneous execution enabled: Attention, Router & Shared Experts pinned in GPU VRAM ({_ctx.DeviceName}); Routed experts executed on CPU SIMD AVX-512 ({Environment.ProcessorCount} threads).");
+        }
 
         _hX = new float[_dim];
         _dKeyCache = new ID3D12Resource[LayerCount];
@@ -293,6 +357,27 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
             _dExpertDownOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
             _dFfnOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
 
+            if (_tieredMoe)
+            {
+                _readbackNormX = _ctx.CreateReadbackBuffer((ulong)(_dim * sizeof(float)));
+                void* pRbNormX = null;
+                _readbackNormX.Map(0, null, &pRbNormX);
+                _pReadbackNormX = (float*)pRbNormX;
+
+                _uploadExpertOut = _ctx.CreateUploadBuffer((ulong)(_dim * sizeof(float)));
+                void* pUpExp = null;
+                _uploadExpertOut.Map(0, null, &pUpExp);
+                _pUploadExpertOut = (float*)pUpExp;
+
+                _normXSums = new float[(_dim + 31) / 32];
+                int topK = _weights.ExpertUsedCount;
+                _expertWorkspaces = new ExpertCpuWorkspace[topK];
+                for (int k = 0; k < topK; k++)
+                {
+                    _expertWorkspaces[k] = new ExpertCpuWorkspace(expertFfnDim, _dim);
+                }
+            }
+
             int maxShexpFfnDim = expertFfnDim * 2;
             bool hasShexp = false;
             for (int l = 0; l < LayerCount; l++)
@@ -313,6 +398,16 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
                 _dShexpGate = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
                 _dShexpUp = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
                 _dShexpAct = _ctx.CreateDeviceBuffer((ulong)(maxShexpFfnDim * sizeof(float)));
+            }
+
+            if (_dExpertDownOut != null)
+            {
+                _ctx.BeginCommands();
+                _ctx.CommandList.ResourceBarrierTransition(_dExpertDownOut, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                if (_dFfnOut != null)
+                    _ctx.CommandList.ResourceBarrierTransition(_dFfnOut, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                _ctx.EndCommandsAndExecute();
+                _ctx.Synchronize();
             }
         }
     }
@@ -416,9 +511,12 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
                     _ctx.CopyToDevice(dFfnGateInpBias, (IntPtr)lw.FfnGateInpBias, (ulong)(numExperts * sizeof(float)));
                 }
 
-                dFfnGateExps = UploadTensor(lw.FfnGateExpsType, (IntPtr)lw.FfnGateExpsWeight, numExperts * expertFfnDim, _dim);
-                dFfnUpExps = UploadTensor(lw.FfnUpExpsType, (IntPtr)lw.FfnUpExpsWeight, numExperts * expertFfnDim, _dim);
-                dFfnDownExps = UploadTensor(lw.FfnDownExpsType, (IntPtr)lw.FfnDownExpsWeight, numExperts * _dim, expertFfnDim);
+                if (!_tieredMoe)
+                {
+                    dFfnGateExps = UploadTensor(lw.FfnGateExpsType, (IntPtr)lw.FfnGateExpsWeight, numExperts * expertFfnDim, _dim);
+                    dFfnUpExps = UploadTensor(lw.FfnUpExpsType, (IntPtr)lw.FfnUpExpsWeight, numExperts * expertFfnDim, _dim);
+                    dFfnDownExps = UploadTensor(lw.FfnDownExpsType, (IntPtr)lw.FfnDownExpsWeight, numExperts * _dim, expertFfnDim);
+                }
 
                 if (lw.FfnGateShexpWeight != null)
                 {
@@ -559,6 +657,16 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
             {
                 _readbackRouterLogits.Unmap(0);
                 _readbackRouterLogits.Dispose();
+            }
+            if (_readbackNormX != null)
+            {
+                _readbackNormX.Unmap(0);
+                _readbackNormX.Dispose();
+            }
+            if (_uploadExpertOut != null)
+            {
+                _uploadExpertOut.Unmap(0);
+                _uploadExpertOut.Dispose();
             }
             _dRouterLogits?.Dispose();
             _dExpertGate?.Dispose();

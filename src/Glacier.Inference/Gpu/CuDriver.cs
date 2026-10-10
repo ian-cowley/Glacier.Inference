@@ -106,6 +106,14 @@ public static class CuDriver
     public static extern int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
 
     [SuppressGCTransition]
+    [DllImport(CudaLib, EntryPoint = "cuMemHostRegister_v2")]
+    public static extern int MemHostRegister(IntPtr p, nuint bytesize, uint flags);
+
+    [SuppressGCTransition]
+    [DllImport(CudaLib, EntryPoint = "cuMemHostUnregister")]
+    public static extern int MemHostUnregister(IntPtr p);
+
+    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemFreeHost")]
     public static extern int MemFreeHost(IntPtr p);
 

@@ -111,3 +111,16 @@ public unsafe struct BlockIQ4_XS
     public fixed byte Qs[128];    // 128 bytes (4-bit table indices for 256 elements)
 }
 
+/// <summary>
+/// Q2_K quantization super-block: 256 elements in 84 bytes (~2.625 bits per weight).
+/// 16 scales/mins (4-bit each, packed in 16 bytes), 64 bytes of 2-bit quants, and FP16 delta/dmin.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ2_K
+{
+    public fixed byte Scales[16]; // 16 bytes: 16 4-bit scales (low nibbles) and 16 4-bit mins (high nibbles)
+    public fixed byte Qs[64];     // 64 bytes: 256 2-bit quants (2 bits per value, 4 values per byte)
+    public Half Delta;            // 2 bytes: super-block scale
+    public Half DeltaMin;         // 2 bytes: super-block min scale
+}
+

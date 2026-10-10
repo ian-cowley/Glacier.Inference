@@ -722,10 +722,21 @@ Glacier is developed with a strict commitment to **zero external C++ dependencie
 ## Ecosystem Cross-References
 
 `Glacier.Inference` powers model execution across the **Glacier .NET 10 High-Performance Ecosystem**:
+- **[Glacier.Inference.Distributed](https://github.com/ian-cowley/Glacier.Inference.Distributed)**: Distributed heterogeneous pipeline inference, cluster activation transport, and warm expert pool execution.
 - **[Glacier.Tune](https://github.com/ian-cowley/Glacier.Tune)**: Zero-copy LLM fine-tuning and LoRA backpropagation using `Glacier.Inference` weights and tokenizers.
 - **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Foundational strided tensor engine with Autograd, hardware GEMM dispatch, and PEFT layers.
 - **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Columnar memory backend for zero-copy feature feeds.
 - **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT deep learning inference microservices.
+
+---
+
+## 🆕 What's New in v1.2.20
+
+- **Tiered Virtual Memory Manager (`TieredVirtualMemoryManager`)**: Three-tier storage hierarchy (`Hot VRAM` -> `Warm Pinned Host RAM` -> `Cold NVMe Memory-Mapped files`) supporting unmanaged 4KB and 2MB OS page boundary alignment, asynchronous speculative expert layer prefetch, zero-copy GGUF file mapping, and LRU cache eviction.
+- **Bandwidth-Adaptive Co-Scheduler ($q^*$ Policy)**: Dynamic, token-level routing engine (`BandwidthCoScheduler`) evaluating PCIe bus bandwidth ($B_{bus}$) against host RAM bandwidth ($B_{host}$) to dynamically assign sparse MoE layers between GPU VRAM and CPU SIMD cores, eradicating PCIe bus bottlenecks.
+- **Decoupled Architecture & `Glacier.Inference.Distributed` Extraction**: Removed all network and cluster dependencies from `Glacier.Inference`. Extracted distributed pipeline coordinators, cluster activation streaming over `System.IO.Pipelines`, and remote network harnesses into the dedicated `Glacier.Inference.Distributed` package.
+- **Full Importance Quantization (I-Quant) Support**: Added complete block stride calculation and memory validation across GGUF formats: `IQ1_S`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`, and `IQ4_NL`.
+- **434/434 Unit Tests Passing (100% Green)** across all quantization, GPU kernels, 3D VAE decoders, virtual memory tiering, and bandwidth co-scheduling.
 
 ---
 

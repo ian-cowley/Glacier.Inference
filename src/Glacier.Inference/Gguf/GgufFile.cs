@@ -83,7 +83,7 @@ public sealed unsafe class GgufFile : IDisposable
     public int ExpertFeedForwardLength => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.expert_feed_forward_length", 0), 0, 1_048_576);
     public int ExpertSharedCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.expert_shared_count", 0), 0, 1024);
     public int LeadingDenseBlockCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.leading_dense_block_count", 0), 0, 1024);
-    public bool NormTopK => Architecture != "deepseek2" && GetMetadataBool($"{Architecture}.expert_weights_norm", Architecture != "deepseek2");
+    public bool NormTopK => Architecture != "deepseek2" && Architecture != "qwen2moe" && GetMetadataBool($"{Architecture}.expert_weights_norm", Architecture != "deepseek2" && Architecture != "qwen2moe");
     public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
 
     public bool IsHybridSsm => Architecture == "qwen35" || Tensors.ContainsKey("blk.0.ssm_out.weight") || Tensors.ContainsKey("blk.0.ssm_conv1d.weight");
