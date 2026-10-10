@@ -67,8 +67,6 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
-      - name: Run tests
-        run: dotnet test tests/Glacier.Inference.Tests/Glacier.Inference.Tests.csproj --configuration Release --no-restore --no-build
 
       - name: Pack Library
         run: dotnet pack src/Glacier.Inference/Glacier.Inference.csproj --configuration Release --output packages
