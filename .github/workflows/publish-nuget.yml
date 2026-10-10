@@ -30,10 +30,10 @@ jobs:
 
       - name: Configure runner swap
         run: |
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 8G /mnt/swapfile_extra || sudo dd if=/dev/zero of=/mnt/swapfile_extra bs=1M count=8192
+          sudo chmod 600 /mnt/swapfile_extra
+          sudo mkswap /mnt/swapfile_extra
+          sudo swapon /mnt/swapfile_extra
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
