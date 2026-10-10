@@ -223,29 +223,36 @@ public sealed unsafe class ModelWeights
 
 
         // Embedding
-        if (!gguf.TryGetTensor("token_embd.weight", out var embdInfo) || embdInfo == null)
+        if (gguf.TryGetTensor("token_embd.weight", out var embdInfo) && embdInfo != null)
         {
-            string fileName = Path.GetFileName(gguf.FilePath);
-            throw new InvalidDataException(
-                $"Model '{fileName}' is missing the required token embedding tensor ('token_embd.weight'). " +
-                $"Please ensure this GGUF file is complete and not a LoRA adapter or unmerged split shard.");
+            EmbdWeight = gguf.GetTensorPointer(embdInfo);
+            EmbdType = embdInfo.Type;
+            VocabSize = (int)embdInfo.Dimensions[1];
         }
-        EmbdWeight = gguf.GetTensorPointer(embdInfo);
-        EmbdType = embdInfo.Type;
-        VocabSize = (int)embdInfo.Dimensions[1];
+        else
+        {
+            EmbdWeight = null;
+            EmbdType = GgufType.F32;
+            VocabSize = (int)gguf.GetMetadataUInt32("tokenizer.ggml.tokens.length", 151936);
+            if (VocabSize <= 0) VocabSize = 151936;
+        }
 
         // Final output norm
-        if (!gguf.TryGetTensor("output_norm.weight", out var outNormInfo) || outNormInfo == null)
+        if (gguf.TryGetTensor("output_norm.weight", out var outNormInfo) && outNormInfo != null)
         {
-            if (!gguf.TryGetTensor("norm.weight", out outNormInfo) || outNormInfo == null)
-            {
-                string fileName = Path.GetFileName(gguf.FilePath);
-                throw new InvalidDataException(
-                    $"Model '{fileName}' is missing the required final output normalization tensor ('output_norm.weight' / 'norm.weight').");
-            }
+            OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
+            OutNormType = outNormInfo.Type;
         }
-        OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
-        OutNormType = outNormInfo.Type;
+        else if (gguf.TryGetTensor("norm.weight", out outNormInfo) && outNormInfo != null)
+        {
+            OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
+            OutNormType = outNormInfo.Type;
+        }
+        else
+        {
+            OutNormWeight = null;
+            OutNormType = GgufType.F32;
+        }
 
         // Output head
         if (gguf.TryGetTensor("output.weight", out var outInfo) && outInfo != null)
@@ -271,11 +278,8 @@ public sealed unsafe class ModelWeights
 
             if (attnNorm == null)
             {
-                string fileName = Path.GetFileName(gguf.FilePath);
-                throw new InvalidDataException(
-                    $"Model '{fileName}' is missing attention normalization tensor for layer {l} ('blk.{l}.attn_norm.weight' / 'blk.{l}.input_layernorm.weight'). " +
-                    $"Detected architecture: '{gguf.Architecture}'. Total layers specified in metadata: {BlockCount}. " +
-                    $"Please verify that the model architecture is supported and that this file is not an unmerged split shard.");
+                // Layer not present in this stage slice
+                continue;
             }
 
             GgufTensorInfo? ssmOut = null;

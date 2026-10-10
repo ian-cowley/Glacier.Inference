@@ -67,4 +67,54 @@ public static unsafe partial class QuantKernels
 
         return sum;
     }
+
+    /// <summary>
+    /// Dequantizes a Q2_K block row into target float destination.
+    /// Super-block size = 256 elements in 84 bytes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeQ2_K(BlockQ2_K* row, float* dst, int k)
+    {
+        int nb = k / QK_K;
+        for (int i = 0; i < nb; i++)
+        {
+            float d = (float)row[i].Delta;
+            float min = (float)row[i].DeltaMin;
+            byte* q = row[i].Qs;
+            byte* sc = row[i].Scales;
+
+            int is_idx = 0;
+            for (int n = 0; n < QK_K; n += 128)
+            {
+                int shift = 0;
+                for (int j = 0; j < 4; ++j)
+                {
+                    byte scaleByte0 = sc[is_idx++];
+                    float dl0 = d * (scaleByte0 & 0x0F);
+                    float ml0 = min * (scaleByte0 >> 4);
+
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int qVal = (q[l + 0] >> shift) & 3;
+                        dst[l] = dl0 * qVal - ml0;
+                    }
+                    dst += 16;
+
+                    byte scaleByte1 = sc[is_idx++];
+                    float dl1 = d * (scaleByte1 & 0x0F);
+                    float ml1 = min * (scaleByte1 >> 4);
+
+                    for (int l = 0; l < 16; ++l)
+                    {
+                        int qVal = (q[l + 16] >> shift) & 3;
+                        dst[l] = dl1 * qVal - ml1;
+                    }
+                    dst += 16;
+
+                    shift += 2;
+                }
+                q += 32;
+            }
+        }
+    }
 }

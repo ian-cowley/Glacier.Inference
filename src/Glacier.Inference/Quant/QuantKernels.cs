@@ -32,6 +32,9 @@ public static unsafe partial class QuantKernels
 
         switch (type)
         {
+            case GgufType.Q2_K:
+                DequantizeQ2_K((BlockQ2_K*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q3_K:
                 DequantizeQ3_K((BlockQ3_K*)rowPtr, dst, embeddingDim);
                 break;
