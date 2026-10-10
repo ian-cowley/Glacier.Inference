@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -16,11 +20,20 @@ jobs:
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
       NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GLACIER_EMBED_NO_DOWNLOAD: "1"
+      DOTNET_gcServer: 0
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure runner swap
+        run: |
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
