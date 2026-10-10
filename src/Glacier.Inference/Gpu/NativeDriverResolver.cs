@@ -45,8 +45,8 @@ public static class NativeDriverResolver
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                if (NativeLibrary.TryLoad("libcuda.so.1", assembly, searchPath, out IntPtr handle) ||
-                    NativeLibrary.TryLoad("libcuda.so", assembly, searchPath, out handle))
+                if (NativeLibrary.TryLoad("libcuda.so.1", out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libcuda.so", out handle))
                     return handle;
             }
         }
@@ -61,9 +61,9 @@ public static class NativeDriverResolver
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                if (NativeLibrary.TryLoad("libamdhip64.so", assembly, searchPath, out IntPtr handle) ||
-                    NativeLibrary.TryLoad("libamdhip64.so.6", assembly, searchPath, out handle) ||
-                    NativeLibrary.TryLoad("/opt/rocm/lib/libamdhip64.so", assembly, searchPath, out handle))
+                if (NativeLibrary.TryLoad("libamdhip64.so", out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libamdhip64.so.6", out handle) ||
+                    NativeLibrary.TryLoad("/opt/rocm/lib/libamdhip64.so", out handle))
                     return handle;
             }
         }
@@ -76,8 +76,8 @@ public static class NativeDriverResolver
             }
             else
             {
-                if (NativeLibrary.TryLoad("libvulkan.so", assembly, searchPath, out IntPtr handle) ||
-                    NativeLibrary.TryLoad("libvulkan.so.1", assembly, searchPath, out handle))
+                if (NativeLibrary.TryLoad("libvulkan.so", out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libvulkan.so.1", out handle))
                     return handle;
             }
         }
@@ -90,9 +90,9 @@ public static class NativeDriverResolver
             }
             else
             {
-                if (NativeLibrary.TryLoad("libOpenCL.so", assembly, searchPath, out IntPtr handle) ||
-                    NativeLibrary.TryLoad("libOpenCL.so.1", assembly, searchPath, out handle) ||
-                    NativeLibrary.TryLoad("/vendor/lib64/libOpenCL.so", assembly, searchPath, out handle) ||
+                if (NativeLibrary.TryLoad("libOpenCL.so", out IntPtr handle) ||
+                    NativeLibrary.TryLoad("libOpenCL.so.1", out handle) ||
+                    NativeLibrary.TryLoad("/vendor/lib64/libOpenCL.so", out handle) ||
                     NativeLibrary.TryLoad("/system/vendor/lib64/libOpenCL.so", assembly, searchPath, out handle))
                     return handle;
             }

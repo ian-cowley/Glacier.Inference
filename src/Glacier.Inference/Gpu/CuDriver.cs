@@ -29,10 +29,22 @@ public static class CuDriver
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                return NativeLibrary.TryLoad("nvcuda.dll", out IntPtr handle) && handle != IntPtr.Zero;
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                return (NativeLibrary.TryLoad("libcuda.so.1", out IntPtr handle) || NativeLibrary.TryLoad("libcuda.so", out handle)) && handle != IntPtr.Zero;
-            return false;
+            {
+                if (!NativeLibrary.TryLoad("nvcuda.dll", out IntPtr handle) || handle == IntPtr.Zero)
+                    return false;
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                if (!NativeLibrary.TryLoad("libcuda.so.1", out IntPtr handle) && !NativeLibrary.TryLoad("libcuda.so", out handle))
+                    return false;
+                if (handle == IntPtr.Zero) return false;
+            }
+            else
+            {
+                return false;
+            }
+
+            return Init(0) == 0;
         }
         catch
         {
