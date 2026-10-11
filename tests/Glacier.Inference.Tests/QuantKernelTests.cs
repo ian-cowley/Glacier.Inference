@@ -519,5 +519,39 @@ public unsafe class QuantKernelTests
             Assert.Equal(expectedDot, actualDot, 1e-3f);
         }
     }
+
+    [Fact]
+    public void IQ2_XXS_DequantizeAndVecDot_MatchesExpected()
+    {
+        const int k = 256;
+        BlockIQ2_XXS block = new BlockIQ2_XXS();
+        block.Delta = (Half)1.0f;
+
+        // Populate Qs with deterministic values
+        for (int i = 0; i < 32; i++)
+        {
+            block.Qs[i] = (ushort)(i * 1337 + 42);
+        }
+
+        float[] dequant = new float[k];
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 7) * 0.25f - 0.75f;
+
+        BlockIQ2_XXS* pBlock = &block;
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeIQ2_XXS(pBlock, pDequant, k);
+            float actualDot = QuantKernels.VecDotIQ2_XXS(pBlock, pX, k);
+
+            float expectedDot = 0f;
+            for (int i = 0; i < k; i++)
+            {
+                expectedDot += dequant[i] * x[i];
+            }
+
+            Assert.NotEqual(0f, expectedDot);
+            Assert.Equal(expectedDot, actualDot, 1e-3f);
+        }
+    }
 }
 

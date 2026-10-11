@@ -356,7 +356,7 @@ public sealed unsafe partial class Qwen2D3D12Model
                 {
                     cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                     cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
                 }
             }
             cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
@@ -442,26 +442,14 @@ public sealed unsafe partial class Qwen2D3D12Model
             return;
         }
 
-        if (_weights.IsMoe)
-        {
-            for (int t = 0; t < totalTokens; t++)
-            {
-                bool isLast = (t == totalTokens - 1);
-                var inSlice = !inputXBatch.IsEmpty ? inputXBatch.Slice(t * _dim, _dim) : default;
-                var outSlice = !outputXBatch.IsEmpty ? outputXBatch.Slice(t * _dim, _dim) : default;
-                ForwardStage(
-                    !tokens.IsEmpty ? tokens[t] : 0,
-                    startPos + t,
-                    inSlice,
-                    outSlice,
-                    isLast ? logits : Span<float>.Empty,
-                    isLast && computeLogits);
-            }
-            return;
-        }
+
 
         int qDim = _nHeads * _headDim;
         int kvDim = _nHeadsKv * _headDim;
+
+        int topK = _weights.ExpertUsedCount;
+        int* selectedIndices = stackalloc int[Math.Max(1, topK)];
+        float* selectedWeights = stackalloc float[Math.Max(1, topK)];
 
         for (int offset = 0; offset < totalTokens; offset += MaxBatchChunk)
         {
@@ -540,47 +528,189 @@ public sealed unsafe partial class Qwen2D3D12Model
             {
                 var lw = _layerWeights[l];
 
-                // Attention pre-norm across all tokens in parallel
+                // 1. Attention pre-norm across all tokens in parallel
                 DispatchRmsNormBatch(cmd, _dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dNormXBatch);
 
-                // Batched Q, K, V projections (weights read ONCE into registers)
+                // 2. Batched Q, K, V projections (weights read ONCE into registers)
                 DispatchGemmBatch(cmd, lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, chunkSize, lw.QBias);
                 DispatchGemmBatch(cmd, lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, chunkSize, lw.KBias);
                 DispatchGemmBatch(cmd, lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, chunkSize, lw.VBias);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dQBatch);
+                cmd.ResourceBarrierUnorderedAccessView(_dKBatch);
 
-                // Batched RoPE
+                // 3. Batched RoPE
                 DispatchRopeBatch(cmd, _dQBatch, _dKBatch, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dKBatch);
+                cmd.ResourceBarrierUnorderedAccessView(_dVBatch);
 
-                // Batched KV Cache Store
+                // 4. Batched KV Cache Store
                 DispatchKvStoreBatch(cmd, l, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dKeyCache[l]);
+                cmd.ResourceBarrierUnorderedAccessView(_dValCache[l]);
+                cmd.ResourceBarrierUnorderedAccessView(_dQBatch);
 
-                // Batched Attention GQA
+                // 5. Batched Attention GQA
                 DispatchAttentionBatch(cmd, l, chunkStartPos, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dAttnOutBatch);
 
-                // Batched Attn Out with fused residual addition (_dXBatch += attnOut)
+                // 6. Batched Attn Out with fused residual addition (_dXBatch += attnOut)
                 DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch, lw.AttnOutWeight, qDim, _dim, chunkSize, null, residual: _dXBatch);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dXBatch);
 
-                // FFN pre-norm across all tokens in parallel
+                // 7. FFN pre-norm across all tokens in parallel
                 DispatchRmsNormBatch(cmd, _dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dNormXBatch);
 
-                // Batched FFN Gate and Up projections
-                DispatchGemmBatch(cmd, lw.FfnGateType, _dGateBatch, _dNormXBatch, lw.FfnGateWeight!, _dim, _ffnDim, chunkSize);
-                DispatchGemmBatch(cmd, lw.FfnUpType, _dUpBatch, _dNormXBatch, lw.FfnUpWeight!, _dim, _ffnDim, chunkSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                if (!_weights.IsMoe)
+                {
+                    // 8. Batched FFN Gate and Up projections
+                    DispatchGemmBatch(cmd, lw.FfnGateType, _dGateBatch, _dNormXBatch, lw.FfnGateWeight!, _dim, _ffnDim, chunkSize);
+                    DispatchGemmBatch(cmd, lw.FfnUpType, _dUpBatch, _dNormXBatch, lw.FfnUpWeight!, _dim, _ffnDim, chunkSize);
+                    cmd.ResourceBarrierUnorderedAccessView(_dGateBatch);
+                    cmd.ResourceBarrierUnorderedAccessView(_dUpBatch);
 
-                // SwiGLU activation across all tokens
-                DispatchSwiglu(cmd, _dGateBatch, _dUpBatch, _dFfnActBatch, chunkSize * _ffnDim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                    // 9. SwiGLU activation across all tokens
+                    DispatchSwiglu(cmd, _dGateBatch, _dUpBatch, _dFfnActBatch, chunkSize * _ffnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(_dFfnActBatch);
 
-                // Batched FFN Down projection with fused residual addition (_dXBatch += ffnDown)
-                DispatchGemmBatch(cmd, lw.FfnDownType, null, _dFfnActBatch, lw.FfnDownWeight!, _ffnDim, _dim, chunkSize, null, residual: _dXBatch);
+                    // 10. Batched FFN Down projection with fused residual addition (_dXBatch += ffnDown)
+                    DispatchGemmBatch(cmd, lw.FfnDownType, null, _dFfnActBatch, lw.FfnDownWeight!, _ffnDim, _dim, chunkSize, null, residual: _dXBatch);
+                    cmd.ResourceBarrierUnorderedAccessView(_dXBatch);
+                }
+                else
+                {
+                    int expertFfnDim = _weights.ExpertFeedForwardLength;
+                    int numExperts = _weights.ExpertCount;
+
+                    // Batched router gate projection: [chunkSize, _dim] x [_dim, numExperts] -> [chunkSize, numExperts]
+                    DispatchGemmBatch(cmd, GgufType.F32, _dRouterLogitsBatch, _dNormXBatch, lw.FfnGateInpWeight!, _dim, numExperts, chunkSize, bias: lw.FfnGateInpBias);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.ResourceBarrierTransition(_dRouterLogitsBatch!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackRouterLogitsBatch!, 0, _dRouterLogitsBatch!, 0, (ulong)(chunkSize * numExperts * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dRouterLogitsBatch!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+
+                    _ctx.EndCommandsAndExecute();
+                    _ctx.Synchronize();
+
+                    _ctx.BeginCommands();
+                    cmd = _ctx.CommandList;
+
+                    ulong gateSliceBytes = lw.FfnGateExpsWeight != null ? GetTensorSliceBytes(lw.FfnGateExpsType, expertFfnDim, _dim) : 0;
+                    ulong upSliceBytes = lw.FfnUpExpsWeight != null ? GetTensorSliceBytes(lw.FfnUpExpsType, expertFfnDim, _dim) : 0;
+                    ulong downSliceBytes = lw.FfnDownExpsWeight != null ? GetTensorSliceBytes(lw.FfnDownExpsType, _dim, expertFfnDim) : 0;
+
+                    cmd.ResourceBarrierTransition(_dNormXBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
+
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        ulong tokenOffset = (ulong)((long)t * _dim * sizeof(float));
+
+                        // Copy token t's normalized hidden state into _dNormX and residual state into _dX
+                        cmd.CopyBufferRegion(_dNormX, 0, _dNormXBatch, tokenOffset, (ulong)(_dim * sizeof(float)));
+                        cmd.CopyBufferRegion(_dX, 0, _dXBatch, tokenOffset, (ulong)(_dim * sizeof(float)));
+
+                        cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+
+                        float* pTokenRouterLogits = _pReadbackRouterLogitsBatch + t * numExperts;
+                        QuantKernels.SoftmaxTopK(pTokenRouterLogits, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
+
+                        if (_tieredMoe)
+                        {
+                            cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                            cmd.CopyBufferRegion(_readbackNormX!, 0, _dNormX, 0, (ulong)(_dim * sizeof(float)));
+                            cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+
+                            _ctx.EndCommandsAndExecute();
+                            _ctx.Synchronize();
+
+                            ComputeTieredRoutedExpertsCpu(l, StartLayer + l, expertFfnDim, topK, selectedIndices, selectedWeights);
+
+                            _ctx.BeginCommands();
+                            cmd = _ctx.CommandList;
+
+                            cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+                            cmd.CopyBufferRegion(_dExpertDownOut!, 0, _uploadExpertOut!, 0, (ulong)(_dim * sizeof(float)));
+                            cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+
+                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+                            cmd.CopyBufferRegion(_dFfnOut!, 0, _dExpertDownOut!, 0, (ulong)(_dim * sizeof(float)));
+                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                        }
+                        else
+                        {
+                            for (int k = 0; k < topK; k++)
+                            {
+                                int expertIdx = selectedIndices[k];
+                                float weight = selectedWeights[k];
+
+                                ulong expGateAddr = lw.FfnGateExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * gateSliceBytes;
+                                ulong expUpAddr = lw.FfnUpExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * upSliceBytes;
+                                ulong expDownAddr = lw.FfnDownExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * downSliceBytes;
+
+                                DispatchGemv(cmd, lw.FfnGateExpsType, _dExpertGate, _dNormX, expGateAddr, _dim, expertFfnDim);
+                                DispatchGemv(cmd, lw.FfnUpExpsType, _dExpertUp, _dNormX, expUpAddr, _dim, expertFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchSwiglu(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut, _dExpertAct!, expDownAddr, expertFfnDim, _dim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchVecAddWeighted(cmd, _dExpertDownOut!, _dFfnOut!, weight, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+                            }
+                        }
+
+                        // Shared Expert if present
+                        if (lw.FfnGateShexpWeight != null)
+                        {
+                            int modelLayer = StartLayer + l;
+                            int shexpFfnDim = expertFfnDim * 2;
+                            if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                                shexpFfnDim = (int)tShexp.Dimensions[1];
+
+                            DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight, _dim, shexpFfnDim);
+                            DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp, _dNormX, lw.FfnUpShexpWeight!, _dim, shexpFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchSwiglu(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut, _dShexpAct!, lw.FfnDownShexpWeight!, shexpFfnDim, _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+                        }
+
+                        // Residual connection: _dX += _dFfnOut
+                        DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                        // Copy updated _dX back into _dXBatch at tokenOffset
+                        cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.CopyDest);
+                        cmd.CopyBufferRegion(_dXBatch, tokenOffset, _dX, 0, (ulong)(_dim * sizeof(float)));
+                        cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopyDest, ResourceStates.CopySource);
+
+                        // Prepare _dX and _dNormX for next token copy
+                        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.CopyDest);
+                        cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+                    }
+
+                    // After token loop: transition back to UnorderedAccess / Common
+                    cmd.ResourceBarrierTransition(_dNormXBatch, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+                }
             }
 
             if (IsLastStage)
@@ -595,13 +725,17 @@ public sealed unsafe partial class Qwen2D3D12Model
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
                     cmd.ResourceBarrierTransition(_dXBatch, ResourceStates.CopySource, ResourceStates.Common);
 
+                    // Ensure _dNormX and _dLogits are in UnorderedAccess state
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.Common, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.Common, ResourceStates.UnorderedAccess);
+
                     // Final RMSNorm on final token
                     DispatchRmsNorm(cmd, _dX, _dOutNormWeight!, _dNormX, _dim, _weights.RmsNormEps);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
+                    cmd.ResourceBarrierUnorderedAccessView(_dNormX);
 
                     // Output projection (LM Head)
                     DispatchGemv(cmd, _weights.OutType, _dLogits, _dNormX, _dOutWeight!, _dim, _weights.VocabSize);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
+                    cmd.ResourceBarrierUnorderedAccessView(_dLogits);
 
                     if (!logits.IsEmpty)
                     {
@@ -609,6 +743,11 @@ public sealed unsafe partial class Qwen2D3D12Model
                         cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_weights.VocabSize * sizeof(float)));
                         cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
                     }
+                    else
+                    {
+                        cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.Common);
+                    }
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.Common);
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
                 }
                 else

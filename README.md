@@ -18,8 +18,9 @@
   GLACIER.INFERENCE: PURE C# .NET 10 UNIVERSAL LLM RUNTIME (ZERO PYTHON / ZERO C++ DLLs)
 ========================================================================================================
   Cold Startup (Model Load) :  < 15 ms  (vs 2,500 ms in Python vLLM / Ollama — 160x Faster)
-  VRAM / Driver Overhead    :  0 MB runtime overhead (Direct Driver P/Invoke, Zero CUDA Toolkit)
+  GPU Direct3D 12 Prefill   :  52.46 tok/s (DeepSeek-R1-14B) via 4KB LDS Batched GEMM Shaders (6.19x Speedup)
   GPU Bare-Metal SASS       :  28.1 tok/s (NVIDIA RTX 4060) | 35+ tok/s (DirectX 12 Wave32)
+  Quantization Architecture :  IQ1/IQ2/IQ3/IQ4, Q2_K, Q4_K_M, Q8_0, FP16, and Symmetric INT8 Wire SIMD
   CPU SIMD Throughput       :  Multi-threaded AVX-512 & AVX2 Batched GEMM (Zero Allocations)
   Universal Matrix          :  Meta Llama 3 | DeepSeek-V3/R1 | Microsoft Phi-4 | Mistral | Alibaba Qwen 2.5
 ========================================================================================================

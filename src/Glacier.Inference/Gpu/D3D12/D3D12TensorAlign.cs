@@ -99,6 +99,36 @@ public static unsafe class D3D12TensorAlign
         return aligned;
     }
 
+    public static byte[] AlignIQ2_XXS(ReadOnlySpan<byte> rawIq2, int totalBlocks)
+    {
+        byte[] aligned = GC.AllocateUninitializedArray<byte>(totalBlocks * 68);
+        fixed (byte* pSrc = rawIq2, pDst = aligned)
+        {
+            nint srcAddr = (nint)pSrc;
+            nint dstAddr = (nint)pDst;
+            int numThreads = Math.Max(1, Environment.ProcessorCount);
+            int chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+            Parallel.For(0, numThreads, t =>
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, totalBlocks);
+                byte* pS = (byte*)srcAddr;
+                byte* pD = (byte*)dstAddr;
+                for (int b = start; b < end; b++)
+                {
+                    byte* srcBlk = pS + (long)b * 66;
+                    byte* dstBlk = pD + (long)b * 68;
+                    dstBlk[0] = srcBlk[0];
+                    dstBlk[1] = srcBlk[1];
+                    dstBlk[2] = 0;
+                    dstBlk[3] = 0;
+                    Buffer.MemoryCopy(srcBlk + 2, dstBlk + 4, 64, 64);
+                }
+            });
+        }
+        return aligned;
+    }
+
     public static ulong GetAlignedTensorBytes(GgufType type, int rows, int cols)
     {
         if (type == GgufType.Q3_K)
@@ -115,6 +145,11 @@ public static unsafe class D3D12TensorAlign
         {
             int nb = cols / 32;
             return (ulong)rows * (ulong)nb * 36UL;
+        }
+        if (type == GgufType.IQ2_XXS)
+        {
+            int nb = cols / 256;
+            return (ulong)rows * (ulong)nb * 68UL;
         }
         return (ulong)rows * (ulong)GgufTypes.GetRowBytes(type, cols);
     }
@@ -147,6 +182,16 @@ public static unsafe class D3D12TensorAlign
             int totalBlocks = rows * nb;
             var raw = new ReadOnlySpan<byte>((void*)hostPtr, totalBlocks * 34);
             byte[] aligned = AlignQ8_0(raw, totalBlocks);
+            var buf = ctx.CreateDeviceBuffer((ulong)aligned.Length);
+            ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        if (type == GgufType.IQ2_XXS)
+        {
+            int nb = cols / 256;
+            int totalBlocks = rows * nb;
+            var raw = new ReadOnlySpan<byte>((void*)hostPtr, totalBlocks * 66);
+            byte[] aligned = AlignIQ2_XXS(raw, totalBlocks);
             var buf = ctx.CreateDeviceBuffer((ulong)aligned.Length);
             ctx.CopyToDevice(buf, aligned);
             return buf;

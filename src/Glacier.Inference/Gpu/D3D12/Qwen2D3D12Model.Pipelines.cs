@@ -30,6 +30,8 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
         _psoGemvQ3K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ3K));
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
+        _psoGemvQ2_K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_K));
+        _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
 
         // 2. RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
@@ -137,7 +139,7 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
             new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All), // t0: W
             new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All), // t1: bias
-            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(2, 0), ShaderVisibility.All), // t2: x (SRV for L1 cache)
+            new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All), // u2: x (UAV matching all intermediate buffers)
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All), // u0: residual
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)  // u1: y
         };
@@ -147,6 +149,10 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemmQ6KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ6KBatch));
         _psoGemmQ8_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ8_0Batch));
         _psoGemmFp32Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmFp32Batch));
+        _psoGemmQ3KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ3KBatch));
+        _psoGemmQ5KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5KBatch));
+        _psoGemmQ2_KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_KBatch));
+        _psoGemmIQ2_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XXSBatch));
 
         // 10. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
         var rmsNormBatchParams = new RootParameter[]
@@ -178,8 +184,9 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string kvShaderBatch = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.KvCacheStoreBatchF16 : D3D12Shaders.KvCacheStoreBatch;
         _sigKvStoreBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreBatchParams));
-        _psoKvStoreBatch = _ctx.CreatePipelineState(_sigKvStoreBatch, _ctx.CompileShader(D3D12Shaders.KvCacheStoreBatch));
+        _psoKvStoreBatch = _ctx.CreatePipelineState(_sigKvStoreBatch, _ctx.CompileShader(kvShaderBatch));
 
         // 13. Batched Attention Root Signature: (Params b0, q u0, k_cache u1, v_cache u2, attn_out u3)
         var attnBatchParams = new RootParameter[]
@@ -190,7 +197,8 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string attnShaderBatch = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.AttentionBatchF16 : D3D12Shaders.AttentionBatch;
         _sigAttentionBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnBatchParams));
-        _psoAttentionBatch = _ctx.CreatePipelineState(_sigAttentionBatch, _ctx.CompileShader(D3D12Shaders.AttentionBatch));
+        _psoAttentionBatch = _ctx.CreatePipelineState(_sigAttentionBatch, _ctx.CompileShader(attnShaderBatch));
     }
 }

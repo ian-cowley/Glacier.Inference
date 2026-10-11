@@ -291,10 +291,10 @@ cbuffer Params : register(b0)
     float attn_scale;
 };
 
-RWStructuredBuffer<float> q : register(u0);
+RWByteAddressBuffer q : register(u0);
 RWStructuredBuffer<float> k_cache : register(u1);
 RWStructuredBuffer<float> v_cache : register(u2);
-RWStructuredBuffer<float> attn_out : register(u3);
+RWByteAddressBuffer attn_out : register(u3);
 
 groupshared float s_red[128];
 
@@ -308,7 +308,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
 
-    float q_d = q[h * head_dim + tid];
+    float q_d = asfloat(q.Load((h * head_dim + tid) * 4));
 
     float m = -1e30f;
     float l = 0.0f;
@@ -352,7 +352,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
+    attn_out.Store((h * head_dim + tid) * 4, asuint(final_attn));
 }
 ";
 
@@ -367,10 +368,10 @@ cbuffer Params : register(b0)
     float attn_scale;
 };
 
-RWStructuredBuffer<float> q : register(u0);
+RWByteAddressBuffer q : register(u0);
 RWStructuredBuffer<uint> k_cache : register(u1);
 RWStructuredBuffer<uint> v_cache : register(u2);
-RWStructuredBuffer<float> attn_out : register(u3);
+RWByteAddressBuffer attn_out : register(u3);
 
 groupshared float s_red[128];
 
@@ -384,7 +385,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
 
-    float q_d = q[h * head_dim + tid];
+    float q_d = asfloat(q.Load((h * head_dim + tid) * 4));
 
     float m = -1e30f;
     float l = 0.0f;
@@ -434,7 +435,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
+    attn_out.Store((h * head_dim + tid) * 4, asuint(final_attn));
 }
 ";
 
@@ -729,12 +731,13 @@ cbuffer Params : register(b0)
     uint batch_size;
 };
 
-RWStructuredBuffer<float> q : register(u0);
+RWByteAddressBuffer q : register(u0);
 RWStructuredBuffer<float> k_cache : register(u1);
 RWStructuredBuffer<float> v_cache : register(u2);
-RWStructuredBuffer<float> attn_out : register(u3);
+RWByteAddressBuffer attn_out : register(u3);
 
-groupshared float s_red[128];
+// Tiled LDS reduction scratchpad: 4 tokens * 128 elements = 512 floats (2 KB LDS)
+groupshared float s_red[4][128];
 
 [numthreads(128, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
@@ -749,52 +752,98 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint pos_t = start_pos + t;
 
     uint q_offset = (t * n_heads_q + h) * head_dim + tid;
-    float q_d = q[q_offset];
+    float q_d = asfloat(q.Load(q_offset * 4));
 
     float m = -1e30f;
     float l = 0.0f;
     float acc = 0.0f;
 
-    for (uint p = 0; p <= pos_t; p++)
+    uint warp_id = tid / 32;
+    uint lane_id = tid % 32;
+
+    // Process historical tokens in sequence tiles of 4
+    for (uint p = 0; p <= pos_t; p += 4)
     {
-        uint kv_offset = (h_kv * max_seq_len + p) * head_dim + tid;
-        float k_d = k_cache[kv_offset];
-        float v_d = v_cache[kv_offset];
+        float k_val[4];
+        float v_val[4];
 
-        s_red[tid] = q_d * k_d;
+        [unroll]
+        for (uint i = 0; i < 4; i++)
+        {
+            uint curr_p = p + i;
+            if (curr_p <= pos_t)
+            {
+                uint kv_offset = (h_kv * max_seq_len + curr_p) * head_dim + tid;
+                k_val[i] = k_cache[kv_offset];
+                v_val[i] = v_cache[kv_offset];
+                s_red[i][tid] = q_d * k_val[i];
+            }
+            else
+            {
+                k_val[i] = 0.0f;
+                v_val[i] = 0.0f;
+                s_red[i][tid] = 0.0f;
+            }
+        }
+
+        // Barrier 1: All 128 threads have written products into s_red
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < 64) s_red[tid] += s_red[tid + 64];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 32) s_red[tid] += s_red[tid + 32];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 16) s_red[tid] += s_red[tid + 16];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 8)  s_red[tid] += s_red[tid + 8];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 4)  s_red[tid] += s_red[tid + 4];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 2)  s_red[tid] += s_red[tid + 2];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        // Stage 1: Warp-parallel reduction (Warp w reduces Score w)
+        // Lanes 0..7 sum 16 contiguous elements each (128 -> 8 elements in 15 ALU cycles)
+        if (lane_id < 8)
+        {
+            float chunk_sum = 0.0f;
+            [unroll]
+            for (uint j = 0; j < 16; j++)
+            {
+                chunk_sum += s_red[warp_id][lane_id * 16 + j];
+            }
+            s_red[warp_id][lane_id] = chunk_sum;
+        }
+
+        // Barrier 2: 8 chunk sums written per warp
         GroupMemoryBarrierWithGroupSync();
 
-        float total_dot = s_red[0];
-        float s_p = total_dot * attn_scale;
+        // Stage 2: Lane 0 of each warp sums the 8 chunk sums
+        if (lane_id == 0)
+        {
+            s_red[warp_id][0] = s_red[warp_id][0] + s_red[warp_id][1] +
+                                s_red[warp_id][2] + s_red[warp_id][3] +
+                                s_red[warp_id][4] + s_red[warp_id][5] +
+                                s_red[warp_id][6] + s_red[warp_id][7];
+        }
 
-        float m_new = max(m, s_p);
-        float alpha = exp(m - m_new);
-        float w_p = exp(s_p - m_new);
+        // Barrier 3: Final dot products visible in s_red[0..3][0]
+        GroupMemoryBarrierWithGroupSync();
 
-        acc = acc * alpha + w_p * v_d;
-        l = l * alpha + w_p;
-        m = m_new;
+        // Online Softmax update across the tile
+        [unroll]
+        for (uint k = 0; k < 4; k++)
+        {
+            uint curr_p = p + k;
+            if (curr_p <= pos_t)
+            {
+                float total_dot = s_red[k][0];
+                float s_k = total_dot * attn_scale;
 
+                float m_new = max(m, s_k);
+                float alpha = exp(m - m_new);
+                float w_k = exp(s_k - m_new);
+
+                acc = acc * alpha + w_k * v_val[k];
+                l = l * alpha + w_k;
+                m = m_new;
+            }
+        }
+
+        // Barrier 4: Synchronize before next tile overwrites s_red
         GroupMemoryBarrierWithGroupSync();
     }
 
     uint out_offset = (t * n_heads_q + h) * head_dim + tid;
-    attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
+    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
+    attn_out.Store(out_offset * 4, asuint(final_attn));
 }
 ";
 
@@ -815,12 +864,13 @@ cbuffer Params : register(b0)
     uint batch_size;
 };
 
-RWStructuredBuffer<float> q : register(u0);
+RWByteAddressBuffer q : register(u0);
 RWStructuredBuffer<uint> k_cache : register(u1);
 RWStructuredBuffer<uint> v_cache : register(u2);
-RWStructuredBuffer<float> attn_out : register(u3);
+RWByteAddressBuffer attn_out : register(u3);
 
-groupshared float s_red[128];
+// Tiled LDS reduction scratchpad: 4 tokens * 128 elements = 512 floats (2 KB LDS)
+groupshared float s_red[4][128];
 
 [numthreads(128, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
@@ -835,7 +885,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint pos_t = start_pos + t;
 
     uint q_offset = (t * n_heads_q + h) * head_dim + tid;
-    float q_d = q[q_offset];
+    float q_d = asfloat(q.Load(q_offset * 4));
 
     float m = -1e30f;
     float l = 0.0f;
@@ -843,50 +893,94 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 
     uint pair_idx = tid / 2;
     uint is_odd = tid & 1;
+    uint warp_id = tid / 32;
+    uint lane_id = tid % 32;
 
-    for (uint p = 0; p <= pos_t; p++)
+    // Process historical tokens in sequence tiles of 4
+    for (uint p = 0; p <= pos_t; p += 4)
     {
-        uint kv_offset = (h_kv * max_seq_len + p) * (head_dim / 2) + pair_idx;
-        uint k_packed = k_cache[kv_offset];
-        uint v_packed = v_cache[kv_offset];
+        float k_val[4];
+        float v_val[4];
 
-        float k_d = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
-        float v_d = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
+        [unroll]
+        for (uint i = 0; i < 4; i++)
+        {
+            uint curr_p = p + i;
+            if (curr_p <= pos_t)
+            {
+                uint kv_offset = (h_kv * max_seq_len + curr_p) * (head_dim / 2) + pair_idx;
+                uint k_packed = k_cache[kv_offset];
+                uint v_packed = v_cache[kv_offset];
 
-        s_red[tid] = q_d * k_d;
+                k_val[i] = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
+                v_val[i] = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
+                s_red[i][tid] = q_d * k_val[i];
+            }
+            else
+            {
+                k_val[i] = 0.0f;
+                v_val[i] = 0.0f;
+                s_red[i][tid] = 0.0f;
+            }
+        }
+
+        // Barrier 1: All 128 threads have written products into s_red
         GroupMemoryBarrierWithGroupSync();
 
-        if (tid < 64) s_red[tid] += s_red[tid + 64];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 32) s_red[tid] += s_red[tid + 32];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 16) s_red[tid] += s_red[tid + 16];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 8)  s_red[tid] += s_red[tid + 8];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 4)  s_red[tid] += s_red[tid + 4];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 2)  s_red[tid] += s_red[tid + 2];
-        GroupMemoryBarrierWithGroupSync();
-        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        // Stage 1: Warp-parallel reduction (Warp w reduces Score w)
+        if (lane_id < 8)
+        {
+            float chunk_sum = 0.0f;
+            [unroll]
+            for (uint j = 0; j < 16; j++)
+            {
+                chunk_sum += s_red[warp_id][lane_id * 16 + j];
+            }
+            s_red[warp_id][lane_id] = chunk_sum;
+        }
+
+        // Barrier 2: 8 chunk sums written per warp
         GroupMemoryBarrierWithGroupSync();
 
-        float total_dot = s_red[0];
-        float s_p = total_dot * attn_scale;
+        // Stage 2: Lane 0 of each warp sums the 8 chunk sums
+        if (lane_id == 0)
+        {
+            s_red[warp_id][0] = s_red[warp_id][0] + s_red[warp_id][1] +
+                                s_red[warp_id][2] + s_red[warp_id][3] +
+                                s_red[warp_id][4] + s_red[warp_id][5] +
+                                s_red[warp_id][6] + s_red[warp_id][7];
+        }
 
-        float m_new = max(m, s_p);
-        float alpha = exp(m - m_new);
-        float w_p = exp(s_p - m_new);
+        // Barrier 3: Final dot products visible in s_red[0..3][0]
+        GroupMemoryBarrierWithGroupSync();
 
-        acc = acc * alpha + w_p * v_d;
-        l = l * alpha + w_p;
-        m = m_new;
+        // Online Softmax update across the tile
+        [unroll]
+        for (uint k = 0; k < 4; k++)
+        {
+            uint curr_p = p + k;
+            if (curr_p <= pos_t)
+            {
+                float total_dot = s_red[k][0];
+                float s_k = total_dot * attn_scale;
 
+                float m_new = max(m, s_k);
+                float alpha = exp(m - m_new);
+                float w_k = exp(s_k - m_new);
+
+                acc = acc * alpha + w_k * v_val[k];
+                l = l * alpha + w_k;
+                m = m_new;
+            }
+        }
+
+        // Barrier 4: Synchronize before next tile overwrites s_red
         GroupMemoryBarrierWithGroupSync();
     }
 
     uint out_offset = (t * n_heads_q + h) * head_dim + tid;
-    attn_out[out_offset] = (l > 0.0f) ? (acc / l) : 0.0f;
+    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
+    attn_out.Store(out_offset * 4, asuint(final_attn));
 }
 ";
 }

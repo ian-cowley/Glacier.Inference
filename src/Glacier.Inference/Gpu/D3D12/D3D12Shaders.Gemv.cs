@@ -14,10 +14,10 @@ cbuffer Params : register(b0)
 };
 
 ByteAddressBuffer W : register(t0);
-StructuredBuffer<float> bias : register(t1);
+ByteAddressBuffer bias : register(t1);
 RWByteAddressBuffer x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
@@ -118,9 +118,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";
@@ -512,16 +516,16 @@ cbuffer Params : register(b0)
 };
 
 ByteAddressBuffer W : register(t0);
-StructuredBuffer<float> bias : register(t1);
-RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+ByteAddressBuffer bias : register(t1);
+RWByteAddressBuffer x : register(u0);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
 int decode_signed_byte(uint b)
 {
-    return (b >= 128) ? (int)b - 256 : (int)b;
+    return (int)(b << 24) >> 24;
 }
 
 [numthreads(32, 4, 1)]
@@ -539,13 +543,22 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         uint row_byte_offset = warp_id * nb * 212;
         float row_sum = 0.0f;
         uint is_idx = lane_id / 16;
+        uint lane_byte = (lane_id & 3) * 8;
+        uint lane_dword = lane_id & ~3;
 
         for (uint b = 0; b < nb; b++)
         {
             uint blk_addr = row_byte_offset + b * 212;
-            uint d_raw = W.Load(blk_addr + 208) & 0xFFFF;
-            float d = f16tof32(d_raw);
+            float d = f16tof32(W.Load(blk_addr + 208) & 0xFFFF);
             uint x_blk = b * 256;
+
+            // Load all 16 scales for this block via 4-byte aligned scalar loads
+            uint sc0 = W.Load(blk_addr + 192);
+            uint sc1 = W.Load(blk_addr + 196);
+            uint sc2 = W.Load(blk_addr + 200);
+            uint sc3 = W.Load(blk_addr + 204);
+
+            float blk_sum = 0.0f;
 
             [unroll]
             for (uint step = 0; step < 2; step++)
@@ -553,38 +566,35 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                 uint n = step * 128;
                 uint ql_addr = blk_addr + step * 64;
                 uint qh_addr = blk_addr + 128 + step * 32;
-                uint sc_addr = blk_addr + 192 + step * 8;
 
-                uint qh_word = W.Load(qh_addr + (lane_id & ~3));
-                uint qh_val = (qh_word >> ((lane_id & 3) * 8)) & 0xFF;
-
-                uint ql_low_word = W.Load(ql_addr + (lane_id & ~3));
-                uint ql_low = (ql_low_word >> ((lane_id & 3) * 8)) & 0xFF;
-
-                uint ql_high_word = W.Load(ql_addr + 32 + (lane_id & ~3));
-                uint ql_high = (ql_high_word >> ((lane_id & 3) * 8)) & 0xFF;
+                uint qh_val = (W.Load(qh_addr + lane_dword) >> lane_byte) & 0xFF;
+                uint ql_low = (W.Load(ql_addr + lane_dword) >> lane_byte) & 0xFF;
+                uint ql_high = (W.Load(ql_addr + 32 + lane_dword) >> lane_byte) & 0xFF;
 
                 int q1 = (int)((ql_low & 0x0F) | (((qh_val >> 0) & 3) << 4)) - 32;
                 int q2 = (int)((ql_high & 0x0F) | (((qh_val >> 2) & 3) << 4)) - 32;
                 int q3 = (int)((ql_low >> 4) | (((qh_val >> 4) & 3) << 4)) - 32;
                 int q4 = (int)((ql_high >> 4) | (((qh_val >> 6) & 3) << 4)) - 32;
 
-                uint2 sc_words = W.Load2(sc_addr);
+                uint2 sc_words = (step == 0) ? uint2(sc0, sc1) : uint2(sc2, sc3);
                 int s1 = decode_signed_byte((sc_words.x >> (is_idx * 8)) & 0xFF);
                 int s2 = decode_signed_byte((sc_words.x >> ((is_idx + 2) * 8)) & 0xFF);
                 int s3 = decode_signed_byte((sc_words.y >> (is_idx * 8)) & 0xFF);
                 int s4 = decode_signed_byte((sc_words.y >> ((is_idx + 2) * 8)) & 0xFF);
 
-                float w1 = d * (float)s1 * (float)q1;
-                float w2 = d * (float)s2 * (float)q2;
-                float w3 = d * (float)s3 * (float)q3;
-                float w4 = d * (float)s4 * (float)q4;
+                float w1 = (float)s1 * (float)q1;
+                float w2 = (float)s2 * (float)q2;
+                float w3 = (float)s3 * (float)q3;
+                float w4 = (float)s4 * (float)q4;
 
-                row_sum += w1 * x[x_blk + n + lane_id + 0]
-                         + w2 * x[x_blk + n + lane_id + 32]
-                         + w3 * x[x_blk + n + lane_id + 64]
-                         + w4 * x[x_blk + n + lane_id + 96];
+                uint x_addr = (x_blk + n + lane_id) * 4;
+                blk_sum += w1 * asfloat(x.Load(x_addr + 0))
+                         + w2 * asfloat(x.Load(x_addr + 32 * 4))
+                         + w3 * asfloat(x.Load(x_addr + 64 * 4))
+                         + w4 * asfloat(x.Load(x_addr + 96 * 4));
             }
+
+            row_sum += d * blk_sum;
         }
 
         s_mem[s_idx] = row_sum;
@@ -608,9 +618,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";

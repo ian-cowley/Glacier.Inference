@@ -1,6 +1,7 @@
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Vortice.D3DCompiler;
@@ -41,12 +42,33 @@ public sealed unsafe class D3D12Context : IDisposable
     private ulong _sharedSystemMemory;
     public ulong DedicatedVideoMemory => _dedicatedVideoMemory;
     public ulong SharedSystemMemory => _sharedSystemMemory;
+    public ulong TotalAccessibleMemory => (_dedicatedVideoMemory < 4_000_000_000UL || _deviceName.Contains("Radeon", StringComparison.OrdinalIgnoreCase) || _deviceName.Contains("Intel", StringComparison.OrdinalIgnoreCase))
+        ? (_dedicatedVideoMemory + _sharedSystemMemory)
+        : _dedicatedVideoMemory;
     public IDXGIAdapter1? Adapter => _adapter;
 
     public D3D12Context(int adapterIndex = -1)
     {
         _adapterIndex = adapterIndex;
         Initialize();
+    }
+
+    public static List<(int Index, string Name, ulong DedicatedVideoMemory, ulong SharedSystemMemory)> EnumerateAdapters()
+    {
+        var list = new List<(int Index, string Name, ulong DedicatedVideoMemory, ulong SharedSystemMemory)>();
+        if (!OperatingSystem.IsWindows()) return list;
+
+        using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory4>();
+        for (uint i = 0; factory.EnumAdapters1(i, out IDXGIAdapter1 a).Success; i++)
+        {
+            var desc = a.Description1;
+            if ((desc.Flags & AdapterFlags.Software) == 0)
+            {
+                list.Add(((int)i, desc.Description, (ulong)desc.DedicatedVideoMemory, (ulong)desc.SharedSystemMemory));
+            }
+            a.Dispose();
+        }
+        return list;
     }
 
     private void Initialize()
@@ -120,8 +142,13 @@ public sealed unsafe class D3D12Context : IDisposable
         _fenceValue = 0;
         _fenceEvent = new AutoResetEvent(false);
 
-        _dummyBuffer = CreateDeviceBuffer(256);
+        _dummyBuffer = CreateDeviceBuffer(4 * 1024 * 1024);
         _stagingUploadBuffer = CreateUploadBuffer(StagingUploadBufferSize);
+
+        BeginCommands();
+        _cmdList.ResourceBarrierTransition(_dummyBuffer, ResourceStates.Common, ResourceStates.UnorderedAccess);
+        EndCommandsAndExecute();
+        Synchronize();
     }
 
     public ID3D12Resource CreateDeviceBuffer(ulong sizeInBytes, ResourceFlags flags = ResourceFlags.AllowUnorderedAccess)
@@ -225,7 +252,7 @@ public sealed unsafe class D3D12Context : IDisposable
         readbackBuffer.Unmap(0);
     }
 
-    public void Synchronize()
+    public void Synchronize(int timeoutMs = 60000)
     {
         if (_disposed) return;
         _fenceValue++;
@@ -234,7 +261,11 @@ public sealed unsafe class D3D12Context : IDisposable
         if (_fence.CompletedValue < _fenceValue)
         {
             _fence.SetEventOnCompletion(_fenceValue, _fenceEvent);
-            _fenceEvent.WaitOne();
+            if (!_fenceEvent.WaitOne(timeoutMs))
+            {
+                var reason = _device.DeviceRemovedReason;
+                throw new TimeoutException($"D3D12Context.Synchronize timed out after {timeoutMs}ms waiting for fence {_fenceValue} (Completed: {_fence.CompletedValue}). DeviceRemovedReason: 0x{reason.Code:X8} ({reason})");
+            }
         }
     }
 
@@ -243,11 +274,49 @@ public sealed unsafe class D3D12Context : IDisposable
         _cmdList.ResourceBarrierUnorderedAccessView(resource!);
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ReadOnlyMemory<byte>> _memoryShaderCache = new();
+    private static readonly string _diskShaderCacheDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Glacier", "ShaderCache");
+
     public ReadOnlyMemory<byte> CompileShader(string hlsl, string entryPoint = "main", string profile = "cs_5_0")
     {
+        string key = $"{profile}_{entryPoint}_{hlsl}";
+        if (_memoryShaderCache.TryGetValue(key, out var cachedMem))
+        {
+            return cachedMem;
+        }
+
+        byte[] hashBytes = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key));
+        string hashStr = Convert.ToHexString(hashBytes).ToLowerInvariant();
+        string cacheFile = Path.Combine(_diskShaderCacheDir, $"{hashStr}.cso");
+
+        try
+        {
+            if (File.Exists(cacheFile))
+            {
+                byte[] diskBytes = File.ReadAllBytes(cacheFile);
+                if (diskBytes.Length > 0)
+                {
+                    _memoryShaderCache[key] = diskBytes;
+                    return diskBytes;
+                }
+            }
+        }
+        catch { }
+
         var bytecode = Compiler.Compile(hlsl, entryPoint, "source.hlsl", profile);
         if (bytecode.IsEmpty)
             throw new InvalidOperationException($"Failed to compile HLSL compute shader for entry point '{entryPoint}'.");
+
+        try
+        {
+            Directory.CreateDirectory(_diskShaderCacheDir);
+            File.WriteAllBytes(cacheFile, bytecode.ToArray());
+        }
+        catch { }
+
+        _memoryShaderCache[key] = bytecode;
         return bytecode;
     }
 

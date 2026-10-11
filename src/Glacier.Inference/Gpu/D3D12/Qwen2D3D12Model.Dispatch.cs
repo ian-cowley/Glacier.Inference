@@ -47,6 +47,8 @@ public sealed unsafe partial class Qwen2D3D12Model
             GgufType.Q6_K => _psoGemvQ6K,
             GgufType.Q3_K => _psoGemvQ3K,
             GgufType.Q8_0 => _psoGemvQ8_0,
+            GgufType.Q2_K => _psoGemvQ2_K,
+            GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
             GgufType.F32 => _psoGemvFp32,
             _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
         };
@@ -236,6 +238,19 @@ public sealed unsafe partial class Qwen2D3D12Model
         int batchSize,
         ID3D12Resource? bias = null,
         ID3D12Resource? residual = null)
+        => DispatchGemmBatch(cmdList, type, y, x, w.GPUVirtualAddress, kCols, mRows, batchSize, bias, residual);
+
+    private void DispatchGemmBatch(
+        ID3D12GraphicsCommandList cmdList,
+        GgufType type,
+        ID3D12Resource? y,
+        ID3D12Resource x,
+        ulong wGpuVirtualAddress,
+        int kCols,
+        int mRows,
+        int batchSize,
+        ID3D12Resource? bias = null,
+        ID3D12Resource? residual = null)
     {
         cmdList.SetComputeRootSignature(_sigGemmBatch);
         if (type == GgufType.Q4_K)
@@ -246,6 +261,14 @@ public sealed unsafe partial class Qwen2D3D12Model
             cmdList.SetPipelineState(_psoGemmQ8_0Batch);
         else if (type == GgufType.F32)
             cmdList.SetPipelineState(_psoGemmFp32Batch);
+        else if (type == GgufType.Q3_K)
+            cmdList.SetPipelineState(_psoGemmQ3KBatch);
+        else if (type == GgufType.Q5_K)
+            cmdList.SetPipelineState(_psoGemmQ5KBatch);
+        else if (type == GgufType.Q2_K)
+            cmdList.SetPipelineState(_psoGemmQ2_KBatch);
+        else if (type == GgufType.IQ2_XXS)
+            cmdList.SetPipelineState(_psoGemmIQ2_XXSBatch);
         else
             throw new NotSupportedException($"Direct3D 12 batch GEMM does not support tensor quantization type {type}.");
 
@@ -258,12 +281,11 @@ public sealed unsafe partial class Qwen2D3D12Model
         pConsts[5] = (uint)(y != null ? 1 : 0);
         cmdList.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
 
-        cmdList.SetComputeRootShaderResourceView(1, w.GPUVirtualAddress);
+        cmdList.SetComputeRootShaderResourceView(1, wGpuVirtualAddress);
         cmdList.SetComputeRootShaderResourceView(2, bias != null ? bias.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
-        cmdList.SetComputeRootShaderResourceView(3, x.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
-
 
         cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
     }

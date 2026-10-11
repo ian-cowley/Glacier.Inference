@@ -124,3 +124,14 @@ public unsafe struct BlockQ2_K
     public Half DeltaMin;         // 2 bytes: super-block min scale
 }
 
+/// <summary>
+/// IQ2_XXS (Type 16) quantization super-block: 256 elements in 66 bytes (2.0625 b/w).
+/// 2-byte FP16 super-scale + 32 ushort (64 bytes) quantized grid/sign indices.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ2_XXS
+{
+    public Half Delta;          // 2 bytes: super-block scale
+    public fixed ushort Qs[32]; // 64 bytes (32 * 2 = 64 bytes)
+}
+
