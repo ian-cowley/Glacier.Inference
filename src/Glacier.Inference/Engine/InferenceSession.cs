@@ -357,6 +357,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         string finishReason = "length";
 
         int maxSeq = _gpuModel != null ? _maxSeqLen : (_d3d12Model != null ? _maxSeqLen : (_kvCache?.MaxSeqLen ?? _maxSeqLen));
+        var utf8Decoder = Encoding.UTF8.GetDecoder();
+        char[] charBuf = new char[128];
+
         int currentPos = promptTokens.Length;
         for (int step = 0; step < options.MaxTokens && currentPos < maxSeq; step++)
         {
@@ -385,24 +388,33 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 break;
             }
 
-            // Decode token piece
-            string piece = _tokenizer.DecodeToken(nextToken);
-            responseSb.Append(piece);
-            onToken?.Invoke(piece);
+            // Decode token piece safely with stateful UTF-8 decoder (preserves multi-byte characters & emojis across tokens)
+            byte[] tokenBytes = _tokenizer.GetTokenBytes(nextToken);
+            int charsDecoded = utf8Decoder.GetChars(tokenBytes, 0, tokenBytes.Length, charBuf, 0, flush: false);
+            if (charsDecoded > 0)
+            {
+                string piece = new string(charBuf, 0, charsDecoded);
+                responseSb.Append(piece);
+                onToken?.Invoke(piece);
+            }
 
             // Forward next token
             ForwardToken(nextToken, currentPos, computeLogits: true);
             currentPos++;
-
-
-
-
 
             // Yield control briefly
             if ((step & 15) == 0)
             {
                 await Task.Yield();
             }
+        }
+
+        int flushChars = utf8Decoder.GetChars(Array.Empty<byte>(), 0, 0, charBuf, 0, flush: true);
+        if (flushChars > 0)
+        {
+            string piece = new string(charBuf, 0, flushChars);
+            responseSb.Append(piece);
+            onToken?.Invoke(piece);
         }
 
         genStopwatch.Stop();

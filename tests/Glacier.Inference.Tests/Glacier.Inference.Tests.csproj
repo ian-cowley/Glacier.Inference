@@ -24,9 +24,20 @@
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="..\..\src\Glacier.Inference\Glacier.Inference.csproj" />
     <ProjectReference Include="..\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" />
-    <ProjectReference Include="..\..\..\Glacier.Cluster\src\Glacier.Cluster\Glacier.Cluster.csproj" />
-    <ProjectReference Include="..\..\..\Glacier.Inference.Distributed\src\Glacier.Inference.Distributed\Glacier.Inference.Distributed.csproj" />
   </ItemGroup>
+
+  <Choose>
+    <When Condition="Exists('..\..\..\Glacier.Cluster\src\Glacier.Cluster\Glacier.Cluster.csproj')">
+      <ItemGroup>
+        <ProjectReference Include="..\..\..\Glacier.Cluster\src\Glacier.Cluster\Glacier.Cluster.csproj" />
+      </ItemGroup>
+    </When>
+    <Otherwise>
+      <ItemGroup>
+        <PackageReference Include="Glacier.Cluster" Version="1.0.0" />
+      </ItemGroup>
+    </Otherwise>
+  </Choose>
 
   <ItemGroup>
     <None Include="TestData\**\*" CopyToOutputDirectory="PreserveNewest" />

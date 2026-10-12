@@ -557,16 +557,16 @@ public sealed partial class BpeTokenizer
     }
 
     /// <summary>
-    /// Decodes a single token ID into its string representation.
+    /// Gets the raw UTF-8 bytes for a single token ID.
     /// </summary>
-    public string DecodeToken(int tokenId)
+    public byte[] GetTokenBytes(int tokenId)
     {
         if (tokenId < 0 || tokenId >= _idToToken.Length)
-            return "";
+            return Array.Empty<byte>();
 
         string piece = _idToToken[tokenId];
         if (_specialTokens.ContainsKey(piece))
-            return piece;
+            return Encoding.UTF8.GetBytes(piece);
 
         var byteList = new List<byte>(piece.Length);
         foreach (char c in piece)
@@ -582,7 +582,16 @@ public sealed partial class BpeTokenizer
             }
         }
 
-        return Encoding.UTF8.GetString(byteList.ToArray());
+        return byteList.ToArray();
+    }
+
+    /// <summary>
+    /// Decodes a single token ID into its string representation.
+    /// </summary>
+    public string DecodeToken(int tokenId)
+    {
+        byte[] bytes = GetTokenBytes(tokenId);
+        return bytes.Length == 0 ? "" : Encoding.UTF8.GetString(bytes);
     }
 
     /// <summary>
