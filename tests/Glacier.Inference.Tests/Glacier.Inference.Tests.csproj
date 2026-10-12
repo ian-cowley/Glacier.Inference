@@ -26,18 +26,6 @@
     <ProjectReference Include="..\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" />
   </ItemGroup>
 
-  <Choose>
-    <When Condition="Exists('..\..\..\Glacier.Cluster\src\Glacier.Cluster\Glacier.Cluster.csproj')">
-      <ItemGroup>
-        <ProjectReference Include="..\..\..\Glacier.Cluster\src\Glacier.Cluster\Glacier.Cluster.csproj" />
-      </ItemGroup>
-    </When>
-    <Otherwise>
-      <ItemGroup>
-        <PackageReference Include="Glacier.Cluster" Version="1.0.0" />
-      </ItemGroup>
-    </Otherwise>
-  </Choose>
 
   <ItemGroup>
     <None Include="TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
