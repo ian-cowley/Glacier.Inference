@@ -3,6 +3,7 @@ namespace Glacier.Inference.Tests;
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Quant;
 using Vortice.Direct3D12;
@@ -74,7 +75,7 @@ public unsafe class D3D12BatchedGemmAdversarialTests
         cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
         cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
 
-        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 7) / 8, 1);
         ctx.EndCommandsAndExecute();
         ctx.Synchronize();
     }
@@ -1139,4 +1140,271 @@ public unsafe class D3D12BatchedGemmAdversarialTests
             }
         }
     }
+
+    // =========================================================================
+    // 14. IN-VRAM MOE COMPUTE SHADER TESTS
+    // =========================================================================
+    [Fact]
+    public void D3D12_MoeRouterSoftmaxTopK_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int numExperts = 64;
+        int topK = 4;
+
+        float[] logits = new float[numExperts];
+        for (int i = 0; i < numExperts; i++)
+        {
+            logits[i] = MathF.Sin(i * 0.35f) * 10.0f;
+        }
+
+        int[] cpuIndices = new int[topK];
+        float[] cpuWeights = new float[topK];
+        fixed (float* pLogits = logits)
+        fixed (int* pIdx = cpuIndices)
+        fixed (float* pWeights = cpuWeights)
+        {
+            QuantKernels.SoftmaxTopK(pLogits, numExperts, topK, pIdx, pWeights, normTopK: true);
+        }
+
+        using var dLogits = ctx.CreateDeviceBuffer((ulong)(numExperts * sizeof(float)));
+        using var dTopKIndices = ctx.CreateDeviceBuffer((ulong)(topK * sizeof(uint)));
+        using var dTopKWeights = ctx.CreateDeviceBuffer((ulong)(topK * sizeof(float)));
+
+        fixed (float* pLogits = logits)
+        {
+            ctx.CopyToDevice(dLogits, (IntPtr)pLogits, (ulong)(numExperts * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        ctx.DispatchMoeRouterSoftmaxTopK(dLogits, dTopKIndices, dTopKWeights, numExperts, topK, normTopK: true, batchSize: 1);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        uint[] gpuIndices = new uint[topK];
+        float[] gpuWeights = new float[topK];
+        fixed (uint* pGpuIdx = gpuIndices) ctx.CopyToHost((IntPtr)pGpuIdx, dTopKIndices, (ulong)(topK * sizeof(uint)));
+        fixed (float* pGpuW = gpuWeights) ctx.CopyToHost((IntPtr)pGpuW, dTopKWeights, (ulong)(topK * sizeof(float)));
+
+        for (int k = 0; k < topK; k++)
+        {
+            Assert.Equal((uint)cpuIndices[k], gpuIndices[k]);
+            Assert.True(MathF.Abs(cpuWeights[k] - gpuWeights[k]) <= 1e-4f,
+                $"Top-K weight mismatch at k={k}: cpu={cpuWeights[k]}, gpu={gpuWeights[k]}");
+        }
+    }
+
+    [Fact]
+    public void D3D12_MoeSharedExpertGate_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int size = 2048;
+
+        float[] x = new float[size];
+        float[] w = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            x[i] = MathF.Sin(i * 0.05f) * 0.1f;
+            w[i] = MathF.Cos(i * 0.03f) * 0.1f;
+        }
+
+        float cpuDot;
+        fixed (float* pX = x)
+        fixed (float* pW = w)
+        {
+            cpuDot = QuantKernels.VecDotF32(pX, pW, size);
+        }
+        float cpuGate = 1.0f / (1.0f + MathF.Exp(-cpuDot));
+
+        using var dX = ctx.CreateDeviceBuffer((ulong)(size * sizeof(float)));
+        using var dW = ctx.CreateDeviceBuffer((ulong)(size * sizeof(float)));
+        using var dGate = ctx.CreateDeviceBuffer(sizeof(float));
+
+        fixed (float* pX = x) ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(size * sizeof(float)));
+        fixed (float* pW = w) ctx.CopyToDevice(dW, (IntPtr)pW, (ulong)(size * sizeof(float)));
+
+        ctx.BeginCommands();
+        ctx.DispatchMoeSharedExpertGate(dX, dW, dGate, size);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float gpuGate;
+        ctx.CopyToHost((IntPtr)(&gpuGate), dGate, sizeof(float));
+
+        Assert.True(MathF.Abs(cpuGate - gpuGate) <= 1e-4f,
+            $"Shared expert gate mismatch: cpu={cpuGate}, gpu={gpuGate}");
+    }
+
+    [Fact]
+    public void D3D12_VecAddWeightedFromBuffer_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int size = 1024;
+        float[] dst = new float[size];
+        float[] src = new float[size];
+        float[] weights = [0.25f, 0.75f, 1.5f, -0.5f];
+
+        for (int i = 0; i < size; i++)
+        {
+            dst[i] = (float)i * 0.1f;
+            src[i] = MathF.Sin(i * 0.2f);
+        }
+
+        using var dDst = ctx.CreateDeviceBuffer((ulong)(size * sizeof(float)));
+        using var dSrc = ctx.CreateDeviceBuffer((ulong)(size * sizeof(float)));
+        using var dW = ctx.CreateDeviceBuffer((ulong)(weights.Length * sizeof(float)));
+
+        fixed (float* pDst = dst) ctx.CopyToDevice(dDst, (IntPtr)pDst, (ulong)(size * sizeof(float)));
+        fixed (float* pSrc = src) ctx.CopyToDevice(dSrc, (IntPtr)pSrc, (ulong)(size * sizeof(float)));
+        fixed (float* pW = weights) ctx.CopyToDevice(dW, (IntPtr)pW, (ulong)(weights.Length * sizeof(float)));
+
+        // accumulate = 1 with weight index 2 (weight = 1.5)
+        ctx.BeginCommands();
+        ctx.DispatchVecAddWeightedFromBuffer(dDst, dSrc, dW, weightIndex: 2, length: size, accumulate: 1);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float[] gpuOut = new float[size];
+        fixed (float* pGpu = gpuOut) ctx.CopyToHost((IntPtr)pGpu, dDst, (ulong)(size * sizeof(float)));
+
+        for (int i = 0; i < size; i++)
+        {
+            float cpuExpected = dst[i] + weights[2] * src[i];
+            Assert.True(MathF.Abs(cpuExpected - gpuOut[i]) <= 1e-4f,
+                $"VecAddWeightedFromBuffer mismatch at index {i}: cpu={cpuExpected}, gpu={gpuOut[i]}");
+        }
+    }
+
+    [Fact]
+    public void D3D12_ExpertGemv_Q4K_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 256;
+        int mRows = 4;
+        int numExperts = 4;
+        ulong sliceBytes = (ulong)(mRows * 144);
+
+        var allBlocks = new BlockQ4_K[numExperts * mRows];
+        for (int e = 0; e < numExperts; e++)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                int idx = e * mRows + r;
+                allBlocks[idx].Delta = (Half)(1.0f + e * 0.5f + r * 0.1f);
+                allBlocks[idx].DeltaMin = (Half)(0.2f + e * 0.1f + r * 0.05f);
+                for (int i = 0; i < 12; i++) allBlocks[idx].Scales[i] = (byte)(i * 3 + e * 2 + r + 1);
+                for (int i = 0; i < 128; i++) allBlocks[idx].Qs[i] = (byte)(((i * 5) + e * 7 + r * 11) & 0xFF);
+            }
+        }
+
+        float[] x = new float[kCols];
+        for (int c = 0; c < kCols; c++) x[c] = MathF.Cos(c * 0.1f);
+
+        uint[] topkIndices = [3, 1]; // Select expert 3 for k=0, expert 1 for k=1
+
+        using var dW = ctx.CreateDeviceBuffer((ulong)(numExperts * mRows * 144));
+        using var dX = ctx.CreateDeviceBuffer((ulong)(kCols * sizeof(float)));
+        using var dTopK = ctx.CreateDeviceBuffer((ulong)(topkIndices.Length * sizeof(uint)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(mRows * sizeof(float)));
+
+        fixed (BlockQ4_K* pB = allBlocks) ctx.CopyToDevice(dW, (IntPtr)pB, (ulong)(numExperts * mRows * 144));
+        fixed (float* pX = x) ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(kCols * sizeof(float)));
+        fixed (uint* pTopK = topkIndices) ctx.CopyToDevice(dTopK, (IntPtr)pTopK, (ulong)(topkIndices.Length * sizeof(uint)));
+
+        fixed (BlockQ4_K* pB = allBlocks)
+        fixed (float* pX = x)
+        {
+            for (int k = 0; k < topkIndices.Length; k++)
+            {
+                int expectedExpert = (int)topkIndices[k];
+
+                ctx.BeginCommands();
+                ctx.DispatchExpertGemv(ctx.CommandList, GgufType.Q4_K, dY, dX, dW, dTopK, kIndex: k, sliceBytes: sliceBytes, k_cols: kCols, m_rows: mRows);
+                ctx.EndCommandsAndExecute();
+                ctx.Synchronize();
+
+                float[] gpuOut = new float[mRows];
+                fixed (float* pGpu = gpuOut) ctx.CopyToHost((IntPtr)pGpu, dY, (ulong)(mRows * sizeof(float)));
+
+                for (int r = 0; r < mRows; r++)
+                {
+                    BlockQ4_K* pExpBlock = pB + expectedExpert * mRows + r;
+                    float cpuExpected = QuantKernels.VecDotQ4_K(pExpBlock, pX, kCols);
+                    Assert.True(MathF.Abs(cpuExpected - gpuOut[r]) <= 0.05f,
+                        $"Expert GEMV Q4_K mismatch at k={k} (expert {expectedExpert}), row={r}: cpu={cpuExpected}, gpu={gpuOut[r]}");
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void D3D12_ExpertGemv_Fp32_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 256;
+        int mRows = 4;
+        int numExperts = 4;
+        ulong sliceBytes = (ulong)(mRows * kCols * sizeof(float));
+
+        float[] allWeights = new float[numExperts * mRows * kCols];
+        for (int e = 0; e < numExperts; e++)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                for (int c = 0; c < kCols; c++)
+                {
+                    allWeights[e * mRows * kCols + r * kCols + c] = MathF.Sin(e * 1.5f + r * 0.3f + c * 0.02f);
+                }
+            }
+        }
+
+        float[] x = new float[kCols];
+        for (int c = 0; c < kCols; c++) x[c] = MathF.Cos(c * 0.05f);
+
+        uint[] topkIndices = [2, 0]; // Select expert 2 for k=0, expert 0 for k=1
+
+        using var dW = ctx.CreateDeviceBuffer((ulong)(allWeights.Length * sizeof(float)));
+        using var dX = ctx.CreateDeviceBuffer((ulong)(kCols * sizeof(float)));
+        using var dTopK = ctx.CreateDeviceBuffer((ulong)(topkIndices.Length * sizeof(uint)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(mRows * sizeof(float)));
+
+        fixed (float* pW = allWeights) ctx.CopyToDevice(dW, (IntPtr)pW, (ulong)(allWeights.Length * sizeof(float)));
+        fixed (float* pX = x) ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(kCols * sizeof(float)));
+        fixed (uint* pTopK = topkIndices) ctx.CopyToDevice(dTopK, (IntPtr)pTopK, (ulong)(topkIndices.Length * sizeof(uint)));
+
+        fixed (float* pW = allWeights)
+        fixed (float* pX = x)
+        {
+            for (int k = 0; k < topkIndices.Length; k++)
+            {
+                int expectedExpert = (int)topkIndices[k];
+
+                ctx.BeginCommands();
+                ctx.DispatchExpertGemv(ctx.CommandList, GgufType.F32, dY, dX, dW, dTopK, kIndex: k, sliceBytes: sliceBytes, k_cols: kCols, m_rows: mRows);
+                ctx.EndCommandsAndExecute();
+                ctx.Synchronize();
+
+                float[] gpuOut = new float[mRows];
+                fixed (float* pGpu = gpuOut) ctx.CopyToHost((IntPtr)pGpu, dY, (ulong)(mRows * sizeof(float)));
+
+                for (int r = 0; r < mRows; r++)
+                {
+                    float* pExpRow = pW + expectedExpert * mRows * kCols + r * kCols;
+                    float cpuExpected = QuantKernels.VecDotF32(pExpRow, pX, kCols);
+                    Assert.True(MathF.Abs(cpuExpected - gpuOut[r]) <= 1e-4f,
+                        $"Expert GEMV FP32 mismatch at k={k} (expert {expectedExpert}), row={r}: cpu={cpuExpected}, gpu={gpuOut[r]}");
+                }
+            }
+        }
+    }
 }
+

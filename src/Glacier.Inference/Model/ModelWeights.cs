@@ -259,6 +259,10 @@ public sealed unsafe class ModelWeights
         {
             OutWeight = gguf.GetTensorPointer(outInfo);
             OutType = outInfo.Type;
+            if (embdInfo == null && outInfo.Dimensions.Length >= 2)
+            {
+                VocabSize = (int)outInfo.Dimensions[1];
+            }
         }
         else
         {

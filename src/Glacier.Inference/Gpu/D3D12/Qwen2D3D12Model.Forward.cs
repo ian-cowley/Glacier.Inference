@@ -12,6 +12,24 @@ using Vortice.Direct3D12;
 
 public sealed unsafe partial class Qwen2D3D12Model
 {
+    private ID3D12Resource? _dTopKIndices;
+    private ID3D12Resource? _dTopKWeights;
+    private ID3D12Resource? _dShexpGateScalar;
+    private ID3D12Resource? _dTopKIndicesBatch;
+    private ID3D12Resource? _dTopKWeightsBatch;
+    private readonly Dictionary<int, ID3D12Resource> _dShexpGateWeights = new();
+
+    private ID3D12Resource GetOrCreateShexpGateWeight(int layerIdx, float* pWeight)
+    {
+        if (!_dShexpGateWeights.TryGetValue(layerIdx, out var dBuf))
+        {
+            dBuf = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+            _ctx.CopyToDevice(dBuf, (IntPtr)pWeight, (ulong)(_dim * sizeof(float)));
+            _dShexpGateWeights[layerIdx] = dBuf;
+        }
+        return dBuf;
+    }
+
     /// <summary>
     /// Executes full transformer forward pass directly on Direct3D 12 GPU.
     /// Zero CPU synchronization during layer execution.
@@ -161,167 +179,81 @@ public sealed unsafe partial class Qwen2D3D12Model
                 int numExperts = _weights.ExpertCount;
                 int topK = _weights.ExpertUsedCount;
 
-                // Router GEMV: compute logits for all experts into _dRouterLogits
+                // 1. Router GEMV: compute logits for all experts into _dRouterLogits
                 DispatchGemv(cmd, GgufType.F32, _dRouterLogits!, _dNormX, lw.FfnGateInpWeight!, _dim, numExperts, lw.FfnGateInpBias);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                cmd.ResourceBarrierUnorderedAccessView(_dRouterLogits!);
 
-                // Readback router logits to CPU
-                cmd.ResourceBarrierTransition(_dRouterLogits!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                cmd.CopyBufferRegion(_readbackRouterLogits!, 0, _dRouterLogits!, 0, (ulong)(numExperts * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dRouterLogits!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                _dTopKIndices ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(uint)));
+                _dTopKWeights ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(float)));
 
-                if (_tieredMoe)
+                int modelLayer = StartLayer + l;
+                var layer = _weights.Layers[modelLayer];
+                bool hasShexp = (lw.FfnGateShexpWeight != null);
+                bool hasShexpGate = hasShexp && layer.FfnGateInpShexpWeight != null;
+                if (hasShexpGate && _dShexpGateScalar == null)
+                    _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
+
+                // 2. GPU Softmax and Top-K directly in VRAM (zero host sync)
+                _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogits!, _dTopKIndices, _dTopKWeights, numExperts, topK, _weights.NormTopK);
+                cmd.ResourceBarrierUnorderedAccessView(_dTopKIndices);
+                cmd.ResourceBarrierUnorderedAccessView(_dTopKWeights);
+
+                // 3. Routed Experts Execution via Indirected GEMV (Zero-Stall)
+                ulong gateSliceBytes = lw.FfnGateExpsWeight != null ? GetTensorSliceBytes(lw.FfnGateExpsType, expertFfnDim, _dim) : 0;
+                ulong upSliceBytes = lw.FfnUpExpsWeight != null ? GetTensorSliceBytes(lw.FfnUpExpsType, expertFfnDim, _dim) : 0;
+                ulong downSliceBytes = lw.FfnDownExpsWeight != null ? GetTensorSliceBytes(lw.FfnDownExpsType, _dim, expertFfnDim) : 0;
+
+                for (int k = 0; k < topK; k++)
                 {
-                    // Readback _dNormX to CPU
-                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                    cmd.CopyBufferRegion(_readbackNormX!, 0, _dNormX, 0, (ulong)(_dim * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                    _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dNormX, lw.FfnGateExpsWeight!, _dTopKIndices, k, gateSliceBytes, _dim, expertFfnDim);
+                    _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dNormX, lw.FfnUpExpsWeight!, _dTopKIndices, k, upSliceBytes, _dim, expertFfnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                    int modelLayer = StartLayer + l;
-                    var layer = _weights.Layers[modelLayer];
+                    DispatchSwiglu(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                    // Execute Shared Expert on GPU concurrently / immediately if present
-                    bool hasShexp = (lw.FfnGateShexpWeight != null);
-                    if (hasShexp)
+                    _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndices, k, downSliceBytes, expertFfnDim, _dim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeights, k, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+                }
+
+                // 4. Shared Expert if present
+                if (hasShexp)
+                {
+                    int shexpFfnDim = expertFfnDim * 2;
+                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
+                        shexpFfnDim = (int)tShexp.Dimensions[1];
+
+                    DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight!, _dim, shexpFfnDim);
+                    DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp, _dNormX, lw.FfnUpShexpWeight!, _dim, shexpFfnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    DispatchSwiglu(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut, _dShexpAct!, lw.FfnDownShexpWeight!, shexpFfnDim, _dim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    if (hasShexpGate)
                     {
-                        int shexpFfnDim = expertFfnDim * 2;
-                        if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                            shexpFfnDim = (int)tShexp.Dimensions[1];
+                        var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, layer.FfnGateInpShexpWeight);
+                        _ctx.DispatchMoeSharedExpertGate(cmd, _dNormX, dShexpGateW, _dShexpGateScalar!, _dim);
+                        cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar!);
 
-                        DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight!, _dim, shexpFfnDim);
-                        DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp, _dNormX, lw.FfnUpShexpWeight!, _dim, shexpFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        DispatchSwiglu(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        // Store shared expert output directly into _dFfnOut
-                        DispatchGemv(cmd, lw.FfnDownShexpType, _dFfnOut!, _dShexpAct!, lw.FfnDownShexpWeight!, shexpFfnDim, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-                    }
-
-                    // Execute GPU up to readback and wait
-                    _ctx.EndCommandsAndExecute();
-                    _ctx.Synchronize();
-
-                    // Compute Softmax and Top-K on CPU with model's NormTopK configuration
-                    QuantKernels.SoftmaxTopK(_pReadbackRouterLogits, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
-
-                    // Execute routed experts on CPU SIMD AVX-512
-                    ComputeTieredRoutedExpertsCpu(l, modelLayer, expertFfnDim, topK, selectedIndices, selectedWeights);
-
-                    float shexpGate = 1.0f;
-                    if (hasShexp && layer.FfnGateInpShexpWeight != null)
-                    {
-                        float gateVal = QuantKernels.VecDotF32(_pReadbackNormX, layer.FfnGateInpShexpWeight, _dim);
-                        shexpGate = 1.0f / (1.0f + MathF.Exp(-gateVal));
-                    }
-
-                    // Restart GPU command list for upload and accumulation
-                    _ctx.BeginCommands();
-                    cmd = _ctx.CommandList;
-
-                    // Copy uploaded CPU routed expert result to _dExpertDownOut
-                    cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
-                    cmd.CopyBufferRegion(_dExpertDownOut!, 0, _uploadExpertOut!, 0, (ulong)(_dim * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-
-                    if (hasShexp)
-                    {
-                        if (layer.FfnGateInpShexpWeight != null)
-                        {
-                            // Modulate shared expert output by sigmoid gate
-                            DispatchVecAddWeighted(cmd, _dFfnOut!, _dFfnOut!, shexpGate, _dim, accumulate: 0);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-                        }
-
-                        // Accumulate routed expert output into _dFfnOut (which already holds shared expert output)
-                        DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
+                        _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar!, 0, _dim, accumulate: 1);
                     }
                     else
                     {
-                        // Copy _dExpertDownOut into _dFfnOut
-                        cmd.CopyBufferRegion(_dFfnOut!, 0, _dExpertDownOut!, 0, (ulong)(_dim * sizeof(float)));
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-                    }
-
-                    // Residual connection: _dX += _dFfnOut
-                    DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-                }
-                else
-                {
-                    // Pure GPU MoE execution (when all experts fit in VRAM)
-                    _ctx.EndCommandsAndExecute();
-                    _ctx.Synchronize();
-
-                    // Compute Softmax and Top-K on CPU
-                    QuantKernels.SoftmaxTopK(_pReadbackRouterLogits, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
-
-                    // Restart command list for expert dispatches
-                    _ctx.BeginCommands();
-                    cmd = _ctx.CommandList;
-
-                    ulong gateSliceBytes = GetTensorSliceBytes(lw.FfnGateExpsType, expertFfnDim, _dim);
-                    ulong upSliceBytes = GetTensorSliceBytes(lw.FfnUpExpsType, expertFfnDim, _dim);
-                    ulong downSliceBytes = GetTensorSliceBytes(lw.FfnDownExpsType, _dim, expertFfnDim);
-
-                    for (int k = 0; k < topK; k++)
-                    {
-                        int expertIdx = selectedIndices[k];
-                        float weight = selectedWeights[k];
-
-                        ulong expGateAddr = lw.FfnGateExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * gateSliceBytes;
-                        ulong expUpAddr = lw.FfnUpExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * upSliceBytes;
-                        ulong expDownAddr = lw.FfnDownExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * downSliceBytes;
-
-                        // Gate: expGateAddr * _dNormX -> _dExpertGate
-                        DispatchGemv(cmd, lw.FfnGateExpsType, _dExpertGate, _dNormX, expGateAddr, _dim, expertFfnDim);
-
-                        // Up: expUpAddr * _dNormX -> _dExpertUp
-                        DispatchGemv(cmd, lw.FfnUpExpsType, _dExpertUp, _dNormX, expUpAddr, _dim, expertFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        // SwiGLU: SiLU(_dExpertGate) * _dExpertUp -> _dExpertAct
-                        DispatchSwiglu(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        // Down: expDownAddr * _dExpertAct -> _dExpertDownOut
-                        DispatchGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut, _dExpertAct!, expDownAddr, expertFfnDim, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        // Weighted accumulate into _dFfnOut
-                        DispatchVecAddWeighted(cmd, _dExpertDownOut!, _dFfnOut!, weight, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-                    }
-
-                    // Shared Expert if present
-                    if (lw.FfnGateShexpWeight != null)
-                    {
-                        int modelLayer = StartLayer + l;
-                        int shexpFfnDim = expertFfnDim * 2;
-                        if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                            shexpFfnDim = (int)tShexp.Dimensions[1];
-
-                        DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight, _dim, shexpFfnDim);
-                        DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp, _dNormX, lw.FfnUpShexpWeight!, _dim, shexpFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        DispatchSwiglu(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                        DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut, _dShexpAct!, lw.FfnDownShexpWeight!, shexpFfnDim, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
-
                         DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(null!);
                     }
-
-                    // Residual connection: _dX += _dFfnOut
-                    DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
                 }
+
+                // 5. Residual connection: _dX += _dFfnOut
+                DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
             }
             else
             {
@@ -451,11 +383,29 @@ public sealed unsafe partial class Qwen2D3D12Model
         int* selectedIndices = stackalloc int[Math.Max(1, topK)];
         float* selectedWeights = stackalloc float[Math.Max(1, topK)];
 
-        for (int offset = 0; offset < totalTokens; offset += MaxBatchChunk)
+        for (int offset = 0; offset < totalTokens;)
         {
-            int chunkSize = Math.Min(MaxBatchChunk, totalTokens - offset);
+            int remaining = totalTokens - offset;
+            int chunkSize = Math.Min(MaxBatchChunk, remaining);
+            if (chunkSize > 8 && (chunkSize % 8) == 1)
+            {
+                chunkSize -= 1;
+            }
             bool isLastChunk = (offset + chunkSize == totalTokens);
             int chunkStartPos = startPos + offset;
+
+            if (chunkSize == 1)
+            {
+                ForwardStage(
+                    !tokens.IsEmpty ? tokens[offset] : 0,
+                    chunkStartPos,
+                    !inputXBatch.IsEmpty ? inputXBatch.Slice(offset * _dim, _dim) : default,
+                    !outputXBatch.IsEmpty ? outputXBatch.Slice(offset * _dim, _dim) : default,
+                    logits,
+                    isLastChunk && computeLogits);
+                offset += 1;
+                continue;
+            }
 
             // 1. Vectorized host embedding extraction or intermediate activation copy for the chunk
             if (StartLayer == 0)
@@ -539,6 +489,18 @@ public sealed unsafe partial class Qwen2D3D12Model
                 cmd.ResourceBarrierUnorderedAccessView(_dQBatch);
                 cmd.ResourceBarrierUnorderedAccessView(_dKBatch);
 
+                // Optional QK-Norm (e.g. Qwen3 / Qwen3-Coder) across all tokens in the batch
+                if (lw.AttnQNormWeight != null)
+                {
+                    DispatchRmsNormHeads(cmd, _dQBatch, lw.AttnQNormWeight, chunkSize * _nHeads, _headDim, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dQBatch);
+                }
+                if (lw.AttnKNormWeight != null)
+                {
+                    DispatchRmsNormHeads(cmd, _dKBatch, lw.AttnKNormWeight, chunkSize * _nHeadsKv, _headDim, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dKBatch);
+                }
+
                 // 3. Batched RoPE
                 DispatchRopeBatch(cmd, _dQBatch, _dKBatch, chunkStartPos, chunkSize);
                 cmd.ResourceBarrierUnorderedAccessView(_dKBatch);
@@ -582,20 +544,24 @@ public sealed unsafe partial class Qwen2D3D12Model
                 {
                     int expertFfnDim = _weights.ExpertFeedForwardLength;
                     int numExperts = _weights.ExpertCount;
+                    int modelLayer = StartLayer + l;
+                    var layer = _weights.Layers[modelLayer];
+                    bool hasShexp = (lw.FfnGateShexpWeight != null);
+                    bool hasShexpGate = hasShexp && layer.FfnGateInpShexpWeight != null;
+
+                    _dTopKIndicesBatch ??= _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * topK * sizeof(uint)));
+                    _dTopKWeightsBatch ??= _ctx.CreateDeviceBuffer((ulong)(MaxBatchChunk * topK * sizeof(float)));
+                    if (hasShexpGate && _dShexpGateScalar == null)
+                        _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
 
                     // Batched router gate projection: [chunkSize, _dim] x [_dim, numExperts] -> [chunkSize, numExperts]
                     DispatchGemmBatch(cmd, GgufType.F32, _dRouterLogitsBatch, _dNormXBatch, lw.FfnGateInpWeight!, _dim, numExperts, chunkSize, bias: lw.FfnGateInpBias);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
+                    cmd.ResourceBarrierUnorderedAccessView(_dRouterLogitsBatch!);
 
-                    cmd.ResourceBarrierTransition(_dRouterLogitsBatch!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                    cmd.CopyBufferRegion(_readbackRouterLogitsBatch!, 0, _dRouterLogitsBatch!, 0, (ulong)(chunkSize * numExperts * sizeof(float)));
-                    cmd.ResourceBarrierTransition(_dRouterLogitsBatch!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
-
-                    _ctx.EndCommandsAndExecute();
-                    _ctx.Synchronize();
-
-                    _ctx.BeginCommands();
-                    cmd = _ctx.CommandList;
+                    // Batched Softmax Top-K directly in VRAM across all chunkSize tokens (zero host sync)
+                    _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogitsBatch!, _dTopKIndicesBatch, _dTopKWeightsBatch, numExperts, topK, _weights.NormTopK, batchSize: chunkSize);
+                    cmd.ResourceBarrierUnorderedAccessView(_dTopKIndicesBatch);
+                    cmd.ResourceBarrierUnorderedAccessView(_dTopKWeightsBatch);
 
                     ulong gateSliceBytes = lw.FfnGateExpsWeight != null ? GetTensorSliceBytes(lw.FfnGateExpsType, expertFfnDim, _dim) : 0;
                     ulong upSliceBytes = lw.FfnUpExpsWeight != null ? GetTensorSliceBytes(lw.FfnUpExpsType, expertFfnDim, _dim) : 0;
@@ -617,66 +583,31 @@ public sealed unsafe partial class Qwen2D3D12Model
                         cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
                         cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
 
-                        float* pTokenRouterLogits = _pReadbackRouterLogitsBatch + t * numExperts;
-                        QuantKernels.SoftmaxTopK(pTokenRouterLogits, numExperts, topK, selectedIndices, selectedWeights, _weights.NormTopK);
-
-                        if (_tieredMoe)
+                        for (int k = 0; k < topK; k++)
                         {
-                            cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                            cmd.CopyBufferRegion(_readbackNormX!, 0, _dNormX, 0, (ulong)(_dim * sizeof(float)));
-                            cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                            int tokenKIndex = t * topK + k;
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dNormX, lw.FfnGateExpsWeight!, _dTopKIndicesBatch, tokenKIndex, gateSliceBytes, _dim, expertFfnDim);
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dNormX, lw.FfnUpExpsWeight!, _dTopKIndicesBatch, tokenKIndex, upSliceBytes, _dim, expertFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                            _ctx.EndCommandsAndExecute();
-                            _ctx.Synchronize();
+                            DispatchSwiglu(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                            ComputeTieredRoutedExpertsCpu(l, StartLayer + l, expertFfnDim, topK, selectedIndices, selectedWeights);
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndicesBatch, tokenKIndex, downSliceBytes, expertFfnDim, _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                            _ctx.BeginCommands();
-                            cmd = _ctx.CommandList;
-
-                            cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
-                            cmd.CopyBufferRegion(_dExpertDownOut!, 0, _uploadExpertOut!, 0, (ulong)(_dim * sizeof(float)));
-                            cmd.ResourceBarrierTransition(_dExpertDownOut!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-
-                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
-                            cmd.CopyBufferRegion(_dFfnOut!, 0, _dExpertDownOut!, 0, (ulong)(_dim * sizeof(float)));
-                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-                        }
-                        else
-                        {
-                            for (int k = 0; k < topK; k++)
-                            {
-                                int expertIdx = selectedIndices[k];
-                                float weight = selectedWeights[k];
-
-                                ulong expGateAddr = lw.FfnGateExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * gateSliceBytes;
-                                ulong expUpAddr = lw.FfnUpExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * upSliceBytes;
-                                ulong expDownAddr = lw.FfnDownExpsWeight!.GPUVirtualAddress + (ulong)expertIdx * downSliceBytes;
-
-                                DispatchGemv(cmd, lw.FfnGateExpsType, _dExpertGate, _dNormX, expGateAddr, _dim, expertFfnDim);
-                                DispatchGemv(cmd, lw.FfnUpExpsType, _dExpertUp, _dNormX, expUpAddr, _dim, expertFfnDim);
-                                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                                DispatchSwiglu(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
-                                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                                DispatchGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut, _dExpertAct!, expDownAddr, expertFfnDim, _dim);
-                                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                                DispatchVecAddWeighted(cmd, _dExpertDownOut!, _dFfnOut!, weight, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
-                                cmd.ResourceBarrierUnorderedAccessView(null!);
-                            }
+                            _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeightsBatch, tokenKIndex, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
                         }
 
                         // Shared Expert if present
-                        if (lw.FfnGateShexpWeight != null)
+                        if (hasShexp)
                         {
-                            int modelLayer = StartLayer + l;
                             int shexpFfnDim = expertFfnDim * 2;
                             if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
                                 shexpFfnDim = (int)tShexp.Dimensions[1];
 
-                            DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight, _dim, shexpFfnDim);
+                            DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate, _dNormX, lw.FfnGateShexpWeight!, _dim, shexpFfnDim);
                             DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp, _dNormX, lw.FfnUpShexpWeight!, _dim, shexpFfnDim);
                             cmd.ResourceBarrierUnorderedAccessView(null!);
 
@@ -686,7 +617,18 @@ public sealed unsafe partial class Qwen2D3D12Model
                             DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut, _dShexpAct!, lw.FfnDownShexpWeight!, shexpFfnDim, _dim);
                             cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                            DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                            if (hasShexpGate)
+                            {
+                                var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, layer.FfnGateInpShexpWeight);
+                                _ctx.DispatchMoeSharedExpertGate(cmd, _dNormX, dShexpGateW, _dShexpGateScalar!, _dim);
+                                cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar!);
+
+                                _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar!, 0, _dim, accumulate: 1);
+                            }
+                            else
+                            {
+                                DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                            }
                             cmd.ResourceBarrierUnorderedAccessView(null!);
                         }
 
@@ -800,6 +742,8 @@ public sealed unsafe partial class Qwen2D3D12Model
                     }
                 }
             }
+
+            offset += chunkSize;
         }
     }
 

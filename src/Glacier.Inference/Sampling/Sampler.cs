@@ -15,6 +15,8 @@ public sealed class SamplingOptions
     public int TopK { get; set; } = 40;
     public float RepetitionPenalty { get; set; } = 1.1f;
     public int MaxTokens { get; set; } = 512;
+    public bool EnableReasoningLoopGuard { get; set; } = true;
+    public float LoopRecoveryRepetitionPenalty { get; set; } = 1.35f;
 
     public static SamplingOptions Greedy => new()
     {
@@ -26,7 +28,8 @@ public sealed class SamplingOptions
 }
 
 /// <summary>
-/// High-performance token sampler supporting Greedy, Temperature, Top-K, Top-P, and Repetition Penalty.
+/// High-performance token sampler supporting Greedy, Temperature, Top-K, Top-P, Repetition Penalty,
+/// NaN/Inf Logit Sanitization, and Periodic Reasoning Loop Detection &amp; Recovery.
 /// Instances are NOT thread-safe (they own a <see cref="Random"/>); use one sampler per generation stream.
 /// </summary>
 public sealed class Sampler
@@ -39,6 +42,67 @@ public sealed class Sampler
     public Sampler(int? seed = null)
     {
         _random = seed.HasValue ? new Random(seed.Value) : new Random();
+    }
+
+    /// <summary>
+    /// Sanitizes raw logits in-place against NaN and +/-Infinity (which can arise in extreme sub-3-bit
+    /// MoE quantizations or uninitialized residual lanes). Returns the number of non-finite entries repaired.
+    /// </summary>
+    public static int SanitizeLogits(Span<float> logits)
+    {
+        int repaired = 0;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            float v = logits[i];
+            if (!float.IsFinite(v))
+            {
+                logits[i] = float.IsPositiveInfinity(v) ? 1e4f : -1e9f;
+                repaired++;
+            }
+        }
+        return repaired;
+    }
+
+    /// <summary>
+    /// Detects periodic reasoning / code-generation loops in the tail of <paramref name="recentTokens"/>
+    /// (e.g., a sequence of period <c>P in [minPeriod, maxPeriod]</c> repeating at least <paramref name="minRepeats"/> times).
+    /// Returns the detected period length, or <c>0</c> if no periodic loop is present.
+    /// </summary>
+    public static int DetectPeriodicReasoningLoop(
+        ReadOnlySpan<int> recentTokens,
+        int minPeriod = 1,
+        int maxPeriod = 64,
+        int minRepeats = 3)
+    {
+        if (minPeriod < 1 || maxPeriod < minPeriod || minRepeats < 2)
+            return 0;
+
+        int n = recentTokens.Length;
+        int maxCheckPeriod = Math.Min(maxPeriod, n / minRepeats);
+        for (int p = minPeriod; p <= maxCheckPeriod; p++)
+        {
+            int requiredLen = p * minRepeats;
+            int start = n - requiredLen;
+            bool matches = true;
+            for (int r = 1; r < minRepeats && matches; r++)
+            {
+                int baseOffset = n - p;
+                int repOffset = start + (r - 1) * p;
+                for (int k = 0; k < p; k++)
+                {
+                    if (recentTokens[repOffset + k] != recentTokens[baseOffset + k])
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+
+            if (matches)
+                return p;
+        }
+
+        return 0;
     }
 
     /// <summary>
@@ -59,10 +123,27 @@ public sealed class Sampler
 
         int vocabSize = logits.Length;
 
-        // Apply repetition penalty (each token in recentTokens is penalized at most once)
-        if (options.RepetitionPenalty != 1.0f && !recentTokens.IsEmpty)
+        // Guard against NaN/Inf logits before top-K / greedy selection
+        SanitizeLogits(logits);
+
+        float effectivePenalty = options.RepetitionPenalty;
+        ReadOnlySpan<int> penaltyWindow = recentTokens;
+
+        if (options.EnableReasoningLoopGuard && !recentTokens.IsEmpty)
         {
-            ApplyRepetitionPenalty(logits, recentTokens, options.RepetitionPenalty);
+            int loopPeriod = DetectPeriodicReasoningLoop(recentTokens);
+            if (loopPeriod > 0)
+            {
+                effectivePenalty = Math.Max(effectivePenalty, options.LoopRecoveryRepetitionPenalty);
+                int windowLen = Math.Min(recentTokens.Length, loopPeriod * 3);
+                penaltyWindow = recentTokens.Slice(recentTokens.Length - windowLen, windowLen);
+            }
+        }
+
+        // Apply repetition penalty (each token in penaltyWindow is penalized at most once)
+        if (effectivePenalty != 1.0f && !penaltyWindow.IsEmpty)
+        {
+            ApplyRepetitionPenalty(logits, penaltyWindow, effectivePenalty);
         }
 
         // Greedy sampling if temperature is (near) zero or TopK == 1

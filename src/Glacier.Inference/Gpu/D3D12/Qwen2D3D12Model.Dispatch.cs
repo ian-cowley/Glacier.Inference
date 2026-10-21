@@ -48,7 +48,11 @@ public sealed unsafe partial class Qwen2D3D12Model
             GgufType.Q3_K => _psoGemvQ3K,
             GgufType.Q8_0 => _psoGemvQ8_0,
             GgufType.Q2_K => _psoGemvQ2_K,
+            GgufType.Q2_0 => _psoGemvQ2_0,
             GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
+            GgufType.IQ4_NL => _psoGemvIQ4_NL,
+            GgufType.IQ3_S => _psoGemvIQ3_S,
+            GgufType.Ternary_1_58 or GgufType.PQ2_0 => _psoGemvTernary,
             GgufType.F32 => _psoGemvFp32,
             _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
         };
@@ -267,8 +271,16 @@ public sealed unsafe partial class Qwen2D3D12Model
             cmdList.SetPipelineState(_psoGemmQ5KBatch);
         else if (type == GgufType.Q2_K)
             cmdList.SetPipelineState(_psoGemmQ2_KBatch);
+        else if (type == GgufType.Q2_0)
+            cmdList.SetPipelineState(_psoGemmQ2_0Batch);
         else if (type == GgufType.IQ2_XXS)
             cmdList.SetPipelineState(_psoGemmIQ2_XXSBatch);
+        else if (type == GgufType.IQ4_NL)
+            cmdList.SetPipelineState(_psoGemmIQ4_NLBatch);
+        else if (type == GgufType.IQ3_S)
+            cmdList.SetPipelineState(_psoGemmIQ3_SBatch);
+        else if (type is GgufType.Ternary_1_58 or GgufType.PQ2_0)
+            cmdList.SetPipelineState(_psoGemmTernaryBatch);
         else
             throw new NotSupportedException($"Direct3D 12 batch GEMM does not support tensor quantization type {type}.");
 
@@ -287,7 +299,9 @@ public sealed unsafe partial class Qwen2D3D12Model
         cmdList.SetComputeRootUnorderedAccessView(4, residual != null ? residual.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(5, y != null ? y.GPUVirtualAddress : _ctx.DummyBuffer.GPUVirtualAddress);
 
-        cmdList.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+        bool is8TokenTile = type is GgufType.Q4_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F32 or GgufType.Q3_K or GgufType.Q5_K or GgufType.Ternary_1_58 or GgufType.PQ2_0;
+        uint groupsY = is8TokenTile ? (uint)(batchSize + 7) / 8 : (uint)(batchSize + 31) / 32;
+        cmdList.Dispatch((uint)(mRows + 3) / 4, groupsY, 1);
     }
 
 

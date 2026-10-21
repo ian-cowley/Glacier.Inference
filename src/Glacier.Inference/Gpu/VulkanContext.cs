@@ -62,6 +62,64 @@ public sealed unsafe class VulkanContext : IDisposable
         }
     }
 
+    /// <summary>
+    /// Enumerates all available Vulkan physical devices, their device names, and accessible memory heaps.
+    /// Works uniformly across Windows, Linux, and Android.
+    /// </summary>
+    public static List<(int Index, string Name, ulong TotalMemoryBytes)> EnumerateDevices()
+    {
+        var list = new List<(int Index, string Name, ulong TotalMemoryBytes)>();
+        if (!VulkanDriver.IsAvailable()) return list;
+
+        try
+        {
+            var appInfo = new VulkanDriver.VkApplicationInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
+            };
+            var createInfo = new VulkanDriver.VkInstanceCreateInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                pApplicationInfo = new IntPtr(&appInfo)
+            };
+            int res = VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out IntPtr instance);
+            if (res != 0 || instance == IntPtr.Zero) return list;
+
+            try
+            {
+                uint devCount = 0;
+                VulkanDriver.EnumeratePhysicalDevices(instance, ref devCount, null);
+                if (devCount == 0) return list;
+
+                var devices = new IntPtr[devCount];
+                VulkanDriver.EnumeratePhysicalDevices(instance, ref devCount, devices);
+
+                for (uint i = 0; i < devCount; i++)
+                {
+                    VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var props);
+                    VulkanDriver.GetPhysicalDeviceMemoryProperties(devices[i], out var memProps);
+                    ulong totalMem = 0;
+                    var heaps = (VulkanDriver.VkMemoryHeap*)memProps.memoryHeaps;
+                    for (uint h = 0; h < memProps.memoryHeapCount; h++)
+                    {
+                        totalMem += heaps[h].size;
+                    }
+                    list.Add(((int)i, props.deviceName, totalMem));
+                }
+            }
+            finally
+            {
+                VulkanDriver.DestroyInstance(instance, IntPtr.Zero);
+            }
+        }
+        catch
+        {
+            // Defensive: return empty list on environments where Vulkan ICD loader fails
+        }
+        return list;
+    }
+
     public VulkanContext(int deviceOrdinal = 0)
     {
         if (!VulkanDriver.IsAvailable())

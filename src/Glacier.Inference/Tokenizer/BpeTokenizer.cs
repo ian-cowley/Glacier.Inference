@@ -118,7 +118,9 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<think>");
         RegisterSpecialToken("</think>");
         RegisterSpecialToken("<｜begin of sentence｜>");
+        RegisterSpecialToken("<｜begin▁of▁sentence｜>");
         RegisterSpecialToken("<｜end of sentence｜>");
+        RegisterSpecialToken("<｜end▁of▁sentence｜>");
 
         // Gemma 4 special tokens
         RegisterSpecialToken("<|turn>");
@@ -153,6 +155,7 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("<|eot_id|>");
         RegisterStopToken("</s>");
         RegisterStopToken("<｜end of sentence｜>");
+        RegisterStopToken("<｜end▁of▁sentence｜>");
         RegisterStopToken("<turn|>");
         RegisterStopToken("<eos>");
         RegisterStopToken("<|tool_call>");

@@ -1,9 +1,11 @@
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Glacier.Inference.Gguf;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D12;
@@ -46,6 +48,24 @@ public sealed unsafe class D3D12Context : IDisposable
         ? (_dedicatedVideoMemory + _sharedSystemMemory)
         : _dedicatedVideoMemory;
     public IDXGIAdapter1? Adapter => _adapter;
+
+    /// <summary>
+    /// Returns true if Direct3D 12 compute is supported and at least one hardware adapter is present.
+    /// </summary>
+    public static bool IsSupported
+    {
+        get
+        {
+            try
+            {
+                return OperatingSystem.IsWindows() && EnumerateAdapters().Count > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     public D3D12Context(int adapterIndex = -1)
     {
@@ -252,7 +272,7 @@ public sealed unsafe class D3D12Context : IDisposable
         readbackBuffer.Unmap(0);
     }
 
-    public void Synchronize(int timeoutMs = 60000)
+    public void Synchronize(int timeoutMs = 300000)
     {
         if (_disposed) return;
         _fenceValue++;
@@ -347,12 +367,329 @@ public sealed unsafe class D3D12Context : IDisposable
         _queue.ExecuteCommandList(_cmdList);
     }
 
+    private ID3D12RootSignature? _sigMoeRouterSoftmaxTopK;
+    private ID3D12PipelineState? _psoMoeRouterSoftmaxTopK;
+
+    private ID3D12RootSignature? _sigMoeSharedExpertGate;
+    private ID3D12PipelineState? _psoMoeSharedExpertGate;
+
+    private ID3D12RootSignature? _sigVecAddWeightedFromBuffer;
+    private ID3D12PipelineState? _psoVecAddWeightedFromBuffer;
+
+    private ID3D12RootSignature? _sigExpertGemv;
+    private readonly Dictionary<GgufType, ID3D12PipelineState> _psoExpertGemvByType = new();
+
+    private void EnsureMoePipelines()
+    {
+        if (_psoMoeRouterSoftmaxTopK == null)
+        {
+            var routerParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 4), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
+            };
+            _sigMoeRouterSoftmaxTopK = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, routerParams));
+            _psoMoeRouterSoftmaxTopK = CreatePipelineState(_sigMoeRouterSoftmaxTopK, CompileShader(D3D12Shaders.MoeRouterSoftmaxTopK));
+        }
+
+        if (_psoMoeSharedExpertGate == null)
+        {
+            var gateParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 1), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
+            };
+            _sigMoeSharedExpertGate = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gateParams));
+            _psoMoeSharedExpertGate = CreatePipelineState(_sigMoeSharedExpertGate, CompileShader(D3D12Shaders.MoeSharedExpertGate));
+        }
+
+        if (_psoVecAddWeightedFromBuffer == null)
+        {
+            var vecParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 3), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
+            };
+            _sigVecAddWeightedFromBuffer = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, vecParams));
+            _psoVecAddWeightedFromBuffer = CreatePipelineState(_sigVecAddWeightedFromBuffer, CompileShader(D3D12Shaders.VecAddWeightedFromBuffer));
+        }
+    }
+
+    public void DispatchMoeRouterSoftmaxTopK(
+        ID3D12Resource dLogits,
+        ID3D12Resource dTopKIndices,
+        ID3D12Resource dTopKWeights,
+        int numExperts,
+        int topK,
+        bool normTopK = true,
+        int batchSize = 1)
+    {
+        EnsureMoePipelines();
+        _cmdList.SetComputeRootSignature(_sigMoeRouterSoftmaxTopK!);
+        _cmdList.SetPipelineState(_psoMoeRouterSoftmaxTopK!);
+
+        uint* pConsts = stackalloc uint[4];
+        pConsts[0] = (uint)numExperts;
+        pConsts[1] = (uint)topK;
+        pConsts[2] = normTopK ? 1u : 0u;
+        pConsts[3] = (uint)batchSize;
+        _cmdList.SetComputeRoot32BitConstants(0, 4, (IntPtr)pConsts, 0);
+
+        _cmdList.SetComputeRootUnorderedAccessView(1, dLogits.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(2, dTopKIndices.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(3, dTopKWeights.GPUVirtualAddress);
+
+        _cmdList.Dispatch((uint)batchSize, 1, 1);
+    }
+
+    public void DispatchMoeRouterSoftmaxTopK(
+        ID3D12GraphicsCommandList cmdList,
+        ID3D12Resource dLogits,
+        ID3D12Resource dTopKIndices,
+        ID3D12Resource dTopKWeights,
+        int numExperts,
+        int topK,
+        bool normTopK = true,
+        int batchSize = 1)
+    {
+        EnsureMoePipelines();
+        cmdList.SetComputeRootSignature(_sigMoeRouterSoftmaxTopK!);
+        cmdList.SetPipelineState(_psoMoeRouterSoftmaxTopK!);
+
+        uint* pConsts = stackalloc uint[4];
+        pConsts[0] = (uint)numExperts;
+        pConsts[1] = (uint)topK;
+        pConsts[2] = normTopK ? 1u : 0u;
+        pConsts[3] = (uint)batchSize;
+        cmdList.SetComputeRoot32BitConstants(0, 4, (IntPtr)pConsts, 0);
+
+        cmdList.SetComputeRootUnorderedAccessView(1, dLogits.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(2, dTopKIndices.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(3, dTopKWeights.GPUVirtualAddress);
+
+        cmdList.Dispatch((uint)batchSize, 1, 1);
+    }
+
+    public void DispatchMoeSharedExpertGate(
+        ID3D12Resource dX,
+        ID3D12Resource dWeight,
+        ID3D12Resource dShexpGateScalar,
+        int size)
+    {
+        EnsureMoePipelines();
+        _cmdList.SetComputeRootSignature(_sigMoeSharedExpertGate!);
+        _cmdList.SetPipelineState(_psoMoeSharedExpertGate!);
+
+        uint uSize = (uint)size;
+        _cmdList.SetComputeRoot32BitConstants(0, 1, (IntPtr)(&uSize), 0);
+
+        _cmdList.SetComputeRootUnorderedAccessView(1, dWeight.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(2, dX.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(3, dShexpGateScalar.GPUVirtualAddress);
+
+        _cmdList.Dispatch(1, 1, 1);
+    }
+
+    public void DispatchMoeSharedExpertGate(
+        ID3D12GraphicsCommandList cmdList,
+        ID3D12Resource dX,
+        ID3D12Resource dWeight,
+        ID3D12Resource dShexpGateScalar,
+        int size)
+    {
+        EnsureMoePipelines();
+        cmdList.SetComputeRootSignature(_sigMoeSharedExpertGate!);
+        cmdList.SetPipelineState(_psoMoeSharedExpertGate!);
+
+        uint uSize = (uint)size;
+        cmdList.SetComputeRoot32BitConstants(0, 1, (IntPtr)(&uSize), 0);
+
+        cmdList.SetComputeRootUnorderedAccessView(1, dWeight.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(2, dX.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(3, dShexpGateScalar.GPUVirtualAddress);
+
+        cmdList.Dispatch(1, 1, 1);
+    }
+
+    public void DispatchVecAddWeightedFromBuffer(
+        ID3D12Resource dDst,
+        ID3D12Resource dSrc,
+        ID3D12Resource dWeightsBuffer,
+        int weightIndex,
+        int length,
+        uint accumulate = 1)
+    {
+        EnsureMoePipelines();
+        _cmdList.SetComputeRootSignature(_sigVecAddWeightedFromBuffer!);
+        _cmdList.SetPipelineState(_psoVecAddWeightedFromBuffer!);
+
+        uint* pConsts = stackalloc uint[3];
+        pConsts[0] = (uint)length;
+        pConsts[1] = accumulate;
+        pConsts[2] = (uint)weightIndex;
+        _cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
+
+        _cmdList.SetComputeRootUnorderedAccessView(1, dWeightsBuffer.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(2, dSrc.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(3, dDst.GPUVirtualAddress);
+
+        _cmdList.Dispatch(((uint)length + 255) / 256, 1, 1);
+    }
+
+    public void DispatchVecAddWeightedFromBuffer(
+        ID3D12GraphicsCommandList cmdList,
+        ID3D12Resource dDst,
+        ID3D12Resource dSrc,
+        ID3D12Resource dWeightsBuffer,
+        int weightIndex,
+        int length,
+        uint accumulate = 1)
+    {
+        EnsureMoePipelines();
+        cmdList.SetComputeRootSignature(_sigVecAddWeightedFromBuffer!);
+        cmdList.SetPipelineState(_psoVecAddWeightedFromBuffer!);
+
+        uint* pConsts = stackalloc uint[3];
+        pConsts[0] = (uint)length;
+        pConsts[1] = accumulate;
+        pConsts[2] = (uint)weightIndex;
+        cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
+
+        cmdList.SetComputeRootUnorderedAccessView(1, dWeightsBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(2, dSrc.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(3, dDst.GPUVirtualAddress);
+
+        cmdList.Dispatch(((uint)length + 255) / 256, 1, 1);
+    }
+
+    public void EnsureExpertGemvPipelines(GgufType type)
+    {
+        if (_sigExpertGemv == null)
+        {
+            var gemvParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 8), ShaderVisibility.All),
+                new(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All), // t0: W
+                new(RootParameterType.ShaderResourceView, new RootDescriptor(1, 0), ShaderVisibility.All), // t1: bias
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All), // u0: x
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All), // u1: residual
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All), // u2: y
+                new(RootParameterType.ShaderResourceView, new RootDescriptor(2, 0), ShaderVisibility.All), // t2: topk_indices
+            };
+            _sigExpertGemv = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, gemvParams));
+        }
+
+        if (!_psoExpertGemvByType.ContainsKey(type))
+        {
+            string baseShader = type switch
+            {
+                GgufType.Q4_K => D3D12Shaders.GemvQ4K,
+                GgufType.Q5_K => D3D12Shaders.GemvQ5K,
+                GgufType.Q6_K => D3D12Shaders.GemvQ6K,
+                GgufType.Q3_K => D3D12Shaders.GemvQ3K,
+                GgufType.Q8_0 => D3D12Shaders.GemvQ8_0,
+                GgufType.Q2_K => D3D12Shaders.GemvQ2_K,
+                GgufType.Q2_0 => D3D12Shaders.GemvQ2_0,
+                GgufType.IQ2_XXS => D3D12Shaders.GemvIQ2_XXS,
+                GgufType.IQ4_NL => D3D12Shaders.GemvIQ4_NL,
+                GgufType.IQ3_S => D3D12Shaders.GemvIQ3_S,
+                GgufType.Ternary_1_58 or GgufType.PQ2_0 => D3D12Shaders.GemvTernary,
+                GgufType.F32 => D3D12Shaders.GemvFp32,
+                _ => throw new NotSupportedException($"Expert GEMV does not support tensor quantization type {type}.")
+            };
+            string expertShader = D3D12Shaders.MakeExpertGemvShader(baseShader);
+            _psoExpertGemvByType[type] = CreatePipelineState(_sigExpertGemv, CompileShader(expertShader));
+        }
+    }
+
+    public void DispatchExpertGemv(
+        ID3D12GraphicsCommandList cmdList,
+        GgufType type,
+        ID3D12Resource? y,
+        ID3D12Resource x,
+        ulong wGpuVirtualAddress,
+        ID3D12Resource topkIndices,
+        int kIndex,
+        ulong sliceBytes,
+        int k_cols,
+        int m_rows,
+        ID3D12Resource? bias = null,
+        ID3D12Resource? residual = null)
+    {
+        EnsureExpertGemvPipelines(type);
+        var pso = _psoExpertGemvByType[type];
+
+        cmdList.SetComputeRootSignature(_sigExpertGemv!);
+        cmdList.SetPipelineState(pso);
+
+        cmdList.SetComputeRootShaderResourceView(1, wGpuVirtualAddress);
+        cmdList.SetComputeRootShaderResourceView(2, bias?.GPUVirtualAddress ?? DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(3, x.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(4, residual?.GPUVirtualAddress ?? DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(5, y?.GPUVirtualAddress ?? DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootShaderResourceView(6, topkIndices.GPUVirtualAddress);
+
+        const int chunkSize = D3D12TensorAlign.GemvChunkRows;
+        uint* pConsts = stackalloc uint[8];
+        pConsts[0] = (uint)k_cols;
+        pConsts[1] = (uint)m_rows;
+        pConsts[2] = bias != null ? 1u : 0u;
+        pConsts[3] = residual != null ? 1u : 0u;
+        pConsts[4] = y != null ? 1u : 0u;
+        pConsts[6] = (uint)kIndex;
+        pConsts[7] = (uint)sliceBytes;
+
+        for (int r = 0; r < m_rows; r += chunkSize)
+        {
+            int currentChunk = Math.Min(m_rows - r, chunkSize);
+            pConsts[5] = (uint)r;
+            cmdList.SetComputeRoot32BitConstants(0, 8, (IntPtr)pConsts, 0);
+
+            cmdList.Dispatch(((uint)currentChunk + 3) / 4, 1, 1);
+        }
+    }
+
+    public void DispatchExpertGemv(
+        ID3D12GraphicsCommandList cmdList,
+        GgufType type,
+        ID3D12Resource? y,
+        ID3D12Resource x,
+        ID3D12Resource W,
+        ID3D12Resource topkIndices,
+        int kIndex,
+        ulong sliceBytes,
+        int k_cols,
+        int m_rows,
+        ID3D12Resource? bias = null,
+        ID3D12Resource? residual = null)
+        => DispatchExpertGemv(cmdList, type, y, x, W.GPUVirtualAddress, topkIndices, kIndex, sliceBytes, k_cols, m_rows, bias, residual);
+
     public void Dispose()
     {
         if (!_disposed)
         {
             _disposed = true;
             Synchronize();
+
+            _sigExpertGemv?.Dispose();
+            foreach (var pso in _psoExpertGemvByType.Values)
+            {
+                pso.Dispose();
+            }
+            _psoExpertGemvByType.Clear();
+
+            _psoMoeRouterSoftmaxTopK?.Dispose();
+            _sigMoeRouterSoftmaxTopK?.Dispose();
+            _psoMoeSharedExpertGate?.Dispose();
+            _sigMoeSharedExpertGate?.Dispose();
+            _psoVecAddWeightedFromBuffer?.Dispose();
+            _sigVecAddWeightedFromBuffer?.Dispose();
 
             _stagingUploadBuffer?.Dispose();
             _dummyBuffer?.Dispose();

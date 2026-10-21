@@ -49,11 +49,14 @@ public enum GgufType : uint
     IQ3_S = 21,
     IQ2_S = 22,
     IQ4_XS = 23,
-    BF16 = 24,
-    Q4_0_4_4 = 28,
-    Q4_0_4_8 = 29,
-    Q4_0_8_8 = 30,
-    MXFP4 = 39
+    BF16 = 30,
+    Q4_0_4_4 = 31,
+    Q4_0_4_8 = 32,
+    Q4_0_8_8 = 33,
+    Q2_0 = 36,
+    MXFP4 = 39,
+    Ternary_1_58 = 100,
+    PQ2_0 = 142
 }
 
 /// <summary>
@@ -82,7 +85,9 @@ public static class GgufTypes
         GgufType.IQ3_S => ((long)count / 256) * 110,
         GgufType.IQ4_XS => ((long)count / 256) * 136,
         GgufType.IQ4_NL => ((long)count / 32) * 18,
+        GgufType.Q2_0 => ((long)count / 64) * 20,
         GgufType.MXFP4 => ((long)count / 32) * 17,
+        GgufType.Ternary_1_58 or GgufType.PQ2_0 => ((long)count / 256) * 68,
         _ => (long)count * 2
     };
 }
@@ -131,7 +136,9 @@ public sealed class GgufTensorInfo
             GgufType.IQ3_S => (count / 256) * 110, // 256 elements in 110 bytes (3.4375 b/w)
             GgufType.IQ4_XS => (count / 256) * 136, // 256 elements in 136 bytes
             GgufType.IQ4_NL => (count / 32) * 18,  // 32 elements in 18 bytes
+            GgufType.Q2_0 => (count / 64) * 20,    // 64 elements in 20 bytes (2.50 b/w fast MoE block)
             GgufType.MXFP4 => (count / 32) * 17,  // 32 elements in 17 bytes (E8M0 + 32x E2M1 FP4)
+            GgufType.Ternary_1_58 or GgufType.PQ2_0 => (count / 256) * 68, // 256 elements in 68 bytes (2.125 b/w multiplication-free ternary / Prism PQ2_0)
             _ => count * 2 // conservative fallback
         };
     }

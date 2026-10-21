@@ -31,7 +31,11 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemvQ3K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ3K));
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
         _psoGemvQ2_K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_K));
+        _psoGemvQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_0));
         _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
+        _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
+        _psoGemvIQ3_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
+        _psoGemvTernary = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvTernary));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
 
         // 2. RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
@@ -152,7 +156,11 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemmQ3KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ3KBatch));
         _psoGemmQ5KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5KBatch));
         _psoGemmQ2_KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_KBatch));
+        _psoGemmQ2_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_0Batch));
         _psoGemmIQ2_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XXSBatch));
+        _psoGemmIQ4_NLBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ4_NLBatch));
+        _psoGemmIQ3_SBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ3_SBatch));
+        _psoGemmTernaryBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmTernaryBatch));
 
         // 10. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
         var rmsNormBatchParams = new RootParameter[]

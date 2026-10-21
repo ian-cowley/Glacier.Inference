@@ -983,4 +983,193 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     attn_out.Store(out_offset * 4, asuint(final_attn));
 }
 ";
+
+    public const string MoeRouterSoftmaxTopK = @"
+cbuffer Params : register(b0)
+{
+    uint num_experts;
+    uint top_k;
+    uint norm_top_k;
+    uint batch_size;
+};
+
+RWStructuredBuffer<float> logits : register(u0);
+RWStructuredBuffer<uint> topk_indices : register(u1);
+RWStructuredBuffer<float> topk_weights : register(u2);
+
+groupshared float s_logits[256];
+groupshared float s_probs[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint token_idx = gid.x;
+    if (token_idx >= batch_size) return;
+    uint tid = gtid.x;
+
+    uint logit_base = token_idx * num_experts;
+    float l = (tid < num_experts) ? logits[logit_base + tid] : -1e30f;
+    s_logits[tid] = l;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            s_logits[tid] = max(s_logits[tid], s_logits[tid + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float max_logit = s_logits[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    float exp_val = (tid < num_experts) ? exp(l - max_logit) : 0.0f;
+    s_probs[tid] = exp_val;
+    s_logits[tid] = exp_val;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s2 = 128; s2 > 0; s2 >>= 1)
+    {
+        if (tid < s2)
+        {
+            s_logits[tid] += s_logits[tid + s2];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float sum_exp = s_logits[0];
+    float inv_sum = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
+    s_probs[tid] = exp_val * inv_sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid == 0)
+    {
+        uint out_base = token_idx * top_k;
+        float sum_topk = 0.0f;
+
+        for (uint k = 0; k < top_k; k++)
+        {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint e = 0; e < num_experts; e++)
+            {
+                if (s_probs[e] > best_val)
+                {
+                    best_val = s_probs[e];
+                    best_idx = e;
+                }
+            }
+            topk_indices[out_base + k] = best_idx;
+            topk_weights[out_base + k] = best_val;
+            sum_topk += best_val;
+            s_probs[best_idx] = -2.0f;
+        }
+
+        if (norm_top_k != 0 && sum_topk > 0.0f)
+        {
+            float inv_norm = 1.0f / sum_topk;
+            for (uint k = 0; k < top_k; k++)
+            {
+                topk_weights[out_base + k] *= inv_norm;
+            }
+        }
+    }
 }
+";
+
+    public const string MoeSharedExpertGate = @"
+cbuffer Params : register(b0)
+{
+    uint size;
+};
+
+RWStructuredBuffer<float> weight : register(u0);
+RWStructuredBuffer<float> x : register(u1);
+RWStructuredBuffer<float> shexp_gate : register(u2);
+
+groupshared float s_dot[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID)
+{
+    float local_sum = 0.0f;
+    for (uint i = tid.x; i < size; i += 256)
+    {
+        local_sum += x[i] * weight[i];
+    }
+    s_dot[tid.x] = local_sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (tid.x < s)
+        {
+            s_dot[tid.x] += s_dot[tid.x + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid.x == 0)
+    {
+        float dot_val = s_dot[0];
+        shexp_gate[0] = 1.0f / (1.0f + exp(-dot_val));
+    }
+}
+";
+
+    public const string VecAddWeightedFromBuffer = @"
+cbuffer Params : register(b0)
+{
+    uint size;
+    uint accumulate;
+    uint weight_offset;
+};
+
+RWStructuredBuffer<float> weight_buf : register(u0);
+RWStructuredBuffer<float> b : register(u1);
+RWStructuredBuffer<float> a : register(u2);
+
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < size)
+    {
+        float w = weight_buf[weight_offset];
+        if (accumulate != 0)
+        {
+            a[id.x] += w * b[id.x];
+        }
+        else
+        {
+            a[id.x] = w * b[id.x];
+        }
+    }
+}
+";
+
+    public static string MakeExpertGemvShader(string baseShader)
+    {
+        string shader = baseShader.Replace(
+            "    uint row_offset;\r\n};",
+            "    uint row_offset;\r\n    uint k_index;\r\n    uint slice_bytes;\r\n};\r\n\r\nStructuredBuffer<uint> topk_indices : register(t2);"
+        ).Replace(
+            "    uint row_offset;\n};",
+            "    uint row_offset;\n    uint k_index;\n    uint slice_bytes;\n};\n\nStructuredBuffer<uint> topk_indices : register(t2);"
+        );
+
+        shader = shader.Replace(
+            "uint row_byte_offset = warp_id *",
+            "uint expert_idx = topk_indices[k_index];\r\n        uint row_byte_offset = expert_idx * slice_bytes + warp_id *"
+        );
+        shader = shader.Replace(
+            "uint row_data_offset = warp_id * k_cols;",
+            "uint expert_idx = topk_indices[k_index];\r\n        uint row_data_offset = expert_idx * (m_rows * k_cols) + warp_id * k_cols;"
+        );
+
+        return shader;
+    }
+}
+
+

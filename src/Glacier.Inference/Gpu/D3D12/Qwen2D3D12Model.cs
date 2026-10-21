@@ -35,7 +35,11 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ3K = null!;
     private ID3D12PipelineState _psoGemvQ8_0 = null!;
     private ID3D12PipelineState _psoGemvQ2_K = null!;
+    private ID3D12PipelineState _psoGemvQ2_0 = null!;
     private ID3D12PipelineState _psoGemvIQ2_XXS = null!;
+    private ID3D12PipelineState _psoGemvIQ4_NL = null!;
+    private ID3D12PipelineState _psoGemvIQ3_S = null!;
+    private ID3D12PipelineState _psoGemvTernary = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
 
     private ID3D12RootSignature _sigRmsNorm = null!;
@@ -74,7 +78,11 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemmQ3KBatch = null!;
     private ID3D12PipelineState _psoGemmQ5KBatch = null!;
     private ID3D12PipelineState _psoGemmQ2_KBatch = null!;
+    private ID3D12PipelineState _psoGemmQ2_0Batch = null!;
     private ID3D12PipelineState _psoGemmIQ2_XXSBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ4_NLBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ3_SBatch = null!;
+    private ID3D12PipelineState _psoGemmTernaryBatch = null!;
 
     private ID3D12RootSignature _sigRmsNormBatch = null!;
     private ID3D12PipelineState _psoRmsNormBatch = null!;
@@ -465,6 +473,8 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     private static ulong GetTensorSliceBytes(GgufType type, int rows, int cols) =>
         D3D12TensorAlign.GetAlignedTensorBytes(type, rows, cols);
 
+    private static GgufType NormalizeGpuType(GgufType t) => t == GgufType.BF16 ? GgufType.F32 : t;
+
     private ID3D12Resource UploadTensor(GgufType type, IntPtr hostPtr, int rows, int cols)
     {
         return D3D12TensorAlign.UploadAlignedTensor(_ctx, type, hostPtr, rows, cols);
@@ -617,13 +627,13 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
                 FfnGateShexpType = lw.FfnGateShexpType,
                 FfnUpShexpType = lw.FfnUpShexpType,
                 FfnDownShexpType = lw.FfnDownShexpType,
-                QType = lw.QType,
-                KType = lw.KType,
-                VType = lw.VType,
-                AttnOutType = lw.AttnOutType,
-                FfnGateType = lw.FfnGateType,
-                FfnUpType = lw.FfnUpType,
-                FfnDownType = lw.FfnDownType
+                QType = NormalizeGpuType(lw.QType),
+                KType = NormalizeGpuType(lw.KType),
+                VType = NormalizeGpuType(lw.VType),
+                AttnOutType = NormalizeGpuType(lw.AttnOutType),
+                FfnGateType = NormalizeGpuType(lw.FfnGateType),
+                FfnUpType = NormalizeGpuType(lw.FfnUpType),
+                FfnDownType = NormalizeGpuType(lw.FfnDownType)
             };
         }
 
@@ -734,7 +744,11 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
             _psoGemvQ3K?.Dispose();
             _psoGemvQ8_0?.Dispose();
             _psoGemvQ2_K?.Dispose();
+            _psoGemvQ2_0?.Dispose();
             _psoGemvIQ2_XXS?.Dispose();
+            _psoGemvIQ4_NL?.Dispose();
+            _psoGemvIQ3_S?.Dispose();
+            _psoGemvTernary?.Dispose();
             _psoGemvFp32?.Dispose();
             _sigGemv?.Dispose();
 
@@ -751,7 +765,11 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
             _psoGemmQ3KBatch?.Dispose();
             _psoGemmQ5KBatch?.Dispose();
             _psoGemmQ2_KBatch?.Dispose();
+            _psoGemmQ2_0Batch?.Dispose();
             _psoGemmIQ2_XXSBatch?.Dispose();
+            _psoGemmIQ4_NLBatch?.Dispose();
+            _psoGemmIQ3_SBatch?.Dispose();
+            _psoGemmTernaryBatch?.Dispose();
             _sigGemmBatch?.Dispose();
 
             _psoRmsNorm?.Dispose();

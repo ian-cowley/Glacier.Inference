@@ -35,8 +35,27 @@ public static unsafe partial class QuantKernels
             case GgufType.Q2_K:
                 DequantizeQ2_K((BlockQ2_K*)rowPtr, dst, embeddingDim);
                 break;
+            case GgufType.Q2_0:
+                DequantizeQ2_0((BlockQ2_0*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q3_K:
                 DequantizeQ3_K((BlockQ3_K*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ2_XXS:
+                DequantizeIQ2_XXS((BlockIQ2_XXS*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ3_S:
+                DequantizeIQ3_S((BlockIQ3_S*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ4_NL:
+                DequantizeIQ4_NL((BlockIQ4_NL*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ4_XS:
+                DequantizeIQ4_XS((BlockIQ4_XS*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.Ternary_1_58:
+            case GgufType.PQ2_0:
+                DequantizeTernary256((BlockTernary256*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.Q4_0:
                 for (int i = 0; i < embeddingDim / 32; i++)

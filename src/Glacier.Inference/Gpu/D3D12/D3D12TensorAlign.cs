@@ -129,6 +129,66 @@ public static unsafe class D3D12TensorAlign
         return aligned;
     }
 
+    public static byte[] AlignIQ4_NL(ReadOnlySpan<byte> rawIq4Nl, int totalBlocks)
+    {
+        byte[] aligned = GC.AllocateUninitializedArray<byte>(totalBlocks * 20);
+        fixed (byte* pSrc = rawIq4Nl, pDst = aligned)
+        {
+            nint srcAddr = (nint)pSrc;
+            nint dstAddr = (nint)pDst;
+            int numThreads = Math.Max(1, Environment.ProcessorCount);
+            int chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+            Parallel.For(0, numThreads, t =>
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, totalBlocks);
+                byte* pS = (byte*)srcAddr;
+                byte* pD = (byte*)dstAddr;
+                for (int b = start; b < end; b++)
+                {
+                    byte* srcBlk = pS + (long)b * 18;
+                    byte* dstBlk = pD + (long)b * 20;
+                    dstBlk[0] = srcBlk[0];
+                    dstBlk[1] = srcBlk[1];
+                    dstBlk[2] = 0;
+                    dstBlk[3] = 0;
+                    Buffer.MemoryCopy(srcBlk + 2, dstBlk + 4, 16, 16);
+                }
+            });
+        }
+        return aligned;
+    }
+
+    public static byte[] AlignIQ3_S(ReadOnlySpan<byte> rawIq3S, int totalBlocks)
+    {
+        byte[] aligned = GC.AllocateUninitializedArray<byte>(totalBlocks * 112);
+        fixed (byte* pSrc = rawIq3S, pDst = aligned)
+        {
+            nint srcAddr = (nint)pSrc;
+            nint dstAddr = (nint)pDst;
+            int numThreads = Math.Max(1, Environment.ProcessorCount);
+            int chunkSize = (totalBlocks + numThreads - 1) / numThreads;
+            Parallel.For(0, numThreads, t =>
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, totalBlocks);
+                byte* pS = (byte*)srcAddr;
+                byte* pD = (byte*)dstAddr;
+                for (int b = start; b < end; b++)
+                {
+                    byte* srcBlk = pS + (long)b * 110;
+                    byte* dstBlk = pD + (long)b * 112;
+                    dstBlk[0] = srcBlk[0];
+                    dstBlk[1] = srcBlk[1];
+                    dstBlk[2] = 0;
+                    dstBlk[3] = 0;
+                    Buffer.MemoryCopy(srcBlk + 2, dstBlk + 4, 108, 108);
+                }
+            });
+        }
+        return aligned;
+    }
+
     public static ulong GetAlignedTensorBytes(GgufType type, int rows, int cols)
     {
         if (type == GgufType.Q3_K)
@@ -150,6 +210,20 @@ public static unsafe class D3D12TensorAlign
         {
             int nb = cols / 256;
             return (ulong)rows * (ulong)nb * 68UL;
+        }
+        if (type == GgufType.IQ4_NL)
+        {
+            int nb = cols / 32;
+            return (ulong)rows * (ulong)nb * 20UL;
+        }
+        if (type == GgufType.IQ3_S)
+        {
+            int nb = cols / 256;
+            return (ulong)rows * (ulong)nb * 112UL;
+        }
+        if (type == GgufType.BF16)
+        {
+            return (ulong)rows * (ulong)cols * sizeof(float);
         }
         return (ulong)rows * (ulong)GgufTypes.GetRowBytes(type, cols);
     }
@@ -194,6 +268,50 @@ public static unsafe class D3D12TensorAlign
             byte[] aligned = AlignIQ2_XXS(raw, totalBlocks);
             var buf = ctx.CreateDeviceBuffer((ulong)aligned.Length);
             ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        if (type == GgufType.IQ4_NL)
+        {
+            int nb = cols / 32;
+            int totalBlocks = rows * nb;
+            var raw = new ReadOnlySpan<byte>((void*)hostPtr, totalBlocks * 18);
+            byte[] aligned = AlignIQ4_NL(raw, totalBlocks);
+            var buf = ctx.CreateDeviceBuffer((ulong)aligned.Length);
+            ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        if (type == GgufType.IQ3_S)
+        {
+            int nb = cols / 256;
+            int totalBlocks = rows * nb;
+            var raw = new ReadOnlySpan<byte>((void*)hostPtr, totalBlocks * 110);
+            byte[] aligned = AlignIQ3_S(raw, totalBlocks);
+            var buf = ctx.CreateDeviceBuffer((ulong)aligned.Length);
+            ctx.CopyToDevice(buf, aligned);
+            return buf;
+        }
+        if (type == GgufType.BF16)
+        {
+            int count = rows * cols;
+            float[] f32 = GC.AllocateUninitializedArray<float>(count);
+            ushort* pSrc = (ushort*)hostPtr;
+            fixed (float* pDst = f32)
+            {
+                uint* pDstU = (uint*)pDst;
+                int numThreads = Math.Max(1, Environment.ProcessorCount);
+                int chunkSize = (count + numThreads - 1) / numThreads;
+                Parallel.For(0, numThreads, t =>
+                {
+                    int start = t * chunkSize;
+                    int end = Math.Min(start + chunkSize, count);
+                    for (int i = start; i < end; i++)
+                    {
+                        pDstU[i] = ((uint)pSrc[i]) << 16;
+                    }
+                });
+            }
+            var buf = ctx.CreateDeviceBuffer((ulong)count * sizeof(float));
+            ctx.CopyToDevice(buf, MemoryMarshal.AsBytes(f32.AsSpan()));
             return buf;
         }
 
