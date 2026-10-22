@@ -154,6 +154,25 @@ public class D3D12ShaderTests
 
         var qwenAttnGate = Compiler.Compile(D3D12Shaders.Qwen3AttnOutGate, "main", "qwen3_attn_gate.hlsl", "cs_5_0");
         Assert.False(qwenAttnGate.IsEmpty);
+
+        // FastMoE Compute Shaders
+        var gemvQ2_0 = Compiler.Compile(D3D12Shaders.GemvQ2_0, "main", "gemv_q2_0.hlsl", "cs_5_0");
+        Assert.False(gemvQ2_0.IsEmpty);
+
+        var gemmQ2_0Batch = Compiler.Compile(D3D12Shaders.GemmQ2_0Batch, "main", "gemm_q2_0_batch.hlsl", "cs_5_0");
+        Assert.False(gemmQ2_0Batch.IsEmpty);
+
+        var gemvIQ4_NL = Compiler.Compile(D3D12Shaders.GemvIQ4_NL, "main", "gemv_iq4_nl.hlsl", "cs_5_0");
+        Assert.False(gemvIQ4_NL.IsEmpty);
+
+        var gemmIQ4_NLBatch = Compiler.Compile(D3D12Shaders.GemmIQ4_NLBatch, "main", "gemm_iq4_nl_batch.hlsl", "cs_5_0");
+        Assert.False(gemmIQ4_NLBatch.IsEmpty);
+
+        var gemvIQ3_S = Compiler.Compile(D3D12Shaders.GemvIQ3_S, "main", "gemv_iq3_s.hlsl", "cs_5_0");
+        Assert.False(gemvIQ3_S.IsEmpty);
+
+        var gemmIQ3_SBatch = Compiler.Compile(D3D12Shaders.GemmIQ3_SBatch, "main", "gemm_iq3_s_batch.hlsl", "cs_5_0");
+        Assert.False(gemmIQ3_SBatch.IsEmpty);
     }
 
     [Fact]
@@ -1450,4 +1469,603 @@ public class D3D12ShaderTests
 
         Assert.Equal(cpuResult, gpuResult, 0.001f);
     }
+
+    [Fact]
+    public unsafe void D3D12_GemvQ2_0_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 64;
+        int mRows = 1;
+
+        var block = new BlockQ2_0
+        {
+            Delta = (Half)1.5f,
+            Min = (Half)(-0.5f)
+        };
+        for (int l = 0; l < 16; l++) block.Qs[l] = (byte)((l * 17) & 0xFF);
+
+        float[] x = new float[kCols];
+        for (int i = 0; i < kCols; i++) x[i] = (i % 7) - 3.0f;
+
+        float cpuResult;
+        fixed (float* pX = x)
+        {
+            cpuResult = QuantKernels.VecDotQ2_0(&block, pX, kCols);
+        }
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemv = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemvQ2_0));
+
+        using var dW = ctx.CreateDeviceBuffer(20);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer(sizeof(float));
+
+        fixed (float* pX = x)
+        {
+            BlockQ2_0* pB = &block;
+            ctx.CopyToDevice(dW, (IntPtr)pB, 20);
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemv);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = 0;
+        pConsts[3] = 0;
+        pConsts[4] = 1; // has_y
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch(1, 1, 1);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float gpuResult = 0;
+        ctx.CopyToHost((IntPtr)(&gpuResult), dY, sizeof(float));
+
+        Assert.Equal(cpuResult, gpuResult, 0.01f);
+    }
+
+    [Fact]
+    public unsafe void D3D12_GemmQ2_0Batch_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 64;
+        int mRows = 4;
+        int batchSize = 5;
+
+        var blocks = new BlockQ2_0[mRows];
+        for (int r = 0; r < mRows; r++)
+        {
+            blocks[r].Delta = (Half)(1.5f + r * 0.2f);
+            blocks[r].Min = (Half)(-0.5f + r * 0.1f);
+            for (int l = 0; l < 16; l++) blocks[r].Qs[l] = (byte)((l * 17 + r) & 0xFF);
+        }
+
+        float[] x = new float[batchSize * kCols];
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int i = 0; i < kCols; i++)
+            {
+                x[t * kCols + i] = (t + 1) * 0.1f + (i % 8) * 0.02f;
+            }
+        }
+
+        float[] cpuResults = new float[batchSize * mRows];
+        fixed (BlockQ2_0* pB = blocks)
+        fixed (float* pX = x)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                float* xToken = pX + t * kCols;
+                for (int r = 0; r < mRows; r++)
+                {
+                    cpuResults[t * mRows + r] = QuantKernels.VecDotQ2_0(pB + r, xToken, kCols);
+                }
+            }
+        }
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmQ2_0Batch));
+
+        int allocBatch = Math.Max(32, batchSize);
+        using var dW = ctx.CreateDeviceBuffer((ulong)(mRows * 20));
+        using var dX = ctx.CreateDeviceBuffer((ulong)(allocBatch * kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(allocBatch * mRows * sizeof(float)));
+
+        fixed (BlockQ2_0* pB = blocks)
+        fixed (float* pX = x)
+        {
+            ctx.CopyToDevice(dW, (IntPtr)pB, (ulong)(mRows * 20));
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(batchSize * kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemm);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = (uint)batchSize;
+        pConsts[3] = 0; // has_bias
+        pConsts[4] = 0; // has_residual
+        pConsts[5] = 1; // has_y
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float[] gpuResults = new float[batchSize * mRows];
+        fixed (float* pGpu = gpuResults)
+        {
+            ctx.CopyToHost((IntPtr)pGpu, dY, (ulong)(batchSize * mRows * sizeof(float)));
+        }
+
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                int idx = t * mRows + r;
+                Assert.Equal(cpuResults[idx], gpuResults[idx], 0.01f);
+            }
+        }
+    }
+
+    [Fact]
+    public unsafe void D3D12_GemvIQ4_NL_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 32;
+        int mRows = 1;
+
+        var block = new BlockIQ4_NL
+        {
+            Delta = (Half)0.5f
+        };
+        for (int l = 0; l < 16; l++) block.Qs[l] = (byte)(l | ((15 - l) << 4));
+
+        float[] x = new float[kCols];
+        for (int i = 0; i < kCols; i++) x[i] = (i % 5) - 2.0f;
+
+        float cpuResult;
+        fixed (float* pX = x)
+        {
+            cpuResult = QuantKernels.VecDotIQ4_NL(&block, pX, kCols);
+        }
+
+        // Align block to 20 bytes (2B Delta, 2B Pad, 16B Qs)
+        byte[] aligned = new byte[20];
+        fixed (byte* pDst = aligned)
+        {
+            *(ushort*)pDst = *(ushort*)(&block.Delta);
+            pDst[2] = 0;
+            pDst[3] = 0;
+            Buffer.MemoryCopy(block.Qs, pDst + 4, 16, 16);
+        }
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemv = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
+
+        using var dW = ctx.CreateDeviceBuffer(20);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer(sizeof(float));
+
+        fixed (float* pX = x)
+        {
+            ctx.CopyToDevice(dW, aligned);
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemv);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = 0;
+        pConsts[3] = 0;
+        pConsts[4] = 1; // has_y
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch(1, 1, 1);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float gpuResult = 0;
+        ctx.CopyToHost((IntPtr)(&gpuResult), dY, sizeof(float));
+
+        Assert.Equal(cpuResult, gpuResult, 0.01f);
+    }
+
+    [Fact]
+    public unsafe void D3D12_GemmIQ4_NLBatch_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 32;
+        int mRows = 4;
+        int batchSize = 5;
+
+        var blocks = new BlockIQ4_NL[mRows];
+        byte[] aligned = new byte[mRows * 20];
+        fixed (byte* pDst = aligned)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                blocks[r].Delta = (Half)(0.5f + r * 0.1f);
+                for (int l = 0; l < 16; l++) blocks[r].Qs[l] = (byte)(((l * 3 + r) & 0x0F) | ((((l * 7) + r) & 0x0F) << 4));
+
+                byte* pD = pDst + r * 20;
+                fixed (BlockIQ4_NL* pB = &blocks[r])
+                {
+                    *(ushort*)pD = *(ushort*)(&pB->Delta);
+                    pD[2] = 0;
+                    pD[3] = 0;
+                    Buffer.MemoryCopy(pB->Qs, pD + 4, 16, 16);
+                }
+            }
+        }
+
+        float[] x = new float[batchSize * kCols];
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int i = 0; i < kCols; i++)
+            {
+                x[t * kCols + i] = (t + 1) * 0.1f + (i % 8) * 0.02f;
+            }
+        }
+
+        float[] cpuResults = new float[batchSize * mRows];
+        fixed (BlockIQ4_NL* pB = blocks)
+        fixed (float* pX = x)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                float* xToken = pX + t * kCols;
+                for (int r = 0; r < mRows; r++)
+                {
+                    cpuResults[t * mRows + r] = QuantKernels.VecDotIQ4_NL(pB + r, xToken, kCols);
+                }
+            }
+        }
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmIQ4_NLBatch));
+
+        using var dW = ctx.CreateDeviceBuffer((ulong)aligned.Length);
+        int allocBatch = Math.Max(32, batchSize);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(allocBatch * kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(allocBatch * mRows * sizeof(float)));
+
+        ctx.CopyToDevice(dW, aligned);
+        fixed (float* pX = x)
+        {
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(batchSize * kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemm);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = (uint)batchSize;
+        pConsts[3] = 0; // has_bias
+        pConsts[4] = 0; // has_residual
+        pConsts[5] = 1; // has_y
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float[] gpuResults = new float[batchSize * mRows];
+        fixed (float* pGpu = gpuResults)
+        {
+            ctx.CopyToHost((IntPtr)pGpu, dY, (ulong)(batchSize * mRows * sizeof(float)));
+        }
+
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                int idx = t * mRows + r;
+                Assert.Equal(cpuResults[idx], gpuResults[idx], 0.01f);
+            }
+        }
+    }
+
+    [Fact]
+    public unsafe void D3D12_GemvIQ3_S_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 256;
+        int mRows = 1;
+
+        var block = new BlockIQ3_S
+        {
+            Delta = (Half)0.25f
+        };
+        for (int i = 0; i < 4; i++) block.Scales[i] = (byte)(0x21 * (i + 1));
+        for (int i = 0; i < 64; i++) block.Qs[i] = (byte)(i * 7 + 3);
+        for (int i = 0; i < 8; i++) block.Qh[i] = (byte)(i * 13);
+        for (int i = 0; i < 32; i++) block.Signs[i] = (byte)(i * 19 + 5);
+
+        float[] x = new float[kCols];
+        for (int i = 0; i < kCols; i++) x[i] = (i % 7) * 0.5f - 1.5f;
+
+        float cpuResult;
+        fixed (float* pX = x)
+        {
+            cpuResult = QuantKernels.VecDotIQ3_S(&block, pX, kCols);
+        }
+
+        // Align block to 112 bytes using D3D12TensorAlign
+        byte[] raw = new byte[110];
+        BlockIQ3_S* pB = &block;
+        fixed (byte* pRaw = raw)
+        {
+            Buffer.MemoryCopy((void*)pB, (void*)pRaw, 110, 110);
+        }
+        byte[] aligned = D3D12TensorAlign.AlignIQ3_S(raw, 1);
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemv = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
+
+        using var dW = ctx.CreateDeviceBuffer(112);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer(sizeof(float));
+
+        fixed (float* pX = x)
+        {
+            ctx.CopyToDevice(dW, aligned);
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemv);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = 0;
+        pConsts[3] = 0;
+        pConsts[4] = 1; // has_y
+        pConsts[5] = 0; // row_offset
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch(1, 1, 1);
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float gpuResult = 0;
+        ctx.CopyToHost((IntPtr)(&gpuResult), dY, sizeof(float));
+
+        Assert.Equal(cpuResult, gpuResult, 0.01f);
+    }
+
+    [Fact]
+    public unsafe void D3D12_GemmIQ3_SBatch_Matches_CPU()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        using var ctx = new D3D12Context();
+        int kCols = 256;
+        int mRows = 4;
+        int batchSize = 5;
+
+        var blocks = new BlockIQ3_S[mRows];
+        byte[] raw = new byte[mRows * 110];
+        fixed (byte* pRaw = raw)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                blocks[r].Delta = (Half)(0.25f + r * 0.05f);
+                for (int i = 0; i < 4; i++) blocks[r].Scales[i] = (byte)(0x21 * (i + 1) + r);
+                for (int i = 0; i < 64; i++) blocks[r].Qs[i] = (byte)(i * 7 + 3 + r);
+                for (int i = 0; i < 8; i++) blocks[r].Qh[i] = (byte)(i * 13 + r);
+                for (int i = 0; i < 32; i++) blocks[r].Signs[i] = (byte)(i * 19 + 5 + r);
+
+                fixed (BlockIQ3_S* pB = &blocks[r])
+                {
+                    Buffer.MemoryCopy((void*)pB, (void*)(pRaw + r * 110), 110, 110);
+                }
+            }
+        }
+        byte[] aligned = D3D12TensorAlign.AlignIQ3_S(raw, mRows);
+
+        float[] x = new float[batchSize * kCols];
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int i = 0; i < kCols; i++)
+            {
+                x[t * kCols + i] = (t + 1) * 0.1f + (i % 8) * 0.02f;
+            }
+        }
+
+        float[] cpuResults = new float[batchSize * mRows];
+        fixed (BlockIQ3_S* pB = blocks)
+        fixed (float* pX = x)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                float* xToken = pX + t * kCols;
+                for (int r = 0; r < mRows; r++)
+                {
+                    cpuResults[t * mRows + r] = QuantKernels.VecDotIQ3_S(pB + r, xToken, kCols);
+                }
+            }
+        }
+
+        var rootSig = ctx.CreateRootSignature(new Vortice.Direct3D12.RootSignatureDescription(
+            Vortice.Direct3D12.RootSignatureFlags.None,
+            new Vortice.Direct3D12.RootParameter[]
+            {
+                new(new Vortice.Direct3D12.RootConstants(0, 0, 6), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.ShaderResourceView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(2, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(0, 0), Vortice.Direct3D12.ShaderVisibility.All),
+                new(Vortice.Direct3D12.RootParameterType.UnorderedAccessView, new Vortice.Direct3D12.RootDescriptor(1, 0), Vortice.Direct3D12.ShaderVisibility.All)
+            }));
+        var psoGemm = ctx.CreatePipelineState(rootSig, ctx.CompileShader(D3D12Shaders.GemmIQ3_SBatch));
+
+        using var dW = ctx.CreateDeviceBuffer((ulong)aligned.Length);
+        int allocBatch = Math.Max(32, batchSize);
+        using var dX = ctx.CreateDeviceBuffer((ulong)(allocBatch * kCols * sizeof(float)));
+        using var dY = ctx.CreateDeviceBuffer((ulong)(allocBatch * mRows * sizeof(float)));
+
+        ctx.CopyToDevice(dW, aligned);
+        fixed (float* pX = x)
+        {
+            ctx.CopyToDevice(dX, (IntPtr)pX, (ulong)(batchSize * kCols * sizeof(float)));
+        }
+
+        ctx.BeginCommands();
+        var cmd = ctx.CommandList;
+        cmd.SetComputeRootSignature(rootSig);
+        cmd.SetPipelineState(psoGemm);
+
+        uint* pConsts = stackalloc uint[6];
+        pConsts[0] = (uint)kCols;
+        pConsts[1] = (uint)mRows;
+        pConsts[2] = (uint)batchSize;
+        pConsts[3] = 0; // has_bias
+        pConsts[4] = 0; // has_residual
+        pConsts[5] = 1; // has_y
+        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)pConsts, 0);
+
+        cmd.SetComputeRootShaderResourceView(1, dW.GPUVirtualAddress);
+        cmd.SetComputeRootShaderResourceView(2, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(3, dX.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(4, ctx.DummyBuffer.GPUVirtualAddress);
+        cmd.SetComputeRootUnorderedAccessView(5, dY.GPUVirtualAddress);
+
+        cmd.Dispatch((uint)(mRows + 3) / 4, (uint)(batchSize + 31) / 32, 1);
+
+        ctx.EndCommandsAndExecute();
+        ctx.Synchronize();
+
+        float[] gpuResults = new float[batchSize * mRows];
+        fixed (float* pGpu = gpuResults)
+        {
+            ctx.CopyToHost((IntPtr)pGpu, dY, (ulong)(batchSize * mRows * sizeof(float)));
+        }
+
+        for (int t = 0; t < batchSize; t++)
+        {
+            for (int r = 0; r < mRows; r++)
+            {
+                int idx = t * mRows + r;
+                Assert.Equal(cpuResults[idx], gpuResults[idx], 0.01f);
+            }
+        }
+    }
 }
+

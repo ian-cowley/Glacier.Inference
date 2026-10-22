@@ -45,22 +45,6 @@ jobs:
           mkdir -p ../nuget-local
           dotnet nuget add source --name "github-packages" --username "${{ github.repository_owner }}" --password "${{ secrets.GITHUB_TOKEN }}" --store-password-in-clear-text "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" || true
 
-      - name: Wait for upstream NuGet packages to be available
-        run: |
-          wait_for_nuget() {
-            local pkg=$1 ver=$2 timeout=1200 elapsed=0
-            echo "Waiting for $pkg $ver on nuget.org..."
-            until curl -sf "https://api.nuget.org/v3-flatcontainer/${pkg,,}/${ver}/${pkg,,}.${ver}.nupkg" -o /dev/null; do
-              if [ $elapsed -ge $timeout ]; then echo "TIMEOUT waiting for $pkg $ver" && exit 1; fi
-              echo "  $pkg $ver not yet available, retrying in 30s (${elapsed}s elapsed)..."
-              sleep 30; elapsed=$((elapsed+30))
-            done
-            echo "  $pkg $ver is available."
-          }
-          wait_for_nuget Glacier.Polaris 1.0.17
-          wait_for_nuget Glacier.Gpu 1.0.7
-          wait_for_nuget Glacier.Tensor 1.0.7
-
       - name: Restore dependencies
         run: dotnet restore
 

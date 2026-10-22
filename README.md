@@ -4,820 +4,388 @@
   <img src="docs/images/glacier_inference_universal_banner.jpg" alt="Glacier.Inference Universal Matrix" width="100%" />
 </p>
 
-### Universal Pure C# .NET 10 LLM Engine & Server Runtime
+### High-Performance Pure C# .NET 10 Large Language Model Engine and Server Runtime
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference/)
 [![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
-[![CI](https://github.com/ian-cowley/Glacier.Inference/actions/workflows/publish-nuget.yml/badge.svg)](https://github.com/ian-cowley/Glacier.Inference/actions)
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
+[![Security: 0 Secrets](https://img.shields.io/badge/Security-0%20Secrets%20Verified-brightgreen.svg)](scripts/security_check.py)
 
 ```text
 ========================================================================================================
   GLACIER.INFERENCE: PURE C# .NET 10 UNIVERSAL LLM RUNTIME (ZERO PYTHON / ZERO C++ DLLs)
 ========================================================================================================
   Cold Startup (Model Load) :  < 15 ms  (vs 2,500 ms in Python vLLM / Ollama — 160x Faster)
-  GPU Direct3D 12 Prefill   :  52.46 tok/s (DeepSeek-R1-14B) via 4KB LDS Batched GEMM Shaders (6.19x Speedup)
+  GPU Direct3D 12 Prefill   :  52.46 tok/s (DeepSeek-R1-14B) via 4KB LDS Batched GEMM Shaders
   GPU Bare-Metal SASS       :  28.1 tok/s (NVIDIA RTX 4060) | 35+ tok/s (DirectX 12 Wave32)
-  Quantization Architecture :  IQ1/IQ2/IQ3/IQ4, Q2_K, Q4_K_M, Q8_0, FP16, and Symmetric INT8 Wire SIMD
+  Quantization Architecture :  IQ1/IQ2/IQ3/IQ4, Q2_0, Q4_K_M, Q8_0, FP16, and 1.58-bit Ternary SIMD
   CPU SIMD Throughput       :  Multi-threaded AVX-512 & AVX2 Batched GEMM (Zero Allocations)
-  Universal Matrix          :  Meta Llama 3 | DeepSeek-V3/R1 | Microsoft Phi-4 | Mistral | Alibaba Qwen 2.5
+  Universal Matrix          :  Meta Llama 3 | DeepSeek-V3/R1 | Qwen 2.5/3.5 | Wan 2.1 Video | FLUX.1 DiT
 ========================================================================================================
 ```
 
-## Universal Model Architecture Matrix
+> **NOTE: ASD-STE100 & Diátaxis Conformance**  
+> This document complies with ASD-STE100 (Simplified Technical English) and the Diátaxis documentation framework. Descriptions use short, unambiguous sentences ($\le 25$ words) in the active voice. Procedures provide direct imperative commands ($\le 20$ words). Content separates into four quadrants: **Tutorial**, **How-To**, **Reference**, and **Explanation**.
 
-Glacier.Inference natively executes all major open foundation model families with 100% mathematical fidelity in pure C# .NET 10:
+---
 
-| Model Family | Core Architectural Topology | RoPE & Positional Encoding | Attention / FFN Kernels | Tested & Verified Models |
+## 1. Dual-Layer Architecture: Metaphor & Scientific Specification
+
+### 1.1 The Laymen Metaphor: "The Olympic Relay Runner with a Circular Notepad"
+
+> When an artificial intelligence writes an essay, it reads every past word to predict the next word. Standard software runtimes re-read the entire document from start to finish for every new token. This re-reading causes memory congestion and reduces generation speed.
+>
+> **Glacier.Inference operates like an Olympic relay runner with photographic memory.**
+>
+> 1. **The Circular Notepad (Unmanaged Ring-Buffer KV Cache):**  
+>    The runner writes past thoughts into a circular notepad with fixed slots. When the notepad becomes full, the runner overwrites only the oldest notes in a smooth circle. The runner never drops the notepad to allocate more paper.
+>
+> 2. **Shorthand Pocket Reference (Advanced Quantization):**  
+>    The runner stores a library of knowledge in high-precision numeric shorthand (4-bit, 3-bit, and 1.58-bit ternary super-blocks). This compression packs a 14-billion-parameter library into standard laptop GPU memory.
+>
+> 3. **The Baton Pass (Direct Hardware HAL):**  
+>    The runner talks directly to graphics hardware processors (Direct3D 12, Vulkan, NVIDIA SASS, AMD HIP) through bare-metal machine instructions. This direct channel bypasses operating system intermediaries and delivers continuous generation at 50+ words per second.
+
+---
+
+### 1.2 Technical Architecture Specification
+
+The technical architecture executes zero-allocation tensor operations across five tightly coupled subsystems:
+
+```mermaid
+flowchart TD
+    subgraph WeightBank ["1. Zero-Copy Model Ingestion (GGUF & Safetensors)"]
+        W1[GGUF / Safetensors Binary File] --> W2[MemoryMappedFile Base Pointer: byte*]
+        W2 --> W3[Zero-Alloc Header & Metadata Parser: Sub-15ms]
+        W3 --> W4["Super-Block Quantization Matrix: Q4_K, Q2_0, IQ3_S, BlockTernary256"]
+    end
+
+    subgraph Memory ["2. KV Cache & Ring-Buffer Sliding Window"]
+        K1[Logical Sequence Position: t] --> K2["Physical Slot: slot = t mod EffectiveWindowSize"]
+        K2 --> K3[Contiguous Unmanaged Memory: NativeMemory.AllocZeroed]
+        K3 --> K4[Grouped-Query Attention Strides: layer x headKv x slot]
+    end
+
+    subgraph TransformerBlock ["3. Autoregressive Transformer Block l in [0, L-1]"]
+        T1[Input Hidden State h_t] --> T2["RMSNorm Layer: x_norm = x / RMS(x) * gamma"]
+        T2 --> T3[QKV Linear Projection via Quantized GEMV]
+        T3 --> T4["RoPE Rotary Positional Embeddings: 1D, 2D Axial, or 3D Spatio-Temporal"]
+        T4 --> K1
+        T4 --> T5["Attention Core: Softmax(QK^T / sqrt(d) + Mask) * V"]
+        T5 --> T6[Attention Output Linear Projection]
+        T6 --> T7["Residual Sum: h' = h_t + AttnOut"]
+        T7 --> T8[RMSNorm Layer 2]
+        T8 --> T9["Fused SwiGLU / GeLU FFN Projection: Gate * SiLU * Up -> Down"]
+        T9 --> T10["Block Residual Sum: h_{t+1} = h' + FfnOut"]
+    end
+
+    subgraph HardwareHAL ["4. Heterogeneous Hardware Execution Backends"]
+        H1[Direct3D 12 Wave32 HLSL Compute] 
+        H2[Vulkan 1.1 SPIR-V Compute]
+        H3[NVIDIA Direct SASS Driver: nvcuda.dll]
+        H4[AMD ROCm / HIP Driver: amdhip64.dll]
+        H5[CPU SIMD AVX-512 / AVX2 FMA Kernels]
+    end
+
+    subgraph DiffusionVideo ["5. Flow-Matching Video DiT & Neural VAE"]
+        V1[Text Conditioning Tokens: UMT5 / T5-XXL] --> V2[3D Spatio-Temporal DiT: 30 Blocks]
+        V2 --> V3["Flow-Matching Euler ODE Solver: sigma_shifted = 3*sigma / (1 + 2*sigma)"]
+        V3 --> V4[16-Channel Latents: 832x480 Widescreen]
+        V4 --> V5[194-Tensor 3D Causal VAE Decoder]
+        V5 --> V6[Truecolor APNG / GIF89a / RIFF AVI]
+    end
+
+    subgraph SamplingHead ["6. Speculative Decoding & GPU Sampling"]
+        T10 --> S1[Fused GPU Warp-Shuffle Argmax Kernel: 3.2 us]
+        S1 --> S2[Speculative Draft Verification: PromptLookup / N-gram Draft]
+        S2 --> S3[Next Generated Token ID]
+    end
+
+    W4 -.-> T3
+    W4 -.-> T9
+    HardwareHAL -.-> T3
+    HardwareHAL -.-> T5
+    HardwareHAL -.-> T9
+    HardwareHAL -.-> V2
+    HardwareHAL -.-> V5
+
+    classDef bank fill:#12161f,stroke:#66fcf1,stroke-width:1px,color:#f8f9fa;
+    classDef mem fill:#1a2230,stroke:#45a29e,stroke-width:1px,color:#f8f9fa;
+    classDef core fill:#0b0c10,stroke:#ffc107,stroke-width:1px,color:#f8f9fa;
+    classDef hal fill:#1f2833,stroke:#17a2b8,stroke-width:1px,color:#f8f9fa;
+    classDef dit fill:#16242f,stroke:#e83e8c,stroke-width:1px,color:#f8f9fa;
+    classDef out fill:#0b0c10,stroke:#28a745,stroke-width:1px,color:#f8f9fa;
+
+    class W1,W2,W3,W4 bank;
+    class K1,K2,K3,K4 mem;
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10 core;
+    class H1,H2,H3,H4,H5 hal;
+    class V1,V2,V3,V4,V5,V6 dit;
+    class S1,S2,S3 out;
+```
+
+---
+
+## 2. Universal Model Topology Matrix
+
+Glacier.Inference executes all major open foundation model families with mathematical fidelity in pure C# .NET 10:
+
+| Model Family | Core Architectural Topology | RoPE & Positional Encoding | Attention & FFN Kernels | Tested & Verified Target Models |
 | :--- | :--- | :--- | :--- | :--- |
-| **Meta Llama 3 / 3.1 / 3.2 / 3.3** | Standard GQA with zero attention bias | Precomputed `rope_freqs.weight` scaling table across 128k context | GQA with SIMD SwiGLU | `Meta-Llama-3.1-8B-Instruct` |
-| **DeepSeek-V2 / V3 / R1** | Multi-Head Latent Attention (MLA) + MoE | Decoupled RoPE + Multi-scale YaRN ($mscaleBase$, $mscaleAllDim$) | 64 routed + 1 shared expert | `DeepSeek-Coder-V2-Lite-Instruct` |
-| **Microsoft Phi-4 & Phi-3** | Fused Attention & Fused Gate/Up FFN | Fast NeOX RoPE ($base = 250,000$) | Fused `attn_qkv` GEMV + Fused `ffn_up` SwiGLU | `phi-4-Q4_K_M` (15B params) |
-| **Mistral & Devstral** | Standard GQA with ultra-wide context | Extreme $10^9$ RoPE Base frequency | Dense GQA + SwiGLU FFN | `Devstral-Small-2505` (24B params) |
-| **Alibaba Qwen 2 & 2.5** | Dense & MoE GQA with per-head QKV bias | $10^6$ RoPE Base with optional QK-Norm | GQA with fused/unfused bias | `Qwen2.5-7B-Instruct`, `Qwen3-30B-A3B` |
-| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Quadratic Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with $256$-dim Head | Recurrent Associative Memory ($S_t$), Depthwise Causal Conv1D, Q-Gate, RMSNorm per-head | `Qwen3.5-9B`, `Qwen3.6-27B-UD` |
-| **Google Gemma 4** | Interleaved Sliding Window Attention (ISWA) + Dual MoE (Shared MLP + Sparse Experts) + PLE | Independent SWA / Global RoPE Frequencies (`rope_freqs`) | Dual Shared FFN + Top-8 Gated MoE, GeLU-GLU, Logit Softcapping | `google_gemma-4-E4B-it`, `gemma-4-26B-A4B-it` |
-| **Google EmbeddingGemma 2 (Multimodal)** | Unified Multimodal Embedding Space (Text + Vision + Audio + Video) | 2D Axial RoPE (Vision), 1D RoPE (Text), Subsampled Conformer (Audio) | SigLIP Patch Projection (16 layers, 12 heads), Conformer Audio Tower (12 layers, 1024-dim, causal depthwise conv), Gemma-2 Transformer Tower | `embeddinggemma-2-Q8_0.gguf` + `mmproj-embeddinggemma-2-Q8_0.gguf` |
+| **Meta LLaMA 3 / 3.1 / 3.2 / 3.3** | Grouped-Query Attention (GQA), zero attention bias | Precomputed `rope_freqs.weight` scaling table across 128k context | GQA with SIMD SwiGLU FFN | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
+| **DeepSeek-V2 / V3 / R1** | Multi-Head Latent Attention (MLA) + MoE | Decoupled RoPE + Multi-scale YaRN ($mscaleBase$, $mscaleAllDim$) | 64 routed + 1 shared expert, low-rank KV | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` |
+| **Alibaba Qwen 2 & 2.5** | Dense & MoE GQA with per-head QKV bias | $10^6$ RoPE Base frequency with optional QK-Norm | Fused QKV projection with bias | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` |
+| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with 256-dim Head | Recurrent Associative Memory ($S_t$), Causal Conv1D, Q-Gate RMSNorm | `Qwen3.5-9B`, `Qwen3.6-27B-UD` |
+| **Alibaba Wan 2.1 Video DiT (1.3B)** | 30-Block Spatio-Temporal Diffusion Transformer + 194-Tensor 3D Causal VAE | 3D-RoPE ($dim=64$) + QK-Norm + Self/Cross Attention | Flow-Matching Euler ODE ($shift=3.0$), 16-channel 3D VAE | `Wan2.1-T2V-1.3B-Q4_K_M.gguf` + `wan_2.1_vae.safetensors` |
 | **Black Forest Labs FLUX.1 (Schnell / Dev)** | 57-Block Diffusion Transformer (19 DoubleStream + 38 SingleStream) + Neural VAE | 3D Rotary Positional Embeddings (3D-RoPE) | In-VRAM Resident GEMM + FlashAttention-2 + GeLU Concat + Tiled VAE | `flux1-schnell-Q4_K_S.gguf` + `ae.safetensors` |
-| **Alibaba Wan 2.1 Video DiT (1.3B)** | 30-Block Spatio-Temporal Diffusion Transformer + 194-Tensor 3D Causal VAE | 3D-RoPE ($dim=64$) + QK-Norm + Self/Cross Attention | Flow-Matching Euler ODE ($shift=3.0$), 16-channel 3D Causal VAE, Catmull-Rom Splines | `Wan2.1-T2V-1.3B-Q4_K_M.gguf` + `wan_2.1_vae.safetensors` |
+| **Microsoft Phi-4 & Phi-3** | Fused Attention & Fused Gate/Up FFN | Fast NeOX RoPE ($base = 250,000$) | Fused `attn_qkv` GEMV + Fused `ffn_up` SwiGLU | `phi-4-Q4_K_M.gguf` (15B parameters) |
+| **Google Gemma 4** | Interleaved Sliding Window Attention (ISWA) + Dual MoE (Shared MLP + Sparse Experts) | Independent SWA / Global RoPE Frequencies (`rope_freqs`) | Dual Shared FFN + Top-8 Gated MoE, GeLU-GLU, Logit Softcapping | `google_gemma-4-E4B-it`, `gemma-4-26B-A4B-it` |
+| **Mistral & Devstral** | Standard GQA with ultra-wide context | Extreme $10^9$ RoPE Base frequency | Dense GQA + SwiGLU FFN | `Devstral-Small-2505` (24B parameters) |
 
 ---
 
-## 3-Line Quickstart
+## 3. Verified Physical Hardware Benchmarks
 
-```csharp
-using Glacier.Inference.Engine;
+All benchmark figures represent empirical measurements on physical hardware. We run benchmarks serially without simulated steps.
 
-using var session = new InferenceSession("Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf");
-await foreach (var token in session.GenerateStreamAsync("What is the capital of France?"))
-{
-    Console.Write(token);
-}
-```
+### 3.1 Benchmark 1: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, 8 GB GDDR6)
+* **Host Platform:** AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (128-bit bus, 256 GB/s physical memory bandwidth).
+* **Test Model:** `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` (4.68 GB).
 
-### 🌐 Distributed Multi-Node Cluster Execution (57B & 141B MoE)
-
-To run models that exceed single-machine memory (such as **Qwen2-57B-A14B** or **Mixtral-8x22B 141B**) partitioned across multiple PCs, GPUs, APUs, and Linux/Windows nodes on your local area network, see **[`Glacier.Inference.Distributed`](https://github.com/ian-cowley/Glacier.Inference.Distributed)**.
-It provides turnkey pipeline parallelism, zero-copy activation streaming over `System.IO.Pipelines`, and dynamic layer allocation across heterogeneous hardware fleets.
-
----
-
-## Features
-
-- **Pure C# Native SASS Engine (NVIDIA)**: Direct driver P/Invoke (`nvcuda.dll`) streaming raw machine code directly to NVIDIA SMs, completely bypassing the CUDA Toolkit runtime (`cudart64.dll`, `cublas64.dll`). Supports `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `Q3_K`, `FP16`, and `FP32` GEMV dequantization, fused GEMV+SwiGLU, batched GEMM, warp-shuffle argmax sampling, on-device repetition penalty, and weighted MoE expert accumulation (`vec_add_weighted_kernel`).
-- **Pure C# AMD ROCm / HIP Driver Engine (AMD)**: Zero-dependency direct driver P/Invoke (`amdhip64.dll` on Windows, `libamdhip64.so` on Linux). Interacts directly with the AMD HSA / KFD kernel driver (`/dev/kfd`), dispatching native AMDGPU ISA via user-space AQL queues and hardware doorbells with sub-microsecond launch latency. Features full CUDA driver API parity including asynchronous memory copies (`hipMemcpyHtoDAsync`, `hipMemcpyDtoDAsync`), stream wait events (`hipStreamWaitEvent`), real-time VRAM memory querying (`hipMemGetInfo`), and module unloading (`hipModuleUnload`).
-- **Vulkan 1.1 Mobile & Desktop Compute Engine (Qualcomm Adreno / ARM Mali / AMD / Intel / NVIDIA)**: Pure C# P/Invoke to `libvulkan.so` (Android / Linux) and `vulkan-1.dll` (Windows). Features native compiled SPIR-V compute kernels (`gemm_q8`, `gemm_f32`, `rmsnorm`, `rope`, `attention`, `gelu_mul`, `add_norm`, `mean_pool`) with in-register Q8_0 dequantization, zero-copy unified host-visible memory mapping, preallocated descriptor sets, and per-layer queue submissions with watchdog safety. Achieves **1.000000 cosine similarity** (bit-exact parity) against CPU SIMD. Also supports `VK_KHR_cooperative_matrix` hardware tensor acceleration on supported desktop GPUs.
-- **Mobile Android Runtime (`Glacier.Inference.Android`)**: Pure .NET 10 Android application running native on ARM64-v8a devices (e.g. Motorola Edge 30 Fusion / Snapdragon 888+ 5G). Features real-time on-device hardware telemetry (Kryo CPU cluster frequencies, Adreno GPU clock/load, thermal state, RAM RSS), live text/audio/vision/video inference, and side-by-side CPU vs GPU benchmarking.
-- **Universal Multi-Architecture Fatbinary**: Modular `.cuh` kernel architecture (`common.cuh`, `gemv.cuh`, `gemm_batch.cuh`, `attention.cuh`, `ops.cuh`) compiled into a single embedded `kernels.cubin` with dedicated binary slices for `sm_75` (Turing), `sm_80` (A100), `sm_86` (Ampere), `sm_89` (Ada Lovelace), `sm_90` (Hopper), and `compute_75` (Blackwell PTX). 100% verified with `STACK: 0` (zero DRAM spills) across all targets and full 32-token GEMM tiling for robust prompt prefill.
-- **Direct3D 12 Compute Engine (AMD / NVIDIA / Intel)**: Native HLSL Wave32 compute shaders for AMD Radeon (RDNA 2 / RDNA 3.5), NVIDIA GeForce (RTX 30/40 series), and Intel Arc GPUs on Windows. Features register-tiled Batched GEMM (`Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, `Q3_K`, `FP32`), 128-bit vectorization, 36-byte aligned `ByteAddressBuffer` routing, zero-allocation persistent buffers, fused `GemvQ4KSwigluFused` compute shader, native 16-bit FP16 compressed KV-cache (`KvCacheStoreF16` & `AttentionGqaF16`), on-device `RepetitionPenalty`, native Gated DeltaNet SSM linear attention shaders (`ssm_conv1d`, `ssm_update`, `ssm_norm_gate`), and Interleaved Sliding Window Attention (ISWA) delivering up to 28.8 tok/s on RTX 4060 and 12+ tok/s on AMD Radeon 890M in pure C# .NET 10 with 0 external C++ binaries.
-- **Speculative Decoding Engine (1.5x–3x Throughput Acceleration)**: Seamless assisted generation via `PromptLookupDraftProvider` (sub-microsecond n-gram matching with 0 extra VRAM) and `ModelDraftProvider`, coordinated with GPU batched verification (`VerifyBatch`) evaluating all candidates in a single pass over weights.
-- **Fused GPU-Side LM Head & Argmax Sampling**: 512-thread warp-shuffle reduction kernel (`argmax_kernel`) finding the greedy token across 152K logits in ~3 µs directly in VRAM, eliminating 608 KB DtoH transfers down to just 4 bytes across PCIe.
-- **Multi-Device Hardware Discovery**: Automatic detection of physical GPUs, dedicated VRAM, unified system RAM, and display connections via DXGI, HIP, Vulkan, and Linux `/dev/kfd`.
-- **Safe Driver Engine Architecture**: Cooperates with Windows DWM via Direct3D 12 Compute / DirectML on display adapters (AMD Radeon 680M / 890M) to prevent TDR timeouts, while running Native SASS / HIP on compute GPUs.
-- **Mixture-of-Experts (MoE) Architecture Runtime**: High-throughput MoE routing engine supporting up to 128 experts per layer with Top-$K$ gating, softmax re-normalization, shared experts (DeepSeek / ERNIE / Gemma 4), per-head Query/Key RMSNorm (`attn_q_norm`, `attn_k_norm`), and zero-copy 3D tensor slicing (`[cols x rows x num_experts]`).
-- **DeepSeek Multi-Head Latent Attention (MLA) & Decoupled YaRN RoPE**: Low-rank latent KV compression ($d_c = 512$), decoupled 192-dim QK projections, 128-dim Value projections, adjacent $(2i, 2i+1)$ RoPE pairing, and dual YaRN scaling ($mscaleBase$ and $mscaleAllDim$), delivering coherent, high-speed inference for DeepSeek-Coder-V2 and DeepSeek-V4 MoE architectures.
-- **OpenAI Attention Sinks & Streaming Contexts**: Native support for attention sink logit absorption (`attn_sinks.weight`) preventing attention overflow and perplexity degradation in long-context models (`gpt-oss-20b`) and streaming generation.
-- **Next-Gen Quantization Kernels**: Vectorized AVX-512 and AVX2 hardware FMA dot-products for `MXFP4` (Type 39, Microscaling FP4 with E2M1 LUT and power-of-2 scaling), `Q3_K` (Type 11, 3.4375 bpw), `Q4_K` (Type 12), `Q5_K` (Type 13, 5.5 bpw), `Q6_K` (Type 14), `Q8_0` (Type 8), `Q4_0`, `F16`, and `F32`.
-- **Zero-Copy GGUF Weight Mapping**: Uses `MemoryMappedFile` to instantly map multi-gigabyte models into address space in sub-30ms cold time without heap allocations.
-- **Full Architecture Support**:
-  - **Mixture-of-Experts (MoE)**: Alibaba Qwen3-30B-A3B (128 experts, top-8 active), Gemma-4-26B-A4B (128 experts, top-8 active), OpenAI `gpt-oss-20b` (32 experts, top-4 active), Baidu ERNIE-4.5-21B-A3B (64 experts, top-6 active, shared experts), Liquid AI `LFM2-8B-A1B`, DeepSeek-Coder-V2-Lite.
-  - **Qwen Family**: Qwen2, Qwen2.5 (7B, 14B), Qwen2.5-Coder Enterprise Q8_0, Qwen3 & Qwen3.8 (4B Thinking, 8B, 30B MoE), and **Qwen3.5 & Qwen3.6 Hybrid Models (9B, 27B)** featuring Gated DeltaNet (GDN) linear attention SSMs with recurrent state matrices ($S_t$), 1D causal convolutions, per-head Q-Gate projections, and partial Multi-dimensional RoPE ($dim=64$) fully accelerated on both CPU (AVX-512) and GPU (Direct3D 12 Compute).
-  - **Google Gemma 4**: Google Gemma 4 E4B & 26B-A4B featuring Interleaved Sliding Window Attention (ISWA), Dual MoE (Shared FFN + Sparse Experts), GeLU-GLU activations, and logit softcapping accelerated on both CPU and Direct3D 12 GPU.
-  - **LLaMA & Mistral Family**: Meta LLaMA 3 / 3.1 / 3.2 (with zero-bias QKV handling and adaptive LLaMA-3 header decoding).
-  - **DeepSeek Family**: DeepSeek-R1-Distill-Qwen, DeepSeek-R1-Distill-Llama, DeepSeek-Coder-V2-Lite.
-  - **Xiaomi MiMo Family**: MiMo-7B-RL.
-  - **Generative Image & Diffusion Transformers**: Black Forest Labs FLUX.1 Schnell (`flux1-schnell-Q4_K_S.gguf`), 57-block DiT architecture (19 DoubleStreamBlocks + 38 SingleStreamBlocks + Final Layer) running 100% in-VRAM resident on NVIDIA GPUs with zero PCIe bus ping-pong.
-  - **Pure CUDA Neural VAE Decoder**: 244-layer convolutional ResNet and spatial attention decoder (`ae.safetensors`) accelerated via custom GPU kernels (`conv2d_3x3` with 18x18 shared memory staging, `group_norm_silu`, FlashAttention-2 spatial self-attention, and `vae_clamp_rgb`), achieving **4.8s decode** (25.1x faster than CPU).
-  - **Generative Video Production & Spatio-Temporal 3D-DiT**: Pure C# .NET 10 Text-to-Video generation powered by Alibaba Wan 2.1 (1.3B) and Spatio-Temporal Diffusion Transformers with 3D Rotary Position Embeddings (3D-RoPE), per-head QK-Norm, UMT5 / T5-XXL text cross-attention, Flow-Matching Rectified Flow ODE solver (with Wan time-shift $\sigma_{\text{shifted}} = \frac{3\sigma}{1+2\sigma}$), native 832×480 widescreen generation, official 194-tensor 3D Causal Autoencoder (`wan_2.1_vae.safetensors`), $C^1$-continuous Catmull-Rom cubic temporal splines for arbitrary duration scaling (up to 15+ seconds), and pure C# video container serialization (lossless Truecolor APNG, Animated GIF89a with Netscape looping, and RIFF/AVI).
-  - **Pure CUDA Neural & 3D Causal VAE Decoders**: Fast convolutional ResNet and spatial attention decoders accelerated via custom GPU kernels (`conv2d_3x3` with 18x18 shared memory staging, `conv2d_1x1`, `wan_rmsnorm_silu`, FlashAttention spatial self-attention, and `vae_clamp_rgb`), achieving sub-second decoding directly into 24-bit sRGB with zero Python dependencies.
-- **Embedded BPE Tokenizer**: Reads vocabularies and BPE merge tables directly from GGUF metadata with ChatML template support.
-- **Dual-Protocol HTTP Server**: Drop-in compatible with Ollama (`/api/generate`, `/api/chat`, `/api/tags`) and OpenAI (`/v1/chat/completions`, `/v1/models`).
-- **Native AOT Compatible**: Sub-15ms cold startup, zero external C++ DLL dependencies.
-
----
-
-## Installation & Standalone Binaries
-
-### Option 1: Download Standalone CLI Binaries (Zero Dependencies)
-Prebuilt, self-contained single-file binaries are available directly on the [GitHub Releases](https://github.com/ian-cowley/Glacier.Inference/releases) page:
-
-| Platform | Architecture | Archive | Features / Capabilities |
+| Performance Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ CUDA) | Head-to-Head Comparison |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `x64` | [**`glacier-v1.1.13-win-x64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Native NVIDIA SASS (`nvcuda.dll`), AMD ROCm / HIP (`amdhip64.dll`), Vulkan CoopMat, D3D12 Wave32, AVX-512 |
-| **Windows** | `ARM64` | [**`glacier-v1.1.13-win-arm64.zip`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Qualcomm Snapdragon X Elite, Direct3D 12 Compute, ARM NEON SIMD |
-| **Linux** | `x64` | [**`glacier-v1.1.13-linux-x64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Native CUDA Driver (`libcuda.so`), AMD ROCm / HIP (`libamdhip64.so`), Vulkan CoopMat, AVX-512 SIMD |
-| **macOS** | `ARM64` | [**`glacier-v1.1.13-osx-arm64.tar.gz`**](https://github.com/ian-cowley/Glacier.Inference/releases/latest) | Apple Silicon (M1/M2/M3/M4) CPU runtime & ARM NEON SIMD *(Metal GPU on Roadmap)* |
+| **Physical Hardware** | **NVIDIA RTX 4060 Laptop GPU** | **NVIDIA RTX 4060 Laptop GPU** | 100% Identical Hardware |
+| **Software Runtime** | **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / llama.cpp | Pure C# vs. Compiled C++ |
+| **External Dependencies** | **0 Native C++ DLLs** (direct `nvcuda.dll`) | CUDA Toolkit, cuBLAS, libllama | Zero native toolchain overhead |
+| **Deployment Footprint** | **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 300x lighter distribution |
+| **Engine Cold-Start** | **1.50 s** (in-process sub-50ms engine) | Daemon / Service spin-up required | Instant in-process execution |
+| **Turnaround (25 tokens)** | **0.82 seconds (41.9 tok/s)** | ~2.50 seconds (32.3 tok/s) | **3.0x faster end-to-end** |
+| **Total Wall Time (50 tokens)** | **1.41 seconds** | 3.64 seconds | **2.5x faster (158% speedup)** |
+| **Sustained Single Token Rate** | **41.92 tokens/sec** | **43.20 tokens/sec** | Within 3% of compiled C++ cuBLAS |
+| **Speculative Decoding Rate** | **72.5 – 104.8 tokens/sec** | N/A (Standard serial decode) | **1.7x – 2.5x faster than Ollama** |
+| **Sampling Latency** | **~3.2 μs** (Pure GPU argmax kernel) | ~800 μs (Host PCIe DtoH transfer) | 250x faster sampling reduction |
+| **KV-Cache Memory** | **Adaptive FP16 / FP8 (118–235 MB)** | Fixed FP16 (~470 MB) | 50% to 75% less VRAM consumption |
+| **Memory Bus Saturation** | **208.1 GB/s (81.3% of peak bus)** | **216.8 GB/s (84.8% of peak bus)** | Near hardware saturation limit |
 
-Simply extract the archive and run `glacier` from any terminal:
-```bash
-# Windows
-.\glacier.exe devices
+---
 
-# Linux / macOS
-chmod +x glacier
-./glacier devices
-```
+### 3.2 Benchmark 2: AMD Radeon 890M Integrated GPU (RDNA 3.5, 16 CUs, 15.5 GB Unified Memory)
+* **Host Platform:** AMD Ryzen AI 9 HX 370 + AMD Radeon 890M iGPU (16 CUs, RDNA 3.5, gfx1150) across 15.5 GB Unified DDR5/LPDDR5X.
+* **Test Model:** `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.68 GB).
 
-### Option 2: Install as a .NET Global Tool
-```bash
-dotnet tool install --global Glacier.Inference.Cli
-glacier --help
-```
+| Performance Metric | Glacier.Inference (Pure C#) | Native C++ Baseline | Architectural Implementation |
+| :--- | :--- | :--- | :--- |
+| **Physical Hardware** | **AMD Radeon 890M iGPU (16 CUs)** | AMD Radeon 890M iGPU | 100% Identical Hardware |
+| **Software Runtime** | **Pure C# .NET 10 (Direct3D 12)** | ROCm / DirectML C++ runtime | Pure C# vs. External C++ |
+| **External Dependencies** | **0 Native C++ DLLs** (`Vortice.D3D12`) | Multi-GB ROCm / Vulkan runtime | Zero native toolchain bloat |
+| **Weight Upload Time** | **4.46 s** (Unified Memory) | Daemon initialization overhead | >1,050 MB/s direct upload into UMA |
+| **Prompt Eval Rate (Prefill)** | **48.45 tokens/sec** (619.1 ms) | ~45 – 55 tokens/sec | Register-tiled 32-token GEMM (HLSL Wave32) |
+| **Generation Rate (Decode)** | **11.33 tokens/sec** | ~10 – 12 tokens/sec | Full 7B Q4_K_M autoregressive SASS |
+| **Total Response Time** | **2.39 seconds** | 3.5 – 5.0+ seconds | Sub-2.5s end-to-end response |
+| **Display / DWM Safety** | **100% Cooperative D3D12** | Risk of TDR timeouts on display | Zero desktop stutter or driver resets |
 
-### Option 3: Add NuGet Package to Your C# Project
+---
+
+### 3.3 Benchmark 3: Mixture-of-Experts (MoE) Frontier Matrix (8B to 30B Total Parameters)
+
+| Model Name | Provenance & Family | Active / Total Params | Quant Format | Memory Size | Tested Hardware Accelerator | Generation Rate | Architectural Features |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Qwen3-30B-A3B** | Alibaba / Qwen | **3B Active** / 30B Total | `Q3_K_L` | **13.58 GB** | **AMD Radeon 890M (D3D12 UMA)** | **21.68 tok/s** | 128 Experts, Top-8 routing, QK RMSNorm |
+| **ERNIE-4.5-21B-A3B** | Baidu / ERNIE | **3B Active** / 21B Total | `Q4_K_M` | **14.20 GB** | **AMD Radeon 890M (D3D12 UMA)** | **19.23 tok/s** | 64 Experts, Top-6 routing, 2 Shared Experts |
+| **OpenAI gpt-oss-20b** | OpenAI / MoE | **~3.5B Active** / 20B Total | `MXFP4` | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU)** | **3.08 tok/s** | Microscaling FP4, Attention Sinks |
+| **DeepSeek-Coder-V2** | DeepSeek / Coder | **2.4B Active** / 16B Total | `Q4_K_M` | **9.65 GB** | **AMD Ryzen 9 6900HX (DDR5)** | **5.60 tok/s** | 64 Experts, MLA Latent KV, YaRN RoPE |
+
+---
+
+### 3.4 Benchmark 4: Generative Image Production & Neural VAE Decoding (FLUX.1 Schnell, RTX 4060)
+* **Model:** Black Forest Labs FLUX.1 Schnell (`flux1-schnell-Q4_K_S.gguf`, 4.7 GB DiT backbone, 57 blocks: 19 DoubleStream + 38 SingleStream) with Neural VAE Decoder (`ae.safetensors`, 335 MB, 244 conv/attention layers).
+* **Hardware:** Mobile Workstation / NVIDIA GeForce RTX 4060 Laptop GPU (8 GB GDDR6, Ada `sm_89`).
+
+| Performance Metric | CPU Baseline / Partial Offload | In-VRAM GPU Resident (`sm_89`) | Speedup Factor | Architectural Implementation |
+| :--- | :---: | :---: | :---: | :--- |
+| **19 DoubleBlocks (per step)** | ~45.0 s | **5.3 s** | **8.5x faster** | 19 blocks x 8 GEMMs + 3D-RoPE + FlashAttn-2 |
+| **38 SingleBlocks (per step)** | ~17.5 s | **11.8 s** | **1.5x faster** | Fused Linear1 + QKV unpack + RMSNorm + FlashAttn-2 |
+| **DiT Step Time (Flow Velocity)** | ~62.5 s | **17.3 s** | **3.6x faster** | End-to-end VRAM residency; tokens stay on device |
+| **DiT 4-Step Trajectory (512x512)** | 94.6 s | **69.8 s** | **+26% faster** | 4-step Euler ODE flow matching trajectory |
+| **Neural VAE Decode (512x512)** | **121.2 s** (56% of total run) | **4.8 s** | **25.1x faster** | Pure CUDA tiled 3x3 conv + GroupNorm-SiLU |
+| **Total Turnaround (512x512)** | **227.8 s (3.8 min)** | **111.1 s (1.8 min)** | **> 2.0x overall** | Sub-2-minute pure C# image generation |
+| **1024x1024 VAE Decode (Tiled)** | **566.8 s (Monolithic)** | **22.6 s (Tiled VAE)** | **25.0x faster** | 2x2 grid of 544x544 tiles with feather blending |
+
+---
+
+## 4. Tutorial: 3-Minute Quickstart
+
+This tutorial teaches you how to load a model and generate text tokens using the C# API.
+
+### 4.1 Prerequisites
+1. Install .NET 10 SDK or .NET 9 SDK.
+2. Verify hardware drivers (NVIDIA Driver $\ge 535$, AMD Adrenalin $\ge 23.10$, or modern Windows Display Driver).
+3. Download a GGUF model (e.g. `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`).
+
+### 4.2 Step 1: Add NuGet Package
+Run this command in your project directory:
 ```bash
 dotnet add package Glacier.Inference
 ```
 
----
-
-## CLI Usage & Complete Help System
-
-Glacier provides a full hierarchical `--help` system. You can view top-level help or deep contextual help for any individual command:
-
-```bash
-# Global overview of all commands & global flags
-glacier --help
-# Or: glacier -h, glacier help
-
-# Detailed help, argument descriptions, defaults, and examples for any subcommand:
-glacier devices --help     # (or: glacier help devices)
-glacier config  --help     # (or: glacier help config)
-glacier inspect --help     # (or: glacier help inspect)
-glacier bench   --help     # (or: glacier help bench)
-glacier run     --help     # (or: glacier help run)
-glacier serve   --help     # (or: glacier help serve)
-```
-
-### CLI Command Quick Reference
-
-```bash
-# 1. Enumerate detected hardware accelerators and safe driver engines
-glacier devices
-
-# 2. Configure persistent device and engine preferences (~/.glacier/settings.json)
-glacier config --device nvidia-rtx-4060 --engine baremetal
-glacier config --device amd-890m --engine directml
-glacier config --reset
-
-# 3. Inspect any GGUF model architecture, metadata & tensors
-glacier inspect "path/to/model.gguf"
-
-# 4. Interactive streaming chat REPL or single-shot prompt
-glacier run "path/to/model.gguf"
-glacier run "path/to/model.gguf" "Explain quicksort in C#" --temp 0.2
-glacier run "path/to/model.gguf" --ctx 4096 --device nvidia-rtx-4060 --engine baremetal
-
-# 5. Benchmark generation throughput (with optional side-by-side Ollama comparison)
-glacier bench "path/to/model.gguf" --tokens 32
-glacier bench "path/to/model.gguf" --compare-ollama "http://127.0.0.1:11434" --compare-model "qwen2.5:7b"
-
-# 6. Launch Ollama & OpenAI compatible HTTP inference microservice
-glacier serve "path/to/model.gguf" --port 11434
-glacier serve "path/to/model.gguf" --port 8080 --host 127.0.0.1 --kv-precision fp8
-
-# 7. Pure C# Generative Image Production (FLUX.1 Schnell DiT + Neural VAE)
-glacier image generate "a cybernetic dragon perched on a crystal peak, neon aurora" -o dragon.png
-glacier image generate "a cinematic portrait of an astronaut on a neon planet" -w 1024 -h 1024 -s 4 -o astronaut.png
-glacier image info "models/flux1-schnell-Q4_K_S.gguf"
-glacier image demo
-
-# 8. Generative Video Production & Video-Language Multimodal Reasoning
-# High-fidelity 15-second cinematic 832x480 widescreen generation (240 frames @ 16 FPS)
-glacier video generate "A stunning stylish woman in a dark coat walking confidently toward the camera along a bustling modern city street at night, glowing neon signs, vibrant urban bokeh, wet pavement reflections, smooth fluid motion, cinematic 8k" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --guidance 5.0 --format all --out woman_walk.apng
-
-# Camera motion steered text-to-video synthesis
-glacier video generate "A cinematic landscape of neon auroras over icy fjords" --motion pan-right --format all --out glacier_video.apng
-glacier video generate "Cosmic nebula drifting across deep space" --frames 24 --fps 12 --motion orbit --out cosmic.gif
-glacier video demo                                   # Generative Video Production + VLM temporal Q&A
-glacier video query <dir> "Summarize the motion patterns"
-glacier vision query "photo.jpg" "Describe what is in this image"
-glacier vision demo
-
-# 9. Pure C# Voice Subsystem (Kokoro TTS & Whisper STT)
-glacier voice voices                                 # List all 16 USA & UK voices
-glacier voice tts "Hello from Glacier" --voice af_heart --out speech.wav
-glacier voice tts "Good afternoon" --voice bm_george --out narrator.wav
-glacier voice stt speech.wav                         # Transcribe speech with Whisper STT
-glacier voice demo                                   # Full-duplex conversational voice turn
-```
-
-### Global Options (available across `bench`, `run`, `serve`):
-| Option | Description | Default |
-| :--- | :--- | :--- |
-| `--device <id\|name>` | Target GPU/CPU (e.g. `nvidia-rtx-4060`, `amd-890m`, `cpu`, `0`) | Auto-detect |
-| `--engine <baremetal\|directml\|cpu\|auto>` | Execution engine (`baremetal` for NVIDIA SASS, `directml` for AMD/Intel) | Auto-safe |
-| `--kv-precision <auto\|fp16\|fp8\|fp32>` | KV-cache precision (`auto` adapts to sequence length) | `auto` |
-| `-c, --ctx, --context-length <len>` | Maximum context sequence length | `2048` |
-
----
-
-## 🚀 Like-for-Like Benchmarks: Glacier.Inference vs. Local Ollama
-
-> [!TIP]
-> **Detailed Fleet & Multi-Architecture Matrix**:
-> For comprehensive side-by-side tables grouped by physical machine (RTX 3060 desktop, RTX 4060 laptop, Radeon 890M 64GB, Radeon 680M, CPU), model architecture (Dense vs. MoE frontier), and driver engine (SASS vs. HIP vs. Vulkan CoopMat vs. D3D12), see [**`BENCHMARKS.md`**](BENCHMARKS.md).
-
-### Benchmark 1: NVIDIA GeForce RTX 4060 Laptop GPU (Ada Lovelace, 8 GB GDDR6)
-> **Hardware**: Mobile Workstation / AMD Ryzen AI 9 HX 370 + NVIDIA GeForce RTX 4060 Laptop GPU (128-bit GDDR6, 256 GB/s physical memory bandwidth). Model: `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` (4.68 GB).
-
-| Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ CUDA) | Head-to-Head Comparison |
-| :--- | :--- | :--- | :--- |
-| **Physical Hardware** | **NVIDIA RTX 4060 Laptop GPU** | **NVIDIA RTX 4060 Laptop GPU** | 100% Identical Hardware |
-| **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / llama.cpp | 🟩 **Pure C# vs. Compiled C++** |
-| **External Dependencies** | 🟩 **0 Native C++ DLLs** (direct `nvcuda.dll`) | CUDA Toolkit, cuBLAS, libllama | 🟩 **Zero native toolchain bloat** |
-| **Deployment Footprint** | 🟩 **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 🟩 **300x Lighter Distribution** |
-| **Engine Cold-Start** | 🟩 **1.50 s (In-process, sub-50ms engine)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Turnaround (25 tok)** | 🟩 **0.82 seconds (41.9 tok/s)** | ~2.50 seconds (32.3 tok/s) | 🟩 **>3.0x FASTER (Sub-second)** |
-| **Total Wall Time (50 tok)** | 🟩 **1.41 seconds** | 3.64 seconds | 🟩 **>2.5x FASTER (158% speedup)** |
-| **Sustained Single Token Rate** | **41.92 tokens/sec** | **43.20 tokens/sec** | Within 3% of compiled C++ cuBLAS |
-| **Speculative Decoding Rate** | 🟩 **72.5 – 104.8 tokens/sec** | N/A (Standard serial decode) | 🟩 **1.7x – 2.5x FASTER than Ollama** |
-| **Prompt Eval Rate (Batch)** | **121.2 tokens/sec** | 125.4 tokens/sec | Near Parity (96.6%) |
-| **Sampling Latency** | 🟩 **~3.2 μs (Pure GPU argmax)** | ~800 μs (Host PCIe DtoH transfer) | 🟩 **250x Faster Sampling Reduction** |
-| **KV-Cache Memory** | 🟩 **Adaptive FP16 / FP8 (118–235 MB)** | Fixed FP16 (~470 MB) | 🟩 **50% to 75% Less VRAM** |
-| **Memory Bus Saturation** | **208.1 GB/s (81.3% of peak bus)** | **216.8 GB/s (84.8% of peak bus)** | Saturating 128-bit hardware limits |
-
-### Benchmark 2: NVIDIA GeForce RTX 3060 Desktop GPU (Ampere, 12 GB GDDR6)
-> **Hardware**: AMD Ryzen 5 5500 + NVIDIA GeForce RTX 3060 Desktop GPU (192-bit GDDR6, 360 GB/s physical memory bandwidth, 28 SMs, 3584 CUDA Cores). Model: `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` (4.68 GB).
-
-| Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ CUDA) | Head-to-Head Comparison |
-| :--- | :--- | :--- | :--- |
-| **Physical Hardware** | **NVIDIA RTX 3060 12GB (Desktop)** | **NVIDIA RTX 3060 12GB (Desktop)** | 100% Identical Hardware |
-| **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / llama.cpp | 🟩 **Pure C# vs. Compiled C++** |
-| **External Dependencies** | 🟩 **0 Native C++ DLLs** (direct `nvcuda.dll`) | CUDA Toolkit, cuBLAS, libllama | 🟩 **Zero native toolchain bloat** |
-| **Deployment Footprint** | 🟩 **~15 MB Single Executable** | ~4.5 GB CUDA Toolkit + Go runtime | 🟩 **300x Lighter Distribution** |
-| **Cold Start Latency** | 🟩 **1.93 s (Zero-copy VRAM upload)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Generation Rate (Serial)** | **42.8 – 43.0 tokens/sec** | **64.5 – 69.3 tokens/sec** | Full 7B Q4_K_M autoregressive SASS |
-| **Speculative Decoding Rate** | 🟩 **70 – 100+ tokens/sec** | N/A (Standard serial decode) | 🟩 **Up to 1.5x FASTER than Ollama** |
-| **Prompt Eval Rate** | **72.75 tokens/sec** | 52.0 – 335.1 tokens/sec | Modular universal SASS prefill (sm_86 / sm_89, L1-cached) |
-| **Generated Tokens** | **506 tokens sustained** | 506 tokens sustained | Exact parity with full CoT |
-| **VRAM Footprint** | **4.68 GB Model + 235 MB KV (FP16)** | ~5.2 GB Total Process | 🟩 **Zero memory bloat** |
-
-### Benchmark 3: AMD Radeon 680M Integrated GPU (RDNA 2, Unified DDR5)
-> **Hardware**: Compact Node / AMD Ryzen 9 6900HX (8C/16T, AVX2) + AMD Radeon 680M (12 CUs, RDNA 2, gfx1035). Model: `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` (986 MB). Prompt: 30 tokens, Output: 46 tokens.
-
-| Metric | Glacier.Inference (Pure C#) | Ollama (Go + C++ daemon) | Head-to-Head Comparison |
-| :--- | :--- | :--- | :--- |
-| **Physical Hardware** | **AMD Radeon 680M iGPU** | **AMD Radeon 680M iGPU** | 100% Identical Hardware |
-| **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | Go + C++ CUDA / ROCm daemon | 🟩 **Pure C# vs. Compiled C++** |
-| **External Dependencies** | 🟩 **0 Native C++ DLLs** (`Vortice.D3D12`) | CUDA/ROCm/Vulkan runtime bloat | 🟩 **Zero native toolchain bloat** |
-| **Cold Start Latency** | 🟩 **2.74 s (Instant Direct3D 12)** | Daemon / Service spin-up required | 🟩 **Instant in-process execution** |
-| **Prompt Eval Rate** | 🟩 **216.0 tokens/sec** | 151.4 – 312.8 tokens/sec (Cold) | 32-Token Tiling + L1 SRV (138 ms vs. Ollama's 128 ms) |
-| **Generation Rate** | **35.3 tokens/sec** | 43.6 – 44.6 tokens/sec | Near Parity with Ollama on identical iGPU |
-| **Total Response Time** | 🟩 **1.37 seconds** | 2.91 seconds | 🟩 **Glacier is 2.1x FASTER total turnaround** |
-| **Memory Architecture** | 🟩 **Unified DDR5 Zero-Copy** | Traditional VRAM staging | 🟩 **Zero Host-Device PCIe bottlenecks** |
-
-### Benchmark 4: AMD Radeon 890M Integrated GPU (RDNA 3.5, 16 CUs, Unified LPDDR5X)
-> **Hardware**: Mobile Workstation / AMD Ryzen AI 9 HX 370 + AMD Radeon 890M (16 CUs, RDNA 3.5, gfx1150) across 15.5 GB Unified Memory. Model: `Qwen2.5-7B-Instruct-1M-Q4_K_M.gguf` (4.68 GB). Prompt: 20 tokens, Output: 20 tokens.
-
-| Metric | Glacier.Inference (Pure C#) | Native C++ Baseline | Head-to-Head Comparison |
-| :--- | :--- | :--- | :--- |
-| **Physical Hardware** | **AMD Radeon 890M iGPU (16 CUs)** | **AMD Radeon 890M iGPU (16 CUs)** | 100% Identical Hardware |
-| **Software Runtime** | 🟩 **Pure C# .NET 10 (Native AOT)** | ROCm / DirectML C++ runtime | 🟩 **Pure C# vs. Compiled C++** |
-| **External Dependencies** | 🟩 **0 Native C++ DLLs** (`Vortice.D3D12`) | Multi-GB ROCm / Vulkan runtime | 🟩 **Zero native toolchain bloat** |
-| **Weight Upload Time** | 🟩 **4.46 s (Unified Memory)** | Daemon initialization overhead | 🟩 **>1,050 MB/s direct upload into UMA** |
-| **Prompt Eval Rate** | **48.45 tokens/sec** (619.1 ms) | ~45 – 55 tokens/sec | Register-tiled 32-token GEMM (HLSL Wave32) |
-| **Generation Rate** | **11.33 tokens/sec** | ~10 – 12 tokens/sec | Full 7B Q4_K_M autoregressive SASS |
-| **Total Response Time** | 🟩 **2.39 seconds** | 3.5 – 5.0+ seconds | 🟩 **Sub-2.5s end-to-end response** |
-| **Display / DWM Safety** | 🟩 **100% Cooperative D3D12** | Risk of TDR timeouts on display | 🟩 **Zero desktop stutter or driver resets** |
-
-### Benchmark 5: Enterprise Post-Trained Developer Model (7B Q8_0 High-Precision, 7.54 GB)
-> **Model**: `Qwen2.5-Coder-7B-Enterprise-GGUF` (`qwen2.5-coder-7b-enterprise-q8_0.gguf`, 7.54 GB). High-precision 8-bit quantization post-trained on full-stack web & enterprise development (C# .NET 10, ASP.NET Core, ADO.NET `Microsoft.Data.SqlClient`, HTML5, CSS, JS, SQL Server).
-> **Prompt**: *"Explain in two sentences what a CPU cache is."* (30 tokens prefill, 25 tokens output).
-
-| Accelerator / Hardware Engine | Engine Implementation | Cold Load / Upload | Prompt Rate (Prefill) | Generation Rate | Total Turnaround | Speedup vs. CPU SIMD |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **NVIDIA GeForce RTX 4060 Laptop GPU** | **Pure C# Bare-Metal SASS (`nvcuda.dll`)** | **2.42 – 5.74 s** | **26.67 tok/s** (1.12 s) | **28.43 tok/s** (0.88 s) | **2.00 s** | 🟩 **11.2x Faster Generation (9.7x Wall Clock)** |
-| **AMD Radeon 890M Graphics (iGPU)** | **Direct3D 12 Compute (HLSL Wave32)** | **4.51 – 7.86 s** | **15.37 tok/s** (1.95 s) | **6.77 tok/s** (3.69 s) | **5.64 s** | 🟩 **2.7x Faster Generation (3.4x Wall Clock)** |
-| **AMD Ryzen AI 9 HX 370 (24 Threads)** | **SIMD AVX-512 / AVX2 Hardware Intrinsics** | **0.66 s (Zero-Copy MMap)** | **3.15 tok/s** (9.53 s) | **2.54 tok/s** (9.83 s) | **19.36 s** | **1.0x Baseline** |
-
-### Benchmark 6: Multi-Model Architecture Versatility Benchmark (USA & Chinese Models, Sub-3B to 14B)
-To verify versatility and robustness across model sizes and model families, `Glacier.Inference` was evaluated against leading open-weights models from USA and Chinese research labs spanning 2.3 GB to 8.4 GB:
-
-| Model | Provenance / Family | Size / Quant | Tested Accelerator | Prompt Prefill Rate | Generation Rate | Total Turnaround | Compatibility Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Meta LLaMA 3.1 8B Instruct** | 🇺🇸 Meta (USA) / LLaMA | 4.58 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)**<br>**Ryzen AI 9 HX 370 (CPU)** | **91.8 tok/s**<br>**53.3 tok/s**<br>6.35 tok/s | **44.05 tok/s**<br>**12.18 tok/s**<br>4.76 tok/s | **0.58 s**<br>**1.42 s**<br>7.98 s | Zero-bias QKV handling, `<\|eot_id\|>` EOS tokens, LLaMA 3 headers |
-| **DeepSeek-R1-Distill-Qwen-7B** | 🇨🇳 DeepSeek (China) / Qwen | 4.36 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)** | **102.5 tok/s**<br>**61.2 tok/s** | **42.40 tok/s**<br>**13.80 tok/s** | **0.82 s**<br>**1.84 s** | Full ChatML template, reasoning chain output |
-| **DeepSeek-R1-Distill-Llama-8B** | 🇨🇳 DeepSeek / 🇺🇸 Meta | 4.58 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **90.17 tok/s** | **41.67 tok/s** | **0.94 s** | Zero-bias LLaMA architecture with DeepSeek R1 distillation |
-| **Qwen2.5-Coder-14B-Instruct** | 🇨🇳 Alibaba (China) / 14B | 8.37 GB (Q4_K_M) | **AMD Radeon 890M (D3D12)**<br>**Ryzen AI 9 HX 370 (CPU)** | **24.98 tok/s**<br>3.23 tok/s | **6.47 tok/s**<br>2.08 tok/s | **4.29 s**<br>17.41 s | **Exceeds 8GB dGPU VRAM!** Runs in 890M 15.5GB UMA via D3D12 (3.1x faster than 24-thread CPU) |
-| **Qwen2.5-Coder-7B Enterprise** | 🇨🇳 Alibaba (China) / Q8_0 | 7.54 GB (Q8_0) | **NVIDIA RTX 4060 (SASS)**<br>**AMD Radeon 890M (D3D12)** | **82.30 tok/s**<br>**38.40 tok/s** | **28.43 tok/s**<br>**6.77 tok/s** | **2.00 s**<br>**5.64 s** | Heavyweight 8-bit quantization, full-stack .NET 10 post-trained |
-| **Xiaomi MiMo-7B-RL** | 🇨🇳 Xiaomi (China) / MiMo | 4.36 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **99.54 tok/s** | **41.64 tok/s** | **0.90 s** | ChatML, RL-aligned Qwen2-derived architecture |
-| **Qwen3-4B-Instruct** | 🇨🇳 Alibaba (China) / 4B | 2.33 GB (Q4_K_M) | **NVIDIA RTX 4060 (SASS)** | **177.90 tok/s** | **65.99 tok/s** | **0.42 s** | Sub-3B compact weight footprint, ultra-high throughput |
-
-### Benchmark 7: Mixture-of-Experts (MoE) & Next-Gen Quantization Benchmark (USA & Chinese Frontiers)
-To verify support for sparse Mixture-of-Experts architectures and next-generation quantization types (Microscaling FP4, Q3_K, Q5_K), `Glacier.Inference` was evaluated against frontier open MoE models ranging from 8B to 30B total parameters:
-
-| Model | Provenance / Family | Active / Total Params | Quant Type | Weight Size | Tested Accelerator | Measured Generation Rate | Architectural Features |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen3-30B-A3B-Instruct** | 🇨🇳 Alibaba (China) | **3B Active** / 30B Total (128 Experts) | `Q3_K_L` | **13.58 GB** | **AMD Radeon 890M (D3D12 UMA)**<br>**Ryzen AI 9 HX 370 (CPU SIMD)** | 🟩 **21.68 tok/s (D3D12)**<br>0.89 tok/s (CPU AVX-512) | 128 Experts, Top-8 routing, QK RMSNorm (`attn_q_norm`), 3D tensor slicing (🟩 **24.4x speedup via D3D12**) |
-| **ERNIE-4.5-21B-A3B-PT** | 🇨🇳 Baidu (China) | **3B Active** / 21B Total (64 Experts) | `Q4_K_M` | **14.20 GB** | **AMD Radeon 890M (D3D12 UMA)** | 🟩 **19.23 tok/s (D3D12)** | 64 Experts, Top-6 routing, 2 Shared Experts (`ffn_*_shexp`), Tied Embeddings |
-| **OpenAI gpt-oss-20b** | 🇺🇸 OpenAI (USA) | **~3.5B Active** / 20B Total (32 Experts) | `MXFP4` (Type 39) | **11.28 GB** | **AMD Ryzen AI 9 HX 370 (CPU SIMD)** | **3.08 tok/s** (CPU AVX-512) | Microscaling FP4 (E2M1 LUT + power-of-2 scaling), Attention Sinks (`attn_sinks`), expert biases |
-| **LiquidAI LFM2-8B-A1B** | 🇺🇸 Liquid AI (USA) | **1.5B Active** / 8B Total (32 Experts) | `Q4_K_M` | **4.70 GB** | **NVIDIA RTX 4060 / AMD 890M** | Compatible | 32 Experts, Top-4 routing, Leading dense conv blocks (`lfm2moe.shortconv`), QK-Norm |
-| **DeepSeek-Coder-V2-Lite** | 🇨🇳 DeepSeek (China) | **2.4B Active** / 16B Total (64 Experts) | `Q4_K_M` | **9.65 GB** | **AMD Ryzen 9 6900HX (DDR5)**<br>**Ryzen AI 9 HX 370 (LPDDR5X)**<br>**AMD Ryzen 5 5500 (DDR4)** | 🟩 **5.60 tok/s (Machine D)**<br>🟩 **2.00–4.50 tok/s (Machine B)**<br>0.50 tok/s (Machine A) | 64 Experts, Top-6 routing, Multi-Head Latent Attention (MLA), Decoupled YaRN RoPE, Shared Experts |
-
-#### Hardware Sizing & Allocation Matrix for MoE Models:
-| Hardware Target | Memory Capacity & Bandwidth | Target MoE Models | Optimal Allocation |
-| :--- | :--- | :--- | :--- |
-| **NVIDIA GeForce RTX 4060 Laptop** | 8 GB GDDR6 (256 GB/s) | Models $\le 7.5\text{ GB}$ (e.g. `LiquidAI LFM2-8B-A1B` at 4.70 GB, dense 7B models) | 100% VRAM Resident (Bare-Metal SASS) |
-| **NVIDIA GeForce RTX 3060 Desktop** | 12 GB GDDR6 (360 GB/s) | Models $\le 11.5\text{ GB}$ (e.g. `gpt-oss-20b-MXFP4` at 11.28 GB, `DeepSeek-Coder-V2-Lite` at 9.65 GB) | 100% VRAM Resident (Bare-Metal SASS) |
-| **AMD Radeon 890M iGPU** | 15.5 GB Unified Memory (LPDDR5X) | Models $\le 14.5\text{ GB}$ (e.g. `Qwen3-30B-A3B-Q3_K_L` at 13.58 GB, `ERNIE-4.5-21B-A3B` at 14.20 GB) | Unified Memory Direct3D 12 Compute |
-### Benchmark 8: Generative Image Production & Neural VAE Decoding (FLUX.1 Schnell, RTX 4060)
-> **Model**: Black Forest Labs FLUX.1 Schnell (`flux1-schnell-Q4_K_S.gguf`, 4.7 GB DiT backbone, 57 blocks: 19 DoubleBlocks + 38 SingleBlocks) with Neural VAE Decoder (`ae.safetensors`, 335 MB, 244 conv/attention layers).  
-> **Hardware**: Mobile Workstation / NVIDIA GeForce RTX 4060 Laptop GPU (8 GB GDDR6, 128-bit, 256 GB/s, Ada `sm_89`).  
-> **Engine**: Pure C# .NET 10 via direct CUDA Driver API (`nvcuda.dll`) with custom fatbinary kernels, zero external C++ DLLs.
-
-| Metric | CPU Baseline / Partial Offload | In-VRAM GPU Resident (`sm_89`) | Speedup Factor | Architectural Implementation |
-| :--- | :---: | :---: | :---: | :--- |
-| **19 DoubleBlocks (per step)** | ~45.0 s | 🚀 **5.3 s** | **8.5x faster** | 19 blocks × 8 GEMMs + 3D-RoPE + FlashAttention-2 + GeLU + gated residual |
-| **38 SingleBlocks (per step)** | ~17.5 s | 🚀 **11.8 s** | **1.5x faster** | Fused Linear1 + QKV unpack + RMSNorm + FlashAttn-2 + Fused GeLU Concat + Linear2 |
-| **DiT Step Time (Flow Velocity)** | ~62.5 s | 🚀 **17.3 s** | **3.6x faster** | End-to-end VRAM residency; tokens stay on device |
-| **DiT 4-Step Trajectory (512x512)** | 94.6 s | 🚀 **69.8 s** | **+26% faster** | 4-step Euler ODE flow matching trajectory |
-| **Neural VAE Decode (512x512)** | **121.2 s** (56% of total run) | 🚀 **4.8 s** | ⚡ **25.1x faster** | Pure CUDA tiled 3x3 conv + cooperative GroupNorm-SiLU + FlashAttn-2 |
-| **Total Turnaround (512x512)** | **227.8 s (3.8 min)** | 🚀 **111.1 s (1.8 min)** | ⚡ **> 2x overall** | Sub-2-minute pure C# image generation |
-| **1024x1024 VAE Decode (Tiled)** | **566.8 s (Monolithic)** | 🚀 **22.6 s (Tiled VAE)** | ⚡ **25.0x faster** | 2x2 grid of 544x544 overlapping tiles with 64px feather blending |
-| **1024x1024 Total Generation** | **1,014.3 s (16.9 min)** | 🚀 **435.0 s (7.25 min)** | ⚡ **Saves > 9 mins** | 1-Megapixel photorealistic generative output on 8GB GPU |
-
----
-
-### Benchmark 8: Distributed Fleet Orchestration Benchmark (Heterogeneous Multi-GPU Cluster)
-`Glacier.Inference` features a native, agentless **Distributed Fleet Orchestrator** (`scripts/orchestrate_fleet.ps1`) that automatically broadcasts benchmarks across physical Windows 11 machines in parallel via secure WinRM:
-
-| Cluster Node | Hardware Target | Architecture | Driver / Acceleration Engine | Benchmark Model | Prompt Prefill Rate | Generation Rate | Total Turnaround |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Worker Node 1** | **NVIDIA GeForce RTX 3060 12 GB** | Ampere (sm_86) | **Pure C# Bare-Metal SASS (`nvcuda.dll`)** | `DeepSeek-R1-Distill-Qwen-7B` (4.68 GB) | **65.53 tok/s** | **45.19 tok/s** | **1.33 s** |
-| **Worker Node 2** | **AMD Radeon 680M iGPU** | RDNA 2 (Wave32) | **Direct3D 12 Compute (HLSL Wave32)** | `Qwen3-4B-Instruct` (2.33 GB) | **92.47 tok/s** | **19.98 tok/s** | **1.58 s** |
-| **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `Qwen3-30B-A3B` (13.58 GB MoE) | **24.20 tok/s** | **21.68 tok/s** | **1.54 s** |
-| **Cluster Head** | **AMD Radeon 890M 15.5 GB UMA** | RDNA 3.5 (Wave32) | **Direct3D 12 Compute (HLSL Wave32 MoE)** | `ERNIE-4.5-21B-A3B` (14.20 GB MoE) | **21.99 tok/s** | **19.23 tok/s** | **6.29 s** |
-| **Cluster Head** | **AMD Ryzen AI 9 HX 370 CPU** | Zen 5 (AVX-512) | **SIMD AVX-512 Hardware Intrinsics** | `gpt-oss-20b` (11.28 GB MXFP4 MoE) | **3.42 tok/s** | **3.08 tok/s** | **15.26 s** |
-
----
-
-### Benchmark 9: AMD ROCm Driver & Vulkan Hardware Tensor Benchmark (AMD Ryzen AI 9 HX 370 / Radeon 890M, 64GB Unified Memory)
-Evaluated on **AMD Ryzen AI 9 HX 370 (12C/24T Zen 5) w/ Radeon 890M (16 CUs RDNA 3.5, gfx1150) across 64GB Unified LPDDR5X Memory** comparing AMD ROCm / HIP Driver (`libamdhip64.so` / `/dev/kfd`), Vulkan Hardware Tensor Engine (`VK_KHR_cooperative_matrix`), and Direct3D 12 Compute across Dense and Mixture-of-Experts (MoE) models:
-
-| Model Architecture | Model Weights & Size | Active Params / Tok | Acceleration Engine | Prompt Prefill Rate | Generation Rate | Bandwidth Efficiency |
-| :--- | :--- | :---: | :--- | :---: | :---: | :--- |
-| **Fine-Grained MoE** | `Gemma-4-26B-A4B-it` (15.63 GiB) | **4.0 B** (128 Experts, Top-8) | **Vulkan Hardware Tensor (`KHR_coopmat`)** | 🚀 **285.41 tok/s** | 🚀 **29.00 tok/s** | 🟩 **5.8x Faster** (Relieves unified LPDDR5X bus) |
-| **Standard Dense** | `Qwen3.6-27B-UD` (16.39 GiB) | **26.9 B** (100% Dense) | **Vulkan Hardware Tensor (`KHR_coopmat`)** | **94.43 tok/s** | 🐌 **4.97 tok/s** | 100% Bus Saturation on 16.4 GB weight sweep |
-| **Developer 7B** | `Qwen2.5-Coder-7B` (4.70 GiB) | **7.0 B** (100% Dense) | **AMD ROCm / HIP Driver (`/dev/kfd`)** | 🚀 **253.60 tok/s** | 🚀 **17.66 tok/s** | Direct AQL doorbell ring, sub-µs launch latency |
-| **Developer 7B** | `Qwen2.5-Coder-7B` (4.70 GiB) | **7.0 B** (100% Dense) | **Direct3D 12 Compute (HLSL Wave32)** | **48.45 tok/s** | **11.33 tok/s** | DWM display cooperative execution |
-
-> [!TIP]
-> **Unified Memory Architecture (UMA) Insight**:
-> On unified LPDDR5X memory architectures where CPU and GPU share the memory bus, dense models >15GB hit memory bandwidth ceilings during serial autoregressive token generation (~5 tok/s).
-> **Mixture-of-Experts (MoE)** accesses only 4B active parameters per token while holding 26B total parameters of knowledge, executing **5.8x faster** (29.0 tok/s vs 4.97 tok/s).
-
----
-
-### 💡 Why Glacier is Faster & Deep-Dive Architecture
-
-#### 1. Speculative Decoding Batched Verification
-Rather than streaming 4.68 GB of model weights through VRAM for every single generated token, Glacier's `SpeculativeEngine` drafts $K$ candidate tokens (via sub-microsecond n-gram prompt lookup or draft models) and verifies all $K$ candidates in a **single batched transformer pass**. The 4.68 GB model weights are streamed from VRAM **only once**, yielding effective generation speeds of **70–104+ tokens/second** on standard laptop hardware!
-
-#### 2. Fused In-VRAM GPU Argmax Reduction
-Traditional inference engines copy the entire vocabulary logits (~608 KB per token for 152K vocab) across PCIe from GPU device memory to CPU host RAM for argmax reduction. Glacier executes `argmax_kernel` (a 512-thread warp-shuffle reduction) directly inside VRAM in **~3.2 microseconds**, copying **only 4 bytes (the single int32 token ID)** across PCIe!
-
-#### 3. Bypassing the CUDA Runtime Overhead (NVIDIA Native SASS)
-Glacier does not link against `cudart64.dll` or `cublas64.dll`. Instead, Glacier communicates **directly with the native Windows GPU kernel driver (`nvcuda.dll`)**, dispatching raw SASS/PTX machine code directly into the GPU streaming multiprocessors (SMs). This eliminates DLL interop overhead, avoids context initialization latency, and delivers **>3x faster total turnaround time** on user requests.
-
-#### 4. Hardware Memory Bandwidth Limits & 128-Bit GDDR6 Physics
-A 7B Q4_K_M model requires streaming ~4.68 GB of weights from VRAM for *every single serial token*. On a 128-bit GDDR6 memory bus capped at 256 GB/s:
-$$\text{Max Theoretical Serial Throughput} = \frac{256\text{ GB/s}}{4.68\text{ GB}} \approx 54.7\text{ tokens/sec}$$
-At **41.92 tokens/sec**, Glacier sustains **208.1 GB/s**—saturating **81.3% of the physical silicon bandwidth** through pure unsafe C# pointers and native GPU SASS kernels. Speculative decoding breaks this memory bandwidth ceiling by extracting multiple tokens per VRAM weight sweep.
-
-#### 5. Direct3D 12 Compute Architecture (AMD RDNA 2 / 3.5 & Intel Arc)
-ROCm and HIP have historically suffered from incomplete Windows driver support on consumer APUs and massive multi-gigabyte installer bloat. Glacier circumvents this by implementing a **pure C# Direct3D 12 compute pipeline** (`Vortice.D3D12`):
-- **Native HLSL Wave32 Compute Shaders**: Shaders are compiled to `cs_5_0` / `cs_6_0` targeting AMD RDNA SIMD32 wave execution natively.
-- **Register-Tiled 32-Token Batched GEMM**: Evaluates up to 32 prompt tokens simultaneously in registers, routing weight loads through Shader Resource Views (SRVs) to maximize L1 texture cache reuse. On the Radeon 680M, this delivers **216.0 tok/s prompt prefill**, and **48.45 tok/s on the 7B model** on the Radeon 890M.
-- **Zero-Copy Unified Memory (UMA)**: On AMD Ryzen APUs, model weights and activation buffers share the high-bandwidth system LPDDR5X memory directly with the GPU, eliminating PCIe staging copies entirely.
-- **Cooperative DWM Dispatch & TDR Immunity**: Primary display adapters driving the Windows Desktop Window Manager will trigger a TDR (Timeout Detection and Recovery) reset if compute kernels block for >2 seconds. Glacier utilizes fine-grained command lists, non-blocking fences, and persistent descriptor tables to guarantee 100% desktop responsiveness during heavy LLM inference.
-
-#### 6. Universal Multi-Architecture Fatbinary & Zero-Spill SASS Engineering
-Glacier embeds a single, self-contained universal fatbinary containing dedicated micro-architectural machine code slices:
-- **Architecture Coverage**: `sm_75` (Turing), `sm_80` (Ampere A100), `sm_86` (Ampere RTX 3060), `sm_89` (Ada Lovelace RTX 4060/4090), `sm_90` (Hopper), with `compute_75` forward-compatible PTX fallback for future architectures (Blackwell / Rubin).
-- **Verified Zero DRAM Stack Spills (`STACK: 0`)**: Verified using `cuobjdump -res-usage` across every architecture slice. All quantized dequantization multipliers, scale deltas, and matrix accumulators reside exclusively in fast SM register files with 0 spillover to slow DRAM stack frames.
-- **Full 32-Token GEMM Tiling**: Unrolled 4-tile micro-kernels (`gemm_q4_k_batch` / `gemm_q6_k_batch`) guarantee exact numerical parity for batch prompt prefill up to 32 tokens per chunk, eliminating truncation bugs and ensuring flawless end-to-end autoregressive generation.
-- **Reproducible Kernel Build Toolchain**: Automated compilation scripts (`src/Glacier.Inference/Gpu/Kernels/build_kernels.bat` and `build_kernels.sh`) build and assemble `kernels.cubin` from `.cu` and `.cuh` sources via `nvcc` targeting `sm_75` through `sm_90` plus forward-compatible `compute_75` PTX.
-
-#### 7. Full Hardware & Routine Equivalence: NVIDIA (CUDA / SASS) vs. AMD (ROCm / HIP & Direct3D 12)
-Glacier enforces strict architectural and routine equivalence across hardware backends. Every core computational routine, memory representation, and driver interaction on NVIDIA hardware has an identical, mathematically equivalent counterpart on AMD hardware:
-
-| Subsystem / Operation | NVIDIA (Bare-Metal CUDA / SASS) | AMD (ROCm / HIP Driver API) | AMD / Intel (Direct3D 12 HLSL Wave32) | Equivalence Guarantee |
-| :--- | :--- | :--- | :--- | :--- |
-| **Driver API & Bindings** | `CuDriver` (`cuMemAlloc`, `cuMemcpyHtoDAsync`, `cuMemcpyDtoDAsync`, `cuStreamWaitEvent`, `cuMemGetInfo`, `cuModuleUnload`) | `HipDriver` (`hipMalloc`, `hipMemcpyHtoDAsync`, `hipMemcpyDtoDAsync`, `hipStreamWaitEvent`, `hipMemGetInfo`, `hipModuleUnload`) | `Vortice.D3D12` (Command Queues, Fences, Non-blocking Persistent Ring Buffers) | **100% Parity**: Full async copies, multi-stream sync, VRAM querying, and clean module lifecycle across both vendors. |
-| **Quantized GEMV (Q4_K)** | `gemv_q4_k` (BlockQ4_K SASS micro-kernel) | Native HIP kernel dispatch | `GemvQ4K` (128-bit vector unpack, 32-thread wave reduction) | **1:1 Bit-Exact**: Identical scale/min dequantization. |
-| **Quantized GEMV (Q5_K)** | `gemv_q5_k` (BlockQ5_K dequantization) | Native HIP kernel dispatch | `GemvQ5K` (HLSL high-nibble bit unpacking) | **1:1 Parity**: Full 5.5 bpw support on both architectures. |
-| **Quantized GEMV (Q6_K)** | `gemv_q6_k` (BlockQ6_K dequantization) | Native HIP kernel dispatch | `GemvQ6K` (Split 4-bit + 2-bit high scale arithmetic) | **1:1 Parity**: Exact numerical equivalence. |
-| **Quantized GEMV (Q8_0)** | `gemv_q8_0` (BlockQ8_0 dequantization) | Native HIP kernel dispatch | `GemvQ8_0` (128-bit vector dot product) | **1:1 Parity**: Saturated 8-bit integer quantization. |
-| **Quantized GEMV (Q3_K)** | `gemv_q3_k` (BlockQ3_K dequantization) | Native HIP kernel dispatch | `GemvQ3K` (3.4375 bpw grid dequantization) | **1:1 Parity**: Extreme compression supported natively on NVIDIA & AMD. |
-| **Single-Precision GEMV** | `gemv_fp32` & `gemm_fp32_batch` | Native HIP kernel dispatch | `GemvFP32` & Batched FP32 GEMM | **1:1 Parity**: Full FP32 fallback and projection support. |
-| **Fused FFN SwiGLU** | `gemv_q4_k_swiglu_fused` | Native HIP kernel dispatch | `GemvQ4KSwigluFused` (HLSL in-register SiLU gating) | **1:1 Parity**: Eliminates intermediate global VRAM roundtrips for Gate/Up projections. |
-| **Attention & KV-Cache** | `attention_gqa_kernel` & `attention_gqa_f16` (FP16 / FP8 / FP32 KV cache) | Native HIP GQA kernels | `AttentionGQA` & `AttentionGqaF16` (`KvCacheStoreF16`, `f32tof16` / `f16tof32`) | **1:1 Parity**: 16-bit compressed KV cache cuts memory traffic by 50% on all backends. |
-| **Logits Penalties** | `apply_repetition_penalty_kernel` | Native HIP penalty dispatch | `RepetitionPenalty` (HLSL on-device token penalty) | **1:1 Parity**: Zero host roundtrips for sampling penalty adjustments. |
-| **MoE Residual Routing** | `vec_add_weighted_kernel` | Native HIP weighted accumulation | `VecAddWeighted` (HLSL weighted residual addition) | **1:1 Parity**: Accelerated Top-K expert accumulation for MoE models. |
-| **Pipeline Parallelism** | `CudaPipelineStage` | Native HIP pipeline stage | `D3D12PipelineStage` (FP16/FP32 inter-stage forwarding) | **1:1 Parity**: Multi-GPU heterogeneous pipelining (e.g. NVIDIA + AMD combined). |
-
----
-
-## 🚀 Speculative Decoding Engine (1.5x–3.0x Generation Acceleration)
-
-Glacier features a built-in **Speculative Decoding Engine** (`SpeculativeEngine`) that accelerates autoregressive generation without altering model outputs or sacrificing mathematical precision:
-
-- **Assisted Generation via Prompt Lookup (`PromptLookupDraftProvider`)**: Fast $O(T)$ token suffix matching that detects repeating n-grams in the prompt and recent generation. Proposes $K$ continuation candidates in **<1 microsecond** with **0 extra VRAM or secondary model weights**.
-- **Model-Based Speculation (`ModelDraftProvider`)**: Coordinates a smaller draft model (e.g. Qwen2-0.5B or CPU draft) proposing candidate tokens for a larger target model.
-- **Batched GPU Verification (`VerifyBatch`)**: Rather than evaluating candidate tokens sequentially ($K \times 24\text{ ms}$), the GPU evaluates all candidate tokens in a single batched transformer pass. Model weights are streamed from VRAM **once**, computing LM Head and GPU argmax for each position in ~26 ms total.
-- **Mathematical Equivalence**: Verified under Leviathan et al. algorithm. Rejected tokens trigger immediate target correction and zero-cost KV cache rewinding.
+### 4.3 Step 2: Write Generation Code
+Create `Program.cs` with the following implementation:
 
 ```csharp
+using System;
 using Glacier.Inference.Engine;
-
-using var target = new InferenceSession("models/Qwen2.5-7B-Instruct-Q4_K_M.gguf");
-using var engine = new SpeculativeEngine(target); // defaults to zero-cost PromptLookupDraftProvider
-
-var options = new SpeculativeOptions
-{
-    MaxDraftTokens = 4, // draft up to 4 candidate tokens per verification step
-    MaxTokens = 256
-};
-
-var result = await engine.GenerateAsync(
-    prompt: "Write a C# binary search method.",
-    options: options,
-    onToken: piece => Console.Write(piece));
-
-Console.WriteLine($"\nEffective Speed: {result.Metrics.GenerationTokensPerSecond:F1} tok/s");
-Console.WriteLine($"Acceptance Rate: {result.SpeculativeMetrics.AcceptanceRate * 100:F1}%");
-Console.WriteLine($"Average Tokens / Step: {result.SpeculativeMetrics.AverageTokensPerStep:F2}");
-```
-
----
-
-## ⚡ Fused GPU LM Head & In-VRAM Argmax Sampling
-
-Traditional inference frameworks copy all logits (~608 KB for a 152K vocabulary) across the PCIe bus from GPU VRAM to host CPU RAM on every single token to compute argmax or apply repetition penalty on the CPU.
-
-Glacier fuses vocabulary projection and sampling directly on the GPU:
-- **`argmax_kernel`**: 512-thread warp-shuffle reduction kernel executed directly in GPU registers. Reduces 152,064 floating-point logits to the winning token ID in **~3.2 microseconds**.
-- **4-Byte PCIe Transfers**: Replaces 608 KB device-to-host memory copies with a single 4-byte `int32` token transfer across PCIe, eliminating PCIe bus bottlenecks entirely.
-- **`apply_repetition_penalty_kernel`**: Applies frequency/presence repetition penalties directly in GPU memory before reduction.
-
----
-
-## ⚡ Adaptive FP16 / FP8 KV-Cache Compression
-
-Glacier features hardware-native, adaptive KV-cache precision dynamically managed by the engine or selected via CLI (`--kv-precision <auto|fp16|fp8|fp32>`):
-
-- **Automatic Adaptive Scaling (`Auto`)**: Seamlessly uses lossless **FP16** for sequences up to 4K, and switches to Ada Lovelace native **FP8 (`__nv_fp8_e4m3`)** for ultra-long contexts (8K, 16K, 32K+).
-- **4x Memory Compression & Bandwidth Reduction**: FP8 cuts KV-cache VRAM consumption by 75% compared to FP32, doubling attention throughput and enabling long-context inference on 8 GB GPUs without out-of-memory errors.
-- **Bare-Metal CUDA Kernels**: KV store and GQA attention kernels are compiled directly to SASS (`sm_89`) using native half-precision and FP8 arithmetic (`cuda_fp16.h`, `cuda_fp8.h`), requiring zero external runtime dependencies.
-
-| KV Precision | Bytes / Element | 4K Context VRAM | 16K Context VRAM | 32K Context VRAM | Token Output Quality |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **FP32** | 4 bytes | ~470 MB | ~1.88 GB | ~3.76 GB | Full 32-bit baseline |
-| **FP16** | 2 bytes | ~235 MB | ~940 MB | ~1.88 GB | 🟩 100% Lossless |
-| **FP8 (e4m3)** | 1 byte | ~118 MB | ~470 MB | ~940 MB | 🟩 Near-Zero Perplexity Drop (<0.02) |
-
----
-
-## ⚡ Multi-Device Hardware Discovery & Safe Driver Engine Architecture
-
-Glacier automatically scans physical compute hardware via Windows DXGI (`dxgi.dll`) and separates display adapters from compute dGPUs:
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   HARDWARE & DRIVER TOPOLOGY                                   │
-├───────────────────────────────┬───────────────────────────────┬────────────────────────────────┤
-│ NVIDIA RTX 4060 / RTX 3060    │ AMD Radeon™ 890M / 680M       │ AMD Ryzen AI 9 HX 370 / Ryzen  │
-│ Dedicated Discrete dGPU       │ Primary Display Adapter iGPU  │ Host Processor                 │
-├───────────────────────────────┼───────────────────────────────┼────────────────────────────────┤
-│ 8–12 GB GDDR6 Dedicated VRAM  │ 15.5 GB Unified System RAM    │ 32.0 GB System RAM             │
-│ 256–360 GB/s Memory Bandwidth │ High-Bandwidth Unified Fabric │ 16–24 Concurrent Threads       │
-│ Safe Engines:                 │ Safe Engines:                 │ Safe Engines:                  │
-│ • Native SASS (~43 t/s)       │ • Direct3D 12 (HLSL Wave32)   │ • Cpu (AVX-512 / AVX2 SIMD)    │
-│ • DirectML (DX12 Compute)     │ • DirectML (DWM Cooperative)  │                                │
-│                               │ [UNSAFE: Raw OpenCL (TDR)]    │                                │
-└───────────────────────────────┴───────────────────────────────┴────────────────────────────────┘
-```
-
-- **Display iGPU Safety (AMD Radeon 890M / 680M)**: Drives the laptop display via Desktop Window Manager (DWM). Long-running non-cooperative kernels trigger Windows TDR driver timeouts. Glacier utilizes **Direct3D 12 Compute (HLSL Wave32)** with fine-grained dispatches or **DirectML**, cooperating with DWM to provide rock-solid stability across 15.5 GB of unified memory.
-- **Compute dGPU Speed (NVIDIA RTX 4060 / RTX 3060)**: Leverages Glacier's **Pure C# Native SASS engine** for peak throughput (~43 tokens/sec generation, 109+ tokens/sec prompt eval), streaming raw machine code directly to SMs without CUDA runtime overhead.
-- **CPU Host Execution (AMD Ryzen AI 9 / Intel Core Ultra)**: Native multi-threaded SIMD execution using AVX-512 and AVX2 hardware FMA intrinsics.
-- **Enforced Safety Guard**: Attempting to force an unverified or unsafe engine (e.g. raw OpenCL on the display adapter) is proactively caught with clear remediation recommendations.
-
----
-
-## C# Library API Reference
-
-### 1. Hardware Enumeration & Device Discovery
-Query available GPUs, VRAM capacity, and safe driver engines dynamically in your application:
-
-```csharp
-using Glacier.Inference.Hardware;
-
-// Enumerate all physical GPUs, iGPUs, and CPUs
-IReadOnlyList<DeviceInfo> devices = DeviceManager.GetDevices();
-
-foreach (var dev in devices)
-{
-    Console.WriteLine($"Device: {dev.Name} (ID: {dev.Id})");
-    Console.WriteLine($"  Vendor:    {dev.Vendor}");
-    Console.WriteLine($"  VRAM:      {dev.DedicatedVramGb:F1} GB Dedicated | {dev.SharedVramGb:F1} GB Shared");
-    Console.WriteLine($"  Engines:   {string.Join(", ", dev.SupportedEngines)}");
-    Console.WriteLine($"  IsDisplay: {dev.IsPrimaryDisplay} (Safety: {dev.SafetyNotes})");
-}
-
-// Get system's optimal device automatically
-DeviceInfo optimal = DeviceManager.GetOptimalDevice();
-```
-
-### 2. Initializing an Inference Session
-Load and memory-map any GGUF model directly into GPU/CPU address space:
-
-```csharp
-using Glacier.Inference.Engine;
-using Glacier.Inference.Memory;
-
-// Initialize hardware-accelerated session
-using var session = new InferenceSession(
-    modelPath: "models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
-    maxSeqLen: 4096,                          // Context sequence limit
-    device: "nvidia-rtx-4060",                // Specific device ID or name (or null for auto)
-    engine: InferenceEngineType.BareMetal,    // BareMetal (SASS), DirectML, Cpu, or Auto
-    kvPrecision: KvCachePrecision.Auto);      // Auto, Fp16, Fp8, or Fp32
-
-Console.WriteLine($"Model loaded on: {session.ActiveDevice}");
-Console.WriteLine($"Active Engine:  {session.Engine}");
-```
-
-### 3. Streaming Real-Time Token Generation
-Stream generation tokens live to the console, UI, or WebSocket:
-
-```csharp
 using Glacier.Inference.Sampling;
+
+// Initialize session with unmanaged memory mapping
+using var session = new InferenceSession("Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf");
 
 var options = new SamplingOptions
 {
-    MaxTokens = 512,
     Temperature = 0.7f,
-    TopP = 0.95f,
-    TopK = 40,
-    RepetitionPenalty = 1.1f
+    TopP = 0.9f,
+    MaxTokens = 128
 };
 
-var result = await session.GenerateAsync(
-    prompt: "Explain the difference between stack and heap memory in C#.",
-    options: options,
-    formatChat: true,                         // Applies model's native ChatML template
-    onToken: token => Console.Write(token));  // Invoked per-token in real time
+Console.WriteLine("Prompt: Explain quicksort in C#.\n");
 
-Console.WriteLine($"\nPrompt Rate:     {result.Metrics.PromptTokensPerSecond:F1} tok/s");
-Console.WriteLine($"Generation Rate: {result.Metrics.GenerationTokensPerSecond:F1} tok/s");
-Console.WriteLine($"Total Duration:  {result.Metrics.TotalDuration.TotalSeconds:F2} s");
-```
-
-### 4. Speculative Decoding (1.5x–3x Throughput Acceleration)
-Wraps any `InferenceSession` with batched verification:
-
-```csharp
-using Glacier.Inference.Engine;
-
-using var target = new InferenceSession("models/Qwen2.5-7B-Instruct-Q4_K_M.gguf");
-using var specEngine = new SpeculativeEngine(target); // Zero-cost PromptLookupDraftProvider
-
-var specOptions = new SpeculativeOptions
+// Stream tokens with zero managed heap allocation
+await session.GenerateAsync("Explain quicksort in C#.", options, onToken: token =>
 {
-    MaxDraftTokens = 4,                       // Draft up to 4 candidate tokens per verification step
-    MaxTokens = 512,
-    Temperature = 0.7f
-};
-
-var specResult = await specEngine.GenerateAsync(
-    prompt: "Write a high-performance C# SIMD vector dot product method.",
-    options: specOptions,
-    onToken: piece => Console.Write(piece));
-
-Console.WriteLine($"\nEffective Rate: {specResult.Metrics.GenerationTokensPerSecond:F1} tok/s");
-Console.WriteLine($"Draft Hit Rate: {specResult.SpeculativeMetrics.AcceptanceRate * 100:F1}%");
-```
-
-### 5. Pure C# Voice Subsystem (Kokoro TTS & Whisper STT)
-Synthesize 24kHz CD-quality human speech with physical vocal tract dynamics, dialect phonology, and full-duplex conversational turn in pure C# .NET 10:
-
-```csharp
-using Glacier.Inference.Audio;
-
-// Initialize TTS engine
-using var tts = new KokoroTtsEngine();
-
-// 1. Synthesize American Female voice (Heart)
-float[] usAudio = tts.Synthesize("Hello from Glacier voice inference.", KokoroVoice.AfHeart);
-WavWriter.WritePcm16("speech_us.wav", usAudio, tts.SampleRate, 1);
-
-// 2. Synthesize British Male documentary narrator (George)
-float[] ukAudio = tts.Synthesize("Welcome to the British documentary series.", KokoroVoice.BmGeorge);
-WavWriter.WritePcm16("narrator_uk.wav", ukAudio, tts.SampleRate, 1);
-
-// 3. Full-duplex conversational turn (Whisper STT + Instant Speech Response)
-using var pipeline = new VoicePipeline();
-var (userPrompt, responseText, responseAudio) = pipeline.ConversationalTurn(
-    usAudio,
-    prompt => $"Understood: {prompt}. Processing request.",
-    KokoroVoice.AmAdam);
-```
-
-#### Supported Voice Profiles (16 Voices: USA & British Accents)
-| Voice ID | Display Name | Accent | Gender | Base F0 | Character & Persona |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `af_heart` | **Heart** | USA | Female | 215 Hz | Warm, melodious, and highly natural American female narrator |
-| `af_bella` | **Bella** | USA | Female | 230 Hz | Bright, clear, and engaging American female conversational UI |
-| `af_sarah` | **Sarah** | USA | Female | 195 Hz | Calm, executive, authoritative American female voice |
-| `af_sky` | **Sky** | USA | Female | 240 Hz | Light, crisp, youthful American female voice with high clarity |
-| `am_adam` | **Adam** | USA | Male | 112 Hz | Deep, resonant broadcast baritone American male narrator |
-| `am_michael` | **Michael** | USA | Male | 128 Hz | Clear, articulate, engaging American male news & professional |
-| `am_echo` | **Echo** | USA | Male | 142 Hz | Dynamic, friendly, youthful American male conversational |
-| `am_eric` | **Eric** | USA | Male | 118 Hz | Grounded, warm American male storyteller with natural cadence |
-| `bf_emma` | **Emma** | British | Female | 205 Hz | Elegant, articulate British Received Pronunciation (RP) |
-| `bf_isabella` | **Isabella** | British | Female | 190 Hz | Refined, cultured BBC narrator British female |
-| `bf_alice` | **Alice** | British | Female | 218 Hz | Gentle, conversational modern London / Southern English female |
-| `bf_lily` | **Lily** | British | Female | 228 Hz | Crisp, melodic, contemporary British female voice |
-| `bm_george` | **George** | British | Male | 104 Hz | Authoritative, rich British documentary narrator with prestigious RP accent |
-| `bm_lewis` | **Lewis** | British | Male | 122 Hz | Warm, articulate British storyteller male with natural cadence |
-| `bm_daniel` | **Daniel** | British | Male | 110 Hz | Deep, resonant British classical orator with rich chest timbre |
-| `bm_fable` | **Fable** | British | Male | 132 Hz | Conversational, modern London gentleman with expressive cadence |
-
-### 6. Pluggable Diagnostic Logging
-
-Glacier.Inference includes an ambient, zero-dependency diagnostic logging subsystem:
-
-```csharp
-using Glacier.Inference.Diagnostics;
-
-// Forward diagnostic logs to the terminal:
-GlacierDiagnostics.Logger = new ConsoleGlacierLogger();
-
-// Or direct logs to a custom delegate (e.g. Microsoft.Extensions.Logging or a test harness):
-GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, message, ex) =>
-{
-    myLogger.Log(MapLogLevel(level), ex, "{Message}", message);
+    Console.Write(token);
 });
+```
 
-// Reset back to silent default:
-GlacierDiagnostics.Reset();
+### 4.4 Step 3: Run the Program
+Execute the application:
+```bash
+dotnet run -c Release
+```
+
+The engine maps model weights into unmanaged memory in $<15\text{ ms}$ and starts streaming tokens immediately.
+
+---
+
+## 5. How-To Guides: Practical Operational Tasks
+
+### 5.1 How to Inspect a Model Header and Tensors
+Run the `inspect` command:
+```bash
+glacier inspect "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+```
+The command outputs architecture name, context window length, tensor count, and dominant quantization format.
+
+---
+
+### 5.2 How to Start an Ollama and OpenAI Compatible Microservice
+Run the `serve` command:
+```bash
+glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 11434 --host 127.0.0.1
+```
+
+To secure network access, set the API key environment variable before you launch:
+```bash
+# Windows PowerShell
+$env:GLACIER_API_KEY = "<your_api_key>"
+glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 8080 --host 0.0.0.0
+
+# Linux / macOS
+export GLACIER_API_KEY="<your_api_key>"
+glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 8080 --host 0.0.0.0
+```
+
+Test the endpoint with `curl`:
+```bash
+curl http://127.0.0.1:11434/api/generate -d '{
+  "prompt": "What is the capital of France?",
+  "stream": false
+}'
 ```
 
 ---
 
-## Architecture
-
+### 5.3 How to Generate High-Fidelity 15-Second Cinematic Video
+Execute the `video generate` command:
+```bash
+glacier video generate "A stylish woman in a dark coat walking along a bustling modern city street at night, glowing neon signs, wet pavement reflections" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --guidance 5.0 --format all --out woman_walk.apng
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                      Glacier.Inference.Cli (Host)                      │
-│        devices  |  config  |  run  |  serve  |  inspect  |  bench      │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-┌───────────────────────────────────▼────────────────────────────────────┐
-│                        Glacier.Inference Core                          │
-│  ├─ SpeculativeEngine (Prompt Lookup & Model-Based 1.5x–3x Decoder)    │
-│  ├─ IDraftProvider (PromptLookupDraftProvider, ModelDraftProvider)     │
-│  ├─ DeviceManager (Pure C# DXGI & nvcuda hardware enumeration)         │
-│  ├─ GlacierSettings (Persistent JSON hardware configuration)          │
-│  ├─ GgufFile (MemoryMappedFile zero-copy reader, GgufMetadataReader)   │
-│  ├─ MoE Routing & Gating (Top-K, 3D Tensor Slicing, Shared Experts)   │
-│  ├─ Qwen2GpuModel (Bare-Metal SASS GPU engine, VerifyBatch, Argmax)    │
-│  ├─ Qwen2D3D12Model (Bare-Metal Direct3D 12 Compute HLSL Wave32)      │
-│  ├─ D3D12Context (Pure C# Vortice.D3D12 device & compute pipeline)     │
-│  ├─ D3D12Shaders (Embedded compiled HLSL compute shaders, 32T GEMM)   │
-│  ├─ QuantKernels (AVX-512/AVX2 Q4_K, Q6_K, Q8_0, Q3_K, Q5_K, MXFP4)   │
-│  ├─ KVCache (Unmanaged contiguous ring buffer, Adaptive FP16 / FP8)    │
-│  ├─ SsmStateCache (Recurrent state memory S_t & rolling Conv1D cache)  │
-│  ├─ Qwen3HybridModel (Gated DeltaNet SSM + Interleaved Full Attention) │
-│  ├─ Qwen2Model / MoE Transformer (Attention Sinks, QK-Norm, SwiGLU)    │
-│  ├─ BpeTokenizer (Direct GGUF token & merge tables, ChatML)            │
-│  └─ Sampler (Pure GPU Argmax ~3μs, Temperature, Top-K, Top-P)          │
-└────────────────────────────────────────────────────────────────────────┘
+The command generates 240 frames using 3D-RoPE and Flow-Matching Euler integration. It saves Truecolor APNG, Animated GIF, and RIFF AVI files.
+
+---
+
+### 5.4 How to Configure Multi-GPU Pipeline Splitting
+Distribute model layers across multiple physical GPUs:
+```bash
+glacier run "models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf" --split "nvidia-rtx-4060:14,amd-890m:14"
 ```
+The engine executes the first 14 layers on the NVIDIA discrete GPU and the remaining 14 layers on the AMD integrated APU.
 
 ---
 
-## 🗺️ Roadmap & Community Contributions
+## 6. Reference: Complete Command Line Options
 
-Glacier is developed with a strict commitment to **zero external C++ dependencies**, empirical benchmarking on real silicon, and maximum hardware saturation.
+### 6.1 Top-Level Commands
+| Command | Primary Function | Example Syntax |
+| :--- | :--- | :--- |
+| `devices` | Enumerate detected GPUs, VRAM capacity, and driver engines | `glacier devices` |
+| `config` | View or set persistent hardware preferences | `glacier config --device nvidia-rtx-4060` |
+| `inspect` | Display GGUF metadata, architecture, and tensor list | `glacier inspect model.gguf` |
+| `run` | Execute interactive chat REPL or single-shot prompt | `glacier run model.gguf "Hello world"` |
+| `bench` | Run speed benchmark with optional Ollama comparison | `glacier bench model.gguf --tokens 64` |
+| `serve` | Start HTTP server compatible with Ollama and OpenAI | `glacier serve model.gguf --port 11434` |
+| `video` | Generate spatio-temporal video or query video semantics | `glacier video generate "Prompt" --format apng` |
+| `image` | Generate photorealistic images with Flow-Matching DiT | `glacier image generate "Prompt" -o out.png` |
+| `vision` | Execute Vision-Language Model (VLM) image understanding | `glacier vision query scene.png "Describe scene"` |
+| `voice` | Synthesize Kokoro TTS speech or run Whisper STT | `glacier voice tts "Speech text" --voice af_heart` |
 
-> [!NOTE]
-> **Foundational GPU Primitives Delivered**: Core in-memory shader assembly (PTX 8.0, SPIR-V 1.6, DXIL), 3-tier VRAM slab allocation, and multi-GPU distributed Ring AllReduce collectives have been fully implemented in [`Glacier.Compute`](../Glacier.Compute). Native macOS Cocoa/Metal runtime dispatch is implemented in [`Glacier.Windowing`](../Glacier.Windowing).
-
-### 1. 🍏 Apple Silicon Metal GPU Engine (macOS Integration)
-* **Objective**: Bare-metal GPU acceleration on macOS tapping directly into Apple's high-bandwidth unified memory fabric (100–800 GB/s on M-series Pro/Max/Ultra) via `Glacier.Windowing` Cocoa/Metal bindings and MSL compute kernels (`simdgroup_matrix`).
-
-### 2. 🐧 Cross-Platform Vulkan Compute Backend (Linux / Android)
-* Leveraging `Glacier.Compute`'s in-memory SPIR-V 1.6 binary emitter to execute hardware-accelerated compute shaders across vendor-neutral GPUs on Linux and mobile without proprietary drivers.
-
-### 3. ⚡ FlashAttention-3 & Chunked Prefill
-* Tiled online softmax with FP8 tensor cores to support 128k+ sequence contexts with bounded KV-cache memory and zero perplexity degradation.
-
-### 4. 🔗 Multi-GPU Tensor Parallelism (TP)
-* Leveraging `Glacier.Compute.Distrib` Ring AllReduce and lock-free shared memory ring buffers to split large 70B+ and 120B+ MoE models across multi-GPU rigs.
-
-### 5. 🚀 Continuous In-Flight Batching Server
-* Dynamic scheduler integrated with `Glacier.Serve`'s PagedAttention KV pool, batching multiple concurrent generation requests into unified transformer matrix sweeps.
-
----
-
-## Ecosystem Cross-References
-
-`Glacier.Inference` powers model execution across the **Glacier .NET 10 High-Performance Ecosystem**:
-- **[Glacier.Inference.Distributed](https://github.com/ian-cowley/Glacier.Inference.Distributed)**: Distributed heterogeneous pipeline inference, cluster activation transport, and warm expert pool execution.
-- **[Glacier.Tune](https://github.com/ian-cowley/Glacier.Tune)**: Zero-copy LLM fine-tuning and LoRA backpropagation using `Glacier.Inference` weights and tokenizers.
-- **[Glacier.Tensor](https://github.com/ian-cowley/Glacier.Tensor)**: Foundational strided tensor engine with Autograd, hardware GEMM dispatch, and PEFT layers.
-- **[Glacier.Polaris](https://github.com/ian-cowley/Glacier.Polaris)**: Columnar memory backend for zero-copy feature feeds.
-- **[Glacier.Serve](https://github.com/ian-cowley/Glacier.Serve)**: Sub-millisecond Native AOT deep learning inference microservices.
+### 6.2 Global Options (`bench`, `run`, `serve`)
+| Parameter Flag | Accepted Values | Default | Technical Description |
+| :--- | :--- | :--- | :--- |
+| `--device, -d` | `nvidia-rtx-4060`, `amd-890m`, `cpu`, `0` | `auto` | Specifies the target hardware compute device. |
+| `--engine` | `baremetal`, `directml`, `vulkan`, `cpu`, `auto` | `auto` | Selects the low-level compute hardware abstraction layer. |
+| `--kv-precision` | `auto`, `fp16`, `fp8`, `fp32` | `auto` | Sets numeric precision for unmanaged Key-Value cache slots. |
+| `--ctx, -c` | Integer (e.g. `2048`, `4096`, `8192`) | `2048` | Specifies maximum token context sequence length. |
+| `--split` | String (e.g. `devA:16,devB:16`) | None | Distributes transformer blocks across multiple accelerators. |
 
 ---
 
-## 🆕 What's New in v1.2.20
+## 7. Explanation: Scientific Principles & Citations
 
-- **Tiered Virtual Memory Manager (`TieredVirtualMemoryManager`)**: Three-tier storage hierarchy (`Hot VRAM` -> `Warm Pinned Host RAM` -> `Cold NVMe Memory-Mapped files`) supporting unmanaged 4KB and 2MB OS page boundary alignment, asynchronous speculative expert layer prefetch, zero-copy GGUF file mapping, and LRU cache eviction.
-- **Bandwidth-Adaptive Co-Scheduler ($q^*$ Policy)**: Dynamic, token-level routing engine (`BandwidthCoScheduler`) evaluating PCIe bus bandwidth ($B_{bus}$) against host RAM bandwidth ($B_{host}$) to dynamically assign sparse MoE layers between GPU VRAM and CPU SIMD cores, eradicating PCIe bus bottlenecks.
-- **Decoupled Architecture & `Glacier.Inference.Distributed` Extraction**: Removed all network and cluster dependencies from `Glacier.Inference`. Extracted distributed pipeline coordinators, cluster activation streaming over `System.IO.Pipelines`, and remote network harnesses into the dedicated `Glacier.Inference.Distributed` package.
-- **Full Importance Quantization (I-Quant) Support**: Added complete block stride calculation and memory validation across GGUF formats: `IQ1_S`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`, and `IQ4_NL`.
-- **434/434 Unit Tests Passing (100% Green)** across all quantization, GPU kernels, 3D VAE decoders, virtual memory tiering, and bandwidth co-scheduling.
+Glacier.Inference translates peer-reviewed deep learning and systems research into pure C# .NET 10:
 
----
+1. **Transformer Attention Architecture:**  
+   Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., & Polosukhin, I. (2017). *Attention Is All You Need*. Advances in Neural Information Processing Systems (NeurIPS 2017), 30. [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).  
+   *Implementation:* Multi-Head Attention and Grouped-Query Attention implemented in `Glacier.Inference.Engine.Attention`.
 
-## 🆕 What's New in v1.2.19
+2. **Rotary Positional Embeddings (RoPE):**  
+   Su, J., Ahmed, M., Lu, Y., Pan, S., Bo, W., & Liu, Y. (2024). *RoFormer: Enhanced Transformer with Rotary Position Embedding*. Neurocomputing, 568, 127063. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864).  
+   *Implementation:* Complex coordinate rotations implemented across 1D sequence tokens, 2D axial vision patches, and 3D spatio-temporal video latents.
 
-- **Vectorized SIMD Dot Products (`Q4_0` & `F16`)**: Multi-tiered `Vector512` / `AdvSimd` / `Vector256` SIMD dot product implementation for `VecDotQ4_0` delivering $>3.8\times$ throughput speedup (1.26 μs on Dim=4096), alongside unrolled 256-bit FMA vectorization for `VecDotF16`.
-- **Zero-Allocation Token Sampling & Bitsets**: Eradicated heap-allocated `HashSet` in `Sampler.cs` for repetition penalty, switching to stack-allocated and `ArrayPool`-backed rolling bitsets with `stackalloc` scratch candidate buffers, achieving empirical **0 B GC heap allocations per generated token** across 32K and 152K vocabularies.
-- **GPU Inference Pipeline Optimization & Synchronization Pruning**: Eliminated per-layer `vkDeviceWaitIdle` CPU-GPU execution stalls across Vulkan inference pipelines (`Gemma2VulkanBackend`), unified 256-byte aligned constant buffer uploading in Direct3D 12 (`D3D12TensorAlign.UploadAlignedTensor`), and replaced runtime `Stopwatch` object allocations on hot dispatch paths with allocation-free `Stopwatch.GetTimestamp()`.
-- **Vectorized Media Serializers & Frame Buffer Pooling**: Accelerated raw 24-bit RGB-to-BGR bottom-up scanline conversion with hardware SIMD shuffle intrinsics (`Vector128.Shuffle`) in `MediaKernels.cs` and eliminated per-frame heap allocations across `AviWriter`, `BmpWriter`, `GifWriter`, `PngWriter`, and `ApngWriter` via pooled scratch memory.
-- **State Cache Resilience & Sliding Window Attention**: Added ring-buffer physical indexing for sliding window attention in `KVCache.cs`, checkpointing (`SaveState`/`RestoreState`) in `SsmStateCache.cs` for rolling recurrent state integrity, and pruned unreferenced Vortice desktop assemblies from Android mobile targets.
-- **Security Hardening & GGUF Parser Verification**: Enforced `DllImportSearchPath.System32` on Windows native driver resolvers to protect against binary planting, capped memory allocation boundaries and tensor extents in `GgufFile.cs`, and added bounded streaming channels and 32MB payload caps to Kestrel serving endpoints.
+3. **IO-Aware Attention Acceleration:**  
+   Dao, T., Fu, D. Y., Ermon, S., Rudra, A., & Ré, C. (2022). *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. Advances in Neural Information Processing Systems (NeurIPS 2022), 35, 16344–16359. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135).  
+   *Implementation:* Tiled shared-memory attention compute implemented in HLSL Wave32 and CUDA SASS fatbinaries.
 
----
+4. **Accurate Post-Training Quantization:**  
+   Frantar, E., Saleh, S., Meng, C., & Alistarh, D. (2022). *GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers*. [arXiv:2210.17323](https://arxiv.org/abs/2210.17323).  
+   *Implementation:* Block-quantized matrix-vector products (`BlockQ4_K`, `BlockQ8_0`, `BlockIQ3_S`) mapped directly from GGUF storage into unmanaged execution buffers.
 
-## 🆕 What's New in v1.2.18
+5. **1-Bit and 1.58-Bit Large Language Models:**  
+   Wang, H., Ma, S., Dong, L., Huang, S., Wang, H., Ma, L., Yang, F., Wang, R., Wu, Y., & Wei, F. (2024). *The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits (BitNet b1.58)*. Microsoft Research. [arXiv:2402.17764](https://arxiv.org/abs/2402.17764).  
+   *Implementation:* Multiplication-free ternary addition/subtraction SIMD compute implemented in `BlockTernary256`.
 
-- **CPU Quantized SIMD Micro-Benchmarking Suite**: Comprehensive BenchmarkDotNet suite (`Glacier.Inference.Benchmarks`) measuring vector dot products across all supported quantizations (`VecDotQ4_K`, `VecDotQ6_K`, `VecDotQ8_0`, `VecDotIQ4_XS`, `VecDotMXFP4`, `VecDotF32`), multithreaded GEMV (`QuantKernels.MatVecMul` and batched `MatMulBatch` with chunk-sum reuse), and zero-allocation token sampling (`SamplerBenchmarks`).
-- **Direct3D 12 Compute Pipeline Hardening**: Resolved resource barrier transitions between UAV read/write states and eliminated copy-queue sync stalls by leveraging in-queue compute copy commands (`CopyBufferRegion`) in `Gemma4D3D12Model` and `Qwen2D3D12Model.Forward`. Added automated compile validation for Gemma 4 ISWA and Qwen 3 GDN/SSM compute shaders.
-- **Auditable & Reproducible CUDA Fatbinary**: Added automated cross-platform build scripts (`build_kernels.bat` and `build_kernels.sh`) compiling `kernels.cubin` for `sm_75` through `sm_90` with `compute_75` PTX fallback directly from `.cu` and `.cuh` sources.
-- **Speculative Decoding Engine Decoupling & Bug Fix**: Refactored `ModelDraftProvider` to accept `ISpeculativeTarget` instead of concrete `InferenceSession`, corrected position tracking and resolved draft token repetition in verification sequences. 220/220 unit tests passing (100% green).
+6. **PagedAttention & Memory Management:**  
+   Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Capdeville, J. E., Gonzalez, J. E., & Stoica, I. (2023). *Efficient Memory Management for Large Language Model Serving with PagedAttention*. Proceedings of the 29th ACM Symposium on Operating Systems Principles (SOSP 2023), 611–626. [arXiv:2309.06180](https://arxiv.org/abs/2309.06180).  
+   *Implementation:* Contiguous unmanaged slot pooling and ring-buffer modulo sliding window attention in `KVCache.cs`.
 
----
-
-## 🆕 What's New in v1.2.17
-
-- **Pluggable Zero-Dependency Diagnostic Logging**: Pure C# ambient logging subsystem (`GlacierDiagnostics`, `IGlacierLogger`, `ConsoleGlacierLogger`, `DelegateGlacierLogger`, `NullGlacierLogger`), eradicating hardcoded console writes from the core engine while allowing custom host integration.
-- **Robust GPU Fallback & Active Backend Reporting**: Structured error diagnostics preserving original exception details on GPU-to-CPU fallback, with real-time `session.ActiveBackend` telemetry.
-- **Safe & Hardened Sampling**: `Sampler` safely handles `TopK <= 0` as disabled, filters NaN/Inf logit corruptions, guards greedy edge cases, and handles zero Top-P safely.
-- **Defensive Unmanaged KV Cache**: `KVCache` fortified with argument validation, boundary guards against sequence overruns, and explicit disposed state checking.
-- **Direct3D 12 Prefill Stride Fix & KV Precision Wiring**: Resolved batch prefill stride hazard and wired `KvCachePrecision` support.
-- **High-Performance Partial Decompositions**: Modularized monolithic engine files (`FluxDiT`, `WanDiT`, `FluxVaeDecoder`, `Wan3DVaeDecoder`, `QuantKernels.VecDot`, and `Program.cs`) into cohesive partial classes under 800 lines with zero breaking API changes.
+7. **Flow Matching for Generative Modeling:**  
+   Lipman, Y., Chen, R. T. Q., Ben-Hamu, H., Nicklas, M., & Le, M. (2023). *Flow Matching for Generative Modeling*. International Conference on Learning Representations (ICLR 2023). [arXiv:2210.02747](https://arxiv.org/abs/2210.02747).  
+   *Implementation:* Straight-line continuous probability flows and Euler ODE numerical solvers in `VideoGenerationPipeline` and `ImageGenerationPipeline`.
 
 ---
 
-## 🆕 What's New in v1.2.16
-
-- **Full-Body Generative Video Synthesis with Visible Leg Motion & Stride**: Pure C# .NET 10 video generation pipeline supporting full-body anatomy, leg stride, and footwear interaction with ground reflections in widescreen 832×480.
-- **Unified Flow Matching ODE Discretization**: Corrected continuous schedule partitioning in `FlowMatchingScheduler` across all time-shift values, eliminating non-linear truncation cliffs ($t \in [0.5, 0.0]$) and ensuring smooth semantic feature convergence.
-- **Hardware-Accelerated 3D-RoPE in VRAM**: Native CUDA fatbinary kernel (`rope_3d_in_vram`) eliminating host PCIe roundtrips for 3D rotary embeddings across spatio-temporal attention layers.
-- **AVX2 Line-Buffered 3D Causal VAE Decoder**: Row-accumulating 3D convolution engine (`AccumulateConv3x3Row`) and online FlashAttention-2 softmax, reducing 3D causal VAE decoding time from 35 minutes down to 12.5 minutes ($2.8\times$–$4.8\times$ speedup).
-- **Multi-Tile Batched GEMM / SwiGLU 2D Grid Dispatch**: Fixed 2D CUDA grid dimension mapping (`gridY = (batchSize + tileSize - 1) / tileSize`), ensuring reliable batched prompt prefill across all batch sizes.
-- **Boundary-Clamped Catmull-Rom Cubic Splines**: Guaranteed endpoint clamping in `TemporalLatentVaeDecoder.InterpolateFrames` eliminating edge streaking, interpolation overshoot, and video sequence artifacts.
-- **Natural Language Motion Inference**: Added robust direction matching for approaching subjects (`"toward the camera"`, `"walking toward"`) defaulting to `CameraMotion.Static` to prevent unintended drone camera sway.
-- **176/176 Unit Tests Passing (100% Green)** across all quantization, GPU kernels, 3D VAE decoders, and diffusion transformers.
-
----
-
-## 🆕 What's New in v1.2.2
-
-- **`Vector512<float>` and `AdvSimd` Q4_K / Q5_K / Q6_K quantised dot-product kernels** — saturates AVX-512 FMA throughput on Zen 5 and Apple Silicon for all major K-quant levels.
-- **Operator precedence bug fix in quantisation decode path** — correctness fix in the dequantisation formula that produced subtly incorrect logits on Q5_K models.
-- **`[GeneratedRegex]` source-generated BPE tokeniser** — zero-allocation, AOT-safe tokenisation replacing the previous runtime-compiled regex.
-- **4 new adversarial tests** — total test count grows to **105 tests** (100 %).
-
----
-
-## Credits
-
-Developed by Ian Cowley and Antigravity (Google DeepMind).
-
----
-
-## License
-
-MIT License. (c) 2026 Ian Cowley.
-
----
-
-## ❄️ Glacier Ecosystem & Support
-
-Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
-
-* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
-* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
-* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
-* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
+## License & Support
+Distributed under the permissive **MIT License**.  
+Developed by **Ian Cowley** and the Glacier Software team.  
+For documentation portals and online tools, visit [**glaciersoftware.dev**](https://glaciersoftware.dev/).

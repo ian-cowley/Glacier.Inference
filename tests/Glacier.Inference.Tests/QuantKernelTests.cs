@@ -553,5 +553,283 @@ public unsafe class QuantKernelTests
             Assert.Equal(expectedDot, actualDot, 1e-3f);
         }
     }
+
+    [Fact]
+    public void Q2_0_DequantizeAndVecDot_MatchesExpected()
+    {
+        const int k = 128; // 2 blocks of 64
+        BlockQ2_0[] blocks = new BlockQ2_0[2];
+        blocks[0].Delta = (Half)1.5f;
+        blocks[0].Min = (Half)(-0.5f);
+        for (int l = 0; l < 16; l++)
+        {
+            blocks[0].Qs[l] = (byte)((l * 17) & 0xFF);
+        }
+
+        blocks[1].Delta = (Half)2.0f;
+        blocks[1].Min = (Half)0.25f;
+        for (int l = 0; l < 16; l++)
+        {
+            blocks[1].Qs[l] = (byte)((l * 31 + 7) & 0xFF);
+        }
+
+        float[] dequant = new float[k];
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 7) - 3.0f;
+
+        fixed (BlockQ2_0* pBlocks = blocks)
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeQ2_0(pBlocks, pDequant, k);
+
+            // 1. Verify dequantization against expected formula
+            for (int b = 0; b < 2; b++)
+            {
+                float d = (float)blocks[b].Delta;
+                float m = (float)blocks[b].Min;
+                for (int l = 0; l < 16; l++)
+                {
+                    byte qByte = blocks[b].Qs[l];
+                    float q0 = (float)((qByte >> 0) & 3);
+                    float q1 = (float)((qByte >> 2) & 3);
+                    float q2 = (float)((qByte >> 4) & 3);
+                    float q3 = (float)((qByte >> 6) & 3);
+
+                    Assert.Equal(d * q0 + m, dequant[b * 64 + l + 0], 1e-4f);
+                    Assert.Equal(d * q1 + m, dequant[b * 64 + l + 16], 1e-4f);
+                    Assert.Equal(d * q2 + m, dequant[b * 64 + l + 32], 1e-4f);
+                    Assert.Equal(d * q3 + m, dequant[b * 64 + l + 48], 1e-4f);
+                }
+            }
+
+            // 2. Verify VecDot matches scalar sum of (dequant * x)
+            float expectedDot = 0f;
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotQ2_0(pBlocks, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.01f);
+        }
+
+        // 3. Test Quantize -> Dequantize round-trip error bounds
+        float[] original = new float[k];
+        for (int i = 0; i < k; i++) original[i] = (float)Math.Sin(i * 0.1) * 6.0f;
+
+        BlockQ2_0[] qBlocks = new BlockQ2_0[k / 64];
+        float[] reconstructed = new float[k];
+        fixed (float* pOrig = original, pRecon = reconstructed)
+        fixed (BlockQ2_0* pQ = qBlocks)
+        {
+            QuantKernels.QuantizeQ2_0(pOrig, pQ, k);
+            QuantKernels.DequantizeQ2_0(pQ, pRecon, k);
+        }
+
+        for (int b = 0; b < k / 64; b++)
+        {
+            float d = (float)qBlocks[b].Delta;
+            float maxAllowedError = (d * 0.5f) + 0.05f;
+            for (int j = 0; j < 64; j++)
+            {
+                int idx = b * 64 + j;
+                float err = MathF.Abs(original[idx] - reconstructed[idx]);
+                Assert.True(err <= maxAllowedError,
+                    $"Q2_0 round-trip error too large at {idx}: err={err}, maxAllowed={maxAllowedError}");
+            }
+        }
+    }
+
+    [Fact]
+    public void IQ4_NL_DequantizeAndVecDot_MatchesExpected()
+    {
+        const int k = 64; // 2 blocks of 32
+        BlockIQ4_NL[] blocks = new BlockIQ4_NL[2];
+        blocks[0].Delta = (Half)0.5f;
+        for (int l = 0; l < 16; l++)
+        {
+            blocks[0].Qs[l] = (byte)(l | ((15 - l) << 4));
+        }
+
+        blocks[1].Delta = (Half)1.25f;
+        for (int l = 0; l < 16; l++)
+        {
+            blocks[1].Qs[l] = (byte)(((l * 3) & 0x0F) | (((l * 7 + 1) & 0x0F) << 4));
+        }
+
+        float[] dequant = new float[k];
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 5) - 2.0f;
+
+        float[] kValues = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+        fixed (BlockIQ4_NL* pBlocks = blocks)
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeIQ4_NL(pBlocks, pDequant, k);
+
+            // 1. Verify dequantization against expected non-linear codebook lookup
+            for (int b = 0; b < 2; b++)
+            {
+                float d = (float)blocks[b].Delta;
+                for (int l = 0; l < 16; l++)
+                {
+                    byte q = blocks[b].Qs[l];
+                    float expLow = d * kValues[q & 0x0F];
+                    float expHigh = d * kValues[q >> 4];
+
+                    Assert.Equal(expLow, dequant[b * 32 + l], 1e-4f);
+                    Assert.Equal(expHigh, dequant[b * 32 + l + 16], 1e-4f);
+                }
+            }
+
+            // 2. Verify VecDot matches scalar sum of (dequant * x)
+            float expectedDot = 0f;
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotIQ4_NL(pBlocks, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.01f);
+        }
+
+        // 3. Test Quantize -> Dequantize round-trip error bounds
+        float[] original = new float[k];
+        for (int i = 0; i < k; i++) original[i] = (float)Math.Cos(i * 0.2) * 10.0f;
+
+        BlockIQ4_NL[] qBlocks = new BlockIQ4_NL[k / 32];
+        float[] reconstructed = new float[k];
+        fixed (float* pOrig = original, pRecon = reconstructed)
+        fixed (BlockIQ4_NL* pQ = qBlocks)
+        {
+            QuantKernels.QuantizeIQ4_NL(pOrig, pQ, k);
+            QuantKernels.DequantizeIQ4_NL(pQ, pRecon, k);
+        }
+
+        for (int i = 0; i < k; i++)
+        {
+            int b = i / 32;
+            float d = (float)qBlocks[b].Delta;
+            float maxError = 15.0f * d + 0.1f;
+            float err = MathF.Abs(original[i] - reconstructed[i]);
+            Assert.True(err <= maxError,
+                $"IQ4_NL roundtrip error at {i}: orig={original[i]}, recon={reconstructed[i]}, err={err}, maxErr={maxError}");
+        }
+    }
+
+    [Fact]
+    public void IQ3_S_DequantizeAndVecDot_MatchesExpected()
+    {
+        const int k = 256; // 1 super-block
+        BlockIQ3_S block = new BlockIQ3_S();
+        block.Delta = (Half)0.25f;
+
+        for (int i = 0; i < 4; i++) block.Scales[i] = (byte)(0x21 * (i + 1));
+        for (int i = 0; i < 64; i++) block.Qs[i] = (byte)(i * 7 + 3);
+        for (int i = 0; i < 8; i++) block.Qh[i] = (byte)(i * 13);
+        for (int i = 0; i < 32; i++) block.Signs[i] = (byte)(i * 19 + 5);
+
+        float[] dequant = new float[k];
+        float[] x = new float[k];
+        for (int i = 0; i < k; i++) x[i] = (i % 7) * 0.5f - 1.5f;
+
+        BlockIQ3_S* pBlock = &block;
+        fixed (float* pDequant = dequant, pX = x)
+        {
+            QuantKernels.DequantizeIQ3_S(pBlock, pDequant, k);
+
+            // 1. Verify against 4D sphere lattice reconstruction
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int ls = (ib & 1) == 0 ? (block.Scales[ib / 2] & 0x0F) : (block.Scales[ib / 2] >> 4);
+                float db = (float)block.Delta * (1 + 2 * ls);
+                byte qhByte = block.Qh[ib];
+
+                for (int g = 0; g < 8; g++)
+                {
+                    int gridIdx = block.Qs[ib * 8 + g] | (((qhByte >> g) & 1) << 8);
+                    uint gridWord = QuantKernels.Iq3sGrid[gridIdx];
+                    int signNibble = (block.Signs[ib * 4 + (g >> 1)] >> ((g & 1) * 4)) & 0x0F;
+
+                    float g0 = db * (gridWord & 0xFF) * ((signNibble & 1) != 0 ? -1f : 1f);
+                    float g1 = db * ((gridWord >> 8) & 0xFF) * ((signNibble & 2) != 0 ? -1f : 1f);
+                    float g2 = db * ((gridWord >> 16) & 0xFF) * ((signNibble & 4) != 0 ? -1f : 1f);
+                    float g3 = db * (gridWord >> 24) * ((signNibble & 8) != 0 ? -1f : 1f);
+
+                    int baseIdx = ib * 32 + g * 4;
+                    Assert.Equal(g0, dequant[baseIdx + 0], 1e-4f);
+                    Assert.Equal(g1, dequant[baseIdx + 1], 1e-4f);
+                    Assert.Equal(g2, dequant[baseIdx + 2], 1e-4f);
+                    Assert.Equal(g3, dequant[baseIdx + 3], 1e-4f);
+                }
+            }
+
+            // 2. Verify VecDot matches scalar sum of (dequant * x)
+            float expectedDot = 0f;
+            for (int i = 0; i < k; i++) expectedDot += dequant[i] * x[i];
+
+            float actualDot = QuantKernels.VecDotIQ3_S(pBlock, pX, k);
+            Assert.Equal(expectedDot, actualDot, 0.01f);
+        }
+
+        // 3. Test Quantize -> Dequantize round-trip
+        float[] original = new float[k];
+        for (int i = 0; i < k; i++) original[i] = (float)Math.Sin(i * 0.15) * 8.0f;
+
+        BlockIQ3_S[] qBlocks = new BlockIQ3_S[1];
+        float[] reconstructed = new float[k];
+        fixed (float* pOrig = original, pRecon = reconstructed)
+        fixed (BlockIQ3_S* pQ = qBlocks)
+        {
+            QuantKernels.QuantizeIQ3_S(pOrig, pQ, k);
+            QuantKernels.DequantizeIQ3_S(pQ, pRecon, k);
+        }
+
+        float dotOrigRecon = 0f, dotOrigOrig = 0f;
+        for (int i = 0; i < k; i++)
+        {
+            Assert.False(float.IsNaN(reconstructed[i]));
+            dotOrigRecon += original[i] * reconstructed[i];
+            dotOrigOrig += original[i] * original[i];
+        }
+
+        float cosSim = dotOrigRecon / dotOrigOrig;
+        Assert.True(cosSim > 0.90f, $"IQ3_S cosine similarity: {cosSim}");
+    }
+
+    [Theory]
+    [InlineData(Glacier.Inference.Gguf.GgufType.Q2_0)]
+    [InlineData(Glacier.Inference.Gguf.GgufType.IQ4_NL)]
+    [InlineData(Glacier.Inference.Gguf.GgufType.IQ3_S)]
+    public void MatMulBatch_Supports_FastMoE_QuantTypes(Glacier.Inference.Gguf.GgufType quantType)
+    {
+        const int nCols = 256;
+        const int nRows = 8;
+        const int batchSize = 4;
+
+        int rowBytes = (int)Glacier.Inference.Gguf.GgufTypes.GetRowBytes(quantType, nCols);
+        byte[] weights = new byte[rowBytes * nRows];
+        new Random(42 + (int)quantType).NextBytes(weights);
+
+        float[] xBatch = new float[batchSize * nCols];
+        for (int i = 0; i < xBatch.Length; i++) xBatch[i] = (i % 17) - 8.0f;
+
+        float[] yBatch = new float[batchSize * nRows];
+        float[] ySingle = new float[batchSize * nRows];
+
+        fixed (byte* pW = weights)
+        fixed (float* pX = xBatch, pYBatch = yBatch, pYSingle = ySingle)
+        {
+            // Compute via MatMulBatch
+            QuantKernels.MatMulBatch(quantType, pW, pX, pYBatch, nCols, nRows, batchSize);
+
+            // Compute individually via MatVecMul
+            for (int b = 0; b < batchSize; b++)
+            {
+                QuantKernels.MatVecMul(quantType, pW, pX + b * nCols, pYSingle + b * nRows, nCols, nRows);
+            }
+        }
+
+        for (int i = 0; i < yBatch.Length; i++)
+        {
+            Assert.Equal(ySingle[i], yBatch[i], 0.0001f);
+        }
+    }
 }
+
 
