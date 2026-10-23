@@ -94,19 +94,23 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
 
             _compressedKvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * kvMqaDim * sizeof(float)));
             _decompressedKvBatch = (float*)NativeMemory.AllocZeroed((nuint)(MaxBatchSize * decompKvDim * sizeof(float)));
+        }
 
+        bool isYarn = weights.Gguf.RopeScalingType.Equals("yarn", StringComparison.OrdinalIgnoreCase) || weights.Gguf.RopeScalingFactor > 1.0f;
+        if (isYarn)
+        {
             _yarnInvFreq = (float*)NativeMemory.AllocZeroed((nuint)(halfRope * sizeof(float)));
-            if (weights.Gguf.RopeScalingType.Equals("yarn", StringComparison.OrdinalIgnoreCase))
-            {
-                QuantKernels.PrecomputeYarnFrequencies(
-                    new Span<float>(_yarnInvFreq, halfRope),
-                    _qkRopeDim,
-                    weights.RopeFreqBase,
-                    weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f,
-                    weights.Gguf.RopeScalingOriginalContextLength > 0 ? weights.Gguf.RopeScalingOriginalContextLength : 4096);
+            QuantKernels.PrecomputeYarnFrequencies(
+                new Span<float>(_yarnInvFreq, halfRope),
+                _qkRopeDim,
+                weights.RopeFreqBase,
+                weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f,
+                weights.Gguf.RopeScalingOriginalContextLength > 0 ? weights.Gguf.RopeScalingOriginalContextLength : 4096);
 
-                float logMul = weights.Gguf.RopeScalingYarnLogMultiplier > 0 ? weights.Gguf.RopeScalingYarnLogMultiplier : 0.0707f;
-                float factor = weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f;
+            float logMul = weights.Gguf.RopeScalingYarnLogMultiplier > 0 ? weights.Gguf.RopeScalingYarnLogMultiplier : 0.0707f;
+            float factor = weights.Gguf.RopeScalingFactor > 0 ? weights.Gguf.RopeScalingFactor : 1.0f;
+            if (_weights.IsMla)
+            {
                 float mscaleAllDim = factor > 1.0f ? (logMul * MathF.Log(factor) + 1.0f) : 1.0f;
                 float mscaleBase = factor > 1.0f ? (0.1f * MathF.Log(factor) + 1.0f) : 1.0f;
                 _yarnMscale = mscaleBase / mscaleAllDim;
@@ -114,12 +118,13 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
             }
             else
             {
-                _yarnMscale = 1.0f;
+                _yarnMscale = QuantKernels.ComputeYarnMscale(factor, mscale: 1.0f, mscaleAllDim: logMul / 0.1f);
                 _attnScale = 1.0f / MathF.Sqrt(_headDim);
             }
         }
         else
         {
+            _yarnInvFreq = null;
             _yarnMscale = 1.0f;
             _attnScale = 1.0f / MathF.Sqrt(_headDim);
         }

@@ -830,6 +830,49 @@ public unsafe class QuantKernelTests
             Assert.Equal(ySingle[i], yBatch[i], 0.0001f);
         }
     }
+
+    [Fact]
+    public void ComputeYarnMscale_MatchesDeepSeekSpecification()
+    {
+        // For scaling factor <= 1.0, mscale must always be 1.0 (identity)
+        Assert.Equal(1.0f, QuantKernels.ComputeYarnMscale(1.0f, 1.0f, 0.0f, 1.0f));
+        Assert.Equal(1.0f, QuantKernels.ComputeYarnMscale(0.5f, 1.0f, 0.0f, 1.0f));
+
+        // For scaling factor = 31.25 (1M context / 32k context) with mscale = 1.0
+        // Expected: 0.1 * 1.0 * ln(31.25) + 1.0 = 0.1 * 3.4420 + 1.0 = 1.3442
+        float scale = 31.25f;
+        float expected = 0.1f * MathF.Log(scale) + 1.0f;
+        float actual = QuantKernels.ComputeYarnMscale(scale, mscale: 1.0f, mscaleAllDim: 0.0f, attnFactor: 1.0f);
+        Assert.Equal(expected, actual, 0.0001f);
+    }
+
+    [Fact]
+    public void PrecomputeYarnFrequencies_InterpolatesHighDimensionsAndExtrapolatesLowDimensions()
+    {
+        const int dim = 128;
+        const int halfDim = dim / 2;
+        float[] invFreq = new float[halfDim];
+
+        // 1M context config
+        QuantKernels.PrecomputeYarnFrequencies(
+            invFreq.AsSpan(),
+            dim: dim,
+            freqBase: 1000000.0f,
+            scalingFactor: 31.25f,
+            originalCtx: 32768,
+            betaFast: 32.0f,
+            betaSlow: 1.0f);
+
+        // Low dimensions (high frequency, i=0) should be purely extrapolated: 1 / base^0 = 1.0
+        Assert.Equal(1.0f, invFreq[0], 0.0001f);
+
+        // Higher dimensions should be strictly decreasing positive frequencies
+        for (int i = 1; i < halfDim; i++)
+        {
+            Assert.True(invFreq[i] > 0f, $"invFreq[{i}] was {invFreq[i]} <= 0");
+            Assert.True(invFreq[i] < invFreq[i - 1], $"invFreq[{i}] was not strictly decreasing: {invFreq[i]} >= {invFreq[i - 1]}");
+        }
+    }
 }
 
 

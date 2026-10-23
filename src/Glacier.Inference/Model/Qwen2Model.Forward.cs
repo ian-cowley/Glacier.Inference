@@ -68,7 +68,7 @@ public sealed unsafe partial class Qwen2Model
                 }
             }
 
-            QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount);
+            QuantKernels.RoPE(_q, _k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount, invFreqTable: _yarnInvFreq, mscale: _yarnMscale);
             kvCache?.Store(stageLayer, pos, _k, _v);
 
             if (kvCache != null)
@@ -156,7 +156,7 @@ public sealed unsafe partial class Qwen2Model
                     }
                 }
 
-                QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount);
+                QuantKernels.RoPE(q, k, _nHeads, _nHeadsKv, _headDim, pos, _weights.RopeFreqBase, ropeFreqs: _weights.RopeFreqsWeight, ropeDim: _weights.RopeDimensionCount, invFreqTable: _yarnInvFreq, mscale: _yarnMscale);
                 kvCache?.Store(stageLayer, pos, k, v);
 
                 if (kvCache != null)

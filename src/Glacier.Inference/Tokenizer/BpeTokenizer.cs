@@ -121,6 +121,19 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<｜begin▁of▁sentence｜>");
         RegisterSpecialToken("<｜end of sentence｜>");
         RegisterSpecialToken("<｜end▁of▁sentence｜>");
+        RegisterSpecialToken("<｜System｜>");
+        RegisterSpecialToken("<｜User｜>");
+        RegisterSpecialToken("<｜Assistant｜>");
+        RegisterSpecialToken("<｜latest_reminder｜>");
+        RegisterSpecialToken("｜DSML｜");
+        RegisterSpecialToken("<｜ref｜>");
+        RegisterSpecialToken("<｜/ref｜>");
+        RegisterSpecialToken("<｜box｜>");
+        RegisterSpecialToken("<｜/box｜>");
+        RegisterSpecialToken("<｜point｜>");
+        RegisterSpecialToken("<｜/point｜>");
+        RegisterSpecialToken("<｜polygon｜>");
+        RegisterSpecialToken("<｜/polygon｜>");
 
         // Gemma 4 special tokens
         RegisterSpecialToken("<|turn>");
@@ -156,6 +169,8 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("</s>");
         RegisterStopToken("<｜end of sentence｜>");
         RegisterStopToken("<｜end▁of▁sentence｜>");
+        RegisterStopToken("<｜User｜>");
+        RegisterStopToken("<｜System｜>");
         RegisterStopToken("<turn|>");
         RegisterStopToken("<eos>");
         RegisterStopToken("<|tool_call>");
@@ -205,143 +220,109 @@ public sealed partial class BpeTokenizer
     }
 
     /// <summary>
-    /// Formats a user prompt and optional system prompt into the model's native chat template (ChatML or LLaMA-3).
+    /// Sanitizes user prompt content to prevent injection of control tokens and role impersonation.
     /// </summary>
-    public string FormatChatML(string prompt, string systemPrompt = "You are a helpful assistant.")
+    public static string SanitizePrompt(string input)
     {
-        // 0. Check for Gemma format (<start_of_turn> or <|turn>)
-        if (_specialTokens.ContainsKey("<start_of_turn>"))
-        {
-            var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
-            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
-            {
-                sb.Append($"<start_of_turn>system\n{systemPrompt}<end_of_turn>\n");
-            }
-            sb.Append($"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n");
-            return sb.ToString();
-        }
+        if (string.IsNullOrEmpty(input)) return input;
 
-        if (_specialTokens.ContainsKey("<|turn>"))
-        {
-            var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
-            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
-            {
-                sb.Append($"<|turn>system\n{systemPrompt}<turn|>\n");
-            }
-            sb.Append($"<|turn>user\n{prompt}<turn|>\n");
-            sb.Append("<|turn>model\n");
-            return sb.ToString();
-        }
-
-        // 1. Check for LLaMA 3 header format
-        if (_specialTokens.ContainsKey("<|start_header_id|>"))
-        {
-            var sb = new StringBuilder();
-            if (_specialTokens.ContainsKey("<|begin_of_text|>"))
-            {
-                sb.Append("<|begin_of_text|>");
-            }
-            if (!string.IsNullOrEmpty(systemPrompt))
-            {
-                sb.Append($"<|start_header_id|>system<|end_header_id|>\n\n{systemPrompt}<|eot_id|>");
-            }
-            sb.Append($"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>");
-            sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
-            return sb.ToString();
-        }
-
-        // 2. Microsoft Phi-3 / Phi-4 format with <|im_sep|>
-        if (_specialTokens.ContainsKey("<|im_sep|>"))
-        {
-            var sb = new StringBuilder();
-            if (!string.IsNullOrEmpty(systemPrompt))
-            {
-                sb.Append($"<|im_start|>system<|im_sep|>{systemPrompt}<|im_end|>");
-            }
-            sb.Append($"<|im_start|>user<|im_sep|>{prompt}<|im_end|>");
-            sb.Append("<|im_start|>assistant<|im_sep|>");
-            return sb.ToString();
-        }
-
-        // 3. DeepSeek format ({{ bos_token }}User: ... \n\nAssistant:)
-        if (_architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) || _chatTemplate.Contains("User: "))
-        {
-            var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
-            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
-            {
-                sb.Append(systemPrompt);
-                sb.Append("\n\n");
-            }
-            sb.Append("User: ");
-            sb.Append(prompt);
-            sb.Append("\n\nAssistant:");
-            return sb.ToString();
-        }
-
-        // 4. Mistral / Devstral format ([INST] ... [/INST])
-        if (_specialTokens.ContainsKey("[INST]"))
-        {
-            var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
-            sb.Append("[INST] ");
-            if (!string.IsNullOrEmpty(systemPrompt) && systemPrompt != "You are a helpful assistant.")
-            {
-                sb.Append(systemPrompt).Append("\n\n");
-            }
-            sb.Append(prompt);
-            sb.Append(" [/INST]");
-            return sb.ToString();
-        }
-
-        // 5. Standard ChatML format (Qwen2, Qwen3, MiMo)
-        {
-            var sb = new StringBuilder();
-            if (!string.IsNullOrEmpty(systemPrompt))
-            {
-                sb.Append("<|im_start|>system\n");
-                sb.Append(systemPrompt);
-                sb.Append("<|im_end|>\n");
-            }
-            sb.Append("<|im_start|>user\n");
-            sb.Append(prompt);
-            sb.Append("<|im_end|>\n");
-            sb.Append("<|im_start|>assistant\n");
-            return sb.ToString();
-        }
+        return input
+            .Replace("<｜begin of sentence｜>", "< ｜begin of sentence｜ >")
+            .Replace("<｜begin▁of▁sentence｜>", "< ｜begin▁of▁sentence｜ >")
+            .Replace("<｜end of sentence｜>", "< ｜end of sentence｜ >")
+            .Replace("<｜end▁of▁sentence｜>", "< ｜end▁of▁sentence｜ >")
+            .Replace("<｜System｜>", "< ｜System｜ >")
+            .Replace("<｜User｜>", "< ｜User｜ >")
+            .Replace("<｜Assistant｜>", "< ｜Assistant｜ >")
+            .Replace("<｜latest_reminder｜>", "< ｜latest_reminder｜ >")
+            .Replace("｜DSML｜", "｜ DSML ｜")
+            .Replace("<think>", "< think >")
+            .Replace("</think>", "< /think >")
+            .Replace("<|im_start|>", "< |im_start| >")
+            .Replace("<|im_end|>", "< |im_end| >")
+            .Replace("<|im_sep|>", "< |im_sep| >")
+            .Replace("<|start_header_id|>", "< |start_header_id| >")
+            .Replace("<|end_header_id|>", "< |end_header_id| >")
+            .Replace("<|eot_id|>", "< |eot_id| >")
+            .Replace("<|begin_of_text|>", "< |begin_of_text| >")
+            .Replace("<|end_of_text|>", "< |end_of_text| >")
+            .Replace("<|endoftext|>", "< |endoftext| >")
+            .Replace("<start_of_turn>", "< start_of_turn >")
+            .Replace("<end_of_turn>", "< end_of_turn >")
+            .Replace("<|turn>", "< |turn >")
+            .Replace("<turn|>", "< turn| >");
     }
 
     /// <summary>
-    /// Formats a sequence of chat messages into the model's native chat template (e.g. ChatML, LLaMA-3, Gemma, DeepSeek, Mistral, Phi).
+    /// Sanitizes user prompt content to prevent injection of control tokens and role impersonation.
     /// </summary>
-    public string FormatChat(IEnumerable<(string Role, string Content)> messages)
+    public string Sanitize(string input) => SanitizePrompt(input);
+
+    /// <summary>
+    /// Formats a multi-turn conversation into the model's native chat template
+    /// supporting DeepSeek (deepseek-recipe), ChatML, LLaMA-3, and Gemma.
+    /// </summary>
+    public string FormatConversation(IEnumerable<(string Role, string Content)> messages, bool thinkingMode = false)
     {
-        // 0. Gemma
-        if (_specialTokens.ContainsKey("<start_of_turn>"))
+        // 1. DeepSeek V3 / R1 / V4 format (from deepseek-recipe)
+        if ((_specialTokens.ContainsKey("<｜User｜>") || _specialTokens.ContainsKey("<｜begin of sentence｜>") || _specialTokens.ContainsKey("<｜begin▁of▁sentence｜>"))
+            && !_chatTemplate.Contains("User: "))
         {
             var sb = new StringBuilder();
             if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
             {
                 sb.Append(_idToToken[BosTokenId]);
             }
+            else if (_specialTokens.TryGetValue("<｜begin of sentence｜>", out int bosId))
+            {
+                sb.Append(_idToToken[bosId]);
+            }
+            else if (_specialTokens.TryGetValue("<｜begin▁of▁sentence｜>", out int bos2Id))
+            {
+                sb.Append(_idToToken[bos2Id]);
+            }
+
+            string eosToken = _specialTokens.ContainsKey("<｜end▁of▁sentence｜>") && !_specialTokens.ContainsKey("<｜end of sentence｜>")
+                ? "<｜end▁of▁sentence｜>"
+                : "<｜end of sentence｜>";
+
             foreach (var (role, content) in messages)
             {
-                string r = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? "model" : role;
-                sb.Append($"<start_of_turn>{r}\n{content}<end_of_turn>\n");
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase)
+                    ? content
+                    : SanitizePrompt(content);
+
+                if (role.Equals("system", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append("<｜System｜>").Append(safeContent);
+                }
+                else if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append("<｜User｜>").Append(safeContent);
+                }
+                else if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append("<｜Assistant｜>").Append(safeContent).Append(eosToken);
+                }
+            }
+            sb.Append("<｜Assistant｜>");
+            if (thinkingMode && _specialTokens.ContainsKey("<think>"))
+            {
+                sb.Append("<think>\n");
+            }
+            return sb.ToString();
+        }
+
+        // 2. Gemma format (<start_of_turn> or <|turn>)
+        if (_specialTokens.ContainsKey("<start_of_turn>"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) sb.Append(_idToToken[BosTokenId]);
+            foreach (var (role, content) in messages)
+            {
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                string r = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? "model" : role.ToLowerInvariant();
+                sb.Append($"<start_of_turn>{r}\n{safeContent}<end_of_turn>\n");
             }
             sb.Append("<start_of_turn>model\n");
             return sb.ToString();
@@ -350,98 +331,124 @@ public sealed partial class BpeTokenizer
         if (_specialTokens.ContainsKey("<|turn>"))
         {
             var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) sb.Append(_idToToken[BosTokenId]);
             foreach (var (role, content) in messages)
             {
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
                 string r = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? "model" : role;
-                sb.Append($"<|turn>{r}\n{content}<turn|>\n");
+                sb.Append($"<|turn>{r}\n{safeContent}<turn|>\n");
             }
             sb.Append("<|turn>model\n");
             return sb.ToString();
         }
 
-        // 1. LLaMA 3
+        // 3. LLaMA 3 format (<|start_header_id|>)
         if (_specialTokens.ContainsKey("<|start_header_id|>"))
         {
             var sb = new StringBuilder();
-            if (_specialTokens.ContainsKey("<|begin_of_text|>"))
-            {
-                sb.Append("<|begin_of_text|>");
-            }
+            if (_specialTokens.ContainsKey("<|begin_of_text|>")) sb.Append("<|begin_of_text|>");
             foreach (var (role, content) in messages)
             {
-                sb.Append($"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>");
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                sb.Append($"<|start_header_id|>{role.ToLowerInvariant()}<|end_header_id|>\n\n{safeContent}<|eot_id|>");
             }
             sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n");
             return sb.ToString();
         }
 
-        // 2. Microsoft Phi-3 / Phi-4
+        // 4. Microsoft Phi-3 / Phi-4 format with <|im_sep|>
         if (_specialTokens.ContainsKey("<|im_sep|>"))
         {
             var sb = new StringBuilder();
             foreach (var (role, content) in messages)
             {
-                sb.Append($"<|im_start|>{role}<|im_sep|>{content}<|im_end|>");
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                sb.Append($"<|im_start|>{role}<|im_sep|>{safeContent}<|im_end|>");
             }
             sb.Append("<|im_start|>assistant<|im_sep|>");
             return sb.ToString();
         }
 
-        // 3. DeepSeek
+        // 5. Mistral format ([INST] ... [/INST])
+        if (_specialTokens.ContainsKey("[INST]"))
+        {
+            var sb = new StringBuilder();
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) sb.Append(_idToToken[BosTokenId]);
+            foreach (var (role, content) in messages)
+            {
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
+                    sb.Append("[INST] ").Append(safeContent).Append(" [/INST]");
+                else if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+                    sb.Append(' ').Append(safeContent).Append(' ');
+                else
+                    sb.Append(safeContent).Append("\n\n");
+            }
+            return sb.ToString();
+        }
+
+        // 6. Legacy DeepSeek format (User: ... \n\nAssistant:)
         if (_architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) || _chatTemplate.Contains("User: "))
         {
             var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) sb.Append(_idToToken[BosTokenId]);
             foreach (var (role, content) in messages)
             {
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
                 if (role.Equals("system", StringComparison.OrdinalIgnoreCase))
-                    sb.Append(content).Append("\n\n");
+                    sb.Append(safeContent).Append("\n\n");
                 else if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
-                    sb.Append("User: ").Append(content).Append("\n\n");
+                    sb.Append("User: ").Append(safeContent).Append("\n\n");
                 else
-                    sb.Append("Assistant: ").Append(content).Append("\n\n");
+                    sb.Append("Assistant: ").Append(safeContent).Append("\n\n");
             }
             sb.Append("Assistant:");
             return sb.ToString();
         }
 
-        // 4. Mistral
-        if (_specialTokens.ContainsKey("[INST]"))
-        {
-            var sb = new StringBuilder();
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
-            {
-                sb.Append(_idToToken[BosTokenId]);
-            }
-            foreach (var (role, content) in messages)
-            {
-                if (role.Equals("user", StringComparison.OrdinalIgnoreCase))
-                    sb.Append("[INST] ").Append(content).Append(" [/INST]");
-                else if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
-                    sb.Append(' ').Append(content).Append(' ');
-                else
-                    sb.Append(content).Append("\n\n");
-            }
-            return sb.ToString();
-        }
-
-        // 5. Standard ChatML fallback
+        // 7. Standard ChatML format (Qwen2, Qwen3, etc.)
         {
             var sb = new StringBuilder();
             foreach (var (role, content) in messages)
             {
-                sb.Append($"<|im_start|>{role}\n{content}<|im_end|>\n");
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                sb.Append($"<|im_start|>{role.ToLowerInvariant()}\n{safeContent}<|im_end|>\n");
             }
             sb.Append("<|im_start|>assistant\n");
             return sb.ToString();
         }
+    }
+
+    /// <summary>
+    /// Formats a user prompt and optional system prompt into the model's native chat template (DeepSeek, ChatML, LLaMA-3, Gemma, Mistral, Phi).
+    /// </summary>
+    public string FormatChatML(string prompt, string systemPrompt = "You are a helpful assistant.")
+    {
+        var messages = new List<(string Role, string Content)>();
+        bool isDefaultSystem = string.IsNullOrEmpty(systemPrompt) || systemPrompt == "You are a helpful assistant.";
+
+        bool suppressDefaultSystem = _specialTokens.ContainsKey("<start_of_turn>") ||
+                                     _specialTokens.ContainsKey("<|turn>") ||
+                                     _specialTokens.ContainsKey("[INST]") ||
+                                     _architecture.Equals("deepseek2", StringComparison.OrdinalIgnoreCase) ||
+                                     _chatTemplate.Contains("User: ") ||
+                                     ((_specialTokens.ContainsKey("<｜User｜>") || _specialTokens.ContainsKey("<｜begin of sentence｜>") || _specialTokens.ContainsKey("<｜begin▁of▁sentence｜>")) && !_chatTemplate.Contains("User: "));
+
+        if (!string.IsNullOrEmpty(systemPrompt) && (!isDefaultSystem || !suppressDefaultSystem))
+        {
+            messages.Add(("system", systemPrompt));
+        }
+
+        messages.Add(("user", prompt));
+        return FormatConversation(messages, thinkingMode: false);
+    }
+
+    /// <summary>
+    /// Formats a sequence of chat messages into the model's native chat template (DeepSeek, ChatML, LLaMA-3, Gemma, Mistral, Phi).
+    /// </summary>
+    public string FormatChat(IEnumerable<(string Role, string Content)> messages)
+    {
+        return FormatConversation(messages, thinkingMode: false);
     }
 
     /// <summary>

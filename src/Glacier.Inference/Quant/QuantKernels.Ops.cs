@@ -199,7 +199,9 @@ public static unsafe partial class QuantKernels
         int headDim, int pos,
         float freqBase, float freqScale = 1.0f,
         float* ropeFreqs = null,
-        int ropeDim = -1)
+        int ropeDim = -1,
+        float* invFreqTable = null,
+        float mscale = 1.0f)
     {
         if (ropeDim <= 0 || ropeDim > headDim) ropeDim = headDim;
         int halfDim = ropeDim / 2;
@@ -209,11 +211,19 @@ public static unsafe partial class QuantKernels
 
         for (int i = 0; i < halfDim; i++)
         {
-            float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / ropeDim);
-            float freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
+            float freq;
+            if (invFreqTable != null)
+            {
+                freq = invFreqTable[i];
+            }
+            else
+            {
+                float baseFreq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / ropeDim);
+                freq = ropeFreqs != null ? (baseFreq / ropeFreqs[i]) : baseFreq;
+            }
             float theta = pos * freq * freqScale;
-            cosTable[i] = MathF.Cos(theta);
-            sinTable[i] = MathF.Sin(theta);
+            cosTable[i] = MathF.Cos(theta) * mscale;
+            sinTable[i] = MathF.Sin(theta) * mscale;
         }
 
         fixed (float* pCos = cosTable, pSin = sinTable)
@@ -329,7 +339,24 @@ public static unsafe partial class QuantKernels
     }
 
     /// <summary>
-    /// Precomputes YaRN (Yet another RoPE extensioN) inverse frequencies for a given dimension.
+    /// Computes YaRN magnitude scale factor derived from DeepSeek DeepInfer (yarn_get_mscale).
+    /// </summary>
+    public static float ComputeYarnMscale(
+        float scalingFactor,
+        float mscale = 1.0f,
+        float mscaleAllDim = 0.0f,
+        float attnFactor = 1.0f)
+    {
+        if (scalingFactor <= 1.0f) return 1.0f;
+        static float GetMscale(float s, float m) => s <= 1.0f ? 1.0f : (0.1f * m * MathF.Log(s) + 1.0f);
+        float num = GetMscale(scalingFactor, mscale);
+        float den = GetMscale(scalingFactor, mscaleAllDim);
+        return (num / den) * attnFactor;
+    }
+
+    /// <summary>
+    /// Precomputes YaRN (Yet another RoPE extensioN) inverse frequencies for a given dimension,
+    /// ported from DeepSeek DeepInfer (rotary_embedding.py).
     /// </summary>
     public static void PrecomputeYarnFrequencies(
         Span<float> invFreq,
@@ -338,7 +365,8 @@ public static unsafe partial class QuantKernels
         float scalingFactor,
         int originalCtx,
         float betaFast = 32.0f,
-        float betaSlow = 1.0f)
+        float betaSlow = 1.0f,
+        float extrapolationFactor = 1.0f)
     {
         int halfDim = dim / 2;
         float logBase = MathF.Log(freqBase);
@@ -351,9 +379,13 @@ public static unsafe partial class QuantKernels
 
         for (int i = 0; i < halfDim; i++)
         {
-            float freq = 1.0f / MathF.Pow(freqBase, (float)(2 * i) / dim);
+            float posFreq = MathF.Pow(freqBase, (float)(2 * i) / dim);
+            float invFreqExtrap = 1.0f / posFreq;
+            float invFreqInterp = 1.0f / (scalingFactor * posFreq);
+
             float ramp = Math.Clamp((i - low) * invRange, 0.0f, 1.0f);
-            float yarnFreq = (freq / scalingFactor) * ramp + freq * (1.0f - ramp);
+            float invFreqMask = (1.0f - ramp) * extrapolationFactor;
+            float yarnFreq = invFreqInterp * (1.0f - invFreqMask) + invFreqExtrap * invFreqMask;
             invFreq[i] = yarnFreq;
         }
     }

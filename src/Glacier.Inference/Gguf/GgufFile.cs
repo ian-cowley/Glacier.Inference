@@ -147,6 +147,21 @@ public sealed unsafe class GgufFile : IDisposable
 
         var fileInfo = new FileInfo(filePath);
         _fileLength = fileInfo.Length;
+        if (_fileLength == 0)
+        {
+            try
+            {
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                _fileLength = fs.Length;
+            }
+            catch
+            {
+                if (fileInfo.LinkTarget != null && File.Exists(fileInfo.LinkTarget))
+                {
+                    _fileLength = new FileInfo(fileInfo.LinkTarget).Length;
+                }
+            }
+        }
         const long MinGgufHeaderSize = 4 + 4 + 8 + 8; // magic + version + tensor_count + metadata_kv_count
         if (_fileLength < MinGgufHeaderSize)
             throw new InvalidDataException($"File is too short to be a valid GGUF file ({_fileLength} bytes).");
