@@ -17,6 +17,9 @@ public sealed class SamplingOptions
     public int MaxTokens { get; set; } = 512;
     public bool EnableReasoningLoopGuard { get; set; } = true;
     public float LoopRecoveryRepetitionPenalty { get; set; } = 1.35f;
+    public int MaxReasoningTokens { get; set; } = 0;
+    public int ThinkTokenId { get; set; } = -1;
+    public int EndThinkTokenId { get; set; } = -1;
 
     public static SamplingOptions Greedy => new()
     {
@@ -61,6 +64,21 @@ public sealed class Sampler
             }
         }
         return repaired;
+    }
+
+    /// <summary>
+    /// Clamps logits to enforce a reasoning token budget: penalizes continuation tokens
+    /// by 50.0 and biases the closing thinking tag by +20.0 to force transition to final answer.
+    /// </summary>
+    public static void ClampReasoningLogits(Span<float> logits, int endThinkTokenId, float penalty = 50.0f, float bias = 20.0f)
+    {
+        if ((uint)endThinkTokenId >= (uint)logits.Length) return;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            if (i != endThinkTokenId)
+                logits[i] -= penalty;
+        }
+        logits[endThinkTokenId] += bias;
     }
 
     /// <summary>

@@ -169,4 +169,113 @@ public class SamplingTests
         int token = sampler.Sample(logits, opt);
         Assert.InRange(token, 0, 299);
     }
+
+    [Theory]
+    [InlineData(new int[] { 42, 42, 42 }, 1)]                         // Period 1 (repeating token)
+    [InlineData(new int[] { 10, 20, 10, 20, 10, 20 }, 2)]             // Period 2 (alternating pair)
+    [InlineData(new int[] { 1, 2, 3, 1, 2, 3, 1, 2, 3 }, 3)]          // Period 3
+    [InlineData(new int[] { 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4 }, 4)] // Period 4
+    [InlineData(new int[] { 99, 88, 77, 10, 20, 10, 20, 10, 20 }, 2)] // Loop at tail after prefix
+    public void DetectPeriodicReasoningLoop_DetectedCorrectPeriod(int[] tokens, int expectedPeriod)
+    {
+        int detected = Sampler.DetectPeriodicReasoningLoop(tokens.AsSpan(), minPeriod: 1, maxPeriod: 64, minRepeats: 3);
+        Assert.Equal(expectedPeriod, detected);
+    }
+
+    [Theory]
+    [InlineData(new int[] { 1, 2, 3, 4, 5, 6, 7, 8 })]                // Distinct non-repeating sequence
+    [InlineData(new int[] { 10, 20, 10, 20 })]                         // Only 2 repeats (minRepeats = 3)
+    [InlineData(new int[] { 1, 2 })]                                   // Shorter than minRepeats
+    [InlineData(new int[] { })]                                       // Empty history
+    public void DetectPeriodicReasoningLoop_NonRepeating_ReturnsZero(int[] tokens)
+    {
+        int detected = Sampler.DetectPeriodicReasoningLoop(tokens.AsSpan(), minPeriod: 1, maxPeriod: 64, minRepeats: 3);
+        Assert.Equal(0, detected);
+    }
+
+    [Fact]
+    public void Sample_WithPeriodicLoopInRecentTokens_AppliesLoopRecoveryPenalty_BreaksLoop()
+    {
+        var sampler = new Sampler();
+        // Vocab of 5 tokens: [0, 1, 2, 3, 4]
+        // Token 1 has highest unpenalized logit (100.0), Token 2 has 90.0, Token 0 has 55.0
+        float[] logits = [55.0f, 100.0f, 90.0f, 10.0f, 10.0f];
+
+        // Recent history contains a repeating cycle of [1, 2, 1, 2, 1, 2]
+        int[] recentLoop = [1, 2, 1, 2, 1, 2];
+
+        var options = new SamplingOptions
+        {
+            Temperature = 0.0f, // Greedy decoding
+            RepetitionPenalty = 1.0f,
+            EnableReasoningLoopGuard = true,
+            LoopRecoveryRepetitionPenalty = 2.0f // Penalizes 100.0 -> 50.0, 90.0 -> 45.0
+        };
+
+        int sampled = sampler.Sample(logits.AsSpan(), options, recentLoop);
+
+        // Loop recovery penalty was applied to tokens 1 and 2:
+        // logits[1] = 50.0, logits[2] = 45.0, logits[0] = 55.0.
+        // Token 0 must be selected, breaking the loop!
+        Assert.Equal(0, sampled);
+    }
+
+    [Fact]
+    public void Sample_WithNonLoopingRecentTokens_DoesNotApplyLoopRecoveryPenalty_SelectsTopCandidate()
+    {
+        var sampler = new Sampler();
+        float[] logits = [55.0f, 100.0f, 90.0f, 10.0f, 10.0f];
+        // Non-periodic, healthy sequence
+        int[] normalTokens = [3, 4, 0, 4, 3, 0];
+
+        var options = new SamplingOptions
+        {
+            Temperature = 0.0f,
+            RepetitionPenalty = 1.0f,
+            EnableReasoningLoopGuard = true,
+            LoopRecoveryRepetitionPenalty = 2.0f
+        };
+
+        int sampled = sampler.Sample(logits.AsSpan(), options, normalTokens);
+
+        // No loop detected; Token 1 remains top candidate (100.0)
+        Assert.Equal(1, sampled);
+    }
+
+    [Fact]
+    public void Sample_WithLoopGuardDisabled_PermitsLoopContinuation()
+    {
+        var sampler = new Sampler();
+        float[] logits = [55.0f, 100.0f, 90.0f, 10.0f, 10.0f];
+        int[] recentLoop = [1, 2, 1, 2, 1, 2];
+
+        var options = new SamplingOptions
+        {
+            Temperature = 0.0f,
+            RepetitionPenalty = 1.0f,
+            EnableReasoningLoopGuard = false, // Guard explicitly disabled
+            LoopRecoveryRepetitionPenalty = 2.0f
+        };
+
+        int sampled = sampler.Sample(logits.AsSpan(), options, recentLoop);
+
+        // Guard disabled: Token 1 sampled despite loop
+        Assert.Equal(1, sampled);
+    }
+
+    [Fact]
+    public void ClampReasoningLogits_PenalizesNonEndThinkTokens_AndBiasesEndThinkToken()
+    {
+        float[] logits = [10.0f, 20.0f, 30.0f, 5.0f];
+        int endThinkTokenId = 1;
+
+        Sampler.ClampReasoningLogits(logits.AsSpan(), endThinkTokenId, penalty: 50.0f, bias: 20.0f);
+
+        // Token 1 was biased: 20.0 + 20.0 = 40.0
+        Assert.Equal(40.0f, logits[1]);
+        // All other tokens were penalized: 10 - 50 = -40, 30 - 50 = -20, 5 - 50 = -45
+        Assert.Equal(-40.0f, logits[0]);
+        Assert.Equal(-20.0f, logits[2]);
+        Assert.Equal(-45.0f, logits[3]);
+    }
 }

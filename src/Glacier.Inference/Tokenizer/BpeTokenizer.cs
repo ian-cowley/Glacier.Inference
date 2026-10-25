@@ -39,6 +39,15 @@ public sealed partial class BpeTokenizer
 
     public bool IsStopToken(int tokenId) => _stopTokens.Contains(tokenId);
 
+    /// <summary>
+    /// Resolves a token string or special token to its integer token ID.
+    /// </summary>
+    public bool TryGetTokenId(string token, out int tokenId)
+    {
+        if (_specialTokens.TryGetValue(token, out tokenId)) return true;
+        return _tokenToId.TryGetValue(token, out tokenId);
+    }
+
     static BpeTokenizer()
     {
         // Construct the standard GPT-2 byte <-> unicode mapping
