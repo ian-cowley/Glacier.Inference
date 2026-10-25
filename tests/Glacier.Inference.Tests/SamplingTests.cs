@@ -194,6 +194,46 @@ public class SamplingTests
     }
 
     [Fact]
+    public void DetectPeriodicReasoningLoop_OptInMinPeriodTwo_IgnoresPeriodOnePunctuation()
+    {
+        // 3 consecutive periods / dots (period 1)
+        int[] ellipsisTokens = [13, 13, 13];
+        // By default (minPeriod = 1), period 1 is detected
+        int detectedDefault = Sampler.DetectPeriodicReasoningLoop(ellipsisTokens.AsSpan());
+        Assert.Equal(1, detectedDefault);
+
+        // When opt-in minPeriod: 2 is explicitly passed, period 1 is ignored
+        int detectedOptIn = Sampler.DetectPeriodicReasoningLoop(ellipsisTokens.AsSpan(), minPeriod: 2);
+        Assert.Equal(0, detectedOptIn);
+
+        // Alternating pair (period 2) is detected with opt-in minPeriod: 2
+        int[] alternatingTokens = [10, 20, 10, 20, 10, 20];
+        int detectedPair = Sampler.DetectPeriodicReasoningLoop(alternatingTokens.AsSpan(), minPeriod: 2);
+        Assert.Equal(2, detectedPair);
+    }
+
+    [Fact]
+    public void Sample_WithOptInMinPeriodTwo_IgnoresPeriodOneLoop()
+    {
+        var sampler = new Sampler();
+        float[] logits = [55.0f, 100.0f, 90.0f, 10.0f, 10.0f];
+        int[] recentLoop = [1, 1, 1]; // Period 1
+
+        var options = new SamplingOptions
+        {
+            Temperature = 0.0f,
+            RepetitionPenalty = 1.0f,
+            EnableReasoningLoopGuard = true,
+            LoopRecoveryRepetitionPenalty = 2.0f,
+            ReasoningLoopMinPeriod = 2 // Explicit opt-in: ignore period 1
+        };
+
+        // When minPeriod is 2, period-1 loop is ignored, so token 1 retains highest logit
+        int sampled = sampler.Sample(logits.AsSpan(), options, recentLoop.AsSpan());
+        Assert.Equal(1, sampled);
+    }
+
+    [Fact]
     public void Sample_WithPeriodicLoopInRecentTokens_AppliesLoopRecoveryPenalty_BreaksLoop()
     {
         var sampler = new Sampler();

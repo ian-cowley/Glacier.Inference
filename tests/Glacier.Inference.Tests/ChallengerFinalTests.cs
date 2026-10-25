@@ -386,13 +386,16 @@ public unsafe class ChallengerFinalTests
             recentTokensArr[i] = rand.Next(0, vocabSize);
         }
 
-        // Warm up
-        Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
-
         // Measure allocations
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+
+        // Warm up on current thread after GC
+        for (int w = 0; w < 5; w++)
+        {
+            Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
+        }
 
         long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
 
@@ -421,12 +424,15 @@ public unsafe class ChallengerFinalTests
             recentTokensArr[i] = rand.Next(0, vocabSize);
         }
 
-        // Warm up
-        Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
-
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+
+        // Warm up on current thread after GC
+        for (int w = 0; w < 5; w++)
+        {
+            Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
+        }
 
         long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
 
@@ -455,15 +461,15 @@ public unsafe class ChallengerFinalTests
             recentTokensArr[i] = rand.Next(0, vocabSize);
         }
 
-        // Warm up (ensures ArrayPool rent/return is primed)
-        for (int w = 0; w < 5; w++)
-        {
-            Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
-        }
-
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
+
+        // Warm up (primes ArrayPool rent/return and current-thread local bucket cache after GC)
+        for (int w = 0; w < 10; w++)
+        {
+            Sampler.ApplyRepetitionPenalty(logitsArr, recentTokensArr, 1.2f);
+        }
 
         long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
 

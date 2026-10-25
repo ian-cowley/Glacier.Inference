@@ -444,8 +444,21 @@ public sealed class ReasoningLoopAdversarialStressTests
     {
         float[] logits = new float[152_064]; // Typical Qwen2.5/DeepSeek vocab size
 
-        // Warm up JIT
-        Sampler.ClampReasoningLogits(logits.AsSpan(), 151649);
+        // Warm up JIT and tiering
+        for (int w = 0; w < 10; w++)
+        {
+            Sampler.ClampReasoningLogits(logits.AsSpan(), 151649);
+        }
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Warm up on current thread after GC
+        for (int w = 0; w < 5; w++)
+        {
+            Sampler.ClampReasoningLogits(logits.AsSpan(), 151649);
+        }
 
         long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
         for (int iter = 0; iter < 100; iter++)
@@ -494,8 +507,15 @@ public sealed class ReasoningLoopAdversarialStressTests
         int[] recentTokens = new int[256];
         for (int i = 0; i < recentTokens.Length; i++) recentTokens[i] = i * 10;
 
-        // Warm up
-        Sampler.ApplyRepetitionPenalty(logits.AsSpan(), recentTokens.AsSpan(), 1.35f);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        // Warm up on current thread after GC (primes ArrayPool rent/return bucket)
+        for (int w = 0; w < 10; w++)
+        {
+            Sampler.ApplyRepetitionPenalty(logits.AsSpan(), recentTokens.AsSpan(), 1.35f);
+        }
 
         long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
         for (int iter = 0; iter < 100; iter++)

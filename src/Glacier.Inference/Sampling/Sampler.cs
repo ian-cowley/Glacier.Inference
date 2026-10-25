@@ -21,6 +21,22 @@ public sealed class SamplingOptions
     public int ThinkTokenId { get; set; } = -1;
     public int EndThinkTokenId { get; set; } = -1;
 
+    /// <summary>
+    /// Minimum period length checked by the periodic reasoning-loop detector.
+    /// Defaults to 1 (detects single-token loops and multi-token cycles).
+    /// Set to 2 as an explicit opt-in to ignore single-token punctuation artifacts (e.g. "...", "---").
+    /// </summary>
+    public int ReasoningLoopMinPeriod { get; set; } = 1;
+
+    /// <summary>
+    /// Alias for <see cref="ReasoningLoopMinPeriod"/>.
+    /// </summary>
+    public int LoopMinPeriod
+    {
+        get => ReasoningLoopMinPeriod;
+        set => ReasoningLoopMinPeriod = value;
+    }
+
     public static SamplingOptions Greedy => new()
     {
         Temperature = 0.0f,
@@ -149,7 +165,7 @@ public sealed class Sampler
 
         if (options.EnableReasoningLoopGuard && !recentTokens.IsEmpty)
         {
-            int loopPeriod = DetectPeriodicReasoningLoop(recentTokens);
+            int loopPeriod = DetectPeriodicReasoningLoop(recentTokens, minPeriod: options.ReasoningLoopMinPeriod);
             if (loopPeriod > 0)
             {
                 effectivePenalty = Math.Max(effectivePenalty, options.LoopRecoveryRepetitionPenalty);
