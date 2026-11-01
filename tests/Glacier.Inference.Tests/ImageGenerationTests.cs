@@ -171,17 +171,18 @@ public class ImageGenerationTests
         string tmpFile = Path.Combine(Path.GetTempPath(), $"glacier_pipeline_{Guid.NewGuid():N}.bmp");
         try
         {
-            using var pipeline = new ImageGenerationPipeline(numLayers: 2, hiddenDim: 256, numHeads: 4);
-            var result = pipeline.Generate("A majestic crystal glacier fortress illuminated by cyan auroras", width: 256, height: 256, numSteps: 4, seed: 42);
+            const int dim = 128;
+            using var pipeline = new ImageGenerationPipeline(numLayers: 2, hiddenDim: 128, numHeads: 4);
+            var result = pipeline.Generate("A majestic crystal glacier fortress illuminated by cyan auroras", width: dim, height: dim, numSteps: 2, seed: 42);
 
-            BmpWriter.SaveBmp24(tmpFile, result.RgbPixels, 256, 256);
+            BmpWriter.SaveBmp24(tmpFile, result.RgbPixels, dim, dim);
             Assert.True(File.Exists(tmpFile));
 
             // Verify smooth spatial continuity: no scanline alternation between adjacent rows
-            for (int y = 8; y < 248; y += 8)
+            for (int y = 8; y < dim - 8; y += 8)
             {
-                int idxCurrent = (y * 256 + 128) * 3;
-                int idxPrev = ((y - 1) * 256 + 128) * 3;
+                int idxCurrent = (y * dim + (dim / 2)) * 3;
+                int idxPrev = ((y - 1) * dim + (dim / 2)) * 3;
 
                 // Differences between consecutive scanlines must be smooth (< 40 delta, not 255 black/white flip)
                 int deltaR = Math.Abs(result.RgbPixels[idxCurrent] - result.RgbPixels[idxPrev]);

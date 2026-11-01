@@ -109,7 +109,7 @@ public class VisionTests
     [Fact]
     public void VisionPipeline_ProcessesImageAndAnswersVisualQuery()
     {
-        using var pipeline = new VisionPipeline(numLayers: 2, visionDim: 256, llmDim: 512, patchSize: 14);
+        using var pipeline = new VisionPipeline(numLayers: 2, visionDim: 128, llmDim: 256, patchSize: 14);
 
         int w = 200;
         int h = 150;

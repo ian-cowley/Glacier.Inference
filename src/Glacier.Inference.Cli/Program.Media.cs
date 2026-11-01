@@ -177,7 +177,7 @@ public static partial class Program
             }
 
 #pragma warning disable GLACIER_EXP001
-            using var vlm = new VisionPipeline();
+            using var vlm = new VisionPipeline(numLayers: 2, visionDim: 128, llmDim: 256, patchSize: 14);
             var (visualTokens, _, metadata) = vlm.ProcessImage(pixels, w, h, 3);
 #pragma warning restore GLACIER_EXP001
 

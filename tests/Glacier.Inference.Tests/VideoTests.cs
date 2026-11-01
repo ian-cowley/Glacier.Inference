@@ -67,7 +67,7 @@ public class VideoTests
     [Fact]
     public void VideoPipeline_ProcessesMultiFrameSequence_AnswersQueries()
     {
-        using var pipeline = new VideoPipeline(numLayers: 2, visionDim: 256, llmDim: 512, patchSize: 14);
+        using var pipeline = new VideoPipeline(numLayers: 2, visionDim: 128, llmDim: 256, patchSize: 14);
 
         int w = 120;
         int h = 90;

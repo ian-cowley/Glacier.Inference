@@ -9,6 +9,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Cluster.Protocol;
 using Xunit;
@@ -191,6 +192,9 @@ public class E2ETier4RealWorldApplicationScenarioTests
     [Fact]
     public async Task Scenario6_ClusterCoordinatorWorker_EndToEndLoopbackStreaming()
     {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        CancellationToken ct = cts.Token;
+
         // Create loopback socket connection
         using var pair = await TestSocketPair.CreateConnectedAsync();
 
@@ -205,17 +209,17 @@ public class E2ETier4RealWorldApplicationScenarioTests
         {
             byte[] hdrBuf = new byte[32];
             // Read Init
-            await pair.Server.ReceiveAsync(hdrBuf, SocketFlags.None);
+            await ReceiveExactAsync(pair.Server, hdrBuf, ct);
             var initHdr = MemoryMarshal.Read<ClusterFrameHeader>(hdrBuf);
             Assert.Equal(MsgInitStage, initHdr.MessageType);
 
             // Send StageReady
             var readyHdr = new ClusterFrameHeader(MsgStageReady, initHdr.CorrelationId, 0);
             MemoryMarshal.Write(hdrBuf, in readyHdr);
-            await pair.Server.SendAsync(hdrBuf, SocketFlags.None);
+            await SendAllAsync(pair.Server, hdrBuf, ct);
 
             // Read Activation
-            await pair.Server.ReceiveAsync(hdrBuf, SocketFlags.None);
+            await ReceiveExactAsync(pair.Server, hdrBuf, ct);
             var actHdr = MemoryMarshal.Read<ClusterFrameHeader>(hdrBuf);
             Assert.Equal(MsgActivation, actHdr.MessageType);
 
@@ -225,13 +229,13 @@ public class E2ETier4RealWorldApplicationScenarioTests
             MemoryMarshal.Write(resBuf.AsSpan(0, 32), in resHdr);
             BitConverter.TryWriteBytes(resBuf.AsSpan(32 + 16, 4), 151644); // nextTokenId
 
-            await pair.Server.SendAsync(resBuf, SocketFlags.None);
+            await SendAllAsync(pair.Server, resBuf, ct);
 
             // Read Shutdown
-            await pair.Server.ReceiveAsync(hdrBuf, SocketFlags.None);
+            await ReceiveExactAsync(pair.Server, hdrBuf, ct);
             var shutHdr = MemoryMarshal.Read<ClusterFrameHeader>(hdrBuf);
             Assert.Equal(MsgShutdown, shutHdr.MessageType);
-        });
+        }, ct);
 
         // Coordinator side:
         byte[] coordHdr = new byte[32];
@@ -239,29 +243,57 @@ public class E2ETier4RealWorldApplicationScenarioTests
         // Send Init
         var init = new ClusterFrameHeader(MsgInitStage, 101, 0);
         MemoryMarshal.Write(coordHdr, in init);
-        await pair.Client.SendAsync(coordHdr, SocketFlags.None);
+        await SendAllAsync(pair.Client, coordHdr, ct);
 
         // Recv Ready
-        await pair.Client.ReceiveAsync(coordHdr, SocketFlags.None);
+        await ReceiveExactAsync(pair.Client, coordHdr, ct);
         var ready = MemoryMarshal.Read<ClusterFrameHeader>(coordHdr);
         Assert.Equal(MsgStageReady, ready.MessageType);
 
         // Send Activation
         var act = new ClusterFrameHeader(MsgActivation, 102, 0);
         MemoryMarshal.Write(coordHdr, in act);
-        await pair.Client.SendAsync(coordHdr, SocketFlags.None);
+        await SendAllAsync(pair.Client, coordHdr, ct);
 
         // Recv Result
         byte[] coordRes = new byte[60];
-        await pair.Client.ReceiveAsync(coordRes, SocketFlags.None);
+        await ReceiveExactAsync(pair.Client, coordRes, ct);
         int generatedToken = BitConverter.ToInt32(coordRes.AsSpan(32 + 16, 4));
         Assert.Equal(151644, generatedToken);
 
         // Send Shutdown
         var shut = new ClusterFrameHeader(MsgShutdown, 103, 0);
         MemoryMarshal.Write(coordHdr, in shut);
-        await pair.Client.SendAsync(coordHdr, SocketFlags.None);
+        await SendAllAsync(pair.Client, coordHdr, ct);
 
         await workerTask;
+    }
+
+    private static async Task SendAllAsync(Socket socket, Memory<byte> buffer, CancellationToken ct)
+    {
+        int offset = 0;
+        while (offset < buffer.Length)
+        {
+            int sent = await socket.SendAsync(buffer.Slice(offset), SocketFlags.None, ct);
+            if (sent <= 0)
+            {
+                throw new IOException("Socket closed during SendAllAsync.");
+            }
+            offset += sent;
+        }
+    }
+
+    private static async Task ReceiveExactAsync(Socket socket, Memory<byte> buffer, CancellationToken ct)
+    {
+        int offset = 0;
+        while (offset < buffer.Length)
+        {
+            int read = await socket.ReceiveAsync(buffer.Slice(offset), SocketFlags.None, ct);
+            if (read == 0)
+            {
+                throw new EndOfStreamException($"Socket closed after {offset}/{buffer.Length} bytes.");
+            }
+            offset += read;
+        }
     }
 }

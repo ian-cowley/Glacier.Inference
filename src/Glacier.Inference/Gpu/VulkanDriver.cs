@@ -99,6 +99,8 @@ public static unsafe class VulkanDriver
         public IntPtr ppEnabledExtensionNames;
     }
 
+    public const uint VK_PHYSICAL_DEVICE_TYPE_CPU = 4;
+
     [StructLayout(LayoutKind.Sequential)]
     public struct VkPhysicalDeviceProperties
     {
@@ -107,11 +109,21 @@ public static unsafe class VulkanDriver
         public uint vendorID;
         public uint deviceID;
         public uint deviceType;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-        public string deviceName;
+        public fixed byte deviceNameRaw[256];
         public fixed byte pipelineCacheUUID[16];
         public VkPhysicalDeviceLimits limits;
         public VkPhysicalDeviceSparseProperties sparseProperties;
+
+        public string deviceName
+        {
+            get
+            {
+                fixed (byte* p = deviceNameRaw)
+                {
+                    return Marshal.PtrToStringUTF8((IntPtr)p) ?? string.Empty;
+                }
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -124,10 +136,10 @@ public static unsafe class VulkanDriver
         public uint maxImageArrayLayers;
         public uint maxTexelBufferElements;
         public uint maxUniformBufferRange;
-        public ulong maxStorageBufferRange;
-        public ulong maxPushConstantsSize;
-        public ulong maxMemoryAllocationCount;
-        public ulong maxSamplerAllocationCount;
+        public uint maxStorageBufferRange;
+        public uint maxPushConstantsSize;
+        public uint maxMemoryAllocationCount;
+        public uint maxSamplerAllocationCount;
         public ulong bufferImageGranularity;
         public ulong sparseAddressSpaceSize;
         public uint maxBoundDescriptorSets;

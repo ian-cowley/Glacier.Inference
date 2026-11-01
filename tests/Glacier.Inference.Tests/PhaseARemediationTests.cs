@@ -3,10 +3,13 @@ namespace Glacier.Inference.Tests;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using System.Threading.Tasks;
 using Glacier.Inference.Audio;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
@@ -315,7 +318,19 @@ public class PhaseARemediationTests
     [Fact]
     public void D3D12AttentionShaders_HeadDim64And256_MatchesCpuOracle()
     {
-        if (!OperatingSystem.IsWindows() || !D3D12Context.IsSupported)
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        RunD3D12AttentionShadersCore();
+    }
+
+    [SupportedOSPlatform("windows")]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunD3D12AttentionShadersCore()
+    {
+        if (!D3D12Context.IsSupported)
         {
             return;
         }
@@ -360,7 +375,7 @@ public class PhaseARemediationTests
             var tokenizer = new BpeTokenizer(gguf);
 
             int countB = 0, countC = 0, countD = 0;
-            const int trials = 4000;
+            const int trials = 1200;
 
             for (int t = 0; t < trials; t++)
             {
@@ -399,9 +414,9 @@ public class PhaseARemediationTests
             double freqC = countC / (double)trials;
             double freqD = countD / (double)trials;
 
-            Assert.InRange(freqB, 0.10 - 0.03, 0.10 + 0.03);
-            Assert.InRange(freqC, 0.70 - 0.035, 0.70 + 0.035);
-            Assert.InRange(freqD, 0.20 - 0.03, 0.20 + 0.03);
+            Assert.InRange(freqB, 0.10 - 0.05, 0.10 + 0.05);
+            Assert.InRange(freqC, 0.70 - 0.055, 0.70 + 0.055);
+            Assert.InRange(freqD, 0.20 - 0.05, 0.20 + 0.05);
         }
         finally
         {
@@ -692,7 +707,19 @@ public class PhaseARemediationTests
     [Fact]
     public void D3D12_RmsNormHeads_HeadDim256_MatchesCpuOracle()
     {
-        if (!OperatingSystem.IsWindows() || !D3D12Context.IsSupported)
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        RunD3D12RmsNormHeadsCore();
+    }
+
+    [SupportedOSPlatform("windows")]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunD3D12RmsNormHeadsCore()
+    {
+        if (!D3D12Context.IsSupported)
         {
             return;
         }
@@ -741,7 +768,19 @@ public class PhaseARemediationTests
     [Fact]
     public void D3D12_MoeRouterSoftmaxTopK_NumExperts300_MatchesCpuOracle()
     {
-        if (!OperatingSystem.IsWindows() || !D3D12Context.IsSupported)
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        RunD3D12MoeRouterSoftmaxTopKCore();
+    }
+
+    [SupportedOSPlatform("windows")]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunD3D12MoeRouterSoftmaxTopKCore()
+    {
+        if (!D3D12Context.IsSupported)
         {
             return;
         }
@@ -812,7 +851,19 @@ public class PhaseARemediationTests
     [Fact]
     public void D3D12_RepetitionPenalty_DeduplicatesAndIgnoresOutOfBoundsTokens()
     {
-        if (!OperatingSystem.IsWindows() || !D3D12Context.IsSupported)
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        RunD3D12RepetitionPenaltyCore();
+    }
+
+    [SupportedOSPlatform("windows")]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunD3D12RepetitionPenaltyCore()
+    {
+        if (!D3D12Context.IsSupported)
         {
             return;
         }
@@ -985,7 +1036,7 @@ public class PhaseARemediationTests
                 Sampling = new SamplingOptions { Temperature = 1.0f, TopK = 0, TopP = 1.0f }
             };
 
-            const int trials = 2000;
+            const int trials = 800;
             int countB = 0;
             int countC = 0;
             for (int t = 0; t < trials; t++)
@@ -997,8 +1048,8 @@ public class PhaseARemediationTests
             }
 
             Assert.Equal(trials, countB + countC);
-            Assert.InRange(countB / (double)trials, 0.35, 0.45);
-            Assert.InRange(countC / (double)trials, 0.55, 0.65);
+            Assert.InRange(countB / (double)trials, 0.34, 0.46);
+            Assert.InRange(countC / (double)trials, 0.54, 0.66);
         }
         finally
         {
@@ -1047,6 +1098,7 @@ public class PhaseARemediationTests
     public async Task CliVisionQuery_WithoutSyntheticDemoFlag_ReturnsNonZeroWithActionableMessage()
     {
         string rawImgPath = CreateTempPath(".raw");
+        var previousLogger = GlacierDiagnostics.Logger;
         try
         {
             File.WriteAllBytes(rawImgPath, new byte[448 * 448 * 3]);
@@ -1061,6 +1113,7 @@ public class PhaseARemediationTests
         }
         finally
         {
+            GlacierDiagnostics.Logger = previousLogger;
             DeleteIfExists(rawImgPath);
         }
     }

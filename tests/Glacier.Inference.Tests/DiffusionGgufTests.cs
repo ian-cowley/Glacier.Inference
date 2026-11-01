@@ -8,6 +8,7 @@ using Glacier.Inference.Image.Gguf;
 using Glacier.Inference.Model;
 using Xunit;
 
+[Collection("SequentialGpu")]
 public class DiffusionGgufTests
 {
     [Fact]
@@ -43,11 +44,11 @@ public class DiffusionGgufTests
     [Fact]
     public void DiffusionGgufPipeline_RunsEndToEndSyntheticFlow()
     {
-        int w = 256;
-        int h = 256;
-        int steps = 4;
+        int w = 64;
+        int h = 64;
+        int steps = 2;
 
-        using var pipeline = new Glacier.Inference.Image.ImageGenerationPipeline();
+        using var pipeline = new Glacier.Inference.Image.ImageGenerationPipeline(numLayers: 2, hiddenDim: 128, numHeads: 4);
         var result = pipeline.Generate("A cinematic landscape of icy fjords under neon auroras", width: w, height: h, numSteps: steps, seed: 123);
 
         Assert.Equal(w, result.Width);
@@ -231,6 +232,14 @@ public class DiffusionGgufTests
     public void D3D12Context_InspectAdapters()
     {
         if (!OperatingSystem.IsWindows()) return;
+        InspectD3D12AdaptersWindows();
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void InspectD3D12AdaptersWindows()
+    {
+        if (!Glacier.Inference.Gpu.D3D12.D3D12Context.IsSupported) return;
         using var d3d = new Glacier.Inference.Gpu.D3D12.D3D12Context();
         Console.WriteLine($"[D3D12 INFO] Device: {d3d.DeviceName}");
     }

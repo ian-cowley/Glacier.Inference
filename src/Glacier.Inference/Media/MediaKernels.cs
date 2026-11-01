@@ -27,7 +27,7 @@ public static class MediaKernels
     /// Converts a single scanline from 24-bit RGB to 24-bit BGR with SIMD acceleration (15 bytes/step)
     /// and 4-byte row padding.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     public static void ConvertRgbToBgrRow(ReadOnlySpan<byte> srcRow, Span<byte> dstRow, int width, int rowStride)
     {
         int rowBytes = width * 3;
@@ -71,6 +71,7 @@ public static class MediaKernels
     /// <summary>
     /// Converts a full frame from top-down RGB to bottom-up BGR scanlines in dstBgrFrame.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void ConvertFrameBottomUp(
         ReadOnlySpan<byte> srcRgb,
         Span<byte> dstBgrFrame,

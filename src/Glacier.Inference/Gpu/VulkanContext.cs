@@ -30,36 +30,64 @@ public sealed unsafe class VulkanContext : IDisposable
     public IntPtr CommandBufferHandle => _commandBuffer;
     public IntPtr CommandPoolHandle => _commandPool;
 
-    public static bool IsSupported
+    private static readonly Lazy<bool> _isSupported = new(() =>
     {
-        get
+        try
         {
+            if (!VulkanDriver.IsAvailable()) return false;
+            var appInfo = new VulkanDriver.VkApplicationInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
+            };
+            var createInfo = new VulkanDriver.VkInstanceCreateInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                pApplicationInfo = new IntPtr(&appInfo)
+            };
+            int res = VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out IntPtr inst);
+            if (res != 0 || inst == IntPtr.Zero) return false;
+
             try
             {
-                if (!VulkanDriver.IsAvailable()) return false;
-                var appInfo = new VulkanDriver.VkApplicationInfo
+                uint devCount = 0;
+                if (VulkanDriver.EnumeratePhysicalDevices(inst, ref devCount, null) != 0 || devCount == 0)
+                    return false;
+
+                var devices = new IntPtr[devCount];
+                if (VulkanDriver.EnumeratePhysicalDevices(inst, ref devCount, devices) != 0)
+                    return false;
+
+                for (uint i = 0; i < devCount; i++)
                 {
-                    sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
-                    apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
-                };
-                var createInfo = new VulkanDriver.VkInstanceCreateInfo
-                {
-                    sType = VulkanDriver.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-                    pApplicationInfo = new IntPtr(&appInfo)
-                };
-                int res = VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out IntPtr inst);
-                if (res == 0 && inst != IntPtr.Zero)
-                {
-                    VulkanDriver.DestroyInstance(inst, IntPtr.Zero);
-                    return true;
+                    VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var props);
+                    if (!IsSoftwareDevice(in props))
+                    {
+                        return true;
+                    }
                 }
                 return false;
             }
-            catch
+            finally
             {
-                return false;
+                VulkanDriver.DestroyInstance(inst, IntPtr.Zero);
             }
         }
+        catch
+        {
+            return false;
+        }
+    });
+
+    public static bool IsSupported => _isSupported.Value;
+
+    private static bool IsSoftwareDevice(in VulkanDriver.VkPhysicalDeviceProperties props)
+    {
+        if (props.deviceType == VulkanDriver.VK_PHYSICAL_DEVICE_TYPE_CPU) return true;
+        string name = props.deviceName;
+        return string.IsNullOrWhiteSpace(name) ||
+               name.Contains("llvmpipe", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("lavapipe", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -158,8 +186,27 @@ public sealed unsafe class VulkanContext : IDisposable
         var devices = new IntPtr[devCount];
         VulkanDriver.EnumeratePhysicalDevices(_instance, ref devCount, devices);
 
-        DeviceOrdinal = Math.Clamp(deviceOrdinal, 0, (int)devCount - 1);
-        _physicalDevice = devices[DeviceOrdinal];
+        var hwDevices = new List<IntPtr>();
+        for (int i = 0; i < devCount; i++)
+        {
+            VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var candidateProps);
+            if (!IsSoftwareDevice(in candidateProps))
+            {
+                hwDevices.Add(devices[i]);
+            }
+        }
+
+        if (hwDevices.Count > 0)
+        {
+            DeviceOrdinal = Math.Clamp(deviceOrdinal, 0, hwDevices.Count - 1);
+            _physicalDevice = hwDevices[DeviceOrdinal];
+        }
+        else
+        {
+            VulkanDriver.DestroyInstance(_instance, IntPtr.Zero);
+            _instance = IntPtr.Zero;
+            throw new PlatformNotSupportedException("No hardware Vulkan GPU physical devices found (software rasterizers skipped).");
+        }
 
         VulkanDriver.GetPhysicalDeviceProperties(_physicalDevice, out var props);
         DeviceName = props.deviceName;
