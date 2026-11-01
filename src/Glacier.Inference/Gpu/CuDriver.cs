@@ -92,7 +92,6 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuCtxDestroy_v2")]
     public static extern int CtxDestroy(IntPtr ctx);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuCtxSynchronize")]
     public static extern int CtxSynchronize();
 
@@ -105,27 +104,21 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemAlloc_v2")]
     public static extern int MemAlloc(out IntPtr dptr, nuint bytesize);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemFree_v2")]
     public static extern int MemFree(IntPtr dptr);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemHostAlloc")]
     public static extern int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemHostRegister_v2")]
     public static extern int MemHostRegister(IntPtr p, nuint bytesize, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemHostUnregister")]
     public static extern int MemHostUnregister(IntPtr p);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemFreeHost")]
     public static extern int MemFreeHost(IntPtr p);
 
@@ -133,15 +126,12 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuMemHostGetDevicePointer_v2")]
     public static extern int MemHostGetDevicePointer(out IntPtr pdptr, IntPtr p, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemcpyHtoD_v2")]
     public static extern int MemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, nuint byteCount);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemcpyDtoH_v2")]
     public static extern int MemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, nuint byteCount);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuMemcpyDtoD_v2")]
     public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
 
@@ -169,7 +159,6 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuStreamCreate")]
     public static extern int StreamCreate(out IntPtr phStream, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuStreamSynchronize")]
     public static extern int StreamSynchronize(IntPtr hStream);
 
@@ -183,7 +172,6 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuEventRecord")]
     public static extern int EventRecord(IntPtr hEvent, IntPtr hStream);
 
-    [SuppressGCTransition]
     [DllImport(CudaLib, EntryPoint = "cuEventSynchronize")]
     public static extern int EventSynchronize(IntPtr hEvent);
 

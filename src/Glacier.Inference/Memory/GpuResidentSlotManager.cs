@@ -2,6 +2,7 @@ namespace Glacier.Inference.Memory;
 
 using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using Glacier.Inference.Gpu;
 
@@ -96,32 +97,7 @@ public sealed class GpuResidentSlotManager : IDisposable
         bool vramAllocated = false;
         if (allocateVram && CuDriver.IsAvailable())
         {
-            try
-            {
-                for (int i = 0; i < slotCount; i++)
-                {
-                    int err = CuDriver.MemAlloc(out IntPtr dptr, slotByteSize);
-                    if (err == 0 && dptr != IntPtr.Zero)
-                    {
-                        _slots[i] = new ExpertSlot
-                        {
-                            SlotIndex = i,
-                            LayerIndex = -1,
-                            ExpertIndex = -1,
-                            DevicePointer = dptr
-                        };
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-                vramAllocated = true;
-            }
-            catch
-            {
-                vramAllocated = false;
-            }
+            vramAllocated = TryAllocateCudaSlots(_slots, slotCount, slotByteSize);
         }
 
         _allocateVram = vramAllocated;
@@ -400,14 +376,51 @@ public sealed class GpuResidentSlotManager : IDisposable
             _disposed = true;
             if (_allocateVram)
             {
-                for (int i = 0; i < _slots.Length; i++)
+                FreeCudaSlots(_slots);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryAllocateCudaSlots(ExpertSlot[] slots, int slotCount, nuint slotByteSize)
+    {
+        try
+        {
+            for (int i = 0; i < slotCount; i++)
+            {
+                int err = CuDriver.MemAlloc(out IntPtr dptr, slotByteSize);
+                if (err == 0 && dptr != IntPtr.Zero)
                 {
-                    if (_slots[i].DevicePointer != IntPtr.Zero)
+                    slots[i] = new ExpertSlot
                     {
-                        try { CuDriver.MemFree(_slots[i].DevicePointer); } catch { }
-                        _slots[i].DevicePointer = IntPtr.Zero;
-                    }
+                        SlotIndex = i,
+                        LayerIndex = -1,
+                        ExpertIndex = -1,
+                        DevicePointer = dptr
+                    };
                 }
+                else
+                {
+                    break;
+                }
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void FreeCudaSlots(ExpertSlot[] slots)
+    {
+        for (int i = 0; i < slots.Length; i++)
+        {
+            if (slots[i].DevicePointer != IntPtr.Zero)
+            {
+                try { CuDriver.MemFree(slots[i].DevicePointer); } catch { }
+                slots[i].DevicePointer = IntPtr.Zero;
             }
         }
     }

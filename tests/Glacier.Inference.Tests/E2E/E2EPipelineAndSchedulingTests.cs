@@ -110,25 +110,23 @@ public class E2EPipelineAndSchedulingTests
     [Fact]
     public async Task SpeculativeOverlap_ConcurrentExecution_Stage0AndStage1Overlap()
     {
-        // Emulate Stage 0 computing speculative token N+1 concurrently with Stage 1 LM Head
-        var stage0Work = Task.Run(async () =>
+        // Deterministically verify Stage 0 and Stage 1 execute concurrently via a 2-participant barrier
+        // on dedicated workers so 2-vCPU CI ThreadPool queueing never causes false wall-clock failures.
+        using var overlapBarrier = new Barrier(2);
+
+        var stage0Work = Task.Factory.StartNew(() =>
         {
-            await Task.Delay(20);
+            Assert.True(overlapBarrier.SignalAndWait(TimeSpan.FromSeconds(5)), "Stage 0 and Stage 1 did not overlap concurrently");
             return 101; // draft token
-        });
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        var stage1Work = Task.Run(async () =>
+        var stage1Work = Task.Factory.StartNew(() =>
         {
-            await Task.Delay(20);
+            Assert.True(overlapBarrier.SignalAndWait(TimeSpan.FromSeconds(5)), "Stage 0 and Stage 1 did not overlap concurrently");
             return 101; // ground truth matches draft!
-        });
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
-        var sw = Stopwatch.StartNew();
         await Task.WhenAll(stage0Work, stage1Work);
-        sw.Stop();
-
-        // In serial execution, two 20ms delays take >= 40-70ms. In parallel overlap, takes ~20-35ms.
-        Assert.True(sw.ElapsedMilliseconds < 250, $"Elapsed ms: {sw.ElapsedMilliseconds} (expected < 250 ms)");
         Assert.Equal(await stage0Work, await stage1Work);
     }
 

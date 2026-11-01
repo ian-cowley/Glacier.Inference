@@ -2,6 +2,7 @@ namespace Glacier.Inference.Gpu;
 
 using System;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -13,6 +14,10 @@ using System.Threading;
 public static class NativeDriverResolver
 {
     private static int _registered;
+
+    [ModuleInitializer]
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2255:The 'ModuleInitializer' attribute should not be used in libraries", Justification = "Registers cross-platform GPU NativeLibrary resolver prior to P/Invoke JIT stub compilation.")]
+    internal static void InitializeModule() => EnsureRegistered();
 
     public static void EnsureRegistered()
     {

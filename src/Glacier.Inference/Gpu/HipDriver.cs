@@ -94,7 +94,6 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipCtxDestroy")]
     public static extern int CtxDestroy(IntPtr ctx);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipCtxSynchronize")]
     public static extern int CtxSynchronize();
 
@@ -107,19 +106,15 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMalloc")]
     public static extern int MemAlloc(out IntPtr dptr, nuint bytesize);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipFree")]
     public static extern int MemFree(IntPtr dptr);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipHostMalloc")]
     public static extern int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipHostFree")]
     public static extern int MemFreeHost(IntPtr p);
 
@@ -127,15 +122,12 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipHostGetDevicePointer")]
     public static extern int MemHostGetDevicePointer(out IntPtr pdptr, IntPtr p, uint flags);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMemcpyHtoD")]
     public static extern int MemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, nuint byteCount);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMemcpyDtoH")]
     public static extern int MemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, nuint byteCount);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipMemcpyDtoD")]
     public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
 
@@ -163,7 +155,6 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipStreamCreate")]
     public static extern int StreamCreate(out IntPtr phStream);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipStreamSynchronize")]
     public static extern int StreamSynchronize(IntPtr hStream);
 
@@ -177,7 +168,6 @@ public static class HipDriver
     [DllImport(HipLib, EntryPoint = "hipEventRecord")]
     public static extern int EventRecord(IntPtr hEvent, IntPtr hStream);
 
-    [SuppressGCTransition]
     [DllImport(HipLib, EntryPoint = "hipEventSynchronize")]
     public static extern int EventSynchronize(IntPtr hEvent);
 

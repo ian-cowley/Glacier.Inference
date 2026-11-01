@@ -2,6 +2,7 @@ namespace Glacier.Inference.Memory;
 
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Glacier.Inference.Gpu;
@@ -55,12 +56,11 @@ public sealed unsafe class PinnedHostBufferPool : IDisposable
             {
                 if (_isCudaPinned)
                 {
-                    CuDriver.MemFreeHost((IntPtr)_pointer);
+                    FreeCudaPinned((IntPtr)_pointer);
                 }
                 else if (OperatingSystem.IsWindows())
                 {
-                    VirtualMemoryInterop.VirtualUnlock(_pointer, _sizeBytes);
-                    VirtualMemoryInterop.VirtualFree(_pointer, 0, VirtualMemoryInterop.MEM_RELEASE);
+                    FreeWindowsLocked(_pointer, _sizeBytes);
                 }
                 else
                 {
@@ -123,7 +123,15 @@ public sealed unsafe class PinnedHostBufferPool : IDisposable
 
         if (Interlocked.Increment(ref _allocatedBuffers) <= _maxBuffers)
         {
-            return AllocateNewBuffer();
+            try
+            {
+                return AllocateNewBuffer();
+            }
+            catch
+            {
+                Interlocked.Decrement(ref _allocatedBuffers);
+                throw;
+            }
         }
 
         // Capacity reached: spin or wait for returned buffer
@@ -147,32 +155,17 @@ public sealed unsafe class PinnedHostBufferPool : IDisposable
         byte* ptr = null;
         bool isCuda = false;
 
-        if (_useCudaPinning)
+        if (_useCudaPinning && TryAllocCudaPinned(_bufferSizeBytes, out IntPtr pp))
         {
-            int err = CuDriver.MemHostAlloc(out IntPtr pp, _bufferSizeBytes, 0);
-            if (err == 0 && pp != IntPtr.Zero)
-            {
-                ptr = (byte*)pp;
-                isCuda = true;
-            }
+            ptr = (byte*)pp;
+            isCuda = true;
         }
 
         if (ptr == null)
         {
             if (OperatingSystem.IsWindows())
             {
-                // Win32 VirtualAlloc with MEM_COMMIT | MEM_RESERVE, followed by VirtualLock
-                void* vptr = VirtualMemoryInterop.VirtualAlloc(
-                    null,
-                    _bufferSizeBytes,
-                    VirtualMemoryInterop.MEM_COMMIT | VirtualMemoryInterop.MEM_RESERVE,
-                    VirtualMemoryInterop.PAGE_READWRITE);
-
-                if (vptr != null)
-                {
-                    VirtualMemoryInterop.VirtualLock(vptr, _bufferSizeBytes);
-                    ptr = (byte*)vptr;
-                }
+                ptr = TryAllocWindowsLocked(_bufferSizeBytes);
             }
 
             if (ptr == null)
@@ -183,6 +176,44 @@ public sealed unsafe class PinnedHostBufferPool : IDisposable
         }
 
         return new PinnedBuffer(this, ptr, _bufferSizeBytes, isCuda);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryAllocCudaPinned(nuint sizeBytes, out IntPtr pp)
+    {
+        int err = CuDriver.MemHostAlloc(out pp, sizeBytes, 0);
+        return err == 0 && pp != IntPtr.Zero;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void FreeCudaPinned(IntPtr ptr)
+    {
+        CuDriver.MemFreeHost(ptr);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static byte* TryAllocWindowsLocked(nuint sizeBytes)
+    {
+        void* vptr = VirtualMemoryInterop.VirtualAlloc(
+            null,
+            sizeBytes,
+            VirtualMemoryInterop.MEM_COMMIT | VirtualMemoryInterop.MEM_RESERVE,
+            VirtualMemoryInterop.PAGE_READWRITE);
+
+        if (vptr != null)
+        {
+            VirtualMemoryInterop.VirtualLock(vptr, sizeBytes);
+            return (byte*)vptr;
+        }
+
+        return null;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void FreeWindowsLocked(byte* ptr, nuint sizeBytes)
+    {
+        VirtualMemoryInterop.VirtualUnlock(ptr, sizeBytes);
+        VirtualMemoryInterop.VirtualFree(ptr, 0, VirtualMemoryInterop.MEM_RELEASE);
     }
 
     internal void Return(PinnedBuffer buffer)

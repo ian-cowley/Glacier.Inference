@@ -515,7 +515,8 @@ public class E2EGovernanceAndBenchmarkTests
         }
 
         string archText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "ARCHITECTURE.md"));
-        Assert.Contains("PagedAttention", archText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("KV Cache", archText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Zero-Copy", archText, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

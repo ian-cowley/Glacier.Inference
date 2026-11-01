@@ -158,11 +158,7 @@ public sealed unsafe class TieredVirtualMemoryManager : IDisposable
 
         if (_hasCuda && devicePtr != IntPtr.Zero)
         {
-            int err = CuDriver.MemcpyHtoD(devicePtr, (IntPtr)hostPtr, byteCount);
-            if (err != 0)
-            {
-                // Fallback or retry
-            }
+            CopyHostToCudaDevice(devicePtr, (IntPtr)hostPtr, byteCount);
         }
 
         double elapsedMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
@@ -174,6 +170,12 @@ public sealed unsafe class TieredVirtualMemoryManager : IDisposable
             current = Volatile.Read(ref _totalPcieTransferTimeMs);
             updated = current + elapsedMs;
         } while (Interlocked.CompareExchange(ref _totalPcieTransferTimeMs, updated, current) != current);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void CopyHostToCudaDevice(IntPtr devicePtr, IntPtr hostPtr, nuint byteCount)
+    {
+        _ = CuDriver.MemcpyHtoD(devicePtr, hostPtr, byteCount);
     }
 
     /// <summary>
