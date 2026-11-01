@@ -1028,6 +1028,9 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         bool computeLogits,
         int maxLayers)
     {
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds maximum sequence length {_maxSeqLen}.");
+
         if (StartLayer == 0)
         {
             QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
@@ -1661,6 +1664,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
     {
         int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
         if (totalTokens == 0) return;
+        if (startPos < 0 || startPos + totalTokens > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Batch range [{startPos}, {startPos + totalTokens}) exceeds maximum sequence length {_maxSeqLen}.");
 
         if (totalTokens == 1)
         {
@@ -2147,26 +2152,13 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
 
     public void ResetKvCache()
     {
-        // Zero out recurrent SSM states (conv1d state and associative memory state) across GDN layers
-        int convFloats = _gdnConvChannels * 3;
-        int ssmFloats = _ssmHeads * _ssmStateDim * _ssmStateDim;
-        int maxFloats = Math.Max(convFloats, ssmFloats);
-        if (maxFloats <= 0) return;
-
-        float[] zeros = new float[maxFloats];
-        fixed (float* pZeros = zeros)
+        if (_disposed) return;
+        for (int l = 0; l < LayerCount; l++)
         {
-            for (int l = 0; l < LayerCount; l++)
-            {
-                if (_dConvState[l] != null)
-                {
-                    _ctx.CopyToDevice(_dConvState[l], (IntPtr)pZeros, (ulong)(convFloats * sizeof(float)));
-                }
-                if (_dSsmState[l] != null)
-                {
-                    _ctx.CopyToDevice(_dSsmState[l], (IntPtr)pZeros, (ulong)(ssmFloats * sizeof(float)));
-                }
-            }
+            if (_dConvState[l] != null) _ctx.ZeroDeviceBuffer(_dConvState[l]);
+            if (_dSsmState[l] != null) _ctx.ZeroDeviceBuffer(_dSsmState[l]);
+            if (_dKeyCache[l] != null) _ctx.ZeroDeviceBuffer(_dKeyCache[l]);
+            if (_dValCache[l] != null) _ctx.ZeroDeviceBuffer(_dValCache[l]);
         }
     }
 

@@ -272,16 +272,16 @@ Run distributed benchmarks across all configured nodes using the PowerShell Flee
 .\scripts\orchestrate_fleet.ps1 -ModelPath "models/gemma-4-26B-A4B-it-Q4_K_M.gguf" -Tokens 32
 
 # 2. Benchmark local device with explicit engine selection
-glacier bench --device amd-890m --engine rocm       --model "models/qwen2.5-coder-7b.gguf"
-glacier bench --device amd-890m --engine vulkan     --model "models/gemma-4-26B-A4B-it-Q4_K_M.gguf"
-glacier bench --device nvidia-rtx-4060 --engine sass --model "models/qwen2.5-7b.gguf"
+glacier bench "models/qwen2.5-coder-7b.gguf" --device amd-890m --engine baremetal
+glacier bench "models/gemma-4-26B-A4B-it-Q4_K_M.gguf" --device amd-890m --engine vulkan
+glacier bench "models/qwen2.5-7b.gguf" --device nvidia-rtx-4060 --engine baremetal
 ```
 
 ---
 
 ## 7. Pure C# Voice Subsystem Benchmarks & Acoustic Metrics
 
-Glacier.Inference includes a high-performance speech synthesis engine (`KokoroTtsEngine`) based on physical vocal tract acoustics, Liljencrants-Fant glottal flow wave generation, 5-pole digital biquad cascade filtering, and dialect G2P phonology.
+Glacier.Inference includes both neural speech synthesis (`KittenTtsEngine`) and a pure C# acoustic formant speech synthesis engine (`KokoroTtsEngine`) based on physical vocal tract acoustics, Liljencrants-Fant glottal flow wave generation, 5-pole digital biquad cascade filtering, and dialect G2P phonology.
 
 ### Synthesis Speed & Real-Time Factor (RTF)
 Tested on AMD Ryzen AI 9 HX 370 CPU (Single Core, Pure C# .NET 10 SIMD):

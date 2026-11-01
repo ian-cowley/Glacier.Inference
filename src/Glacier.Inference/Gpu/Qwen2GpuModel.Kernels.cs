@@ -84,16 +84,19 @@ public sealed unsafe partial class Qwen2GpuModel
             IntPtr.Zero), "LaunchKernel(kv_cache_store)");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private uint GetAttentionBlockSize() => (uint)Math.Min(256, Math.Max(32, ((_headDim + 31) / 32) * 32));
+
     private void LaunchAttention(int layer, int pos) => LaunchAttention(layer, pos, _dQ, _dAttnOut);
 
     private void LaunchAttention(int layer, int pos, IntPtr dQ, IntPtr dOut)
     {
         uint gridSize = (uint)_nHeads;
-        uint blockSize = (uint)_headDim;
+        uint blockSize = GetAttentionBlockSize();
 
         IntPtr dKCache = _dKeyCache[layer];
         IntPtr dVCache = _dValCache[layer];
-        IntPtr dScores = _dScoresBuf;
+        IntPtr dScores = IntPtr.Zero;
         int nHeadsQ = _nHeads;
         int nHeadsKv = _nHeadsKv;
         int headDim = _headDim;
@@ -133,13 +136,13 @@ public sealed unsafe partial class Qwen2GpuModel
     {
         uint gridX = (uint)_nHeads;
         uint gridY = (uint)batchSize;
-        uint blockSize = (uint)_headDim;
+        uint blockSize = GetAttentionBlockSize();
 
         IntPtr dQ = _dQBatch;
         IntPtr dKCache = _dKeyCache[layer];
         IntPtr dVCache = _dValCache[layer];
         IntPtr dOut = _dAttnOutBatch;
-        IntPtr dScores = _dScoresBufBatch;
+        IntPtr dScores = IntPtr.Zero;
         int nHeadsQ = _nHeads;
         int nHeadsKv = _nHeadsKv;
         int headDim = _headDim;
@@ -535,7 +538,7 @@ public sealed unsafe partial class Qwen2GpuModel
 
     private void LaunchRmsNormHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, float eps)
     {
-        uint blockSize = (uint)Math.Min(128, headDim);
+        uint blockSize = (uint)Math.Min(256, Math.Max(32, ((headDim + 31) / 32) * 32));
         uint gridSize = (uint)nHeads;
 
         void** pArgs = stackalloc void*[5];
@@ -556,7 +559,7 @@ public sealed unsafe partial class Qwen2GpuModel
 
     private void LaunchRmsNormBatchHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, int batchSize, float eps)
     {
-        uint blockSize = (uint)Math.Min(128, headDim);
+        uint blockSize = (uint)Math.Min(256, Math.Max(32, ((headDim + 31) / 32) * 32));
         uint gridX = (uint)nHeads;
         uint gridY = (uint)batchSize;
 
@@ -575,5 +578,154 @@ public sealed unsafe partial class Qwen2GpuModel
             0, IntPtr.Zero,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(rms_norm_batch_heads)");
+    }
+
+    private void LaunchPagedKvStoreF16(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        int total = _nHeadsKv * _headDim;
+        uint threads = 256;
+        uint gridSize = (uint)((total + (int)threads - 1) / (int)threads);
+
+        IntPtr dK = _dK;
+        IntPtr dV = _dV;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+
+        void** pArgs = stackalloc void*[12];
+        pArgs[0] = &dK;
+        pArgs[1] = &dV;
+        pArgs[2] = &dKPool;
+        pArgs[3] = &dVPool;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &pos;
+        pArgs[6] = &modelLayer;
+        pArgs[7] = &numLayers;
+        pArgs[8] = &nHeadsKv;
+        pArgs[9] = &headDim;
+        pArgs[10] = &vHeadDim;
+        pArgs[11] = &kvBlockSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnPagedKvStoreF16,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(paged_kv_cache_store_f16_kernel)");
+    }
+
+    private void LaunchPagedKvStoreBatchF16(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        int total = batchSize * _nHeadsKv * _headDim;
+        uint threads = 256;
+        uint gridSize = (uint)((total + (int)threads - 1) / (int)threads);
+
+        IntPtr dK = _dKBatch;
+        IntPtr dV = _dVBatch;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+
+        void** pArgs = stackalloc void*[13];
+        pArgs[0] = &dK;
+        pArgs[1] = &dV;
+        pArgs[2] = &dKPool;
+        pArgs[3] = &dVPool;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &modelLayer;
+        pArgs[8] = &numLayers;
+        pArgs[9] = &nHeadsKv;
+        pArgs[10] = &headDim;
+        pArgs[11] = &vHeadDim;
+        pArgs[12] = &kvBlockSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnPagedKvStoreBatchF16,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(paged_kv_cache_store_batch_f16_kernel)");
+    }
+
+    private void LaunchPagedAttentionF16(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        uint gridSize = (uint)_nHeads;
+        uint threads = GetAttentionBlockSize();
+
+        IntPtr dQ = _dQ;
+        IntPtr dOut = _dAttnOut;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[14];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKPool;
+        pArgs[2] = &dVPool;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &pos;
+        pArgs[6] = &modelLayer;
+        pArgs[7] = &numLayers;
+        pArgs[8] = &nHeadsQ;
+        pArgs[9] = &nHeadsKv;
+        pArgs[10] = &headDim;
+        pArgs[11] = &vHeadDim;
+        pArgs[12] = &kvBlockSize;
+        pArgs[13] = &attnScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnPagedAttnGqaF16,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(paged_attention_gqa_f16_kernel)");
+    }
+
+    private void LaunchPagedAttentionBatchF16(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        uint gridX = (uint)_nHeads;
+        uint gridY = (uint)batchSize;
+        uint threads = GetAttentionBlockSize();
+
+        IntPtr dQ = _dQBatch;
+        IntPtr dOut = _dAttnOutBatch;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[15];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKPool;
+        pArgs[2] = &dVPool;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &modelLayer;
+        pArgs[8] = &numLayers;
+        pArgs[9] = &nHeadsQ;
+        pArgs[10] = &nHeadsKv;
+        pArgs[11] = &headDim;
+        pArgs[12] = &vHeadDim;
+        pArgs[13] = &kvBlockSize;
+        pArgs[14] = &attnScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnPagedAttnGqaBatchF16,
+            gridX, gridY, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(paged_attention_gqa_batch_f16_kernel)");
     }
 }

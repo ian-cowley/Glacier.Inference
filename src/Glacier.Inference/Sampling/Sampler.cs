@@ -58,6 +58,8 @@ public sealed class Sampler
 
     private readonly Random _random;
 
+    public Random Rng => _random;
+
     public Sampler(int? seed = null)
     {
         _random = seed.HasValue ? new Random(seed.Value) : new Random();
@@ -404,5 +406,163 @@ public sealed class Sampler
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Computes the exact filtered categorical probability distribution over <paramref name="rawLogits"/>
+    /// after NaN/Inf sanitization, periodic-loop-aware repetition penalty, temperature scaling,
+    /// Top-K selection, and Top-P nucleus truncation with renormalization.
+    /// Used by Leviathan et al. speculative rejection sampling so draft/target distributions match <see cref="Sample"/>.
+    /// </summary>
+    public static void ComputeFilteredDistribution(
+        ReadOnlySpan<float> rawLogits,
+        SamplingOptions options,
+        ReadOnlySpan<int> recentTokens,
+        Span<float> probsOut)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (rawLogits.IsEmpty) throw new ArgumentException("Logits must not be empty.", nameof(rawLogits));
+        if (probsOut.Length < rawLogits.Length)
+            throw new ArgumentException("probsOut must have at least rawLogits.Length elements.", nameof(probsOut));
+        if (options.Temperature < 0f || float.IsNaN(options.Temperature))
+            throw new ArgumentOutOfRangeException(nameof(options), options.Temperature, "Temperature must be non-negative.");
+        if (options.TopP < 0f || options.TopP > 1f || float.IsNaN(options.TopP))
+            throw new ArgumentOutOfRangeException(nameof(options), options.TopP, "TopP must be between 0.0 and 1.0.");
+        if (options.RepetitionPenalty <= 0f || float.IsNaN(options.RepetitionPenalty))
+            throw new ArgumentOutOfRangeException(nameof(options), options.RepetitionPenalty, "RepetitionPenalty must be greater than zero.");
+
+        int vocabSize = rawLogits.Length;
+        Span<float> dst = probsOut.Slice(0, vocabSize);
+
+        float[]? rentedLogits = null;
+        Span<float> logits = vocabSize <= 1024
+            ? stackalloc float[vocabSize]
+            : (rentedLogits = ArrayPool<float>.Shared.Rent(vocabSize)).AsSpan(0, vocabSize);
+
+        (int Id, float Logit)[]? rentedCandidates = null;
+        try
+        {
+            rawLogits.CopyTo(logits);
+            SanitizeLogits(logits);
+
+            float effectivePenalty = options.RepetitionPenalty;
+            ReadOnlySpan<int> penaltyWindow = recentTokens;
+
+            if (options.EnableReasoningLoopGuard && !recentTokens.IsEmpty)
+            {
+                int loopPeriod = DetectPeriodicReasoningLoop(recentTokens, minPeriod: options.ReasoningLoopMinPeriod);
+                if (loopPeriod > 0)
+                {
+                    effectivePenalty = Math.Max(effectivePenalty, options.LoopRecoveryRepetitionPenalty);
+                    int windowLen = Math.Min(recentTokens.Length, loopPeriod * 3);
+                    penaltyWindow = recentTokens.Slice(recentTokens.Length - windowLen, windowLen);
+                }
+            }
+
+            if (effectivePenalty != 1.0f && !penaltyWindow.IsEmpty)
+            {
+                ApplyRepetitionPenalty(logits, penaltyWindow, effectivePenalty);
+            }
+
+            dst.Clear();
+
+            if (options.Temperature <= GreedyTemperatureThreshold || options.TopK == 1)
+            {
+                int bestId = 0;
+                float bestLogit = float.NegativeInfinity;
+                for (int i = 0; i < vocabSize; i++)
+                {
+                    if (logits[i] > bestLogit)
+                    {
+                        bestLogit = logits[i];
+                        bestId = i;
+                    }
+                }
+                dst[bestId] = 1.0f;
+                return;
+            }
+
+            int k = options.TopK <= 0 ? vocabSize : Math.Min(options.TopK, vocabSize);
+            Span<(int Id, float Logit)> candidates = k <= 128
+                ? stackalloc (int, float)[k]
+                : (rentedCandidates = ArrayPool<(int Id, float Logit)>.Shared.Rent(k)).AsSpan(0, k);
+
+            SelectTopK(logits, k, candidates);
+
+            float invTemp = 1.0f / options.Temperature;
+            for (int i = 0; i < k; i++)
+            {
+                candidates[i].Logit *= invTemp;
+            }
+
+            float maxLogit = candidates[0].Logit;
+            float sumExp = 0f;
+            for (int i = 0; i < k; i++)
+            {
+                float exp = MathF.Exp(candidates[i].Logit - maxLogit);
+                candidates[i].Logit = exp;
+                sumExp += exp;
+            }
+
+            if (!(sumExp > 0f) || !float.IsFinite(sumExp))
+            {
+                dst[candidates[0].Id] = 1.0f;
+                return;
+            }
+
+            float invSum = 1.0f / sumExp;
+            float cumProb = 0f;
+            int activeCount = 0;
+            for (int i = 0; i < k; i++)
+            {
+                float prob = candidates[i].Logit * invSum;
+                candidates[i].Logit = prob;
+                cumProb += prob;
+                activeCount++;
+                if (cumProb >= options.TopP) break;
+            }
+
+            if (!(cumProb > 0f) || !float.IsFinite(cumProb))
+            {
+                dst[candidates[0].Id] = 1.0f;
+                return;
+            }
+
+            float invTruncated = 1.0f / cumProb;
+            for (int i = 0; i < activeCount; i++)
+            {
+                dst[candidates[i].Id] = candidates[i].Logit * invTruncated;
+            }
+        }
+        finally
+        {
+            if (rentedCandidates != null) ArrayPool<(int Id, float Logit)>.Shared.Return(rentedCandidates);
+            if (rentedLogits != null) ArrayPool<float>.Shared.Return(rentedLogits);
+        }
+    }
+
+    /// <summary>
+    /// Samples a token index from a normalized probability distribution.
+    /// </summary>
+    public static int SampleFromDistribution(ReadOnlySpan<float> probs, Random rng)
+    {
+        ArgumentNullException.ThrowIfNull(rng);
+        if (probs.IsEmpty) throw new ArgumentException("Distribution must not be empty.", nameof(probs));
+
+        float r = (float)rng.NextDouble();
+        float acc = 0f;
+        int lastNonZero = 0;
+        for (int i = 0; i < probs.Length; i++)
+        {
+            float p = probs[i];
+            if (p <= 0f) continue;
+            lastNonZero = i;
+            acc += p;
+            if (r <= acc)
+            {
+                return i;
+            }
+        }
+        return lastNonZero;
     }
 }

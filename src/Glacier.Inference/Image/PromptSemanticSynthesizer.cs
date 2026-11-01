@@ -1,13 +1,14 @@
 namespace Glacier.Inference.Image;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 
 /// <summary>
-/// Semantic conditioning synthesizer for Diffusion Transformers.
-/// Maps textual prompt concepts into spatially coherent, structured multi-channel latent fields
-/// (Luminance, Chrominance, Geometry, Structural Contours, Specular highlights)
-/// with multi-scale continuous parallax camera motion support.
+/// Experimental procedural latent shader synthesizer for synthetic Diffusion Transformer test fixtures.
+/// Generates deterministic multi-channel Perlin/FBM value-noise fields for keyword-steered test imagery.
+/// (Not a neural text encoder; for neural conditioning use <c>FluxClipEncoder</c> and <c>FluxT5Encoder</c>.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public static class PromptSemanticSynthesizer
 {
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]

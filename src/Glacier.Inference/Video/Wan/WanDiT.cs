@@ -109,6 +109,7 @@ public sealed unsafe partial class WanDiT : IDisposable
 
     public int MaxTokens => _maxTokens;
     public bool IsGpuAccelerated => _gpu != null && _gpuWeightsUploaded;
+    public string? GpuDeviceName => _gpu?.DeviceName;
     public string ActiveBackend => IsGpuAccelerated ? "Cuda" : "Cpu";
 
     public sealed class WanBlockWeights

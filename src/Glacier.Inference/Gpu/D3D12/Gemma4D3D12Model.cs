@@ -625,6 +625,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
 
     public void Forward(int token, int pos, Span<float> logits, bool computeLogits = true)
     {
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds maximum sequence length {_maxSeqLen}.");
+
         // 1. Extract token embedding and scale by sqrt(dim)
         QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
         for (int i = 0; i < _dim; i++)
@@ -929,6 +932,16 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         {
             bool isLast = (i == tokens.Length - 1);
             Forward(tokens[i], startPos + i, isLast && computeLogits ? logits : Span<float>.Empty, isLast && computeLogits);
+        }
+    }
+
+    public void ResetKvCache()
+    {
+        if (_disposed) return;
+        for (int l = 0; l < _dKeyCache.Length; l++)
+        {
+            if (_dKeyCache[l] != null) _ctx.ZeroDeviceBuffer(_dKeyCache[l]);
+            if (_dValCache[l] != null) _ctx.ZeroDeviceBuffer(_dValCache[l]);
         }
     }
 

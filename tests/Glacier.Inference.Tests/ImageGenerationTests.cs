@@ -5,6 +5,7 @@ using System.IO;
 using Glacier.Inference.Image;
 using Xunit;
 
+#pragma warning disable GLACIER_EXP001
 public class ImageGenerationTests
 {
     [Fact]

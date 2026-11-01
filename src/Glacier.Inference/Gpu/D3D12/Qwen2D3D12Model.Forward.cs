@@ -50,6 +50,9 @@ public sealed unsafe partial class Qwen2D3D12Model
         Span<float> logits,
         bool computeLogits)
     {
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds maximum sequence length {_maxSeqLen}.");
+
         // 1. Input activation: either extract embedding or copy incoming hidden vector
         bool isCacheHit = false;
         int cachedSlot = -1;
@@ -361,6 +364,8 @@ public sealed unsafe partial class Qwen2D3D12Model
     {
         int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
         if (totalTokens == 0) return;
+        if (startPos < 0 || startPos + totalTokens > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Batch range [{startPos}, {startPos + totalTokens}) exceeds maximum sequence length {_maxSeqLen}.");
 
         if (totalTokens == 1)
         {

@@ -132,6 +132,17 @@ public sealed unsafe partial class Qwen2Model
                 }
             }
 
+            if (LoraWeights != null)
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    float* normXt = _normXBatch + t * _dim;
+                    LoraWeights.Apply(modelLayer, LoraProjection.Q, normXt, _qBatch + t * qDim, _dim, qDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.K, normXt, _kBatch + t * kvDim, _dim, kvDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.V, normXt, _vBatch + t * kvDim, _dim, kvDim);
+                }
+            }
+
             for (int t = 0; t < batchSize; t++)
             {
                 int pos = chunkStartPos + t;
@@ -171,6 +182,13 @@ public sealed unsafe partial class Qwen2Model
                 QuantKernels.ComputeBlockSums32(_attnOutBatch + t * qDim, _attnOutSumBatch + t * attnOutChunks, qDim);
             }
             QuantKernels.MatMulBatch(layer.AttnOutType, layer.AttnOutWeight, _attnOutBatch, _attnProjBatch, qDim, _dim, batchSize, _attnOutSumBatch);
+            if (LoraWeights != null)
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.AttnOut, _attnOutBatch + t * qDim, _attnProjBatch + t * _dim, qDim, _dim);
+                }
+            }
             if (layer.AttnOutBias != null)
             {
                 for (int t = 0; t < batchSize; t++)

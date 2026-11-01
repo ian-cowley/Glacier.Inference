@@ -664,6 +664,7 @@ public unsafe class ChallengerFinalTests
         }
     }
 
+#pragma warning disable GLACIER_EXP001
     [Fact]
     public void OpenCLContext_TrackingCollections_ExistAndThreadSafe()
     {
@@ -678,6 +679,7 @@ public unsafe class ChallengerFinalTests
         Assert.Equal(typeof(List<IntPtr>), buffersField.FieldType);
         Assert.Equal(typeof(List<IntPtr>), kernelsField.FieldType);
     }
+#pragma warning restore GLACIER_EXP001
 
     #endregion
 }

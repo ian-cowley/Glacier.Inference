@@ -117,14 +117,14 @@ public static partial class Program
         Console.WriteLine("  bench   <model.gguf> [options]       Run speed & comparative benchmark");
         Console.WriteLine("  run     <model.gguf> [prompt]        Interactive streaming chat or single prompt");
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
-        Console.WriteLine("  voice   <voices|tts|stt|demo>        Human-quality speech synthesis (16 voices), Whisper STT & voice");
-        Console.WriteLine("  vision  <demo|query> [options]       Vision-Language Model (VLM) patchification & analysis");
+        Console.WriteLine("  voice   <voices|tts|stt|demo>        KittenTTS Neural Speech Synthesis & Formant TTS + Whisper STT");
+        Console.WriteLine("  vision  <demo|query> [options]       [Experimental] Synthetic VisionPipeline patchification & analysis");
         Console.WriteLine("  video   <generate|demo|query>        Generative video production (DiT+VAE) & temporal reasoning");
         Console.WriteLine("  image   <demo|generate> [options]    Text-to-Image production (Flow Matching DiT + VAE)");
         Console.WriteLine();
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
-        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto safe selection)");
+        Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto safe selection)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto adaptive)");
         Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU pipeline split (e.g. 'auto', 'nvidia-rtx-4060:14,amd-890m:14')");
@@ -211,7 +211,7 @@ public static partial class Program
     private static void PrintVoiceHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier voice - Pure C# .NET 10 Voice Subsystem (Kokoro TTS + Whisper STT)");
+        Console.WriteLine("glacier voice - Pure C# .NET 10 Voice Subsystem (KittenTTS Neural Speech Synthesis & Formant TTS + Audio DSP)");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
@@ -230,12 +230,12 @@ public static partial class Program
     private static void PrintVisionHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier vision - Vision-Language Model (VLM) patchification & analysis");
+        Console.WriteLine("glacier vision - [Experimental] Synthetic VisionPipeline patchification & analysis");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  glacier vision demo");
-        Console.WriteLine("  glacier vision query <image> \"<prompt>\"");
+        Console.WriteLine("  glacier vision query <image> \"<prompt>\" --synthetic-demo");
     }
 
     private static void PrintVideoHelp()
@@ -257,12 +257,14 @@ public static partial class Program
         Console.WriteLine();
         Console.WriteLine("Options (for generate):");
         Console.WriteLine("  --image <path>                       Optional reference image to animate with camera motion");
-        Console.WriteLine("  --frames <int>                       Number of output frames (default: 16)");
-        Console.WriteLine("  --fps <int>                          Framerate in FPS (default: 8)");
-        Console.WriteLine("  --width <int>                        Video width in pixels (default: 256)");
-        Console.WriteLine("  --height <int>                       Video height in pixels (default: 256)");
-        Console.WriteLine("  --steps <int>                        Flow matching ODE steps (default: 4)");
-        Console.WriteLine("  --motion <name>                      pan-right, pan-left, zoom-in, zoom-out, tilt-up, orbit, fluid, static (default: pan-right)");
+        Console.WriteLine("  --frames <int>                       Number of output frames (default: 17)");
+        Console.WriteLine("  --duration <float>                   Optional duration in seconds (overrides --frames via duration * fps)");
+        Console.WriteLine("  --fps <int>                          Framerate in FPS (default: 16)");
+        Console.WriteLine("  --width <int>                        Video width in pixels (default: 832)");
+        Console.WriteLine("  --height <int>                       Video height in pixels (default: 480)");
+        Console.WriteLine("  --steps <int>                        Flow matching ODE steps (default: 25)");
+        Console.WriteLine("  --guidance <float>                   Classifier-Free Guidance scale (default: 5.0)");
+        Console.WriteLine("  --motion <name>                      pan-left|pan-right|tilt-up|tilt-down|zoom-in|zoom-out|static|fluid (default: pan-right)");
         Console.WriteLine("  --format <ext>                       apng, gif, avi, or all (default: apng)");
         Console.WriteLine("  --out <path>                         Output file path (default: glacier_video.apng)");
         Console.WriteLine("  --seed <int>                         Random seed for reproducible video synthesis");
@@ -298,7 +300,7 @@ public static partial class Program
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --device <id|name>                   Set default target device (e.g. nvidia-rtx-4060, amd-890m, cpu, auto)");
-        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Set default execution engine");
+        Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Set default execution engine");
         Console.WriteLine("  --reset                              Reset configuration to auto-detected defaults");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
@@ -356,7 +358,7 @@ public static partial class Program
         Console.WriteLine("  -p, --prompt \"<text>\"                Custom benchmark prompt (default: CPU cache question)");
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
-        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  --compare-ollama <url>               Ollama base URL for side-by-side comparison");
@@ -394,7 +396,7 @@ public static partial class Program
         Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7)");
         Console.WriteLine("  --top-p <float>                      Top-p nucleus sampling cutoff (default: 0.9)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
-        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  -h, --help                           Show this help message");
@@ -427,7 +429,7 @@ public static partial class Program
         Console.WriteLine("  --api-key <key>                      Optional API Key / Bearer token (or GLACIER_API_KEY env)");
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
-        Console.WriteLine("  --engine <baremetal|directml|cpu|auto> Execution engine (default: auto)");
+        Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
         Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  -h, --help                           Show this help message");

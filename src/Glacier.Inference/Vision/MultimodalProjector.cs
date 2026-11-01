@@ -1,15 +1,18 @@
 namespace Glacier.Inference.Vision;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using Glacier.Inference.Quant;
 
 /// <summary>
-/// High-performance Multimodal Projector mapping Vision Transformer patch latents
-/// to Large Language Model embedding space (e.g., Qwen 2-VL 2D Spatial Merging, LLaVA 2-layer MLP).
+/// Experimental procedural Multimodal Projector primitive initialized with deterministic trigonometric
+/// test weights for 2D spatial patch merging and projection verification.
+/// (For pretrained neural multimodal projection, use <c>Gemma4VisionTower</c> via <c>EmbeddingGemma2Model</c>.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed unsafe class MultimodalProjector : IDisposable
 {
     public int VisionDim { get; }

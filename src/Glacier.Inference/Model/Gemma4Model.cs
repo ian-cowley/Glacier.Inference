@@ -24,6 +24,7 @@ public sealed unsafe class Gemma4KvCache : IDisposable
     private readonly int[] _layerHeadDims;
     private readonly long[] _layerOffsetsK;
     private readonly long[] _layerOffsetsV;
+    private readonly long _totalBytes;
 
     private float* _kBuffer;
     private float* _vBuffer;
@@ -59,6 +60,7 @@ public sealed unsafe class Gemma4KvCache : IDisposable
         }
 
         long totalBytes = runningOffset * sizeof(float);
+        _totalBytes = totalBytes;
         _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
         _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
     }
@@ -66,6 +68,10 @@ public sealed unsafe class Gemma4KvCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
+
         int headDim = _layerHeadDims[layer];
         long offset = _layerOffsetsK[layer] + ((long)headKv * _maxSeqLen + pos) * headDim;
         return _kBuffer + offset;
@@ -74,9 +80,20 @@ public sealed unsafe class Gemma4KvCache : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetValPtr(int layer, int headKv, int pos)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
+
         int headDim = _layerHeadDims[layer];
         long offset = _layerOffsetsV[layer] + ((long)headKv * _maxSeqLen + pos) * headDim;
         return _vBuffer + offset;
+    }
+
+    public void Reset()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_kBuffer != null) NativeMemory.Clear(_kBuffer, (nuint)_totalBytes);
+        if (_vBuffer != null) NativeMemory.Clear(_vBuffer, (nuint)_totalBytes);
     }
 
     public void Dispose()
@@ -611,6 +628,8 @@ public sealed unsafe class Gemma4Model : CpuModelBase
             ForwardStage(tokens[i], startPos + i, default, default, isLast && computeLogits ? logits : Span<float>.Empty, isLast && computeLogits, kvCache);
         }
     }
+
+    public override void ResetState() => _gemmaKvCache.Reset();
 
     protected override void ForwardAttention(int stageLayer, int modelLayer, int pos, float* x, KVCache? kvCache)
     {

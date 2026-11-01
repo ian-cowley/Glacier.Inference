@@ -199,6 +199,78 @@ public static class HipDriver
         return Encoding.ASCII.GetString(buf).TrimEnd('\0');
     }
 
+    public static unsafe string? TryGetGcnArchName(int device)
+    {
+        try
+        {
+            IntPtr lib = IntPtr.Zero;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                if (!NativeLibrary.TryLoad("amdhip64.dll", out lib) || lib == IntPtr.Zero)
+                    NativeLibrary.TryLoad("amdhip64_6.dll", out lib);
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                if (!NativeLibrary.TryLoad("libamdhip64.so", out lib) || lib == IntPtr.Zero)
+                {
+                    if (!NativeLibrary.TryLoad("libamdhip64.so.6", out lib) || lib == IntPtr.Zero)
+                        NativeLibrary.TryLoad("/opt/rocm/lib/libamdhip64.so", out lib);
+                }
+            }
+
+            if (lib == IntPtr.Zero)
+                return null;
+
+            if (!NativeLibrary.TryGetExport(lib, "hipGetDevicePropertiesR0600", out IntPtr fnPtr) &&
+                !NativeLibrary.TryGetExport(lib, "hipGetDeviceProperties", out fnPtr))
+            {
+                return null;
+            }
+
+            const nuint propBufSize = 4096;
+            byte* pProp = (byte*)NativeMemory.AlignedAlloc(propBufSize, 64);
+            try
+            {
+                NativeMemory.Clear(pProp, propBufSize);
+                var getProps = (delegate* unmanaged[Cdecl]<byte*, int, int>)fnPtr;
+                if (getProps(pProp, device) != 0)
+                    return null;
+
+                // Skip char name[256] at offset 0 and scan for gcnArchName ("gfx...")
+                for (int i = 256; i < (int)propBufSize - 6; i++)
+                {
+                    if (pProp[i] == (byte)'g' &&
+                        pProp[i + 1] == (byte)'f' &&
+                        pProp[i + 2] == (byte)'x' &&
+                        Uri.IsHexDigit((char)pProp[i + 3]))
+                    {
+                        int end = i + 3;
+                        while (end < (int)propBufSize && pProp[end] != 0 && pProp[end] != (byte)':')
+                        {
+                            char ch = (char)pProp[end];
+                            if (!char.IsLetterOrDigit(ch) && ch != '_')
+                                break;
+                            end++;
+                        }
+                        if (end > i + 3 && (end == (int)propBufSize || pProp[end] == 0 || pProp[end] == (byte)':'))
+                        {
+                            return Encoding.ASCII.GetString(pProp + i, end - i);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                NativeMemory.AlignedFree(pProp);
+            }
+        }
+        catch
+        {
+            // Fall back to major/minor formatting if property struct probe is unavailable
+        }
+        return null;
+    }
+
     public static void Check(int res, string op)
     {
         if (res != 0)

@@ -205,6 +205,7 @@ public class DeviceManagerTests
         Assert.NotEmpty(optimal.SupportedEngines);
     }
 
+#pragma warning disable GLACIER_EXP001
     [Fact]
     public unsafe void HipContext_InitializationAndAllocation_SucceedsIfSupported()
     {
@@ -236,6 +237,7 @@ public class DeviceManagerTests
         hip.FreeDevice(dptr);
         Assert.Equal(src, dst);
     }
+#pragma warning restore GLACIER_EXP001
 
     [Fact]
     public unsafe void VulkanContext_InitializationAndBufferMapping_SucceedsIfSupported()

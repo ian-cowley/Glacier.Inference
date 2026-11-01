@@ -136,8 +136,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (head_idx >= n_heads) return;
 
     uint head_offset = head_idx * head_dim;
-    float val = (tid < head_dim) ? x[head_offset + tid] : 0.0f;
-    s_sum[tid] = val * val;
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < head_dim; i += 128)
+    {
+        float v = x[head_offset + i];
+        sum_sq += v * v;
+    }
+    s_sum[tid] = sum_sq;
 
     GroupMemoryBarrierWithGroupSync();
     if (tid < 64) s_sum[tid] += s_sum[tid + 64];
@@ -153,13 +158,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (tid < 2)  s_sum[tid] += s_sum[tid + 2];
     GroupMemoryBarrierWithGroupSync();
     if (tid < 1)  s_sum[tid] += s_sum[tid + 1];
+    GroupMemoryBarrierWithGroupSync();
 
     float rrms = rsqrt(s_sum[0] / (float)head_dim + eps);
 
-    if (tid < head_dim)
+    for (uint j = tid; j < head_dim; j += 128)
     {
-        float w = asfloat(weight.Load(tid * 4));
-        x[head_offset + tid] = val * rrms * w;
+        float w = asfloat(weight.Load(j * 4));
+        x[head_offset + j] = x[head_offset + j] * rrms * w;
     }
 }
 ";
@@ -231,6 +237,7 @@ RWStructuredBuffer<float> v_cache : register(u3);
 [numthreads(256, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    if (pos >= max_seq_len) return;
     uint total = n_heads_kv * head_dim;
     if (id.x >= total) return;
 
@@ -260,6 +267,7 @@ RWStructuredBuffer<uint> v_cache : register(u3);
 [numthreads(128, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
+    if (pos >= max_seq_len) return;
     uint half_elements = n_heads_kv * (head_dim / 2);
     uint idx = id.x;
     if (idx >= half_elements) return;
@@ -302,25 +310,41 @@ groupshared float s_red[128];
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint h = gid.x;
-    if (h >= n_heads_q) return;
+    if (h >= n_heads_q || pos >= max_seq_len) return;
 
     uint tid = gtid.x;
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
+    uint q_base = h * head_dim;
 
-    float q_d = asfloat(q.Load((h * head_dim + tid) * 4));
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
 
     float m = -1e30f;
     float l = 0.0f;
-    float acc = 0.0f;
 
     for (uint t = 0; t <= pos; t++)
     {
-        uint kv_offset = (h_kv * max_seq_len + t) * head_dim + tid;
-        float k_d = k_cache[kv_offset];
-        float v_d = v_cache[kv_offset];
+        uint kv_base = (h_kv * max_seq_len + t) * head_dim;
+        float dot_part = 0.0f;
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                dot_part += q_reg[c] * k_cache[kv_base + d];
+            }
+        }
 
-        s_red[tid] = q_d * k_d;
+        s_red[tid] = dot_part;
         GroupMemoryBarrierWithGroupSync();
 
         if (tid < 64) s_red[tid] += s_red[tid + 64];
@@ -345,15 +369,31 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         float alpha = exp(m - m_new);
         float w_t = exp(s_t - m_new);
 
-        acc = acc * alpha + w_t * v_d;
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                acc[c] = acc[c] * alpha + w_t * v_cache[kv_base + d];
+            }
+        }
         l = l * alpha + w_t;
         m = m_new;
 
         GroupMemoryBarrierWithGroupSync();
     }
 
-    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
-    attn_out.Store((h * head_dim + tid) * 4, asuint(final_attn));
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
 }
 ";
 
@@ -379,31 +419,44 @@ groupshared float s_red[128];
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
     uint h = gid.x;
-    if (h >= n_heads_q) return;
+    if (h >= n_heads_q || pos >= max_seq_len) return;
 
     uint tid = gtid.x;
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
+    uint q_base = h * head_dim;
+    uint half_dim = head_dim / 2;
 
-    float q_d = asfloat(q.Load((h * head_dim + tid) * 4));
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
 
     float m = -1e30f;
     float l = 0.0f;
-    float acc = 0.0f;
-
-    uint pair_idx = tid / 2;
-    uint is_odd = tid & 1;
 
     for (uint t = 0; t <= pos; t++)
     {
-        uint kv_offset = (h_kv * max_seq_len + t) * (head_dim / 2) + pair_idx;
-        uint k_packed = k_cache[kv_offset];
-        uint v_packed = v_cache[kv_offset];
+        uint kv_base = (h_kv * max_seq_len + t) * half_dim;
+        float dot_part = 0.0f;
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                uint k_packed = k_cache[kv_base + (d >> 1)];
+                float k_d = ((d & 1) == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
+                dot_part += q_reg[c] * k_d;
+            }
+        }
 
-        float k_d = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
-        float v_d = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
-
-        s_red[tid] = q_d * k_d;
+        s_red[tid] = dot_part;
         GroupMemoryBarrierWithGroupSync();
 
         if (tid < 64) s_red[tid] += s_red[tid + 64];
@@ -428,15 +481,33 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         float alpha = exp(m - m_new);
         float w_t = exp(s_t - m_new);
 
-        acc = acc * alpha + w_t * v_d;
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                uint v_packed = v_cache[kv_base + (d >> 1)];
+                float v_d = ((d & 1) == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
+                acc[c] = acc[c] * alpha + w_t * v_d;
+            }
+        }
         l = l * alpha + w_t;
         m = m_new;
 
         GroupMemoryBarrierWithGroupSync();
     }
 
-    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
-    attn_out.Store((h * head_dim + tid) * 4, asuint(final_attn));
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
 }
 ";
 
@@ -444,6 +515,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 cbuffer Params : register(b0)
 {
     uint count;
+    uint vocab_size;
     float penalty;
 };
 
@@ -454,11 +526,11 @@ RWStructuredBuffer<float> logits : register(u0);
 void main(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= count) return;
-    int tid = recent_tokens[id.x];
-    if (tid >= 0)
+    int tokenId = recent_tokens[id.x];
+    if (tokenId >= 0 && (uint)tokenId < vocab_size)
     {
-        float val = logits[tid];
-        logits[tid] = (val > 0.0f) ? (val / penalty) : (val * penalty);
+        float val = logits[tokenId];
+        logits[tokenId] = (val > 0.0f) ? (val / penalty) : (val * penalty);
     }
 }
 ";
@@ -656,6 +728,7 @@ void main(uint3 id : SV_DispatchThreadID)
     uint t = id.x / total_per_token;
     uint local_id = id.x % total_per_token;
     uint pos = start_pos + t;
+    if (pos >= max_seq_len) return;
 
     uint h = local_id / head_dim;
     uint d = local_id % head_dim;
@@ -697,6 +770,7 @@ void main(uint3 id : SV_DispatchThreadID)
     uint t = id.x / total_per_token;
     uint local_id = id.x % total_per_token;
     uint pos = start_pos + t;
+    if (pos >= max_seq_len) return;
 
     uint h = local_id / half_dim;
     uint d_pair = local_id % half_dim;
@@ -750,13 +824,21 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
     uint pos_t = start_pos + t;
+    if (pos_t >= max_seq_len) return;
 
-    uint q_offset = (t * n_heads_q + h) * head_dim + tid;
-    float q_d = asfloat(q.Load(q_offset * 4));
+    uint q_base = (t * n_heads_q + h) * head_dim;
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
 
     float m = -1e30f;
     float l = 0.0f;
-    float acc = 0.0f;
 
     uint warp_id = tid / 32;
     uint lane_id = tid % 32;
@@ -764,33 +846,29 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     // Process historical tokens in sequence tiles of 4
     for (uint p = 0; p <= pos_t; p += 4)
     {
-        float k_val[4];
-        float v_val[4];
-
         [unroll]
         for (uint i = 0; i < 4; i++)
         {
             uint curr_p = p + i;
+            float dot_part = 0.0f;
             if (curr_p <= pos_t)
             {
-                uint kv_offset = (h_kv * max_seq_len + curr_p) * head_dim + tid;
-                k_val[i] = k_cache[kv_offset];
-                v_val[i] = v_cache[kv_offset];
-                s_red[i][tid] = q_d * k_val[i];
+                uint kv_base = (h_kv * max_seq_len + curr_p) * head_dim;
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        dot_part += q_reg[c] * k_cache[kv_base + d];
+                    }
+                }
             }
-            else
-            {
-                k_val[i] = 0.0f;
-                v_val[i] = 0.0f;
-                s_red[i][tid] = 0.0f;
-            }
+            s_red[i][tid] = dot_part;
         }
 
-        // Barrier 1: All 128 threads have written products into s_red
         GroupMemoryBarrierWithGroupSync();
 
-        // Stage 1: Warp-parallel reduction (Warp w reduces Score w)
-        // Lanes 0..7 sum 16 contiguous elements each (128 -> 8 elements in 15 ALU cycles)
         if (lane_id < 8)
         {
             float chunk_sum = 0.0f;
@@ -802,10 +880,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             s_red[warp_id][lane_id] = chunk_sum;
         }
 
-        // Barrier 2: 8 chunk sums written per warp
         GroupMemoryBarrierWithGroupSync();
 
-        // Stage 2: Lane 0 of each warp sums the 8 chunk sums
         if (lane_id == 0)
         {
             s_red[warp_id][0] = s_red[warp_id][0] + s_red[warp_id][1] +
@@ -814,10 +890,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                                 s_red[warp_id][6] + s_red[warp_id][7];
         }
 
-        // Barrier 3: Final dot products visible in s_red[0..3][0]
         GroupMemoryBarrierWithGroupSync();
 
-        // Online Softmax update across the tile
         [unroll]
         for (uint k = 0; k < 4; k++)
         {
@@ -830,20 +904,35 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                 float m_new = max(m, s_k);
                 float alpha = exp(m - m_new);
                 float w_k = exp(s_k - m_new);
+                uint kv_base = (h_kv * max_seq_len + curr_p) * head_dim;
 
-                acc = acc * alpha + w_k * v_val[k];
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        acc[c] = acc[c] * alpha + w_k * v_cache[kv_base + d];
+                    }
+                }
                 l = l * alpha + w_k;
                 m = m_new;
             }
         }
 
-        // Barrier 4: Synchronize before next tile overwrites s_red
         GroupMemoryBarrierWithGroupSync();
     }
 
-    uint out_offset = (t * n_heads_q + h) * head_dim + tid;
-    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
-    attn_out.Store(out_offset * 4, asuint(final_attn));
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
 }
 ";
 
@@ -883,51 +972,54 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
     uint pos_t = start_pos + t;
+    if (pos_t >= max_seq_len) return;
 
-    uint q_offset = (t * n_heads_q + h) * head_dim + tid;
-    float q_d = asfloat(q.Load(q_offset * 4));
+    uint q_base = (t * n_heads_q + h) * head_dim;
+    uint half_dim = head_dim / 2;
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
 
     float m = -1e30f;
     float l = 0.0f;
-    float acc = 0.0f;
 
-    uint pair_idx = tid / 2;
-    uint is_odd = tid & 1;
     uint warp_id = tid / 32;
     uint lane_id = tid % 32;
 
     // Process historical tokens in sequence tiles of 4
     for (uint p = 0; p <= pos_t; p += 4)
     {
-        float k_val[4];
-        float v_val[4];
-
         [unroll]
         for (uint i = 0; i < 4; i++)
         {
             uint curr_p = p + i;
+            float dot_part = 0.0f;
             if (curr_p <= pos_t)
             {
-                uint kv_offset = (h_kv * max_seq_len + curr_p) * (head_dim / 2) + pair_idx;
-                uint k_packed = k_cache[kv_offset];
-                uint v_packed = v_cache[kv_offset];
-
-                k_val[i] = (is_odd == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
-                v_val[i] = (is_odd == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
-                s_red[i][tid] = q_d * k_val[i];
+                uint kv_base = (h_kv * max_seq_len + curr_p) * half_dim;
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        uint pair_idx = d >> 1; uint k_packed = k_cache[kv_base + pair_idx];
+                        float k_d = ((d & 1) == 0) ? f16tof32(k_packed & 0xFFFF) : f16tof32(k_packed >> 16);
+                        dot_part += q_reg[c] * k_d;
+                    }
+                }
             }
-            else
-            {
-                k_val[i] = 0.0f;
-                v_val[i] = 0.0f;
-                s_red[i][tid] = 0.0f;
-            }
+            s_red[i][tid] = dot_part;
         }
 
-        // Barrier 1: All 128 threads have written products into s_red
         GroupMemoryBarrierWithGroupSync();
 
-        // Stage 1: Warp-parallel reduction (Warp w reduces Score w)
         if (lane_id < 8)
         {
             float chunk_sum = 0.0f;
@@ -939,10 +1031,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             s_red[warp_id][lane_id] = chunk_sum;
         }
 
-        // Barrier 2: 8 chunk sums written per warp
         GroupMemoryBarrierWithGroupSync();
 
-        // Stage 2: Lane 0 of each warp sums the 8 chunk sums
         if (lane_id == 0)
         {
             s_red[warp_id][0] = s_red[warp_id][0] + s_red[warp_id][1] +
@@ -951,10 +1041,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                                 s_red[warp_id][6] + s_red[warp_id][7];
         }
 
-        // Barrier 3: Final dot products visible in s_red[0..3][0]
         GroupMemoryBarrierWithGroupSync();
 
-        // Online Softmax update across the tile
         [unroll]
         for (uint k = 0; k < 4; k++)
         {
@@ -967,20 +1055,37 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                 float m_new = max(m, s_k);
                 float alpha = exp(m - m_new);
                 float w_k = exp(s_k - m_new);
+                uint kv_base = (h_kv * max_seq_len + curr_p) * half_dim;
 
-                acc = acc * alpha + w_k * v_val[k];
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        uint pair_idx = d >> 1; uint v_packed = v_cache[kv_base + pair_idx];
+                        float v_d = ((d & 1) == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
+                        acc[c] = acc[c] * alpha + w_k * v_d;
+                    }
+                }
                 l = l * alpha + w_k;
                 m = m_new;
             }
         }
 
-        // Barrier 4: Synchronize before next tile overwrites s_red
         GroupMemoryBarrierWithGroupSync();
     }
 
-    uint out_offset = (t * n_heads_q + h) * head_dim + tid;
-    float final_attn = (l > 0.0f) ? (acc / l) : 0.0f;
-    attn_out.Store(out_offset * 4, asuint(final_attn));
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
 }
 ";
 
@@ -998,7 +1103,7 @@ RWStructuredBuffer<uint> topk_indices : register(u1);
 RWStructuredBuffer<float> topk_weights : register(u2);
 
 groupshared float s_logits[256];
-groupshared float s_probs[256];
+groupshared float s_probs[512];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
@@ -1007,9 +1112,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (token_idx >= batch_size) return;
     uint tid = gtid.x;
 
+    uint safe_experts = min(num_experts, 512u);
+    uint safe_topk = min(top_k, safe_experts);
     uint logit_base = token_idx * num_experts;
-    float l = (tid < num_experts) ? logits[logit_base + tid] : -1e30f;
-    s_logits[tid] = l;
+
+    float thread_max = -1e30f;
+    for (uint e = tid; e < safe_experts; e += 256)
+    {
+        thread_max = max(thread_max, logits[logit_base + e]);
+    }
+    s_logits[tid] = thread_max;
     GroupMemoryBarrierWithGroupSync();
 
     [unroll]
@@ -1024,9 +1136,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     float max_logit = s_logits[0];
     GroupMemoryBarrierWithGroupSync();
 
-    float exp_val = (tid < num_experts) ? exp(l - max_logit) : 0.0f;
-    s_probs[tid] = exp_val;
-    s_logits[tid] = exp_val;
+    float thread_sum = 0.0f;
+    for (uint e2 = tid; e2 < safe_experts; e2 += 256)
+    {
+        float ev = exp(logits[logit_base + e2] - max_logit);
+        s_probs[e2] = ev;
+        thread_sum += ev;
+    }
+    s_logits[tid] = thread_sum;
     GroupMemoryBarrierWithGroupSync();
 
     [unroll]
@@ -1040,7 +1157,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     }
     float sum_exp = s_logits[0];
     float inv_sum = sum_exp > 0.0f ? (1.0f / sum_exp) : 0.0f;
-    s_probs[tid] = exp_val * inv_sum;
+    for (uint e3 = tid; e3 < safe_experts; e3 += 256)
+    {
+        s_probs[e3] *= inv_sum;
+    }
     GroupMemoryBarrierWithGroupSync();
 
     if (tid == 0)
@@ -1050,28 +1170,36 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 
         for (uint k = 0; k < top_k; k++)
         {
-            float best_val = -1.0f;
-            uint best_idx = 0;
-            for (uint e = 0; e < num_experts; e++)
+            if (k < safe_topk)
             {
-                if (s_probs[e] > best_val)
+                float best_val = -1.0f;
+                uint best_idx = 0;
+                for (uint ex = 0; ex < safe_experts; ex++)
                 {
-                    best_val = s_probs[e];
-                    best_idx = e;
+                    if (s_probs[ex] > best_val)
+                    {
+                        best_val = s_probs[ex];
+                        best_idx = ex;
+                    }
                 }
+                topk_indices[out_base + k] = best_idx;
+                topk_weights[out_base + k] = best_val;
+                sum_topk += best_val;
+                s_probs[best_idx] = -2.0f;
             }
-            topk_indices[out_base + k] = best_idx;
-            topk_weights[out_base + k] = best_val;
-            sum_topk += best_val;
-            s_probs[best_idx] = -2.0f;
+            else
+            {
+                topk_indices[out_base + k] = 0;
+                topk_weights[out_base + k] = 0.0f;
+            }
         }
 
         if (norm_top_k != 0 && sum_topk > 0.0f)
         {
             float inv_norm = 1.0f / sum_topk;
-            for (uint k = 0; k < top_k; k++)
+            for (uint k2 = 0; k2 < safe_topk; k2++)
             {
-                topk_weights[out_base + k] *= inv_norm;
+                topk_weights[out_base + k2] *= inv_norm;
             }
         }
     }

@@ -8,25 +8,28 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Sampling;
+using Glacier.Inference.Tokenizer;
 
 /// <summary>
 /// Speculative decoding engine delivering 1.5x - 3x autoregressive throughput acceleration.
 /// Coordinates draft proposal (via fast N-gram lookup or secondary draft model) with batched
-/// target model verification. The target model maintains 100% mathematical fidelity.
+/// target model verification using exact Leviathan et al. (2023) speculative rejection sampling.
 /// </summary>
 public sealed class SpeculativeEngine : IDisposable
 {
     private readonly ISpeculativeTarget _targetSession;
     private readonly IDraftProvider _draftProvider;
     private readonly bool _ownsDraftProvider;
+    private readonly Sampler _sampler;
     private bool _disposed;
 
     public ISpeculativeTarget TargetSession => _targetSession;
     public IDraftProvider DraftProvider => _draftProvider;
 
-    public SpeculativeEngine(ISpeculativeTarget targetSession, IDraftProvider? draftProvider = null)
+    public SpeculativeEngine(ISpeculativeTarget targetSession, IDraftProvider? draftProvider = null, int? seed = null)
     {
         _targetSession = targetSession ?? throw new ArgumentNullException(nameof(targetSession));
+        _sampler = new Sampler(seed);
         if (draftProvider != null)
         {
             _draftProvider = draftProvider;
@@ -40,7 +43,7 @@ public sealed class SpeculativeEngine : IDisposable
     }
 
     /// <summary>
-    /// Generates text using speculative decoding with real-time token streaming callback.
+    /// Generates text using speculative decoding with real-time stateful UTF-8 token streaming.
     /// </summary>
     public async Task<SpeculativeGenerationResult> GenerateAsync(
         string prompt,
@@ -50,6 +53,9 @@ public sealed class SpeculativeEngine : IDisposable
         CancellationToken ct = default)
     {
         options ??= new SpeculativeOptions();
+        var sampling = options.Sampling;
+
+        _draftProvider.Reset();
 
         // 1. Format and tokenize prompt
         string formattedPrompt = formatChat ? _targetSession.Tokenizer.FormatChatML(prompt) : prompt;
@@ -66,6 +72,21 @@ public sealed class SpeculativeEngine : IDisposable
             };
         }
 
+        if (options.MaxTokens <= 0)
+        {
+            return new SpeculativeGenerationResult
+            {
+                Text = "",
+                FinishReason = "length",
+                Metrics = new GenerationMetrics
+                {
+                    PromptTokens = promptTokens.Length,
+                    GeneratedTokens = 0
+                },
+                SpeculativeMetrics = new SpeculativeMetrics()
+            };
+        }
+
         var totalStopwatch = Stopwatch.StartNew();
         var promptStopwatch = Stopwatch.StartNew();
 
@@ -74,7 +95,7 @@ public sealed class SpeculativeEngine : IDisposable
         promptStopwatch.Stop();
 
         // 3. Generate first token from prompt prefill
-        int firstToken = _targetSession.SampleNextToken(options.Sampling);
+        int firstToken = _targetSession.SampleNextToken(sampling);
 
         var genStopwatch = Stopwatch.StartNew();
         var allTokens = new List<int>(promptTokens.Length + options.MaxTokens + 16);
@@ -105,15 +126,16 @@ public sealed class SpeculativeEngine : IDisposable
             };
         }
 
+        var utf8Decoder = Encoding.UTF8.GetDecoder();
+        char[] charBuf = new char[128];
+
         // Accept first token
         allTokens.Add(firstToken);
         generatedTokens.Add(firstToken);
-        string firstPiece = _targetSession.Tokenizer.DecodeToken(firstToken);
-        responseSb.Append(firstPiece);
-        onToken?.Invoke(firstPiece);
+        EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, firstToken, responseSb, onToken);
 
         int maxSeq = _targetSession.MaxSeqLen;
-        int currentPos = promptTokens.Length; // position where firstToken was evaluated / next pending token position
+        int currentPos = promptTokens.Length;
         int pendingToken = firstToken;
 
         int draftTokensProposed = 0;
@@ -121,20 +143,55 @@ public sealed class SpeculativeEngine : IDisposable
         int speculativeSteps = 0;
         int serialFallbackSteps = 0;
 
-        int[] draftBuf = new int[options.MaxDraftTokens];
-        int[] verifyBatch = new int[options.MaxDraftTokens + 1];
-        int[] predictions = new int[options.MaxDraftTokens + 1];
+        bool isGreedy = sampling.Temperature <= Sampler.GreedyTemperatureThreshold || sampling.TopK == 1;
+        bool useLeviathanRejection = !isGreedy && _targetSession.SupportsLogitVerification;
+        int vocabSize = useLeviathanRejection ? _targetSession.VocabSize : 0;
+
+        int maxDraftCfg = Math.Max(0, options.MaxDraftTokens);
+        int[] draftBuf = new int[Math.Max(1, maxDraftCfg)];
+        int[] verifyBatch = new int[maxDraftCfg + 1];
+        int[] predictions = new int[maxDraftCfg + 1];
+
+        float[]? draftProbs = useLeviathanRejection && maxDraftCfg > 0 ? new float[maxDraftCfg * vocabSize] : null;
+        float[]? targetBatchLogits = useLeviathanRejection ? new float[(maxDraftCfg + 1) * vocabSize] : null;
+        float[]? targetProbs = useLeviathanRejection ? new float[vocabSize] : null;
+        float[]? residualProbs = useLeviathanRejection ? new float[vocabSize] : null;
+
+        long ssmStateBytes = _targetSession.StateSnapshotBytes;
+        byte[]? ssmSnapshot = ssmStateBytes > 0 ? new byte[ssmStateBytes] : null;
 
         // 4. Main Speculative Decoding Loop
-        while (generatedTokens.Count < options.MaxTokens && currentPos < maxSeq - (options.MaxDraftTokens + 1))
+        while (generatedTokens.Count < options.MaxTokens && (_targetSession.IsRingBufferEnabled || currentPos < maxSeq))
         {
             ct.ThrowIfCancellationRequested();
 
-            // Propose candidate tokens from draft provider
-            int draftedCount = _draftProvider.Draft(
-                CollectionsMarshal.AsSpan(allTokens),
-                options.MaxDraftTokens,
-                draftBuf);
+            int maxDraftThisStep = (_targetSession.IsRingBufferEnabled || _targetSession.HasUnsnapshottableRecurrentState)
+                ? 0
+                : Math.Min(maxDraftCfg, maxSeq - currentPos - 1);
+
+            int draftedCount = 0;
+            if (maxDraftThisStep > 0)
+            {
+                if (useLeviathanRejection)
+                {
+                    draftedCount = _draftProvider.DraftWithProbabilities(
+                        CollectionsMarshal.AsSpan(allTokens),
+                        CollectionsMarshal.AsSpan(generatedTokens),
+                        maxDraftThisStep,
+                        sampling,
+                        _sampler,
+                        vocabSize,
+                        draftBuf,
+                        draftProbs.AsSpan());
+                }
+                else
+                {
+                    draftedCount = _draftProvider.Draft(
+                        CollectionsMarshal.AsSpan(allTokens),
+                        maxDraftThisStep,
+                        draftBuf);
+                }
+            }
 
             if (draftedCount <= 0)
             {
@@ -143,7 +200,7 @@ public sealed class SpeculativeEngine : IDisposable
                 _targetSession.ForwardToken(pendingToken, currentPos, computeLogits: true);
                 currentPos++;
 
-                int nextToken = _targetSession.SampleNextToken(options.Sampling, CollectionsMarshal.AsSpan(generatedTokens));
+                int nextToken = _targetSession.SampleNextToken(sampling, CollectionsMarshal.AsSpan(generatedTokens));
                 allTokens.Add(nextToken);
                 generatedTokens.Add(nextToken);
                 pendingToken = nextToken;
@@ -154,107 +211,216 @@ public sealed class SpeculativeEngine : IDisposable
                     break;
                 }
 
-                string piece = _targetSession.Tokenizer.DecodeToken(nextToken);
-                responseSb.Append(piece);
-                onToken?.Invoke(piece);
+                EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, nextToken, responseSb, onToken);
             }
             else
             {
-                // Speculative verification step
                 speculativeSteps++;
                 draftTokensProposed += draftedCount;
 
-                // Build verification batch: [pendingToken, draftBuf[0], ..., draftBuf[draftedCount-1]]
                 verifyBatch[0] = pendingToken;
                 for (int i = 0; i < draftedCount; i++)
                 {
                     verifyBatch[i + 1] = draftBuf[i];
                 }
 
-                int batchLen = draftedCount + 1;
-                _targetSession.VerifyBatch(
-                    verifyBatch.AsSpan(0, batchLen),
-                    currentPos,
-                    predictions.AsSpan(0, batchLen));
+                if (ssmSnapshot != null)
+                {
+                    _targetSession.SaveRecurrentState(ssmSnapshot);
+                }
 
-                // Verify candidates sequentially
+                int batchLen = draftedCount + 1;
                 int acceptedInStep = 0;
                 bool stopped = false;
 
-                for (int i = 0; i < draftedCount; i++)
+                if (useLeviathanRejection)
                 {
-                    int candidate = draftBuf[i];
-                    int targetPrediction = predictions[i];
+                    _targetSession.VerifyBatchLogits(
+                        verifyBatch.AsSpan(0, batchLen),
+                        currentPos,
+                        targetBatchLogits.AsSpan(0, batchLen * vocabSize));
 
-                    if (candidate == targetPrediction)
+                    for (int i = 0; i < draftedCount; i++)
                     {
-                        // Accepted!
-                        acceptedInStep++;
-                        allTokens.Add(candidate);
-                        generatedTokens.Add(candidate);
+                        int candidate = draftBuf[i];
+                        ReadOnlySpan<float> rawTargetLogits = targetBatchLogits.AsSpan(i * vocabSize, vocabSize);
+                        Sampler.ComputeFilteredDistribution(
+                            rawTargetLogits,
+                            sampling,
+                            CollectionsMarshal.AsSpan(generatedTokens),
+                            targetProbs.AsSpan());
 
-                        if (IsEos(candidate))
+                        ReadOnlySpan<float> qRow = draftProbs.AsSpan(i * vocabSize, vocabSize);
+                        float pCandidate = (uint)candidate < (uint)vocabSize ? targetProbs![candidate] : 0f;
+                        float qCandidate = (uint)candidate < (uint)vocabSize ? qRow[candidate] : 0f;
+
+                        bool accept;
+                        if (qCandidate <= 0f)
                         {
-                            stopped = true;
-                            finishReason = "stop";
-                            break;
+                            accept = false;
                         }
-
-                        string piece = _targetSession.Tokenizer.DecodeToken(candidate);
-                        responseSb.Append(piece);
-                        onToken?.Invoke(piece);
-
-                        if (generatedTokens.Count >= options.MaxTokens)
+                        else if (pCandidate >= qCandidate)
                         {
-                            stopped = true;
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        // Rejection: emit target correction
-                        allTokens.Add(targetPrediction);
-                        generatedTokens.Add(targetPrediction);
-                        pendingToken = targetPrediction;
-                        currentPos += (i + 1);
-
-                        if (IsEos(targetPrediction))
-                        {
-                            stopped = true;
-                            finishReason = "stop";
+                            accept = true;
                         }
                         else
                         {
-                            string piece = _targetSession.Tokenizer.DecodeToken(targetPrediction);
-                            responseSb.Append(piece);
-                            onToken?.Invoke(piece);
+                            accept = _sampler.Rng.NextDouble() < (pCandidate / qCandidate);
                         }
 
-                        stopped = true;
-                        break;
+                        if (accept)
+                        {
+                            acceptedInStep++;
+                            allTokens.Add(candidate);
+                            generatedTokens.Add(candidate);
+
+                            if (IsEos(candidate))
+                            {
+                                stopped = true;
+                                finishReason = "stop";
+                                break;
+                            }
+
+                            EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, candidate, responseSb, onToken);
+
+                            if (generatedTokens.Count >= options.MaxTokens)
+                            {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            int correctionToken = SampleResidualDistribution(targetProbs!, qRow, residualProbs!, _sampler.Rng);
+                            allTokens.Add(correctionToken);
+                            generatedTokens.Add(correctionToken);
+
+                            if (ssmSnapshot != null)
+                            {
+                                RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
+                            }
+
+                            pendingToken = correctionToken;
+                            currentPos += (i + 1);
+
+                            if (IsEos(correctionToken))
+                            {
+                                finishReason = "stop";
+                            }
+                            else
+                            {
+                                EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, correctionToken, responseSb, onToken);
+                            }
+
+                            stopped = true;
+                            break;
+                        }
+                    }
+
+                    draftTokensAccepted += acceptedInStep;
+
+                    if (!stopped && acceptedInStep == draftedCount)
+                    {
+                        ReadOnlySpan<float> bonusLogits = targetBatchLogits.AsSpan(draftedCount * vocabSize, vocabSize);
+                        Sampler.ComputeFilteredDistribution(
+                            bonusLogits,
+                            sampling,
+                            CollectionsMarshal.AsSpan(generatedTokens),
+                            targetProbs.AsSpan());
+                        int bonusToken = Sampler.SampleFromDistribution(targetProbs!, _sampler.Rng);
+
+                        allTokens.Add(bonusToken);
+                        generatedTokens.Add(bonusToken);
+                        pendingToken = bonusToken;
+                        currentPos += (draftedCount + 1);
+
+                        if (IsEos(bonusToken))
+                        {
+                            finishReason = "stop";
+                            break;
+                        }
+
+                        EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
                     }
                 }
-
-                draftTokensAccepted += acceptedInStep;
-
-                if (!stopped && acceptedInStep == draftedCount)
+                else
                 {
-                    // All draft candidates accepted! Emit the bonus token predicted after the last candidate
-                    int bonusToken = predictions[draftedCount];
-                    allTokens.Add(bonusToken);
-                    generatedTokens.Add(bonusToken);
-                    pendingToken = bonusToken;
-                    currentPos += (draftedCount + 1);
+                    _targetSession.VerifyBatch(
+                        verifyBatch.AsSpan(0, batchLen),
+                        currentPos,
+                        predictions.AsSpan(0, batchLen));
 
-                    if (IsEos(bonusToken))
+                    for (int i = 0; i < draftedCount; i++)
                     {
-                        finishReason = "stop";
-                        break;
+                        int candidate = draftBuf[i];
+                        int targetPrediction = predictions[i];
+
+                        if (candidate == targetPrediction)
+                        {
+                            acceptedInStep++;
+                            allTokens.Add(candidate);
+                            generatedTokens.Add(candidate);
+
+                            if (IsEos(candidate))
+                            {
+                                stopped = true;
+                                finishReason = "stop";
+                                break;
+                            }
+
+                            EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, candidate, responseSb, onToken);
+
+                            if (generatedTokens.Count >= options.MaxTokens)
+                            {
+                                stopped = true;
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            allTokens.Add(targetPrediction);
+                            generatedTokens.Add(targetPrediction);
+
+                            if (ssmSnapshot != null)
+                            {
+                                RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
+                            }
+
+                            pendingToken = targetPrediction;
+                            currentPos += (i + 1);
+
+                            if (IsEos(targetPrediction))
+                            {
+                                finishReason = "stop";
+                            }
+                            else
+                            {
+                                EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, targetPrediction, responseSb, onToken);
+                            }
+
+                            stopped = true;
+                            break;
+                        }
                     }
 
-                    string piece = _targetSession.Tokenizer.DecodeToken(bonusToken);
-                    responseSb.Append(piece);
-                    onToken?.Invoke(piece);
+                    draftTokensAccepted += acceptedInStep;
+
+                    if (!stopped && acceptedInStep == draftedCount)
+                    {
+                        int bonusToken = predictions[draftedCount];
+                        allTokens.Add(bonusToken);
+                        generatedTokens.Add(bonusToken);
+                        pendingToken = bonusToken;
+                        currentPos += (draftedCount + 1);
+
+                        if (IsEos(bonusToken))
+                        {
+                            finishReason = "stop";
+                            break;
+                        }
+
+                        EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
+                    }
                 }
 
                 if (finishReason == "stop")
@@ -263,11 +429,18 @@ public sealed class SpeculativeEngine : IDisposable
                 }
             }
 
-            // Yield control periodically
             if ((generatedTokens.Count & 15) == 0)
             {
                 await Task.Yield();
             }
+        }
+
+        int flushChars = utf8Decoder.GetChars(Array.Empty<byte>(), 0, 0, charBuf, 0, flush: true);
+        if (flushChars > 0)
+        {
+            string piece = new string(charBuf, 0, flushChars);
+            responseSb.Append(piece);
+            onToken?.Invoke(piece);
         }
 
         genStopwatch.Stop();
@@ -294,6 +467,83 @@ public sealed class SpeculativeEngine : IDisposable
                 SerialFallbackSteps = serialFallbackSteps
             }
         };
+    }
+
+    private void RollbackAndReplayRecurrentState(byte[] ssmSnapshot, int[] verifyBatch, int basePos, int acceptedDrafts)
+    {
+        _targetSession.RestoreRecurrentState(ssmSnapshot);
+        for (int r = 0; r <= acceptedDrafts; r++)
+        {
+            _targetSession.ForwardToken(verifyBatch[r], basePos + r, computeLogits: false);
+        }
+    }
+
+    private static int SampleResidualDistribution(
+        ReadOnlySpan<float> p,
+        ReadOnlySpan<float> q,
+        Span<float> residualScratch,
+        Random rng)
+    {
+        int n = p.Length;
+        float sumResidual = 0f;
+        for (int v = 0; v < n; v++)
+        {
+            float diff = p[v] - q[v];
+            if (diff > 0f)
+            {
+                residualScratch[v] = diff;
+                sumResidual += diff;
+            }
+            else
+            {
+                residualScratch[v] = 0f;
+            }
+        }
+
+        if (!(sumResidual > 1e-12f) || !float.IsFinite(sumResidual))
+        {
+            return Sampler.SampleFromDistribution(p, rng);
+        }
+
+        float r = (float)rng.NextDouble() * sumResidual;
+        float acc = 0f;
+        int lastPositive = 0;
+        for (int v = 0; v < n; v++)
+        {
+            float w = residualScratch[v];
+            if (w <= 0f) continue;
+            lastPositive = v;
+            acc += w;
+            if (r <= acc)
+            {
+                return v;
+            }
+        }
+        return lastPositive;
+    }
+
+    private static void EmitTokenUtf8(
+        BpeTokenizer tokenizer,
+        Decoder utf8Decoder,
+        ref char[] charBuf,
+        int token,
+        StringBuilder responseSb,
+        Action<string>? onToken)
+    {
+        byte[] tokenBytes = tokenizer.GetTokenBytes(token);
+        int maxChars = Encoding.UTF8.GetMaxCharCount(tokenBytes.Length);
+        if (charBuf.Length < maxChars)
+        {
+            charBuf = new char[maxChars];
+        }
+
+        int charsDecoded = utf8Decoder.GetChars(tokenBytes, 0, tokenBytes.Length, charBuf, 0, flush: false);
+        if (charsDecoded > 0)
+        {
+            string piece = new string(charBuf, 0, charsDecoded);
+            responseSb.Append(piece);
+            onToken?.Invoke(piece);
+        }
     }
 
     private bool IsEos(int token)

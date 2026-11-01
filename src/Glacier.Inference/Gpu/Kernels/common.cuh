@@ -126,3 +126,26 @@ __device__ __forceinline__ float block_reduce_sum_128(float val, float* s_warp_m
     __syncthreads();
     return s_warp_mem[0];
 }
+
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    __shared__ float s_warp_sum[32];
+    int lane = threadIdx.x & 31;
+    int wid = threadIdx.x >> 5;
+    int num_warps = (blockDim.x + 31) >> 5;
+    val = warp_reduce_sum(val);
+    if (lane == 0) {
+        s_warp_sum[wid] = val;
+    }
+    __syncthreads();
+    float block_sum = (threadIdx.x < num_warps) ? s_warp_sum[threadIdx.x] : 0.0f;
+    if (wid == 0) {
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) {
+            s_warp_sum[0] = block_sum;
+        }
+    }
+    __syncthreads();
+    float res = s_warp_sum[0];
+    __syncthreads();
+    return res;
+}

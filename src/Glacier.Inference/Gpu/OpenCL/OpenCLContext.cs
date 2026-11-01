@@ -1,12 +1,15 @@
 namespace Glacier.Inference.Gpu.OpenCL;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// High-level OpenCL context for mobile and desktop GPU acceleration (Qualcomm Adreno, ARM Mali, Intel, AMD, NVIDIA).
+/// Experimental OpenCL context wrapper for mobile and desktop GPU buffer/kernel management.
+/// Note: Model inference pipelines do not yet dispatch through OpenCL.
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed unsafe class OpenCLContext : IDisposable
 {
     private IntPtr _platform;
@@ -50,17 +53,21 @@ public sealed unsafe class OpenCLContext : IDisposable
 
         // Query GPU device
         uint numDevices = 0;
-        err = OpenCLDriver.clGetDeviceIDs(_platform, OpenCLDriver.CL_DEVICE_TYPE_GPU, 0, null, &numDevices);
+        ulong selectedDeviceType = OpenCLDriver.CL_DEVICE_TYPE_GPU;
+        err = OpenCLDriver.clGetDeviceIDs(_platform, selectedDeviceType, 0, null, &numDevices);
         if (err != OpenCLDriver.CL_SUCCESS || numDevices == 0)
         {
             // Fallback to any device
-            err = OpenCLDriver.clGetDeviceIDs(_platform, 0xFFFFFFFF, 0, null, &numDevices);
+            selectedDeviceType = 0xFFFFFFFF; // CL_DEVICE_TYPE_ALL
+            err = OpenCLDriver.clGetDeviceIDs(_platform, selectedDeviceType, 0, null, &numDevices);
             if (err != OpenCLDriver.CL_SUCCESS || numDevices == 0)
                 throw new PlatformNotSupportedException("No OpenCL devices found.");
         }
 
         var devices = stackalloc IntPtr[(int)numDevices];
-        OpenCLDriver.clGetDeviceIDs(_platform, OpenCLDriver.CL_DEVICE_TYPE_GPU, numDevices, devices, null);
+        err = OpenCLDriver.clGetDeviceIDs(_platform, selectedDeviceType, numDevices, devices, null);
+        if (err != OpenCLDriver.CL_SUCCESS || devices[0] == IntPtr.Zero)
+            throw new PlatformNotSupportedException($"OpenCL device enumeration failed: error {err}");
         _device = devices[0];
 
         // Device Name

@@ -80,6 +80,7 @@ public sealed class CpuPipelineStage : IPipelineStage
     public void ResetKvCache()
     {
         _kvCache.Reset();
+        _model.ResetState();
     }
 
     public void Dispose()

@@ -235,6 +235,46 @@ public sealed unsafe class D3D12Context : IDisposable
         }
     }
 
+    public void ZeroDeviceBuffer(ID3D12Resource deviceBuffer, ResourceStates currentState = ResourceStates.Common)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (deviceBuffer == null) return;
+
+        ulong sizeInBytes = deviceBuffer.Description.Width;
+        if (sizeInBytes == 0) return;
+
+        ulong clearBytes = Math.Min(sizeInBytes, StagingUploadBufferSize);
+        void* pUpload = null;
+        _stagingUploadBuffer.Map(0, null, &pUpload);
+        NativeMemory.Clear(pUpload, (nuint)clearBytes);
+        _stagingUploadBuffer.Unmap(0);
+
+        ulong offset = 0;
+        while (offset < sizeInBytes)
+        {
+            ulong chunkSize = Math.Min(sizeInBytes - offset, StagingUploadBufferSize);
+
+            _cmdAlloc.Reset();
+            _cmdList.Reset(_cmdAlloc, null);
+
+            if (currentState != ResourceStates.CopyDest)
+            {
+                _cmdList.ResourceBarrierTransition(deviceBuffer, currentState, ResourceStates.CopyDest);
+            }
+            _cmdList.CopyBufferRegion(deviceBuffer, offset, _stagingUploadBuffer, 0, chunkSize);
+            if (currentState != ResourceStates.CopyDest)
+            {
+                _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.CopyDest, currentState);
+            }
+
+            _cmdList.Close();
+            _queue.ExecuteCommandList(_cmdList);
+            Synchronize();
+
+            offset += chunkSize;
+        }
+    }
+
     public void CopyToHost(Span<byte> hostData, ID3D12Resource deviceBuffer, ulong sizeInBytes)
     {
         fixed (byte* pHost = hostData)
@@ -370,6 +410,13 @@ public sealed unsafe class D3D12Context : IDisposable
     private ID3D12RootSignature? _sigMoeRouterSoftmaxTopK;
     private ID3D12PipelineState? _psoMoeRouterSoftmaxTopK;
 
+    private ID3D12RootSignature? _sigRepetitionPenalty;
+    private ID3D12PipelineState? _psoRepetitionPenalty;
+    private ID3D12Resource? _recentTokensUploadBuffer;
+
+    private ID3D12RootSignature? _sigRmsNormHeads;
+    private ID3D12PipelineState? _psoRmsNormHeads;
+
     private ID3D12RootSignature? _sigMoeSharedExpertGate;
     private ID3D12PipelineState? _psoMoeSharedExpertGate;
 
@@ -474,6 +521,116 @@ public sealed unsafe class D3D12Context : IDisposable
         cmdList.SetComputeRootUnorderedAccessView(3, dTopKWeights.GPUVirtualAddress);
 
         cmdList.Dispatch((uint)batchSize, 1, 1);
+    }
+
+    public void DispatchRmsNormHeads(
+        ID3D12Resource dX,
+        ID3D12Resource dWeight,
+        int nHeads,
+        int headDim,
+        float eps)
+    {
+        if (nHeads <= 0 || headDim <= 0) return;
+
+        if (_psoRmsNormHeads == null)
+        {
+            var rmsHeadsParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 3), ShaderVisibility.All),
+                new(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All)
+            };
+            _sigRmsNormHeads = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, rmsHeadsParams));
+            _psoRmsNormHeads = CreatePipelineState(_sigRmsNormHeads, CompileShader(D3D12Shaders.RmsNormHeads));
+        }
+
+        _cmdList.SetComputeRootSignature(_sigRmsNormHeads!);
+        _cmdList.SetPipelineState(_psoRmsNormHeads!);
+
+        uint* pConsts = stackalloc uint[3];
+        pConsts[0] = (uint)headDim;
+        pConsts[1] = (uint)nHeads;
+        pConsts[2] = BitConverter.SingleToUInt32Bits(eps);
+        _cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
+
+        _cmdList.SetComputeRootShaderResourceView(1, dWeight.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(2, dX.GPUVirtualAddress);
+
+        _cmdList.Dispatch((uint)nHeads, 1, 1);
+    }
+
+    /// <summary>
+    /// Deduplicates <paramref name="recentTokens"/> on the host and dispatches <see cref="D3D12Shaders.RepetitionPenalty"/>
+    /// with vocabulary bounds validation on the GPU.
+    /// </summary>
+    public void DispatchRepetitionPenalty(
+        ID3D12Resource dLogits,
+        int vocabSize,
+        ReadOnlySpan<int> recentTokens,
+        float penalty)
+    {
+        if (penalty == 1.0f || recentTokens.IsEmpty || vocabSize <= 0) return;
+
+        if (_psoRepetitionPenalty == null)
+        {
+            var repParams = new RootParameter[]
+            {
+                new(new RootConstants(0, 0, 3), ShaderVisibility.All),
+                new(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
+                new(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All)
+            };
+            _sigRepetitionPenalty = CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, repParams));
+            _psoRepetitionPenalty = CreatePipelineState(_sigRepetitionPenalty, CompileShader(D3D12Shaders.RepetitionPenalty));
+        }
+
+        const int maxPenaltyTokens = 1024;
+        _recentTokensUploadBuffer ??= CreateUploadBuffer((ulong)(maxPenaltyTokens * sizeof(int)));
+
+        int sliceStart = Math.Max(0, recentTokens.Length - maxPenaltyTokens);
+        ReadOnlySpan<int> window = recentTokens.Slice(sliceStart);
+
+        int* uniqueBuf = stackalloc int[maxPenaltyTokens];
+        int count = 0;
+        for (int i = 0; i < window.Length && count < maxPenaltyTokens; i++)
+        {
+            int tok = window[i];
+            if ((uint)tok >= (uint)vocabSize) continue;
+            bool seen = false;
+            for (int j = 0; j < count; j++)
+            {
+                if (uniqueBuf[j] == tok)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen)
+            {
+                uniqueBuf[count++] = tok;
+            }
+        }
+
+        if (count == 0) return;
+
+        void* pUpload = null;
+        _recentTokensUploadBuffer.Map(0, null, &pUpload);
+        Buffer.MemoryCopy(uniqueBuf, pUpload, (ulong)(maxPenaltyTokens * sizeof(int)), (ulong)(count * sizeof(int)));
+        _recentTokensUploadBuffer.Unmap(0);
+
+        _cmdList.SetComputeRootSignature(_sigRepetitionPenalty!);
+        _cmdList.SetPipelineState(_psoRepetitionPenalty!);
+
+        uint* pConsts = stackalloc uint[3];
+        pConsts[0] = (uint)count;
+        pConsts[1] = (uint)vocabSize;
+        pConsts[2] = BitConverter.SingleToUInt32Bits(penalty);
+        _cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
+
+        _cmdList.SetComputeRootShaderResourceView(1, _recentTokensUploadBuffer.GPUVirtualAddress);
+        _cmdList.SetComputeRootUnorderedAccessView(2, dLogits.GPUVirtualAddress);
+
+        uint groups = (uint)((count + 63) / 64);
+        _cmdList.Dispatch(groups, 1, 1);
     }
 
     public void DispatchMoeSharedExpertGate(
@@ -686,6 +843,11 @@ public sealed unsafe class D3D12Context : IDisposable
 
             _psoMoeRouterSoftmaxTopK?.Dispose();
             _sigMoeRouterSoftmaxTopK?.Dispose();
+            _psoRepetitionPenalty?.Dispose();
+            _sigRepetitionPenalty?.Dispose();
+            _recentTokensUploadBuffer?.Dispose();
+            _psoRmsNormHeads?.Dispose();
+            _sigRmsNormHeads?.Dispose();
             _psoMoeSharedExpertGate?.Dispose();
             _sigMoeSharedExpertGate?.Dispose();
             _psoVecAddWeightedFromBuffer?.Dispose();

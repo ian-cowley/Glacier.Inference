@@ -828,6 +828,11 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     /// </summary>
     public void ResetKvCache()
     {
-        // Direct3D 12 KV cache writes directly overwrite entries by token position.
+        if (_disposed) return;
+        for (int l = 0; l < LayerCount; l++)
+        {
+            if (_dKeyCache[l] != null) _ctx.ZeroDeviceBuffer(_dKeyCache[l], ResourceStates.Common);
+            if (_dValCache[l] != null) _ctx.ZeroDeviceBuffer(_dValCache[l], ResourceStates.Common);
+        }
     }
 }

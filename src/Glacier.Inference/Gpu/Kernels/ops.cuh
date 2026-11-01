@@ -177,6 +177,7 @@ __global__ void kv_cache_store_kernel(
     int max_seq_len,
     int pos
 ) {
+    if (pos < 0 || pos >= max_seq_len) return;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n_heads_kv * head_dim;
     if (idx >= total) return;
@@ -202,6 +203,7 @@ __global__ void kv_cache_store_f16(
     int max_seq_len,
     int pos
 ) {
+    if (pos < 0 || pos >= max_seq_len) return;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n_heads_kv * head_dim;
     if (idx >= total) return;
@@ -227,6 +229,7 @@ __global__ void kv_cache_store_fp8(
     int max_seq_len,
     int pos
 ) {
+    if (pos < 0 || pos >= max_seq_len) return;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n_heads_kv * head_dim;
     if (idx >= total) return;
@@ -378,6 +381,7 @@ __global__ void kv_cache_store_batch(
     int h = sub_idx / head_dim;
     int d = sub_idx % head_dim;
     int pos = start_pos + t;
+    if (pos < 0 || pos >= max_seq_len) return;
 
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = k[idx];
@@ -408,6 +412,7 @@ __global__ void kv_cache_store_batch_f16(
     int h = sub_idx / head_dim;
     int d = sub_idx % head_dim;
     int pos = start_pos + t;
+    if (pos < 0 || pos >= max_seq_len) return;
 
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = __float2half(k[idx]);
@@ -438,10 +443,97 @@ __global__ void kv_cache_store_batch_fp8(
     int h = sub_idx / head_dim;
     int d = sub_idx % head_dim;
     int pos = start_pos + t;
+    if (pos < 0 || pos >= max_seq_len) return;
 
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = __nv_fp8_e4m3(k[idx]);
     v_cache[offset] = __nv_fp8_e4m3(v[idx]);
+}
+
+// =========================================================================
+// 17d. PagedAttention FP16 KV Cache Store Kernel (Single-Token)
+// Pool layout: [num_blocks, num_layers, n_heads_kv, block_size, dim]
+// =========================================================================
+__global__ void paged_kv_cache_store_f16_kernel(
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    half* __restrict__ k_pool,
+    half* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int pos,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (pos < 0 || block_size <= 0) return;
+    int max_dim = (head_dim > v_head_dim) ? head_dim : v_head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads_kv * max_dim;
+    if (idx >= total) return;
+
+    int h = idx / max_dim;
+    int d = idx % max_dim;
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+    if (d < head_dim) {
+        k_pool[head_slot * head_dim + d] = __float2half(k[(size_t)h * head_dim + d]);
+    }
+    if (d < v_head_dim) {
+        v_pool[head_slot * v_head_dim + d] = __float2half(v[(size_t)h * v_head_dim + d]);
+    }
+}
+
+// =========================================================================
+// 17e. PagedAttention FP16 KV Cache Store Kernel (Batched Prefill)
+// =========================================================================
+__global__ void paged_kv_cache_store_batch_f16_kernel(
+    const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch,
+    half* __restrict__ k_pool,
+    half* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int start_pos,
+    int batch_size,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (batch_size <= 0 || block_size <= 0) return;
+    int max_dim = (head_dim > v_head_dim) ? head_dim : v_head_dim;
+    int per_token = n_heads_kv * max_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * per_token;
+    if (idx >= total) return;
+
+    int t = idx / per_token;
+    int rem = idx % per_token;
+    int h = rem / max_dim;
+    int d = rem % max_dim;
+    int pos = start_pos + t;
+    if (pos < 0) return;
+
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+    if (d < head_dim) {
+        k_pool[head_slot * head_dim + d] = __float2half(k_batch[((size_t)t * n_heads_kv + h) * head_dim + d]);
+    }
+    if (d < v_head_dim) {
+        v_pool[head_slot * v_head_dim + d] = __float2half(v_batch[((size_t)t * n_heads_kv + h) * v_head_dim + d]);
+    }
 }
 
 // =========================================================================
@@ -520,12 +612,13 @@ __global__ void apply_repetition_penalty_kernel(
     float* __restrict__ logits,
     const int* __restrict__ recent_tokens,
     int count,
+    int vocab_size,
     float penalty
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
     int tid = recent_tokens[idx];
-    if (tid >= 0) {
+    if (tid >= 0 && tid < vocab_size) {
         float val = logits[tid];
         logits[tid] = (val > 0.0f) ? (val / penalty) : (val * penalty);
     }

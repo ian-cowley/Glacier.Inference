@@ -22,5 +22,5 @@ public interface ID3D12Model : IDisposable
             ForwardStage(tokens[i], startPos + i, inSlice, outSlice, isLast && computeLogits ? logits : Span<float>.Empty, isLast && computeLogits);
         }
     }
-    void ResetKvCache() { }
+    void ResetKvCache();
 }

@@ -62,4 +62,15 @@ generate_*.py
 scratch_*.py
 flux_tensors.txt
 latents_dump.bin
+*_prompt_embeds*.bin
+*_neg_embeds*.bin
+
+# Secrets & environment configuration
+appsettings*.json
+!appsettings.template.json
+*.env*
+*.key
+*.pem
+secrets*.json
+
 

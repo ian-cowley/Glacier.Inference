@@ -1,14 +1,16 @@
 namespace Glacier.Inference.Audio;
 
 using System;
-using System.IO;
+using System.Diagnostics.CodeAnalysis;
 
 /// <summary>
-/// Full-duplex conversational voice pipeline linking Whisper STT and Kokoro TTS.
-/// Provides sub-100ms turnaround for voice-to-voice interaction.
+/// Experimental conversational voice pipeline linking Whisper STT (requires pretrained weights)
+/// and procedural formant TTS (<see cref="KokoroTtsEngine"/>).
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class VoicePipeline : IDisposable
 {
+#pragma warning disable GLACIER_EXP001
     private readonly WhisperEngine _stt;
     private readonly KokoroTtsEngine _tts;
     private bool _disposed;
@@ -29,9 +31,10 @@ public sealed class VoicePipeline : IDisposable
     {
         return _stt.Transcribe(audio16kHz);
     }
+#pragma warning restore GLACIER_EXP001
 
     /// <summary>
-    /// Synthesizes text into 24kHz CD-quality audio samples.
+    /// Synthesizes text into 24kHz audio samples via procedural formant synthesis.
     /// </summary>
     public float[] Speak(string text, KokoroVoice voice = KokoroVoice.AfHeart, float speed = 1.0f)
     {
@@ -47,8 +50,7 @@ public sealed class VoicePipeline : IDisposable
     }
 
     /// <summary>
-    /// Executes a simulated full-duplex conversational turn:
-    /// Ingests audio, transcribes to text, applies a conversational response delegate,
+    /// Executes a conversational turn: ingests audio, transcribes to text, applies a response delegate,
     /// and synthesizes spoken response audio.
     /// </summary>
     public (string TranscribedText, string ResponseText, float[] ResponseAudio) ConversationalTurn(
@@ -57,11 +59,6 @@ public sealed class VoicePipeline : IDisposable
         KokoroVoice voice = KokoroVoice.AfHeart)
     {
         string inputPrompt = Listen(userAudio16kHz);
-        if (string.IsNullOrWhiteSpace(inputPrompt))
-        {
-            inputPrompt = "Hello world";
-        }
-
         string response = responseGenerator(inputPrompt);
         float[] audioOut = Speak(response, voice);
 

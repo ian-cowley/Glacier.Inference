@@ -12,7 +12,7 @@
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference/)
 [![Ecosystem](https://img.shields.io/badge/Glacier-Ecosystem-blue)](https://github.com/ian-cowley)
 [![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
-[![Security: 0 Secrets](https://img.shields.io/badge/Security-0%20Secrets%20Verified-brightgreen.svg)](scripts/security_check.py)
+[![Security: 0 Secrets](https://img.shields.io/badge/Security-0%20Secrets%20Verified-brightgreen.svg)](LICENSE)
 
 ```text
 ========================================================================================================
@@ -337,8 +337,8 @@ The engine executes the first 14 layers on the NVIDIA discrete GPU and the remai
 | `serve` | Start HTTP server compatible with Ollama and OpenAI | `glacier serve model.gguf --port 11434` |
 | `video` | Generate spatio-temporal video or query video semantics | `glacier video generate "Prompt" --format apng` |
 | `image` | Generate photorealistic images with Flow-Matching DiT | `glacier image generate "Prompt" -o out.png` |
-| `vision` | Execute Vision-Language Model (VLM) image understanding | `glacier vision query scene.png "Describe scene"` |
-| `voice` | Synthesize Kokoro TTS speech or run Whisper STT | `glacier voice tts "Speech text" --voice af_heart` |
+| `vision` | Execute `[Experimental]` synthetic `VisionPipeline` patchification & analysis | `glacier vision query scene.png "Describe scene" --synthetic-demo` |
+| `voice` | Synthesize KittenTTS Neural Speech Synthesis & Formant TTS or run Whisper STT | `glacier voice tts "Speech text" --voice af_heart` |
 
 ### 6.2 Global Options (`bench`, `run`, `serve`)
 | Parameter Flag | Accepted Values | Default | Technical Description |

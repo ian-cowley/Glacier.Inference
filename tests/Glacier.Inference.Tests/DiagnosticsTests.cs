@@ -12,6 +12,10 @@ using Glacier.Inference.Image.Gguf;
 using Glacier.Inference.Video;
 using Xunit;
 
+[CollectionDefinition("SequentialDiagnostics", DisableParallelization = true)]
+public sealed class SequentialDiagnosticsCollection { }
+
+[Collection("SequentialDiagnostics")]
 public class DiagnosticsTests : IDisposable
 {
     public DiagnosticsTests()
@@ -55,42 +59,48 @@ public class DiagnosticsTests : IDisposable
         var logs = new List<(LogLevel Level, string Message, Exception? Exception)>();
         GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, msg, ex) =>
         {
-            logs.Add((level, msg, ex));
+            if (msg.StartsWith("[DiagTest]", StringComparison.Ordinal))
+            {
+                lock (logs)
+                {
+                    logs.Add((level, msg, ex));
+                }
+            }
         }, LogLevel.Trace);
 
         var testEx = new InvalidOperationException("Test exception");
 
-        GlacierDiagnostics.LogTrace("Trace entry");
-        GlacierDiagnostics.LogDebug("Debug entry");
-        GlacierDiagnostics.LogInformation("Info entry");
-        GlacierDiagnostics.LogWarning("Warning entry", testEx);
-        GlacierDiagnostics.LogError("Error entry", testEx);
-        GlacierDiagnostics.LogCritical("Critical entry");
+        GlacierDiagnostics.LogTrace("[DiagTest] Trace entry");
+        GlacierDiagnostics.LogDebug("[DiagTest] Debug entry");
+        GlacierDiagnostics.LogInformation("[DiagTest] Info entry");
+        GlacierDiagnostics.LogWarning("[DiagTest] Warning entry", testEx);
+        GlacierDiagnostics.LogError("[DiagTest] Error entry", testEx);
+        GlacierDiagnostics.LogCritical("[DiagTest] Critical entry");
 
         Assert.Equal(6, logs.Count);
 
         Assert.Equal(LogLevel.Trace, logs[0].Level);
-        Assert.Equal("Trace entry", logs[0].Message);
+        Assert.Equal("[DiagTest] Trace entry", logs[0].Message);
         Assert.Null(logs[0].Exception);
 
         Assert.Equal(LogLevel.Debug, logs[1].Level);
-        Assert.Equal("Debug entry", logs[1].Message);
+        Assert.Equal("[DiagTest] Debug entry", logs[1].Message);
         Assert.Null(logs[1].Exception);
 
         Assert.Equal(LogLevel.Information, logs[2].Level);
-        Assert.Equal("Info entry", logs[2].Message);
+        Assert.Equal("[DiagTest] Info entry", logs[2].Message);
         Assert.Null(logs[2].Exception);
 
         Assert.Equal(LogLevel.Warning, logs[3].Level);
-        Assert.Equal("Warning entry", logs[3].Message);
+        Assert.Equal("[DiagTest] Warning entry", logs[3].Message);
         Assert.Same(testEx, logs[3].Exception);
 
         Assert.Equal(LogLevel.Error, logs[4].Level);
-        Assert.Equal("Error entry", logs[4].Message);
+        Assert.Equal("[DiagTest] Error entry", logs[4].Message);
         Assert.Same(testEx, logs[4].Exception);
 
         Assert.Equal(LogLevel.Critical, logs[5].Level);
-        Assert.Equal("Critical entry", logs[5].Message);
+        Assert.Equal("[DiagTest] Critical entry", logs[5].Message);
         Assert.Null(logs[5].Exception);
     }
 
@@ -98,15 +108,24 @@ public class DiagnosticsTests : IDisposable
     public void DelegateGlacierLogger_SingleStringDelegate_CapturesFormattedMessages()
     {
         var lines = new List<string>();
-        GlacierDiagnostics.Logger = new DelegateGlacierLogger(lines.Add, LogLevel.Information);
+        GlacierDiagnostics.Logger = new DelegateGlacierLogger(line =>
+        {
+            if (line.Contains("[DiagTest]", StringComparison.Ordinal))
+            {
+                lock (lines)
+                {
+                    lines.Add(line);
+                }
+            }
+        }, LogLevel.Information);
 
-        GlacierDiagnostics.LogDebug("Should be filtered out");
-        GlacierDiagnostics.LogInformation("Important info");
-        GlacierDiagnostics.LogWarning("Watch out", new Exception("WarnEx"));
+        GlacierDiagnostics.LogDebug("[DiagTest] Should be filtered out");
+        GlacierDiagnostics.LogInformation("[DiagTest] Important info");
+        GlacierDiagnostics.LogWarning("[DiagTest] Watch out", new Exception("WarnEx"));
 
         Assert.Equal(2, lines.Count);
-        Assert.Contains("[Information] Important info", lines[0]);
-        Assert.Contains("[Warning] Watch out: System.Exception: WarnEx", lines[1]);
+        Assert.Contains("[Information] [DiagTest] Important info", lines[0]);
+        Assert.Contains("[Warning] [DiagTest] Watch out: System.Exception: WarnEx", lines[1]);
     }
 
     [Fact]
@@ -115,15 +134,21 @@ public class DiagnosticsTests : IDisposable
         var logs = new List<(LogLevel Level, string Message, Exception? Exception)>();
         GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, msg, ex) =>
         {
-            logs.Add((level, msg, ex));
+            if (msg.StartsWith("[DiagTest]", StringComparison.Ordinal))
+            {
+                lock (logs)
+                {
+                    logs.Add((level, msg, ex));
+                }
+            }
         }, LogLevel.Warning);
 
-        GlacierDiagnostics.LogTrace("Trace filtered");
-        GlacierDiagnostics.LogDebug("Debug filtered");
-        GlacierDiagnostics.LogInformation("Info filtered");
-        GlacierDiagnostics.LogWarning("Warning kept");
-        GlacierDiagnostics.LogError("Error kept");
-        GlacierDiagnostics.LogCritical("Critical kept");
+        GlacierDiagnostics.LogTrace("[DiagTest] Trace filtered");
+        GlacierDiagnostics.LogDebug("[DiagTest] Debug filtered");
+        GlacierDiagnostics.LogInformation("[DiagTest] Info filtered");
+        GlacierDiagnostics.LogWarning("[DiagTest] Warning kept");
+        GlacierDiagnostics.LogError("[DiagTest] Error kept");
+        GlacierDiagnostics.LogCritical("[DiagTest] Critical kept");
 
         Assert.Equal(3, logs.Count);
         Assert.Equal(LogLevel.Warning, logs[0].Level);
@@ -187,7 +212,10 @@ public class DiagnosticsTests : IDisposable
             var capturedLogs = new List<(LogLevel Level, string Message, Exception? Ex)>();
             GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, msg, ex) =>
             {
-                capturedLogs.Add((level, msg, ex));
+                lock (capturedLogs)
+                {
+                    capturedLogs.Add((level, msg, ex));
+                }
             }, LogLevel.Trace);
 
             using (var model = DiffusionGgufModel.Open(tmpGguf))
@@ -200,9 +228,12 @@ public class DiagnosticsTests : IDisposable
                 Assert.NotNull(pipeline.FallbackException);
 
                 // Verify diagnostic logging captured the warning with full details
-                Assert.Contains(capturedLogs, l => l.Level == LogLevel.Warning &&
-                                                   l.Message.Contains("Neural VAE load failed") &&
-                                                   l.Ex != null);
+                lock (capturedLogs)
+                {
+                    Assert.Contains(capturedLogs, l => l.Level == LogLevel.Warning &&
+                                                       l.Message.Contains("Neural VAE load failed") &&
+                                                       l.Ex != null);
+                }
             }
         }
         finally
@@ -224,7 +255,10 @@ public class DiagnosticsTests : IDisposable
             var capturedLogs = new List<(LogLevel Level, string Message, Exception? Ex)>();
             GlacierDiagnostics.Logger = new DelegateGlacierLogger((level, msg, ex) =>
             {
-                capturedLogs.Add((level, msg, ex));
+                lock (capturedLogs)
+                {
+                    capturedLogs.Add((level, msg, ex));
+                }
             }, LogLevel.Trace);
 
             using var pipeline = new VideoGenerationPipeline(
@@ -238,9 +272,12 @@ public class DiagnosticsTests : IDisposable
             Assert.NotNull(pipeline.FallbackException);
 
             // Verify diagnostic logging captured the warning
-            Assert.Contains(capturedLogs, l => l.Level == LogLevel.Warning &&
-                                               l.Message.Contains("Wan 3D VAE load failed") &&
-                                               l.Ex != null);
+            lock (capturedLogs)
+            {
+                Assert.Contains(capturedLogs, l => l.Level == LogLevel.Warning &&
+                                                   l.Message.Contains("Wan 3D VAE load failed") &&
+                                                   l.Ex != null);
+            }
         }
         finally
         {

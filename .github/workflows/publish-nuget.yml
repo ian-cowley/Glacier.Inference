@@ -16,9 +16,9 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: 1
-      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       GLACIER_EMBED_NO_DOWNLOAD: "1"
       DOTNET_gcServer: 0
@@ -51,6 +51,8 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
+      - name: Test
+        run: dotnet test tests/Glacier.Inference.Tests/Glacier.Inference.Tests.csproj -c Release --no-build
 
       - name: Pack Library
         run: dotnet pack src/Glacier.Inference/Glacier.Inference.csproj --configuration Release --output packages
@@ -58,13 +60,22 @@ jobs:
       - name: Pack CLI Tool
         run: dotnet pack src/Glacier.Inference.Cli/Glacier.Inference.Cli.csproj --configuration Release --output packages
 
-      - name: Publish to nuget.org
-        if: env.NUGET_API_KEY != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
-        run: dotnet nuget push "packages/*.nupkg" --api-key $NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate || true
-
       - name: Publish to GitHub Packages
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
-        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate || true
+        run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.GITHUB_TOKEN }} --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --skip-duplicate
+
+      - name: NuGet login (Trusted Publishing OIDC)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: spuriousbugfix
+
+      - name: Publish to nuget.org
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+        env:
+          NUGET_OIDC_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "packages/*.nupkg" --api-key "$NUGET_OIDC_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
 
 
       - name: Publish Standalone CLI Binaries

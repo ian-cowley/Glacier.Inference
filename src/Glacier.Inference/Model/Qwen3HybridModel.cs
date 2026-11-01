@@ -357,36 +357,64 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private void ComputeStandardAttentionToken(int stageLayer, int modelLayer, int pos, float* qHeadBase, float* outHeadBase, KVCache kvCache)
     {
+        bool useWindow = kvCache.IsRingBuffer || kvCache.SlidingWindow > 0;
+        int windowSize = useWindow ? Math.Min(_maxSeqLen, kvCache.EffectiveWindowSize) : _maxSeqLen;
+        int startT = useWindow ? Math.Max(0, pos + 1 - windowSize) : 0;
+        int kvCount = pos - startT + 1;
+        if (pos < 0 || kvCount > _maxSeqLen)
+        {
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Sequence position {pos} exceeds maxSeqLen {_maxSeqLen}.");
+        }
+
         for (int h = 0; h < _nHeads; h++)
         {
             int hKv = h / _groupSize;
             float* qHead = qHeadBase + h * _headDim;
             float* scores = _headScores + (long)h * _maxSeqLen;
 
-            for (int t = 0; t <= pos; t++)
+            for (int idx = 0; idx < kvCount; idx++)
             {
+                int t = startT + idx;
                 float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
                 float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
-                scores[t] = dot * _attnScale;
+                scores[idx] = dot * _attnScale;
             }
 
             var layerWeights = _weights.Layers[modelLayer];
             float? sinkLogit = layerWeights.AttnSinksWeight != null ? (float?)layerWeights.AttnSinksWeight[h] : null;
-            QuantKernels.Softmax(scores, pos + 1, sinkLogit);
+            QuantKernels.Softmax(scores, kvCount, sinkLogit);
 
             float* outHead = outHeadBase + h * _vHeadDim;
             for (int d = 0; d < _vHeadDim; d++) outHead[d] = 0f;
 
-            for (int t = 0; t <= pos; t++)
+            for (int idx = 0; idx < kvCount; idx++)
             {
+                int t = startT + idx;
                 float* vPast = kvCache.GetValuePtr(stageLayer, hKv, t);
-                float w = scores[t];
+                float w = scores[idx];
                 for (int d = 0; d < _vHeadDim; d++)
                 {
                     outHead[d] += w * vPast[d];
                 }
             }
         }
+    }
+
+    public override void ResetState()
+    {
+        _ssmCache.Reset();
+    }
+
+    public override long StateSnapshotBytes => _ssmCache.TotalBytes;
+
+    public override void SaveRecurrentState(Span<byte> destination)
+    {
+        _ssmCache.SaveState(destination);
+    }
+
+    public override void RestoreRecurrentState(ReadOnlySpan<byte> source)
+    {
+        _ssmCache.RestoreState(source);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]

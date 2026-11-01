@@ -2,6 +2,7 @@ namespace Glacier.Inference.Image;
 
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 
 /// <summary>
@@ -15,10 +16,13 @@ public sealed record ImageGenerationResult(
     float PixelsPerSecond,
     byte[] RgbPixels);
 
+#pragma warning disable GLACIER_EXP001
 /// <summary>
-/// End-to-end Text-to-Image Generation pipeline executing distilled Flow-Matching DiT
-/// and Progressive Latent VAE decoding in pure C# .NET 10.
+/// Experimental procedural Text-to-Image test pipeline executing synthetic Flow-Matching DiT
+/// (<see cref="DiffusionTransformer"/>) and procedural <see cref="LatentVaeDecoder"/>.
+/// (For pretrained neural image generation, use <c>DiffusionGgufPipeline</c> with Flux.1 GGUF weights.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class ImageGenerationPipeline : IDisposable
 {
     private readonly DiffusionTransformer _dit;

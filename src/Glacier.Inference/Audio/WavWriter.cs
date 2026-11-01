@@ -124,4 +124,116 @@ public static class WavWriter
 
         return buffer;
     }
+
+    /// <summary>
+    /// Parses a standard RIFF WAVE file (supporting arbitrary intermediate chunks such as LIST/JUNK/fact,
+    /// 16/24/32-bit PCM, 32-bit IEEE float, WAVE_FORMAT_EXTENSIBLE, and multi-channel downmixing) into mono float samples.
+    /// </summary>
+    public static float[] ReadMonoFloat(ReadOnlySpan<byte> wavBytes, out int sampleRate)
+    {
+        if (wavBytes.Length < 12 ||
+            wavBytes[0] != (byte)'R' || wavBytes[1] != (byte)'I' || wavBytes[2] != (byte)'F' || wavBytes[3] != (byte)'F' ||
+            wavBytes[8] != (byte)'W' || wavBytes[9] != (byte)'A' || wavBytes[10] != (byte)'V' || wavBytes[11] != (byte)'E')
+        {
+            throw new InvalidDataException("Invalid RIFF WAVE header.");
+        }
+
+        bool foundFmt = false;
+        ushort audioFormat = 0;
+        ushort channels = 0;
+        sampleRate = 0;
+        ushort bitsPerSample = 0;
+        int dataOffset = -1;
+        int dataLength = 0;
+
+        int pos = 12;
+        while (pos + 8 <= wavBytes.Length)
+        {
+            uint chunkId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(wavBytes.Slice(pos, 4));
+            int chunkSize = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(wavBytes.Slice(pos + 4, 4));
+            if (chunkSize < 0)
+            {
+                throw new InvalidDataException("Corrupt RIFF chunk size.");
+            }
+
+            int payloadStart = pos + 8;
+            int available = wavBytes.Length - payloadStart;
+            int effectiveSize = Math.Min(chunkSize, available);
+
+            // 'fmt ' in little-endian: 'f' (0x66), 'm' (0x6D), 't' (0x74), ' ' (0x20) => 0x20746D66
+            if (chunkId == 0x20746D66u)
+            {
+                if (effectiveSize < 16)
+                {
+                    throw new InvalidDataException("RIFF 'fmt ' chunk is truncated.");
+                }
+                var fmt = wavBytes.Slice(payloadStart, effectiveSize);
+                audioFormat = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(fmt.Slice(0, 2));
+                channels = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(fmt.Slice(2, 2));
+                sampleRate = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(fmt.Slice(4, 4));
+                bitsPerSample = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(fmt.Slice(14, 2));
+
+                // WAVE_FORMAT_EXTENSIBLE (0xFFFE): subformat GUID first 2 bytes at offset 24 store underlying format tag (1=PCM, 3=IEEE Float)
+                if (audioFormat == 0xFFFE && effectiveSize >= 26)
+                {
+                    audioFormat = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(fmt.Slice(24, 2));
+                }
+                foundFmt = true;
+            }
+            // 'data' in little-endian: 'd' (0x64), 'a' (0x61), 't' (0x74), 'a' (0x61) => 0x61746164
+            else if (chunkId == 0x61746164u)
+            {
+                dataOffset = payloadStart;
+                dataLength = effectiveSize;
+                break;
+            }
+
+            long nextPos = (long)payloadStart + chunkSize + (chunkSize & 1); // RIFF word alignment
+            if (nextPos > wavBytes.Length || nextPos <= pos) break;
+            pos = (int)nextPos;
+        }
+
+        if (!foundFmt || channels == 0 || sampleRate <= 0)
+        {
+            throw new InvalidDataException("RIFF WAVE file is missing a valid 'fmt ' chunk.");
+        }
+        if (dataOffset < 0)
+        {
+            throw new InvalidDataException("RIFF WAVE file is missing a 'data' chunk.");
+        }
+
+        int bytesPerSample = bitsPerSample / 8;
+        if (bytesPerSample <= 0)
+        {
+            throw new NotSupportedException($"Unsupported WAV bitsPerSample: {bitsPerSample}.");
+        }
+
+        int frameStride = bytesPerSample * channels;
+        int frameCount = dataLength / frameStride;
+        var mono = new float[frameCount];
+        var data = wavBytes.Slice(dataOffset, frameCount * frameStride);
+
+        for (int f = 0; f < frameCount; f++)
+        {
+            float sum = 0f;
+            int frameBase = f * frameStride;
+            for (int c = 0; c < channels; c++)
+            {
+                int off = frameBase + c * bytesPerSample;
+                float sample = (audioFormat, bitsPerSample) switch
+                {
+                    (1, 8) => (data[off] - 128) / 128.0f,
+                    (1, 16) => System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(data.Slice(off, 2)) / 32768.0f,
+                    (1, 24) => (((sbyte)data[off + 2] << 16) | (data[off + 1] << 8) | data[off]) / 8388608.0f,
+                    (1, 32) => System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(data.Slice(off, 4)) / 2147483648.0f,
+                    (3, 32) => System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(data.Slice(off, 4)),
+                    _ => throw new NotSupportedException($"Unsupported WAV encoding (format={audioFormat}, bits={bitsPerSample}).")
+                };
+                sum += sample;
+            }
+            mono[f] = sum / channels;
+        }
+
+        return mono;
+    }
 }

@@ -12,6 +12,33 @@ using Glacier.Inference.Quant;
 
 public sealed unsafe partial class Qwen2GpuModel
 {
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ValidateTokenId(int token, string paramName = "token")
+    {
+        if ((uint)token >= (uint)_weights.VocabSize)
+        {
+            throw new ArgumentOutOfRangeException(
+                paramName,
+                token,
+                $"Token ID {token} is outside vocabulary range [0, {_weights.VocabSize}).");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ValidateTokenIds(ReadOnlySpan<int> tokens, string paramName = "tokens")
+    {
+        uint vocab = (uint)_weights.VocabSize;
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            if ((uint)tokens[i] >= vocab)
+            {
+                throw new ArgumentOutOfRangeException(
+                    paramName,
+                    tokens[i],
+                    $"Token ID {tokens[i]} at batch index {i} is outside vocabulary range [0, {_weights.VocabSize}).");
+            }
+        }
+    }
 
     /// <summary>
     /// Executes transformer forward pass directly on NVIDIA GPU with zero intermediate PCIe round-trips.
@@ -33,6 +60,15 @@ public sealed unsafe partial class Qwen2GpuModel
         Span<float> logits,
         bool computeLogits)
     {
+        if (!_allocateContiguousKvCache)
+            throw new InvalidOperationException("Contiguous KV cache was disabled on this Qwen2GpuModel instance; use ForwardPagedToken or ForwardPagedBatch.");
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds maximum sequence length {_maxSeqLen}.");
+        if (StartLayer == 0)
+            ValidateTokenId(token, nameof(token));
+
+        _gpu.MakeCurrent();
+
         // 1. Input activation: either extract embedding or copy incoming hidden vector
         if (StartLayer == 0)
         {
@@ -40,7 +76,7 @@ public sealed unsafe partial class Qwen2GpuModel
             {
                 // In-VRAM token embedding lookup: 0 B PCIe copy!
                 IntPtr srcCache = _dEmbdCache + (nint)((long)cachedSlot * _dim * sizeof(float));
-                CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), IntPtr.Zero);
+                CuDriver.Check(CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
             }
             else
             {
@@ -65,7 +101,7 @@ public sealed unsafe partial class Qwen2GpuModel
                     _embdTokenToSlot[token] = slot;
 
                     IntPtr dstCache = _dEmbdCache + (nint)((long)slot * _dim * sizeof(float));
-                    CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), IntPtr.Zero);
+                    CuDriver.Check(CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
                 }
             }
         }
@@ -188,6 +224,15 @@ public sealed unsafe partial class Qwen2GpuModel
     }
 
     /// <summary>
+    /// Alias for <see cref="ForwardBatch"/> executing batched prompt prefill on NVIDIA GPU.
+    /// </summary>
+    public void ForwardPrefillBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
+    {
+        _gpu.MakeCurrent();
+        ForwardBatchStage(tokens, startPos, default, default, logits, computeLogits);
+    }
+
+    /// <summary>
     /// Executes batched prefill for the layers assigned to this stage.
     /// </summary>
     public void ForwardBatchStage(
@@ -198,7 +243,16 @@ public sealed unsafe partial class Qwen2GpuModel
         Span<float> logits,
         bool computeLogits)
     {
+        if (!_allocateContiguousKvCache)
+            throw new InvalidOperationException("Contiguous KV cache was disabled on this Qwen2GpuModel instance; use ForwardPagedToken or ForwardPagedBatch.");
         int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
+        if (totalTokens > 0 && (startPos < 0 || startPos + totalTokens > _maxSeqLen))
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Batch range [{startPos}, {startPos + totalTokens}) exceeds maximum sequence length {_maxSeqLen}.");
+        if (StartLayer == 0 && !tokens.IsEmpty)
+            ValidateTokenIds(tokens, nameof(tokens));
+
+        _gpu.MakeCurrent();
+
         int offset = 0;
         while (offset < totalTokens)
         {
@@ -229,8 +283,16 @@ public sealed unsafe partial class Qwen2GpuModel
     {
         int batchSize = tokens.Length;
         if (batchSize == 0) return;
+        if (!_allocateContiguousKvCache)
+            throw new InvalidOperationException("Contiguous KV cache was disabled on this Qwen2GpuModel instance.");
         if (batchSize > MaxBatchSize)
             throw new ArgumentException($"Batch size {batchSize} exceeds MaxBatchSize {MaxBatchSize}");
+        if (startPos < 0 || startPos + batchSize > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Batch range [{startPos}, {startPos + batchSize}) exceeds maximum sequence length {_maxSeqLen}.");
+        if (StartLayer == 0)
+            ValidateTokenIds(tokens, nameof(tokens));
+
+        _gpu.MakeCurrent();
 
         // Forward through all transformer layers in batch
         ForwardBatchChunk(tokens, startPos, default, default, Span<float>.Empty, computeLogits: false);
@@ -245,44 +307,115 @@ public sealed unsafe partial class Qwen2GpuModel
         }
     }
 
+    public void CopyLogitsToHost(Span<float> destination)
+    {
+        if (destination.Length < _weights.VocabSize)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than vocabulary size {_weights.VocabSize}.", nameof(destination));
+
+        _gpu.MakeCurrent();
+        fixed (float* pDst = destination)
+        {
+            _gpu.CopyToHost((IntPtr)pDst, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+        }
+    }
+
+    public void VerifyBatchLogits(ReadOnlySpan<int> tokens, int startPos, Span<float> batchLogitsOut)
+    {
+        int totalTokens = tokens.Length;
+        if (totalTokens == 0) return;
+        if (!_allocateContiguousKvCache)
+            throw new InvalidOperationException("Contiguous KV cache was disabled on this Qwen2GpuModel instance.");
+        if (startPos < 0 || startPos + totalTokens > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Batch range [{startPos}, {startPos + totalTokens}) exceeds maximum sequence length {_maxSeqLen}.");
+        if (batchLogitsOut.Length < totalTokens * _weights.VocabSize)
+            throw new ArgumentException("batchLogitsOut buffer is too small.", nameof(batchLogitsOut));
+        if (StartLayer == 0)
+            ValidateTokenIds(tokens, nameof(tokens));
+
+        _gpu.MakeCurrent();
+
+        int offset = 0;
+        while (offset < totalTokens)
+        {
+            int chunkSize = Math.Min(totalTokens - offset, MaxBatchSize);
+            ForwardBatchChunk(tokens.Slice(offset, chunkSize), startPos + offset, default, default, Span<float>.Empty, computeLogits: false);
+            for (int t = 0; t < chunkSize; t++)
+            {
+                IntPtr dXt = _dXBatch + t * _dim * sizeof(float);
+                LaunchRmsNorm(dXt, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+                LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+                fixed (float* pDst = batchLogitsOut.Slice((offset + t) * _weights.VocabSize, _weights.VocabSize))
+                {
+                    _gpu.CopyToHost((IntPtr)pDst, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
+                }
+            }
+            offset += chunkSize;
+        }
+    }
+
     /// <summary>
     /// Executes fast GPU argmax reduction directly across the 152K vocab logits in ~3 microseconds.
     /// Transfers only 4 bytes (the sampled token ID) across PCIe, bypassing 608 KB host copies.
     /// </summary>
     public int SampleGreedy(ReadOnlySpan<int> recentTokens = default, float repetitionPenalty = 1.0f)
     {
+        _gpu.MakeCurrent();
+
         IntPtr dLogits = _dLogits;
         IntPtr dBestToken = _dBestToken;
         IntPtr dBestLogit = _dBestLogit;
         IntPtr dRecentTokens = _dRecentTokens;
+        int vocabSize = _weights.VocabSize;
 
         if (repetitionPenalty != 1.0f && !recentTokens.IsEmpty)
         {
-            int count = Math.Min(recentTokens.Length, 1024);
-            fixed (int* pRecent = recentTokens)
+            int sliceStart = Math.Max(0, recentTokens.Length - 1024);
+            ReadOnlySpan<int> window = recentTokens.Slice(sliceStart);
+            int* uniqueBuf = stackalloc int[1024];
+            int count = 0;
+            for (int i = 0; i < window.Length && count < 1024; i++)
             {
-                _gpu.CopyToDevice(dRecentTokens, (IntPtr)pRecent, (nuint)(count * sizeof(int)));
+                int tok = window[i];
+                if ((uint)tok >= (uint)vocabSize) continue;
+                bool seen = false;
+                for (int j = 0; j < count; j++)
+                {
+                    if (uniqueBuf[j] == tok)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen)
+                {
+                    uniqueBuf[count++] = tok;
+                }
             }
 
-            void** pPenArgs = stackalloc void*[4];
-            pPenArgs[0] = &dLogits;
-            pPenArgs[1] = &dRecentTokens;
-            pPenArgs[2] = &count;
-            pPenArgs[3] = &repetitionPenalty;
+            if (count > 0)
+            {
+                _gpu.CopyToDevice(dRecentTokens, (IntPtr)uniqueBuf, (nuint)(count * sizeof(int)));
 
-            uint blockSize = 64;
-            uint gridSize = (uint)((count + (int)blockSize - 1) / (int)blockSize);
+                void** pPenArgs = stackalloc void*[5];
+                pPenArgs[0] = &dLogits;
+                pPenArgs[1] = &dRecentTokens;
+                pPenArgs[2] = &count;
+                pPenArgs[3] = &vocabSize;
+                pPenArgs[4] = &repetitionPenalty;
 
-            CuDriver.Check(CuDriver.LaunchKernel(
-                _fnRepetitionPenalty,
-                gridSize, 1, 1,
-                blockSize, 1, 1,
-                0, IntPtr.Zero,
-                (IntPtr)pPenArgs,
-                IntPtr.Zero), "LaunchKernel(apply_repetition_penalty)");
+                uint blockSize = 64;
+                uint gridSize = (uint)((count + (int)blockSize - 1) / (int)blockSize);
+
+                CuDriver.Check(CuDriver.LaunchKernel(
+                    _fnRepetitionPenalty,
+                    gridSize, 1, 1,
+                    blockSize, 1, 1,
+                    0, IntPtr.Zero,
+                    (IntPtr)pPenArgs,
+                    IntPtr.Zero), "LaunchKernel(apply_repetition_penalty)");
+            }
         }
 
-        int vocabSize = _weights.VocabSize;
         void** pArgs = stackalloc void*[4];
         pArgs[0] = &dLogits;
         pArgs[1] = &vocabSize;
@@ -307,6 +440,8 @@ public sealed unsafe partial class Qwen2GpuModel
     /// </summary>
     public int SampleToken(Sampling.SamplingOptions options, ReadOnlySpan<int> recentTokens = default)
     {
+        _gpu.MakeCurrent();
+
         if (options.Temperature <= 0.001f || options.TopK == 1)
         {
             return SampleGreedy(recentTokens, options.RepetitionPenalty);
@@ -336,6 +471,7 @@ public sealed unsafe partial class Qwen2GpuModel
         // 1. Extract embeddings into host batch buffer or copy from input activations
         if (StartLayer == 0)
         {
+            ValidateTokenIds(chunkTokens, nameof(chunkTokens));
             fixed (float* pXBatch = _hXBatch)
             {
                 for (int t = 0; t < batchSize; t++)
@@ -459,6 +595,8 @@ public sealed unsafe partial class Qwen2GpuModel
         destination.Slice(0, _dim).Clear();
         if (tokens.IsEmpty) return;
 
+        _gpu.MakeCurrent();
+
         // Forward batch without logits
         ForwardBatch(tokens, 0, Span<float>.Empty, computeLogits: false);
 
@@ -481,6 +619,245 @@ public sealed unsafe partial class Qwen2GpuModel
 
         // L2 Normalize
         NormalizeL2Vector(destination.Slice(0, _dim));
+    }
+
+    /// <summary>
+    /// Executes a single-token decode step against an external FP16 PagedAttention KV block pool.
+    /// </summary>
+    public void ForwardPagedToken(
+        int token,
+        int pos,
+        IntPtr dKPool,
+        IntPtr dVPool,
+        IntPtr dBlockTable,
+        int blockSize,
+        Span<float> logits = default,
+        bool computeLogits = true)
+    {
+        if (pos < 0)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, "Token position must be non-negative.");
+        if (blockSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Block size must be positive.");
+        if (dKPool == IntPtr.Zero || dVPool == IntPtr.Zero || dBlockTable == IntPtr.Zero)
+            throw new ArgumentException("PagedAttention device pointers must be non-zero.");
+        ValidateTokenId(token, nameof(token));
+
+        _gpu.MakeCurrent();
+
+        if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdTokenToSlot.TryGetValue(token, out int cachedSlot))
+        {
+            IntPtr srcCache = _dEmbdCache + (nint)((long)cachedSlot * _dim * sizeof(float));
+            CuDriver.Check(CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
+        }
+        else
+        {
+            fixed (float* pX = _hX)
+            {
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
+                _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+            }
+
+            if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdCacheTokens != null)
+            {
+                int slot = _embdCacheHead;
+                _embdCacheHead = (_embdCacheHead + 1) % EmbdCacheCapacity;
+                int evictedToken = _embdCacheTokens[slot];
+                if (evictedToken >= 0) _embdTokenToSlot.Remove(evictedToken);
+                _embdCacheTokens[slot] = token;
+                _embdTokenToSlot[token] = slot;
+                IntPtr dstCache = _dEmbdCache + (nint)((long)slot * _dim * sizeof(float));
+                CuDriver.Check(CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
+            }
+        }
+
+        int qDim = _nHeads * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+        int numLayers = _weights.BlockCount;
+
+        for (int l = 0; l < LayerCount; l++)
+        {
+            int modelLayer = StartLayer + l;
+            var lw = _layerWeights[l];
+
+            LaunchRmsNorm(_dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+            CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
+            CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
+            CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
+
+            LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias);
+            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias, hStream: _streamK);
+            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias, hStream: _streamV);
+
+            CuDriver.EventRecord(_eventKDone, _streamK);
+            CuDriver.EventRecord(_eventVDone, _streamV);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
+
+            if (lw.AttnQNormWeight != IntPtr.Zero)
+                LaunchRmsNormHeads(_dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps);
+            if (lw.AttnKNormWeight != IntPtr.Zero)
+                LaunchRmsNormHeads(_dK, lw.AttnKNormWeight, _nHeadsKv, _headDim, _weights.RmsNormEps);
+
+            LaunchRope(_dQ, _dK, pos);
+            LaunchPagedKvStoreF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize);
+            LaunchPagedAttentionF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize);
+
+            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, qDim, _dim, IntPtr.Zero, _dX);
+            LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+
+            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            {
+                LaunchSwigluFused(_dFfnAct, _dNormX, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim);
+            }
+            else
+            {
+                LaunchGemv(lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim);
+                LaunchGemv(lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim);
+                LaunchSwiglu(_dGate, _dUp, _dFfnAct, _ffnDim);
+            }
+
+            LaunchGemv(lw.FfnDownType, IntPtr.Zero, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, IntPtr.Zero, _dX);
+        }
+
+        if (IsLastStage && computeLogits)
+        {
+            LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+            if (!logits.IsEmpty)
+            {
+                CopyLogitsToHost(logits);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executes batched prefill (chunked internally by MaxBatchSize) against an external FP16 PagedAttention KV block pool.
+    /// </summary>
+    public void ForwardPagedBatch(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        IntPtr dKPool,
+        IntPtr dVPool,
+        IntPtr dBlockTable,
+        int blockSize,
+        Span<float> logits = default,
+        bool computeLogits = true)
+    {
+        if (tokens.IsEmpty) return;
+        if (startPos < 0)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "Start position must be non-negative.");
+        if (blockSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Block size must be positive.");
+        if (dKPool == IntPtr.Zero || dVPool == IntPtr.Zero || dBlockTable == IntPtr.Zero)
+            throw new ArgumentException("PagedAttention device pointers must be non-zero.");
+        ValidateTokenIds(tokens, nameof(tokens));
+
+        _gpu.MakeCurrent();
+
+        int totalTokens = tokens.Length;
+        int offset = 0;
+        while (offset < totalTokens)
+        {
+            int batchSize = Math.Min(totalTokens - offset, MaxBatchSize);
+            bool isLastChunk = (offset + batchSize == totalTokens);
+            ForwardPagedBatchChunk(
+                tokens.Slice(offset, batchSize),
+                startPos + offset,
+                dKPool,
+                dVPool,
+                dBlockTable,
+                blockSize,
+                isLastChunk && computeLogits ? logits : Span<float>.Empty,
+                isLastChunk && computeLogits);
+            offset += batchSize;
+        }
+    }
+
+    private void ForwardPagedBatchChunk(
+        ReadOnlySpan<int> chunkTokens,
+        int chunkStartPos,
+        IntPtr dKPool,
+        IntPtr dVPool,
+        IntPtr dBlockTable,
+        int blockSize,
+        Span<float> logits,
+        bool computeLogits)
+    {
+        int batchSize = chunkTokens.Length;
+        int qDim = _nHeads * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+        int numLayers = _weights.BlockCount;
+
+        ValidateTokenIds(chunkTokens, nameof(chunkTokens));
+        fixed (float* pXBatch = _hXBatch)
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, chunkTokens[t], pXBatch + t * _dim, _dim);
+            }
+            _gpu.CopyToDevice(_dXBatch, (IntPtr)pXBatch, (nuint)(batchSize * _dim * sizeof(float)));
+        }
+
+        for (int l = 0; l < LayerCount; l++)
+        {
+            int modelLayer = StartLayer + l;
+            var lw = _layerWeights[l];
+
+            LaunchRmsNormBatch(_dXBatch, lw.AttnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
+            CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
+            CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
+            CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
+
+            LaunchGemmBatch(lw.QType, _dQBatch, _dNormXBatch, lw.QWeight, _dim, qDim, batchSize, lw.QBias);
+            LaunchGemmBatch(lw.KType, _dKBatch, _dNormXBatch, lw.KWeight, _dim, kvDim, batchSize, lw.KBias, hStream: _streamK);
+            LaunchGemmBatch(lw.VType, _dVBatch, _dNormXBatch, lw.VWeight, _dim, kvDim, batchSize, lw.VBias, hStream: _streamV);
+            CuDriver.EventRecord(_eventKDone, _streamK);
+            CuDriver.EventRecord(_eventVDone, _streamV);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
+            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
+
+            if (lw.AttnQNormWeight != IntPtr.Zero)
+                LaunchRmsNormBatchHeads(_dQBatch, lw.AttnQNormWeight, _nHeads, _headDim, batchSize, _weights.RmsNormEps);
+            if (lw.AttnKNormWeight != IntPtr.Zero)
+                LaunchRmsNormBatchHeads(_dKBatch, lw.AttnKNormWeight, _nHeadsKv, _headDim, batchSize, _weights.RmsNormEps);
+
+            LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
+            LaunchPagedKvStoreBatchF16(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize);
+            LaunchPagedAttentionBatchF16(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize);
+
+            LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, qDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
+            LaunchRmsNormBatch(_dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
+
+            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            {
+                LaunchSwigluBatch(_dFfnActBatch, _dNormXBatch, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim, batchSize);
+            }
+            else
+            {
+                for (int t = 0; t < batchSize; t++)
+                {
+                    IntPtr dNorm = _dNormXBatch + t * _dim * sizeof(float);
+                    IntPtr dAct = _dFfnActBatch + t * _ffnDim * sizeof(float);
+                    LaunchGemv(lw.FfnGateType, _dGate, dNorm, lw.FfnGateWeight, _dim, _ffnDim);
+                    LaunchGemv(lw.FfnUpType, _dUp, dNorm, lw.FfnUpWeight, _dim, _ffnDim);
+                    LaunchSwiglu(_dGate, _dUp, dAct, _ffnDim);
+                }
+            }
+
+            LaunchGemmBatch(lw.FfnDownType, IntPtr.Zero, _dFfnActBatch, lw.FfnDownWeight, _ffnDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
+        }
+
+        if (IsLastStage && computeLogits)
+        {
+            int lastTokenIdx = batchSize - 1;
+            IntPtr dXLast = _dXBatch + lastTokenIdx * _dim * sizeof(float);
+            LaunchRmsNorm(dXLast, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
+            if (!logits.IsEmpty)
+            {
+                CopyLogitsToHost(logits);
+            }
+        }
     }
 
     private static void NormalizeL2Vector(Span<float> vec)

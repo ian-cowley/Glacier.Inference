@@ -1,15 +1,18 @@
 namespace Glacier.Inference.Vision;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using Glacier.Inference.Quant;
 
 /// <summary>
-/// Pure C# Vision Transformer (ViT / SigLIP) encoder for visual representation learning.
-/// Converts image patches into visual latent tokens with zero GC allocations on hot paths.
+/// Experimental procedural Vision Transformer (ViT / SigLIP) primitive initialized with deterministic
+/// trigonometric test weights for patch-level visual encoding benchmarks and pipeline verification.
+/// (For pretrained neural vision encoding, use <c>Gemma4VisionTower</c> via <c>EmbeddingGemma2Model</c>.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed unsafe class VisionTransformer : IDisposable
 {
     public const int DefaultHiddenDim = 768;

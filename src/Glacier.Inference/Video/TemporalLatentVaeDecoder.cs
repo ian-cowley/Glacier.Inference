@@ -2,16 +2,19 @@ namespace Glacier.Inference.Video;
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using Glacier.Inference.Image;
 using Glacier.Inference.Image.Flux;
 using Glacier.Inference.Video.Wan;
 
+#pragma warning disable GLACIER_EXP001
 /// <summary>
-/// 3D Spatio-Temporal Variational Autoencoder (VAE) Decoder.
-/// Reconstructs full-resolution RGB video frame sequences from 4D spatio-temporal latents
-/// [T_lat, C, H_lat, W_lat] through official 3D Causal Autoencoder (wan_2.1_vae.safetensors),
-/// pure CUDA neural VAE (ae.safetensors), or Catmull-Rom cubic temporal spline upsampling in pure C# .NET 10.
+/// 3D Spatio-Temporal Variational Autoencoder (VAE) Decoder wrapper.
+/// Reconstructs RGB video frame sequences from 4D spatio-temporal latents [T_lat, C, H_lat, W_lat]
+/// via <see cref="Wan3DVaeDecoder"/> (<c>wan_2.1_vae.safetensors</c>), <see cref="FluxVaeDecoder"/> (<c>ae.safetensors</c>),
+/// or experimental procedural Catmull-Rom temporal spline projection when invoked directly in unit tests.
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class TemporalLatentVaeDecoder : IDisposable
 {
     public const int DefaultLatentChannels = 16;

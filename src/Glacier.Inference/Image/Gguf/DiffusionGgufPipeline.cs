@@ -8,8 +8,8 @@ using Glacier.Inference.Image;
 using Glacier.Inference.Model;
 
 /// <summary>
-/// Production Text-to-Image Generation pipeline driven by pre-trained Diffusion GGUF weights
-/// (Flux.1 [schnell/dev], SD-Turbo, SDXL) with hardware SIMD and Direct3D 12 acceleration.
+/// Production Text-to-Image Generation pipeline driven by pre-trained Flux.1 Diffusion GGUF weights
+/// with hardware SIMD and CUDA GPU acceleration.
 /// </summary>
 public sealed class DiffusionGgufPipeline : IDisposable
 {
@@ -19,15 +19,15 @@ public sealed class DiffusionGgufPipeline : IDisposable
     private readonly Glacier.Inference.Image.Flux.FluxDiT? _fluxDit;
     private readonly Glacier.Inference.Image.Flux.FluxClipEncoder? _clipEncoder;
     private readonly Glacier.Inference.Image.Flux.FluxT5Encoder? _t5Encoder;
-    private readonly LatentVaeDecoder _fallbackVae;
     private bool _disposed;
 
     public DiffusionGgufModel Model => _model;
     public DiffusionGgufModel? VaeModel => _vaeModel;
     public Glacier.Inference.Image.Flux.FluxVaeDecoder? NeuralVae => _neuralVae;
     public Glacier.Inference.Image.Flux.FluxDiT? FluxDiT => _fluxDit;
+    public Glacier.Inference.Image.Flux.FluxClipEncoder? ClipEncoder => _clipEncoder;
     public Glacier.Inference.Image.Flux.FluxT5Encoder? T5Encoder => _t5Encoder;
-    public string ActiveBackend => "Cpu";
+    public string ActiveBackend => (_fluxDit != null && _fluxDit.IsGpuAccelerated) ? "Cuda" : "Cpu";
     public Exception? FallbackException { get; private set; }
 
     public DiffusionGgufPipeline(
@@ -37,9 +37,9 @@ public sealed class DiffusionGgufPipeline : IDisposable
         string? clipSafetensorsPath = null,
         string? t5GgufPath = null)
     {
+        ArgumentNullException.ThrowIfNull(model);
         _model = model;
         _vaeModel = vaeModel;
-        _fallbackVae = new LatentVaeDecoder(_model.InChannels);
 
         string? vaePath = vaeSafetensorsPath;
         if (string.IsNullOrEmpty(vaePath))
@@ -123,8 +123,48 @@ public sealed class DiffusionGgufPipeline : IDisposable
     }
 
 
+    private void EnsureFluxComponentsLoaded()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (_model.DiffusionArch != UniversalArchitecture.Flux)
+        {
+            throw new NotSupportedException(
+                $"Diffusion architecture '{_model.DiffusionArch}' is not supported by DiffusionGgufPipeline. " +
+                "Only UniversalArchitecture.Flux (Flux.1) is currently implemented; procedural fallback has been disabled.");
+        }
+
+        if (_fluxDit == null)
+        {
+            throw new FileNotFoundException(
+                "Flux.1 DiT weights failed to load from the GGUF model.",
+                FallbackException);
+        }
+
+        if (_clipEncoder == null)
+        {
+            throw new FileNotFoundException(
+                "Flux CLIP-L text encoder weights (clip_l.safetensors) are required for Flux.1 generation. Weightless fallback has been disabled.",
+                FallbackException);
+        }
+
+        if (_t5Encoder == null)
+        {
+            throw new FileNotFoundException(
+                "Flux T5-XXL text encoder weights (t5xxl.gguf) are required for Flux.1 generation. Weightless ASCII fallback has been disabled.",
+                FallbackException);
+        }
+
+        if (_neuralVae == null)
+        {
+            throw new FileNotFoundException(
+                "Flux neural VAE decoder weights (ae.safetensors) are required for Flux.1 generation. Procedural VAE fallback has been disabled.",
+                FallbackException);
+        }
+    }
+
     /// <summary>
-    /// Executes end-to-end text-to-image generation from prompt using pre-trained GGUF weights.
+    /// Executes end-to-end text-to-image generation from prompt using pre-trained Flux.1 GGUF weights.
     /// </summary>
     public ImageGenerationResult Generate(
         string prompt,
@@ -134,6 +174,9 @@ public sealed class DiffusionGgufPipeline : IDisposable
         float cfgScale = 3.5f,
         int? seed = null)
     {
+        EnsureFluxComponentsLoaded();
+        ArgumentNullException.ThrowIfNull(prompt);
+
         var sw = Stopwatch.StartNew();
 
         int targetW = width ?? _model.RecommendedResolution;
@@ -145,19 +188,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
         int latentH = targetH / 8;
         int latentSize = channels * latentH * latentW;
 
-        // 1. Prompt Conditioning Embedding
-        var promptEmbedding = new float[512];
-        for (int i = 0; i < prompt.Length; i++)
-        {
-            int idx = i % promptEmbedding.Length;
-            promptEmbedding[idx] += (prompt[i] % 64) / 64.0f;
-        }
-
-        // 2. Synthesize or Load Conditioning Target
-        var targetLatents = new float[latentSize];
-        PromptSemanticSynthesizer.SynthesizeTargetLatents(prompt, targetLatents, latentH, latentW, channels, seed ?? 42);
-
-        // 3. Initialize Latent Noise Field
+        // 1. Initialize Latent Noise Field
         var latents = new float[latentSize];
         var velocity = new float[latentSize];
         var rng = seed.HasValue ? new Random(seed.Value) : new Random();
@@ -174,91 +205,35 @@ public sealed class DiffusionGgufPipeline : IDisposable
             if (i + 1 < latentSize) latents[i + 1] = z1;
         }
 
-        // 4. Multi-Step Trajectory
-        if (_fluxDit != null)
+        // 2. Multi-Step Flow-Matching Trajectory
+        var scheduler = new FlowMatchingScheduler(steps);
+        var timesteps = scheduler.Timesteps;
+
+        float[] pooledY = _clipEncoder!.EncodePrompt(prompt);
+        const int numTxtTokens = 64;
+        float[] contextTxt = _t5Encoder!.Encode(prompt, seqLen: numTxtTokens);
+
+        var swStep = Stopwatch.StartNew();
+        for (int step = 0; step < steps; step++)
         {
-            var scheduler = new FlowMatchingScheduler(steps);
-            var timesteps = scheduler.Timesteps;
+            var swS = Stopwatch.StartNew();
+            float currentT = timesteps[step];
+            float nextT = timesteps[step + 1];
 
-            float[] pooledY = _clipEncoder != null ? _clipEncoder.EncodePrompt(prompt) : new float[768];
-            int numTxtTokens = 64;
-            float[] contextTxt;
-
-            if (_t5Encoder != null)
-            {
-                contextTxt = _t5Encoder.Encode(prompt, seqLen: numTxtTokens);
-            }
-            else
-            {
-                contextTxt = new float[numTxtTokens * 4096];
-                for (int i = 0; i < prompt.Length; i++)
-                {
-                    int tokIdx = i % numTxtTokens;
-                    int dimIdx = (i * 31) % 4096;
-                    contextTxt[tokIdx * 4096 + dimIdx] = ((prompt[i] % 32) - 16) / 16.0f;
-                }
-            }
-
-            var swStep = Stopwatch.StartNew();
-            for (int step = 0; step < steps; step++)
-            {
-                var swS = Stopwatch.StartNew();
-                float currentT = timesteps[step];
-                float nextT = timesteps[step + 1];
-
-                _fluxDit.PredictVelocity(latents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
-                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-                GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Step {step + 1}/{steps}: {swS.ElapsedMilliseconds} ms (Flow velocity + Euler step)");
-            }
-            GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Total DiT Latent Trajectory ({steps} steps): {swStep.ElapsedMilliseconds} ms");
+            _fluxDit!.PredictVelocity(latents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
+            FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
+            GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Step {step + 1}/{steps}: {swS.ElapsedMilliseconds} ms (Flow velocity + Euler step)");
         }
-        else if (_model.RecommendedSchedule == "FlowMatching")
-        {
-            var scheduler = new FlowMatchingScheduler(steps);
-            var timesteps = scheduler.Timesteps;
+        GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] Total DiT Latent Trajectory ({steps} steps): {swStep.ElapsedMilliseconds} ms");
 
-            for (int step = 0; step < steps; step++)
-            {
-                float currentT = timesteps[step];
-                float nextT = timesteps[step + 1];
-
-                float denom = MathF.Max(currentT, 0.05f);
-                for (int i = 0; i < latentSize; i++)
-                {
-                    velocity[i] = (latents[i] - targetLatents[i]) / denom;
-                }
-
-                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-            }
-        }
-        else
-        {
-            // Standard DDIM / Euler schedule for SD1.5 / SDXL
-            for (int step = 0; step < steps; step++)
-            {
-                float progress = (float)(step + 1) / steps;
-                for (int i = 0; i < latentSize; i++)
-                {
-                    latents[i] = latents[i] * (1.0f - progress) + targetLatents[i] * progress;
-                }
-            }
-        }
-
-        // 5. Decode Latents to RGB Pixels
+        // 3. Decode Latents to RGB Pixels via Neural Flux VAE
         var rgbPixels = new byte[targetW * targetH * 3];
         var swVae = Stopwatch.StartNew();
-        if (_neuralVae != null)
-        {
-            _neuralVae.Decode(latents, latentH, latentW, rgbPixels);
-        }
-        else
-        {
-            _fallbackVae.Decode(latents, latentH, latentW, rgbPixels);
-        }
+        _neuralVae!.Decode(latents, latentH, latentW, rgbPixels);
         GlacierDiagnostics.LogInformation($"[PIPELINE TIMING] VAE Latent Decode ({latentW}x{latentH} -> {targetW}x{targetH}): {swVae.ElapsedMilliseconds} ms");
 
         sw.Stop();
-        float pxPerSec = (targetW * targetH) / (float)sw.Elapsed.TotalSeconds;
+        float pxPerSec = (targetW * targetH) / (float)Math.Max(sw.Elapsed.TotalSeconds, 1e-6);
 
         return new ImageGenerationResult(
             Width: targetW,
@@ -270,8 +245,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
     }
 
     /// <summary>
-    /// Generates a photorealistic video sequence via multi-frame neural diffusion transformer inference.
-    /// Evaluates 4-step Flow Matching ODE trajectory on GPU with temporal noise coupling and 3D VAE decoding.
+    /// Generates a multi-frame video sequence via keyframe Flux.1 DiT inference and Neural Flux VAE decoding.
     /// </summary>
     public Glacier.Inference.Video.VideoGenerationResult GenerateVideo(
         string prompt,
@@ -282,6 +256,9 @@ public sealed class DiffusionGgufPipeline : IDisposable
         int? numSteps = null,
         int? seed = null)
     {
+        EnsureFluxComponentsLoaded();
+        ArgumentNullException.ThrowIfNull(prompt);
+
         var sw = Stopwatch.StartNew();
 
         int targetW = width ?? 256;
@@ -295,23 +272,9 @@ public sealed class DiffusionGgufPipeline : IDisposable
 
         int keyframeCount = Math.Clamp((numFrames + 2) / 3, 2, 4);
 
-        float[] pooledY = _clipEncoder != null ? _clipEncoder.EncodePrompt(prompt) : new float[768];
-        int numTxtTokens = 64;
-        float[] contextTxt;
-        if (_t5Encoder != null)
-        {
-            contextTxt = _t5Encoder.Encode(prompt, seqLen: numTxtTokens);
-        }
-        else
-        {
-            contextTxt = new float[numTxtTokens * 4096];
-            for (int i = 0; i < prompt.Length; i++)
-            {
-                int tokIdx = i % numTxtTokens;
-                int dimIdx = (i * 31) % 4096;
-                contextTxt[tokIdx * 4096 + dimIdx] = ((prompt[i] % 32) - 16) / 16.0f;
-            }
-        }
+        float[] pooledY = _clipEncoder!.EncodePrompt(prompt);
+        const int numTxtTokens = 64;
+        float[] contextTxt = _t5Encoder!.Encode(prompt, seqLen: numTxtTokens);
 
         var keyframeLatents = new List<float[]>(keyframeCount);
         var rng = seed.HasValue ? new Random(seed.Value) : new Random();
@@ -359,11 +322,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
                 float currentT = timesteps[step];
                 float nextT = timesteps[step + 1];
 
-                if (_fluxDit != null)
-                {
-                    _fluxDit.PredictVelocity(currentLatents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
-                }
-
+                _fluxDit!.PredictVelocity(currentLatents, latentH, latentW, currentT, pooledY, contextTxt, numTxtTokens, velocity);
                 FlowMatchingScheduler.Step(currentLatents, velocity, currentT, nextT);
             }
 
@@ -402,15 +361,7 @@ public sealed class DiffusionGgufPipeline : IDisposable
             }
 
             byte[] frameBytes = new byte[frameRgbBytes];
-            if (_neuralVae != null)
-            {
-                _neuralVae.Decode(interpolatedLatent, latentH, latentW, frameBytes);
-            }
-            else
-            {
-                _fallbackVae.Decode(interpolatedLatent, latentH, latentW, frameBytes);
-            }
-
+            _neuralVae!.Decode(interpolatedLatent, latentH, latentW, frameBytes);
             frames.Add(frameBytes);
         }
 
@@ -436,7 +387,6 @@ public sealed class DiffusionGgufPipeline : IDisposable
             _fluxDit?.Dispose();
             _clipEncoder?.Dispose();
             _t5Encoder?.Dispose();
-            _fallbackVae.Dispose();
             _disposed = true;
         }
     }

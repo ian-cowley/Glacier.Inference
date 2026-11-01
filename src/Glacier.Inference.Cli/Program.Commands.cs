@@ -4,26 +4,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Net.Http;
-using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Linq;
 using Glacier.Inference.Audio;
 using Glacier.Inference.Audio.Kitten;
 using Glacier.Inference.Config;
-using Glacier.Inference.Diagnostics;
-using Glacier.Inference.Engine;
-using Glacier.Inference.Gguf;
 using Glacier.Inference.Hardware;
-using Glacier.Inference.Memory;
-using Glacier.Inference.Sampling;
-using Glacier.Inference.Vision;
-using Glacier.Inference.Video;
-using Glacier.Inference.Image;
-using Glacier.Inference.Image.Gguf;
 
 public static partial class Program
 {
@@ -192,7 +177,7 @@ public static partial class Program
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("=========================================================================================================");
-            Console.WriteLine("                GLACIER.INFERENCE: KITTENTTS NEURAL VOICES & KOKORO ROSTER                               ");
+            Console.WriteLine("             GLACIER.INFERENCE: KITTENTTS NEURAL VOICES & FORMANT TTS ROSTER                             ");
             Console.WriteLine("=========================================================================================================");
             Console.ResetColor();
 
@@ -323,7 +308,7 @@ public static partial class Program
                 return 0;
             }
 
-            // Fallback to legacy Kokoro formant engine
+            // Procedural Liljencrants-Fant glottal formant engine
             KokoroVoice voice = rawVoice switch
             {
                 "af_heart" or "heart" => KokoroVoice.AfHeart,
@@ -348,7 +333,7 @@ public static partial class Program
             using var tts = new KokoroTtsEngine();
             var profile = tts.GetVoiceProfile(voice);
 
-            Console.WriteLine($"[Kokoro TTS] Synthesizing '{text}'");
+            Console.WriteLine($"[Formant TTS] Synthesizing '{text}'");
             Console.WriteLine($"   Voice:       {profile.DisplayName} ({profile.Accent}, {profile.Gender}, {profile.BaseF0:F0}Hz)");
             Console.WriteLine($"   Cadence:     {speed:F2}x Speed");
 
@@ -391,17 +376,13 @@ public static partial class Program
             var sw = Stopwatch.StartNew();
 
             byte[] wavBytes = File.ReadAllBytes(wavPath);
-            int dataOffset = 44;
-            int numSamples = (wavBytes.Length - dataOffset) / 2;
-            var audioSamples = new float[numSamples];
-            for (int i = 0; i < numSamples; i++)
-            {
-                short val = BitConverter.ToInt16(wavBytes, dataOffset + i * 2);
-                audioSamples[i] = val / 32768.0f;
-            }
+            float[] audioSamples = WavWriter.ReadMonoFloat(wavBytes, out int sampleRate);
+            Console.WriteLine($"[Whisper STT] Parsed RIFF WAVE ({audioSamples.Length} mono samples @ {sampleRate}Hz).");
 
+#pragma warning disable GLACIER_EXP001
             using var whisper = new WhisperEngine();
             string transcript = whisper.Transcribe(audioSamples);
+#pragma warning restore GLACIER_EXP001
             sw.Stop();
 
             Console.ForegroundColor = ConsoleColor.Green;
@@ -419,19 +400,22 @@ public static partial class Program
 
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("   GLACIER.INFERENCE: FULL-DUPLEX VOICE SUBSYSTEM WORKING DEMONSTRATION   ");
-            Console.WriteLine("       Pure C# .NET 10 | Kokoro-82M TTS + Whisper STT + Win32 Audio Pipeline   ");
+            Console.WriteLine("   GLACIER.INFERENCE: VOICE & AUDIO DSP SUBSYSTEM WORKING DEMONSTRATION   ");
+            Console.WriteLine("    Pure C# .NET 10 | Procedural Formant TTS + SIMD Mel DSP + Win32 Audio ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
 
+#pragma warning disable GLACIER_EXP001
             using var pipeline = new VoicePipeline();
+#pragma warning restore GLACIER_EXP001
             var sw = Stopwatch.StartNew();
 
-            // Step 1: Synthesize prompt using Kokoro (US Female)
+            // Step 1: Synthesize prompt using Formant TTS (US Female)
             string testPrompt = "Hello world from Glacier high performance audio.";
-            Console.WriteLine($"[1. Kokoro TTS] Generating audio for prompt: \"{testPrompt}\" (Voice: AfHeart - US Female)");
+            Console.WriteLine($"[1. Formant TTS] Generating audio for prompt: \"{testPrompt}\" (Voice: AfHeart - US Female)");
             var ttsSw = Stopwatch.StartNew();
+#pragma warning disable GLACIER_EXP001
             float[] generatedSpeech = pipeline.Speak(testPrompt, KokoroVoice.AfHeart);
             ttsSw.Stop();
             float durationSec = (float)generatedSpeech.Length / pipeline.Tts.SampleRate;
@@ -477,36 +461,17 @@ public static partial class Program
             Console.WriteLine($"   -> Extracted {nFrames} frames ({mel.NMels}x{nFrames} tensor) in {dspSw.ElapsedMilliseconds}ms ({nFrames * 1000L / Math.Max(1, dspSw.ElapsedMilliseconds):N0} frames/sec)");
             Console.WriteLine();
 
-            // Step 4: Transcribe Speech using Whisper STT Engine
-            Console.WriteLine("[4. Whisper STT] Transcribing audio via Encoder-Decoder Cross-Attention...");
-            var sttSw = Stopwatch.StartNew();
-            string transcript = pipeline.Listen(generatedSpeech);
-            sttSw.Stop();
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"   -> Transcribed Text ({sttSw.ElapsedMilliseconds}ms): \"{transcript}\"");
-            Console.ResetColor();
+            // Step 4: Verify RIFF WAV Ingestion
+            Console.WriteLine("[4. RIFF WAVE Parser] Verifying round-trip WAV chunk parsing...");
+            byte[] roundTripBytes = File.ReadAllBytes(demoWav);
+            float[] decodedMono = WavWriter.ReadMonoFloat(roundTripBytes, out int decodedSr);
+            Console.WriteLine($"   -> Decoded {decodedMono.Length} samples @ {decodedSr}Hz from '{demoWav}'.");
             Console.WriteLine();
-
-            // Step 5: Full-Duplex Conversational Turn
-            Console.WriteLine("[5. Full-Duplex Conversational Turn] Testing Live Conversation Cycle...");
-            var (userIn, agentResp, respAudio) = pipeline.ConversationalTurn(
-                generatedSpeech,
-                input => $"Glacier Voice Agent received: '{input}'. Synthesizing instant speech response.",
-                KokoroVoice.AmAdam);
-
-            Console.WriteLine($"   - User Input:    \"{userIn}\"");
-            Console.WriteLine($"   - Agent Output:  \"{agentResp}\"");
-            Console.WriteLine($"   - Agent Audio:   {respAudio.Length} samples ({respAudio.Length / 24000f:F2}s @ 24kHz)");
-            if (play)
-            {
-                Console.WriteLine("   -> Playing conversational response speech through speakers...");
-                AudioPlayer.Play(respAudio, pipeline.Tts.SampleRate, wait: true);
-            }
-            Console.WriteLine();
+#pragma warning restore GLACIER_EXP001
 
             sw.Stop();
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VERIFIED] End-to-end full duplex voice demonstration completed in {sw.ElapsedMilliseconds}ms with direct OS & driver interop!");
+            Console.WriteLine($"[VERIFIED] Voice & DSP demonstration completed in {sw.ElapsedMilliseconds}ms with direct OS & driver interop!");
             Console.ResetColor();
             return 0;
         }
@@ -514,5 +479,4 @@ public static partial class Program
         Console.Error.WriteLine($"Unknown voice command: '{subCmd}'. Use 'glacier voice --help' for usage.");
         return 1;
     }
-
 }

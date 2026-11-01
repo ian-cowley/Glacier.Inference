@@ -280,6 +280,11 @@ public abstract unsafe class CpuModelBase : ICpuModel
                 int gateUpDim = 2 * _ffnDim;
                 QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, _normX, _gateUpFused, _dim, gateUpDim, _normXSums);
                 if (layer.FfnUpBias != null) AddVector(_gateUpFused, layer.FfnUpBias, gateUpDim);
+                if (LoraWeights != null)
+                {
+                    LoraWeights.Apply(modelLayer, LoraProjection.Gate, _normX, _gateUpFused, _dim, _ffnDim);
+                    LoraWeights.Apply(modelLayer, LoraProjection.Up, _normX, _gateUpFused + _ffnDim, _dim, _ffnDim);
+                }
 
                 QuantKernels.SwiGLU(_gateUpFused, _gateUpFused + _ffnDim, _ffnAct, _ffnDim);
             }
@@ -534,8 +539,14 @@ public abstract unsafe class CpuModelBase : ICpuModel
                 QuantKernels.MatMulBatch(layer.FfnUpType, layer.FfnUpWeight, _normXBatch, _gateUpBatch, _dim, gateUpDim, batchSize, _normXSumBatch);
                 for (int t = 0; t < batchSize; t++)
                 {
+                    float* normXt = _normXBatch + t * _dim;
                     float* src = _gateUpBatch + t * gateUpDim;
                     if (layer.FfnUpBias != null) AddVector(src, layer.FfnUpBias, gateUpDim);
+                    if (LoraWeights != null)
+                    {
+                        LoraWeights.Apply(modelLayer, LoraProjection.Gate, normXt, src, _dim, _ffnDim);
+                        LoraWeights.Apply(modelLayer, LoraProjection.Up, normXt, src + _ffnDim, _dim, _ffnDim);
+                    }
                     QuantKernels.SwiGLU(src, src + _ffnDim, _ffnActBatch + t * _ffnDim, _ffnDim);
                 }
             }
@@ -583,6 +594,24 @@ public abstract unsafe class CpuModelBase : ICpuModel
     public void PrefillPrompt(ReadOnlySpan<int> tokens, KVCache kvCache)
     {
         ForwardBatch(tokens, 0, Span<float>.Empty, kvCache, computeLogits: false);
+    }
+
+    /// <inheritdoc />
+    public virtual void ResetState()
+    {
+    }
+
+    /// <inheritdoc />
+    public virtual long StateSnapshotBytes => 0;
+
+    /// <inheritdoc />
+    public virtual void SaveRecurrentState(Span<byte> destination)
+    {
+    }
+
+    /// <inheritdoc />
+    public virtual void RestoreRecurrentState(ReadOnlySpan<byte> source)
+    {
     }
 
     /// <summary>

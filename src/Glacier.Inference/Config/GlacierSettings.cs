@@ -7,18 +7,23 @@ using System.Text.Json.Serialization;
 using Glacier.Inference.Hardware;
 
 /// <summary>
+/// Source-generated JSON serialization context for <see cref="GlacierSettings"/> (100% Native AOT compatible).
+/// </summary>
+[JsonSourceGenerationOptions(
+    WriteIndented = true,
+    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+    UseStringEnumConverter = true)]
+[JsonSerializable(typeof(GlacierSettings))]
+public partial class GlacierSettingsJsonContext : JsonSerializerContext
+{
+}
+
+/// <summary>
 /// Persistent user configuration for hardware acceleration and inference execution.
 /// Stored in %LOCALAPPDATA%\Glacier\Inference\settings.json.
 /// </summary>
 public sealed class GlacierSettings
 {
-    private static readonly JsonSerializerOptions JsonOpts = new()
-    {
-        WriteIndented = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        Converters = { new JsonStringEnumConverter() }
-    };
-
     public string? DeviceId { get; set; } = "auto";
     public InferenceEngineType Engine { get; set; } = InferenceEngineType.Auto;
     public bool FallbackToCpu { get; set; } = true;
@@ -46,7 +51,7 @@ public sealed class GlacierSettings
             if (File.Exists(path))
             {
                 string json = File.ReadAllText(path);
-                var settings = JsonSerializer.Deserialize<GlacierSettings>(json, JsonOpts);
+                var settings = JsonSerializer.Deserialize(json, GlacierSettingsJsonContext.Default.GlacierSettings);
                 if (settings != null) return settings;
             }
         }
@@ -63,7 +68,7 @@ public sealed class GlacierSettings
         string dir = GetSettingsDirectory();
         Directory.CreateDirectory(dir);
         string path = GetSettingsFilePath();
-        string json = JsonSerializer.Serialize(this, JsonOpts);
+        string json = JsonSerializer.Serialize(this, GlacierSettingsJsonContext.Default.GlacierSettings);
         File.WriteAllText(path, json);
     }
 

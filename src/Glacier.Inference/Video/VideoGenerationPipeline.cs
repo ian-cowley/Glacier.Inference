@@ -1,7 +1,9 @@
 namespace Glacier.Inference.Video;
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Image;
@@ -9,25 +11,29 @@ using Glacier.Inference.Video.Wan;
 using Glacier.Inference.Image.Flux;
 
 /// <summary>
-/// End-to-End Generative Video Production Pipeline.
-/// Combines 3D Spatio-Temporal Flow-Matching DiT (Text-to-Video), 3D-RoPE spatial-temporal embeddings,
-/// Catmull-Rom cubic temporal spline VAE decoding, and zero-dependency video container export (APNG, GIF, AVI).
+/// End-to-End Generative Video Production Pipeline powered by Wan2.1 Spatio-Temporal Diffusion Transformer GGUF weights,
+/// T5-XXL text conditioning, 3D Causal VAE decoding, and zero-dependency video container export (APNG, GIF, AVI).
 /// </summary>
 public sealed class VideoGenerationPipeline : IDisposable
 {
     private readonly WanDiT? _wanDit;
     private readonly FluxT5Encoder? _t5Encoder;
+#pragma warning disable GLACIER_EXP001
     private readonly SpatioTemporalDiT _dit;
     private readonly TemporalLatentVaeDecoder _vae;
+#pragma warning restore GLACIER_EXP001
     private bool _disposed;
 
     public WanDiT? WanDiT => _wanDit;
     public FluxT5Encoder? T5Encoder => _t5Encoder;
+    [Experimental("GLACIER_EXP001")]
     public SpatioTemporalDiT DiT => _dit;
+    [Experimental("GLACIER_EXP001")]
     public TemporalLatentVaeDecoder VAE => _vae;
     public string ActiveBackend => (_wanDit != null && _wanDit.IsGpuAccelerated) ? "Cuda" : "Cpu";
     public Exception? FallbackException { get; private set; }
 
+#pragma warning disable GLACIER_EXP001
     public VideoGenerationPipeline(
         string? modelPath = null,
         string? t5Path = null,
@@ -79,7 +85,9 @@ public sealed class VideoGenerationPipeline : IDisposable
             try
             {
                 _wanDit = WanDiT.Open(resolvedModel, enableGpu: true);
-                string mode = _wanDit.IsGpuAccelerated ? "NVIDIA RTX 4060 GPU" : "CPU AVX-512";
+                string mode = _wanDit.IsGpuAccelerated
+                    ? $"{_wanDit.GpuDeviceName ?? "CUDA"} GPU"
+                    : "CPU SIMD";
                 GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Loaded pre-trained Video DiT: {Path.GetFileName(resolvedModel)} (30 blocks, 1.3B params) on {mode}");
             }
             catch (Exception ex)
@@ -106,6 +114,7 @@ public sealed class VideoGenerationPipeline : IDisposable
             }
         }
     }
+#pragma warning restore GLACIER_EXP001
 
     private static string? FindModelFile(string filename)
     {
@@ -116,7 +125,6 @@ public sealed class VideoGenerationPipeline : IDisposable
             Path.Combine("Glacier.Inference", "models", filename),
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", filename),
             Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "models", filename),
-            Path.Combine(userProfile, "source", "repos", "PolarsPlus", "Glacier.Inference", "models", filename),
             Path.Combine(userProfile, ".cache", "glacier", "models", filename)
         ];
         foreach (var c in candidates)
@@ -126,8 +134,34 @@ public sealed class VideoGenerationPipeline : IDisposable
         return null;
     }
 
+#pragma warning disable GLACIER_EXP001
+    private void EnsureWanComponentsLoaded()
+    {
+        if (_wanDit == null)
+        {
+            throw new FileNotFoundException(
+                "Wan2.1 Video DiT weights (e.g., Wan2.1-T2V-1.3B-Q4_K_M.gguf) were not found or failed to load. Procedural SpatioTemporalDiT fallback has been disabled.",
+                FallbackException);
+        }
+
+        if (_t5Encoder == null)
+        {
+            throw new FileNotFoundException(
+                "T5-XXL text encoder weights (t5xxl.gguf) are required for Wan2.1 video generation. ASCII prompt hashing fallback has been disabled.",
+                FallbackException);
+        }
+
+        if (!_vae.HasNeuralVae)
+        {
+            throw new FileNotFoundException(
+                "Neural 3D VAE weights (wan_2.1_vae.safetensors or ae.safetensors) are required for Wan2.1 video generation. Procedural VAE fallback has been disabled.",
+                FallbackException);
+        }
+    }
+#pragma warning restore GLACIER_EXP001
+
     /// <summary>
-    /// Generates a cinematic video sequence from a textual prompt with camera motion steering.
+    /// Generates a cinematic video sequence from a textual prompt with Wan2.1 Flow Matching inference.
     /// </summary>
     public VideoGenerationResult Generate(
         string prompt,
@@ -152,267 +186,106 @@ public sealed class VideoGenerationPipeline : IDisposable
             throw new ArgumentException("NumFrames must be at least 1.", nameof(numFrames));
         }
 
+        EnsureWanComponentsLoaded();
+        var wanDit = _wanDit!;
+        var t5Encoder = _t5Encoder!;
+
         var sw = Stopwatch.StartNew();
 
-        int latentH = height / TemporalLatentVaeDecoder.SpatialScaleFactor; // e.g. 30
-        int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;  // e.g. 30
-        int latentChannels = _dit.LatentChannels;                          // 16
+#pragma warning disable GLACIER_EXP001
+        int latentH = height / TemporalLatentVaeDecoder.SpatialScaleFactor;
+        int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;
+        int latentChannels = _dit.LatentChannels;
+#pragma warning restore GLACIER_EXP001
 
         // Compute keyframe latent count: for Wan 3D causal VAE, N_frames = 1 + 4 * (K - 1)
-        // Default to K=9 native keyframes (33 native frames @ 14,040 tokens for 832x480), upscaled to full duration via Catmull-Rom splines
         int spatialTokens = (latentH / 2) * (latentW / 2);
-        int maxWanKeyframes = (_wanDit != null && spatialTokens > 0) ? Math.Min(9, _wanDit.MaxTokens / spatialTokens) : 8;
-        int temporalLatentFrames = (_wanDit != null)
-            ? Math.Clamp((numFrames - 1) / 4 + 1, 2, maxWanKeyframes)
-            : Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);
+        int maxWanKeyframes = spatialTokens > 0 ? Math.Min(9, wanDit.MaxTokens / spatialTokens) : 8;
+        int temporalLatentFrames = Math.Clamp((numFrames - 1) / 4 + 1, 2, maxWanKeyframes);
 
         int frameLatentSize = latentChannels * latentH * latentW;
         int totalLatentSize = temporalLatentFrames * frameLatentSize;
 
-        if (_wanDit != null)
+        const int textSeqLen = 512;
+        GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Encoding prompt text context via pure C# T5-XXL (padded to {textSeqLen} tokens)...");
+        var (promptEmbeds, validCount) = t5Encoder.EncodeWithCount(prompt, maxSeqLen: textSeqLen);
+        float[] contextTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
+        Array.Copy(promptEmbeds, contextTxt, promptEmbeds.Length);
+
+        float[]? uncondTxt = null;
+        if (guidanceScale > 1.0f)
         {
-            const int textSeqLen = 512;
-            float[] contextTxt;
-            float[]? uncondTxt = null;
-            int contextCount = textSeqLen;
-            int uncondCount = textSeqLen;
-
-            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            string repoBase = Path.Combine(userProfile, "source", "repos", "PolarsPlus", "Glacier.Inference");
-            string? autoEmbedFile = null;
-            string? autoNegFile = null;
-
-            const string DefaultWomanPrompt = "A stunning stylish woman in a dark coat walking confidently toward the camera along a bustling modern city street at night, glowing neon signs, vibrant urban bokeh, wet pavement reflections, smooth fluid motion, cinematic 8k";
-
-            if (prompt.Contains("leg", StringComparison.OrdinalIgnoreCase) || prompt.Contains("boots", StringComparison.OrdinalIgnoreCase) || prompt.Contains("full body", StringComparison.OrdinalIgnoreCase))
-            {
-                string candidate = Path.Combine(repoBase, "woman_legs_prompt_embeds.bin");
-                if (File.Exists(candidate) || File.Exists("woman_legs_prompt_embeds.bin"))
-                {
-                    autoEmbedFile = File.Exists(candidate) ? candidate : "woman_legs_prompt_embeds.bin";
-                    autoNegFile = File.Exists(Path.Combine(repoBase, "woman_legs_neg_embeds.bin")) ? Path.Combine(repoBase, "woman_legs_neg_embeds.bin") : "woman_legs_neg_embeds.bin";
-                }
-            }
-            else if (prompt.Trim().Equals(DefaultWomanPrompt, StringComparison.OrdinalIgnoreCase) || prompt.Contains("woman", StringComparison.OrdinalIgnoreCase))
-            {
-                string candidate = Path.Combine(repoBase, "woman_prompt_embeds.bin");
-                if (File.Exists(candidate) || File.Exists("woman_prompt_embeds.bin"))
-                {
-                    autoEmbedFile = File.Exists(candidate) ? candidate : "woman_prompt_embeds.bin";
-                    autoNegFile = File.Exists(Path.Combine(repoBase, "woman_neg_embeds.bin")) ? Path.Combine(repoBase, "woman_neg_embeds.bin") : "woman_neg_embeds.bin";
-                }
-            }
-            else if (prompt.Trim().Equals("A handsome man walking along a city street", StringComparison.OrdinalIgnoreCase))
-            {
-                string candidate = Path.Combine(repoBase, "diffusers_prompt_embeds_832.bin");
-                if (File.Exists(candidate) || File.Exists("diffusers_prompt_embeds_832.bin"))
-                {
-                    autoEmbedFile = File.Exists(candidate) ? candidate : "diffusers_prompt_embeds_832.bin";
-                    autoNegFile = File.Exists(Path.Combine(repoBase, "diffusers_neg_embeds_832.bin")) ? Path.Combine(repoBase, "diffusers_neg_embeds_832.bin") : "diffusers_neg_embeds_832.bin";
-                }
-            }
-            else if (File.Exists("prompt_embeds.bin") && !prompt.Contains("leg", StringComparison.OrdinalIgnoreCase))
-            {
-                autoEmbedFile = "prompt_embeds.bin";
-                autoNegFile = "neg_embeds.bin";
-            }
-
-            if (autoEmbedFile != null && File.Exists(autoEmbedFile))
-            {
-                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Ingesting high-precision UMT5 text embeddings from {Path.GetFileName(autoEmbedFile)}...");
-                using var br = new BinaryReader(File.OpenRead(autoEmbedFile));
-                int seq = br.ReadInt32();
-                int dim = br.ReadInt32();
-                contextTxt = new float[seq * dim];
-                for (int i = 0; i < contextTxt.Length; i++) contextTxt[i] = br.ReadSingle();
-                contextCount = seq;
-
-                if (autoNegFile != null && File.Exists(autoNegFile) && guidanceScale > 1.0f)
-                {
-                    using var brNeg = new BinaryReader(File.OpenRead(autoNegFile));
-                    brNeg.ReadInt32(); brNeg.ReadInt32();
-                    uncondTxt = new float[seq * dim];
-                    for (int i = 0; i < uncondTxt.Length; i++) uncondTxt[i] = brNeg.ReadSingle();
-                    uncondCount = seq;
-                }
-                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Text context loaded ({contextCount} tokens, dim={dim}, CFG enabled={uncondTxt != null}).");
-            }
-            else if (_t5Encoder != null)
-            {
-                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Encoding prompt text context via pure C# T5-XXL (padded to {textSeqLen} tokens)...");
-                var (promptEmbeds, validCount) = _t5Encoder.EncodeWithCount(prompt, maxSeqLen: textSeqLen);
-                contextTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
-                Array.Copy(promptEmbeds, contextTxt, promptEmbeds.Length);
-
-                if (guidanceScale > 1.0f)
-                {
-                    const string defaultNegPrompt = "blurry, distorted, deformed, low quality, cartoon, static, bad anatomy";
-                    var (negEmbeds, _) = _t5Encoder.EncodeWithCount(defaultNegPrompt, maxSeqLen: textSeqLen);
-                    uncondTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
-                    Array.Copy(negEmbeds, uncondTxt, negEmbeds.Length);
-                }
-                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Text context encoded successfully ({validCount} valid prompt tokens padded to {textSeqLen}, uncond={textSeqLen} tokens).");
-            }
-            else
-            {
-                contextTxt = new float[textSeqLen * 4096];
-                for (int i = 0; i < prompt.Length; i++)
-                {
-                    int tokIdx = i % Math.Min(64, prompt.Length);
-                    int dimIdx = (i * 31) % 4096;
-                    contextTxt[tokIdx * 4096 + dimIdx] = ((prompt[i] % 32) - 16) / 16.0f;
-                }
-                if (guidanceScale > 1.0f)
-                {
-                    uncondTxt = new float[textSeqLen * 4096];
-                }
-            }
-
-            var latents = new float[totalLatentSize];
-            var velocity = new float[totalLatentSize];
-            var uncondVel = (guidanceScale > 1.0f) ? new float[totalLatentSize] : null;
-            var rnd = seed.HasValue ? new Random(seed.Value) : new Random();
-            for (int i = 0; i < totalLatentSize; i++)
-            {
-                double u1 = Math.Max(1e-7, rnd.NextDouble());
-                double u2 = rnd.NextDouble();
-                latents[i] = (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
-            }
-
-            // Flow Matching Scheduler with Wan 2.1 flow-shift 3.0
-            var scheduler = new FlowMatchingScheduler(numSteps, timeShift: 3.0f);
-            var timesteps = scheduler.Timesteps;
-
-            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Starting Flow Matching Euler Solver ({numSteps} steps, guidance={guidanceScale:F1}, tokens={temporalLatentFrames * (latentH / 2) * (latentW / 2)})...");
-            for (int step = 0; step < numSteps; step++)
-            {
-                float currentT = timesteps[step];
-                float nextT = timesteps[step + 1];
-                var stepSw = Stopwatch.StartNew();
-
-                _wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, contextTxt, contextCount, velocity);
-
-                if (guidanceScale > 1.0f && uncondTxt != null && uncondVel != null)
-                {
-                    _wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, uncondTxt, uncondCount, uncondVel);
-                    for (int i = 0; i < totalLatentSize; i++)
-                    {
-                        velocity[i] = uncondVel[i] + guidanceScale * (velocity[i] - uncondVel[i]);
-                    }
-                }
-
-                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-                stepSw.Stop();
-
-                float vMin = float.MaxValue, vMax = float.MinValue, vSum = 0f;
-                float lMin = float.MaxValue, lMax = float.MinValue, lSum = 0f;
-                for (int i = 0; i < latents.Length; i++)
-                {
-                    float v = velocity[i];
-                    float l = latents[i];
-                    if (v < vMin) vMin = v;
-                    if (v > vMax) vMax = v;
-                    vSum += v;
-                    if (l < lMin) lMin = l;
-                    if (l > lMax) lMax = l;
-                    lSum += l;
-                }
-                float vMean = vSum / latents.Length;
-                float lMean = lSum / latents.Length;
-
-                GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Step {step + 1}/{numSteps} (t={currentT:F3} -> {nextT:F3}): {stepSw.ElapsedMilliseconds} ms | Vel[min={vMin:F2}, max={vMax:F2}, mean={vMean:F3}] | Lat[min={lMin:F2}, max={lMax:F2}, mean={lMean:F3}]");
-            }
-
-            // Dump latents to disk for precision validation
-            using (var bw = new BinaryWriter(File.Create("latents_dump.bin")))
-            {
-                bw.Write(temporalLatentFrames);
-                bw.Write(latentH);
-                bw.Write(latentW);
-                for (int i = 0; i < latents.Length; i++) bw.Write(latents[i]);
-            }
-
-            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Decoding {temporalLatentFrames} latent keyframes into {numFrames} RGB frames via 3D Causal VAE...");
-            var frames = _vae.DecodeVideo(latents, temporalLatentFrames, numFrames, latentH, latentW);
-            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] 3D VAE decoding complete ({frames.Count} frames).");
-            sw.Stop();
-
-            return new VideoGenerationResult(
-                frames,
-                width,
-                height,
-                fps,
-                sw.ElapsedMilliseconds,
-                prompt,
-                motion);
+            const string defaultNegPrompt = "blurry, distorted, deformed, low quality, cartoon, static, bad anatomy";
+            var (negEmbeds, _) = t5Encoder.EncodeWithCount(defaultNegPrompt, maxSeqLen: textSeqLen);
+            uncondTxt = new float[textSeqLen * FluxT5Encoder.HiddenDim];
+            Array.Copy(negEmbeds, uncondTxt, negEmbeds.Length);
         }
+        GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Text context encoded successfully ({validCount} valid prompt tokens padded to {textSeqLen}, uncond={textSeqLen} tokens).");
 
-        // Fallback: 1. Synthesize Semantic Prompt Target Latents (z_0) for each keyframe with continuous camera motion
-        int effectiveSeed = seed ?? Random.Shared.Next();
-        var targetLatents = new float[totalLatentSize];
-        for (int k = 0; k < temporalLatentFrames; k++)
-        {
-            float u = (temporalLatentFrames <= 1) ? 0.0f : (float)k / (temporalLatentFrames - 1);
-            var (offX, offY, zoom, _) = GetCameraTransform(motion, u);
-            int frameOffset = k * frameLatentSize;
-
-            PromptSemanticSynthesizer.SynthesizeTargetLatents(
-                prompt,
-                targetLatents.AsSpan(frameOffset, frameLatentSize),
-                latentH,
-                latentW,
-                latentChannels,
-                effectiveSeed,
-                offX,
-                offY,
-                zoom);
-        }
-
-        // 2. Initialize Spatio-Temporal Gaussian Noise Latents (z_1 ~ N(0, I))
-        var fallbackLatents = new float[totalLatentSize];
-        var fallbackVelocity = new float[totalLatentSize];
-        var ditVelocity = new float[totalLatentSize];
-
-        var rndFallback = new Random(effectiveSeed);
+        var latents = new float[totalLatentSize];
+        var velocity = new float[totalLatentSize];
+        var uncondVel = (guidanceScale > 1.0f) ? new float[totalLatentSize] : null;
+        var rnd = seed.HasValue ? new Random(seed.Value) : new Random();
         for (int i = 0; i < totalLatentSize; i++)
         {
-            double u1 = Math.Max(1e-7, rndFallback.NextDouble());
-            double u2 = rndFallback.NextDouble();
-            float z = (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
-
-            fallbackLatents[i] = targetLatents[i] * 0.25f + z * 0.75f;
+            double u1 = Math.Max(1e-7, rnd.NextDouble());
+            double u2 = rnd.NextDouble();
+            latents[i] = (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
         }
 
-        // 3. Flow Matching (Euler ODE Integration Loop across continuous time t in [1.0 -> 0.0])
-        var fallbackScheduler = new FlowMatchingScheduler(numSteps);
-        var fallbackTimesteps = fallbackScheduler.Timesteps;
+        // Flow Matching Scheduler with Wan 2.1 flow-shift 3.0
+        var scheduler = new FlowMatchingScheduler(numSteps, timeShift: 3.0f);
+        var timesteps = scheduler.Timesteps;
 
+        GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Starting Flow Matching Euler Solver ({numSteps} steps, guidance={guidanceScale:F1}, tokens={temporalLatentFrames * (latentH / 2) * (latentW / 2)})...");
         for (int step = 0; step < numSteps; step++)
         {
-            float currentT = fallbackTimesteps[step];
-            float nextT = fallbackTimesteps[step + 1];
+            float currentT = timesteps[step];
+            float nextT = timesteps[step + 1];
+            var stepSw = Stopwatch.StartNew();
 
-            _dit.PredictVelocity(fallbackLatents, currentT, targetLatents, motion, temporalLatentFrames, latentH, latentW, ditVelocity);
+            wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, contextTxt, textSeqLen, velocity);
 
-            float denom = MathF.Max(currentT, 0.05f);
-            float ditModulation = currentT * (1.0f - currentT) * 2.0f;
-
-            for (int i = 0; i < totalLatentSize; i++)
+            if (guidanceScale > 1.0f && uncondTxt != null && uncondVel != null)
             {
-                float baseVelocity = (fallbackLatents[i] - targetLatents[i]) / denom;
-                fallbackVelocity[i] = baseVelocity + ditVelocity[i] * ditModulation;
+                wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, uncondTxt, textSeqLen, uncondVel);
+                for (int i = 0; i < totalLatentSize; i++)
+                {
+                    velocity[i] = uncondVel[i] + guidanceScale * (velocity[i] - uncondVel[i]);
+                }
             }
 
-            FlowMatchingScheduler.Step(fallbackLatents, fallbackVelocity, currentT, nextT);
+            FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
+            stepSw.Stop();
+
+            float vMin = float.MaxValue, vMax = float.MinValue, vSum = 0f;
+            float lMin = float.MaxValue, lMax = float.MinValue, lSum = 0f;
+            for (int i = 0; i < latents.Length; i++)
+            {
+                float v = velocity[i];
+                float l = latents[i];
+                if (v < vMin) vMin = v;
+                if (v > vMax) vMax = v;
+                vSum += v;
+                if (l < lMin) lMin = l;
+                if (l > lMax) lMax = l;
+                lSum += l;
+            }
+            float vMean = vSum / latents.Length;
+            float lMean = lSum / latents.Length;
+
+            GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Step {step + 1}/{numSteps} (t={currentT:F3} -> {nextT:F3}): {stepSw.ElapsedMilliseconds} ms | Vel[min={vMin:F2}, max={vMax:F2}, mean={vMean:F3}] | Lat[min={lMin:F2}, max={lMax:F2}, mean={lMean:F3}]");
         }
 
-        // 4. 3D VAE Temporal Spline Upsampling + Spatial Progressive Deconvolution to RGB
-        var fallbackFrames = _vae.DecodeVideo(fallbackLatents, temporalLatentFrames, numFrames, latentH, latentW);
-
+        GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] Decoding {temporalLatentFrames} latent keyframes into {numFrames} RGB frames via 3D Causal VAE...");
+#pragma warning disable GLACIER_EXP001
+        var frames = _vae.DecodeVideo(latents, temporalLatentFrames, numFrames, latentH, latentW);
+#pragma warning restore GLACIER_EXP001
+        GlacierDiagnostics.LogInformation($"[GLACIER VIDEO] 3D VAE decoding complete ({frames.Count} frames).");
         sw.Stop();
 
         return new VideoGenerationResult(
-            fallbackFrames,
+            frames,
             width,
             height,
             fps,
@@ -422,7 +295,7 @@ public sealed class VideoGenerationPipeline : IDisposable
     }
 
     /// <summary>
-    /// Generates video via neural Image-to-Video (I2V) Diffusion Transformer inference.
+    /// Generates video via neural Image-to-Video (I2V) Wan2.1 Diffusion Transformer inference.
     /// Encodes reference image into 16-channel spatial latents, evaluates Spatio-Temporal
     /// attention steered by camera motion, and decodes the neural trajectory through the 3D VAE decoder.
     /// </summary>
@@ -451,20 +324,28 @@ public sealed class VideoGenerationPipeline : IDisposable
             throw new ArgumentException("NumFrames must be at least 1.", nameof(numFrames));
         }
 
+        EnsureWanComponentsLoaded();
+        var wanDit = _wanDit!;
+        var t5Encoder = _t5Encoder!;
+
         var sw = Stopwatch.StartNew();
 
-        int latentH = height / TemporalLatentVaeDecoder.SpatialScaleFactor; // e.g. 32
-        int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;  // e.g. 32
-        int latentChannels = _dit.LatentChannels;                          // 16
+#pragma warning disable GLACIER_EXP001
+        int latentH = height / TemporalLatentVaeDecoder.SpatialScaleFactor;
+        int latentW = width / TemporalLatentVaeDecoder.SpatialScaleFactor;
+        int latentChannels = _dit.LatentChannels;
+#pragma warning restore GLACIER_EXP001
 
-        int temporalLatentFrames = Math.Clamp((numFrames + 3) / 4, 2, _dit.MaxFrames);
+        int spatialTokens = (latentH / 2) * (latentW / 2);
+        int maxWanKeyframes = spatialTokens > 0 ? Math.Min(9, wanDit.MaxTokens / spatialTokens) : 8;
+        int temporalLatentFrames = Math.Clamp((numFrames + 3) / 4, 2, maxWanKeyframes);
         int frameLatentSize = latentChannels * latentH * latentW;
         int totalLatentSize = temporalLatentFrames * frameLatentSize;
 
-        // 1. Neural VAE Latent Encoding: map 24-bit RGB reference image to 16-channel spatial latents
+        // 1. Latent Encoding: map 24-bit RGB reference image to 16-channel spatial latents
         float[] baseImageLatent = EncodeRgbToLatents(rgbPixels, sourceWidth, sourceHeight, latentH, latentW, latentChannels);
 
-        // 2. Synthesize multi-frame latent field with continuous optical warp (zero procedural shader hacks)
+        // 2. Synthesize multi-frame latent field with continuous optical warp
         var targetLatents = new float[totalLatentSize];
         for (int k = 0; k < temporalLatentFrames; k++)
         {
@@ -475,68 +356,31 @@ public sealed class VideoGenerationPipeline : IDisposable
             WarpLatents(baseImageLatent, targetLatents.AsSpan(frameOffset, frameLatentSize), latentH, latentW, latentChannels, offX, offY, zoom);
         }
 
-        // 3. Initialize Spatio-Temporal Latents directly from reference trajectory (Zero artificial noise injection)
+        // 3. Initialize Spatio-Temporal Latents from reference trajectory
         var latents = new float[totalLatentSize];
         var velocity = new float[totalLatentSize];
-        var ditVelocity = new float[totalLatentSize];
         Array.Copy(targetLatents, latents, totalLatentSize);
 
-        // 4. Flow Matching ODE Integration Loop (Neural DiT Forward Pass)
+        // 4. Flow Matching ODE Integration Loop (Wan2.1 DiT Forward Pass)
         var scheduler = new FlowMatchingScheduler(numSteps);
         var timesteps = scheduler.Timesteps;
 
-        if (_wanDit != null)
+        const int numTxtTokens = 64;
+        float[] contextTxt = t5Encoder.Encode(prompt, seqLen: numTxtTokens);
+
+        for (int step = 0; step < numSteps; step++)
         {
-            float[] contextTxt;
-            int numTxtTokens = 64;
-            if (_t5Encoder != null)
-            {
-                contextTxt = _t5Encoder.Encode(prompt, seqLen: numTxtTokens);
-            }
-            else
-            {
-                contextTxt = new float[numTxtTokens * 4096];
-                for (int i = 0; i < prompt.Length; i++)
-                {
-                    int tokIdx = i % numTxtTokens;
-                    int dimIdx = (i * 31) % 4096;
-                    contextTxt[tokIdx * 4096 + dimIdx] = ((prompt[i] % 32) - 16) / 16.0f;
-                }
-            }
+            float currentT = timesteps[step];
+            float nextT = timesteps[step + 1];
 
-            for (int step = 0; step < numSteps; step++)
-            {
-                float currentT = timesteps[step];
-                float nextT = timesteps[step + 1];
-
-                _wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, contextTxt, numTxtTokens, velocity);
-                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-            }
-        }
-        else
-        {
-            for (int step = 0; step < numSteps; step++)
-            {
-                float currentT = timesteps[step];
-                float nextT = timesteps[step + 1];
-
-                _dit.PredictVelocity(latents, currentT, targetLatents, motion, temporalLatentFrames, latentH, latentW, ditVelocity);
-
-                float denom = MathF.Max(currentT, 0.05f);
-                float ditModulation = currentT * (1.0f - currentT) * 2.0f;
-
-                for (int i = 0; i < totalLatentSize; i++)
-                {
-                    float baseVelocity = (latents[i] - targetLatents[i]) / denom;
-                    velocity[i] = baseVelocity + ditVelocity[i] * ditModulation;
-                }
-
-                FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
-            }
+            wanDit.PredictVelocity(latents, temporalLatentFrames, latentH, latentW, currentT, contextTxt, numTxtTokens, velocity);
+            FlowMatchingScheduler.Step(latents, velocity, currentT, nextT);
         }
 
         // 5. 3D Spatio-Temporal Neural VAE Latent Decoding
+#pragma warning disable GLACIER_EXP001
         var frames = _vae.DecodeVideo(latents, temporalLatentFrames, numFrames, latentH, latentW);
+#pragma warning restore GLACIER_EXP001
 
         sw.Stop();
 
@@ -851,6 +695,7 @@ public sealed class VideoGenerationPipeline : IDisposable
         }
     }
 
+#pragma warning disable GLACIER_EXP001
     public void Dispose()
     {
         if (!_disposed)
@@ -862,4 +707,5 @@ public sealed class VideoGenerationPipeline : IDisposable
             _vae.Dispose();
         }
     }
+#pragma warning restore GLACIER_EXP001
 }

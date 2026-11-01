@@ -1,13 +1,15 @@
 namespace Glacier.Inference.Image;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 
 /// <summary>
-/// Variational Autoencoder (VAE) Decoder for Diffusion Latents.
-/// Reconstructs full-resolution RGB image pixels from compressed 16-channel spatial latents
-/// through 8x progressive spatial deconvolution and residual channel projection.
+/// Experimental procedural Latent-to-RGB spatial decoder using fixed linear channel projection weights
+/// for synthetic Flow-Matching test fixtures.
+/// (For pretrained neural VAE decoding, use <c>FluxVaeDecoder</c>.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public unsafe sealed class LatentVaeDecoder : IDisposable
 {
     public const int DefaultLatentChannels = 16;

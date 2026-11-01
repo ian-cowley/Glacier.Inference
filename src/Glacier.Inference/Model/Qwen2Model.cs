@@ -227,27 +227,38 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         float* qHead = qHeadBase + h * _headDim;
         float* scores = _headScores + (long)h * _maxSeqLen;
 
-        // Score calculation Q * K^T
-        for (int t = 0; t <= pos; t++)
+        bool useWindow = kvCache.IsRingBuffer || kvCache.SlidingWindow > 0;
+        int windowSize = useWindow ? Math.Min(_maxSeqLen, kvCache.EffectiveWindowSize) : _maxSeqLen;
+        int startT = useWindow ? Math.Max(0, pos + 1 - windowSize) : 0;
+        int kvCount = pos - startT + 1;
+        if (pos < 0 || kvCount > _maxSeqLen)
         {
-            float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
-            float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
-            scores[t] = dot * _attnScale;
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Sequence position {pos} exceeds maxSeqLen {_maxSeqLen}.");
         }
 
-        // Softmax over 0..pos with optional attention sink logit
+        // Score calculation Q * K^T
+        for (int idx = 0; idx < kvCount; idx++)
+        {
+            int t = startT + idx;
+            float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
+            float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
+            scores[idx] = dot * _attnScale;
+        }
+
+        // Softmax over active window with optional attention sink logit
         var layerWeights = _weights.Layers[modelLayer];
         float? sinkLogit = layerWeights.AttnSinksWeight != null ? (float?)layerWeights.AttnSinksWeight[h] : null;
-        QuantKernels.Softmax(scores, pos + 1, sinkLogit);
+        QuantKernels.Softmax(scores, kvCount, sinkLogit);
 
         // Value aggregation
         float* outHead = outHeadBase + h * _vHeadDim;
         for (int d = 0; d < _vHeadDim; d++) outHead[d] = 0f;
 
-        for (int t = 0; t <= pos; t++)
+        for (int idx = 0; idx < kvCount; idx++)
         {
+            int t = startT + idx;
             float* vPast = kvCache.GetValuePtr(stageLayer, hKv, t);
-            float w = scores[t];
+            float w = scores[idx];
 
             if (Vector512.IsHardwareAccelerated && _vHeadDim >= 16)
             {

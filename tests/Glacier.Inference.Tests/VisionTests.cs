@@ -4,6 +4,7 @@ using System;
 using Glacier.Inference.Vision;
 using Xunit;
 
+#pragma warning disable GLACIER_EXP001
 public class VisionTests
 {
     [Fact]
@@ -128,12 +129,9 @@ public class VisionTests
         Assert.NotEmpty(embeddings);
         Assert.True(meta.AverageB > meta.AverageR);
 
-        // Query color description
-        string colorResp = pipeline.Query(testImage, w, h, "What colors are in this picture?", 3);
-        Assert.Contains("blue", colorResp, StringComparison.OrdinalIgnoreCase);
-
-        // General visual description query
-        string sceneResp = pipeline.Query(testImage, w, h, "Describe the scene layout", 3);
-        Assert.Contains("resolution", sceneResp, StringComparison.OrdinalIgnoreCase);
+        // Heuristic VLM text generation stubs must fail fast until multimodal LLM weights are loaded
+        Assert.Throws<NotSupportedException>(() => pipeline.Query(testImage, w, h, "What colors are in this picture?", 3));
+        Assert.Throws<NotSupportedException>(() => pipeline.Query(meta, "Describe the scene layout", w, h, tokenCount));
     }
 }
+#pragma warning restore GLACIER_EXP001

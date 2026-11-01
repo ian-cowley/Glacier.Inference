@@ -2,6 +2,7 @@ namespace Glacier.Inference.Gpu;
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Diagnostics;
@@ -66,10 +67,16 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnAttentionGqaBatch;
     private IntPtr _fnAttentionGqaBatchF16;
     private IntPtr _fnAttentionGqaBatchFp8;
+    private IntPtr _fnPagedKvStoreF16;
+    private IntPtr _fnPagedKvStoreBatchF16;
+    private IntPtr _fnPagedAttnGqaF16;
+    private IntPtr _fnPagedAttnGqaBatchF16;
     private IntPtr _fnArgmax;
     private IntPtr _fnRepetitionPenalty;
 
     public KvCachePrecision KvPrecision { get; }
+    private readonly bool _allocateContiguousKvCache;
+    private readonly nuint _kvBytesPerLayer;
 
     // CUDA Non-Blocking Streams and Events for Concurrent Projections
     private IntPtr _streamK;
@@ -96,7 +103,6 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _dFfnAct;
     private IntPtr _dFfnOut;
     private IntPtr _dLogits;
-    private IntPtr _dScoresBuf;
     private IntPtr _dBestToken;
     private IntPtr _dBestLogit;
     private IntPtr _dRecentTokens;
@@ -113,7 +119,6 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _dAttnProjBatch;
     private IntPtr _dFfnActBatch;
     private IntPtr _dFfnOutBatch;
-    private IntPtr _dScoresBufBatch;
     private float[] _hXBatch;
 
     // GPU VRAM KV Cache
@@ -141,7 +146,15 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
     public void ResetKvCache()
     {
-        // On GPU, KV cache stores write directly at token position.
+        if (_disposed || !_allocateContiguousKvCache || _kvBytesPerLayer == 0) return;
+        _gpu.MakeCurrent();
+        for (int l = 0; l < LayerCount; l++)
+        {
+            if (_dKeyCache[l] != IntPtr.Zero)
+                CuDriver.Check(CuDriver.MemsetD8(_dKeyCache[l], 0, _kvBytesPerLayer), "MemsetD8(KeyCache)");
+            if (_dValCache[l] != IntPtr.Zero)
+                CuDriver.Check(CuDriver.MemsetD8(_dValCache[l], 0, _kvBytesPerLayer), "MemsetD8(ValCache)");
+        }
     }
 
     public Qwen2GpuModel(
@@ -151,16 +164,27 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         KvCachePrecision kvPrecision = KvCachePrecision.Auto,
         int startLayer = 0,
         int layerCount = -1,
-        bool isLastStage = true)
+        bool isLastStage = true,
+        bool allocateContiguousKvCache = true)
     {
+        ArgumentNullException.ThrowIfNull(gpu);
+        ArgumentNullException.ThrowIfNull(weights);
+
         _gpu = gpu;
         _weights = weights;
         StartLayer = startLayer;
         LayerCount = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
         IsLastStage = isLastStage;
+        _allocateContiguousKvCache = allocateContiguousKvCache;
         _dim = weights.EmbeddingLength;
         _ffnDim = weights.FeedForwardLength;
         _headDim = weights.HeadDim;
+        if (weights.ValueDim != _headDim)
+        {
+            throw new NotSupportedException(
+                $"Qwen2GpuModel requires symmetric K/V head dimensions (HeadDim={_headDim}, ValueDim={weights.ValueDim}).");
+        }
+
         _nHeads = weights.HeadCount;
         _nHeadsKv = weights.HeadCountKv;
         _groupSize = _nHeads / _nHeadsKv;
@@ -179,328 +203,392 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             KvPrecision = kvPrecision;
         }
 
-        // 1. Load compiled CUBIN kernel module for target GPU architecture
-        byte[] cubin = KernelCompiler.GetOrCompileKernels(_gpu.ArchString);
-        CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), $"cuModuleLoadData(kernels.cubin, {_gpu.ArchString})");
-
-        // 2. Retrieve kernel function handles (using fast vectorized kernels)
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ5K, _module, "gemv_q5_k"), "ModuleGetFunction(gemv_q5_k)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ3K, _module, "gemv_q3_k"), "ModuleGetFunction(gemv_q3_k)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvFp32, _module, "gemv_fp32"), "ModuleGetFunction(gemv_fp32)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBias, _module, "add_bias_kernel"), "ModuleGetFunction(add_bias_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddWeighted, _module, "vec_add_weighted_kernel"), "ModuleGetFunction(vec_add_weighted_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRope, _module, "rope_kernel"), "ModuleGetFunction(rope_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8, _module, "kv_cache_store_fp8"), "ModuleGetFunction(kv_cache_store_fp8)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormHeads, _module, "rms_norm_heads_kernel"), "ModuleGetFunction(rms_norm_heads_kernel)");
-
-        // 2b. Retrieve batched prefill kernels
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatchHeads, _module, "rms_norm_batch_heads_kernel"), "ModuleGetFunction(rms_norm_batch_heads_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBiasBatch, _module, "add_bias_batch"), "ModuleGetFunction(add_bias_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddBatch, _module, "vec_add_batch"), "ModuleGetFunction(vec_add_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchF16, _module, "kv_cache_store_batch_f16"), "ModuleGetFunction(kv_cache_store_batch_f16)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchFp8, _module, "kv_cache_store_batch_fp8"), "ModuleGetFunction(kv_cache_store_batch_fp8)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchF16, _module, "attention_gqa_batch_f16"), "ModuleGetFunction(attention_gqa_batch_f16)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchFp8, _module, "attention_gqa_batch_fp8"), "ModuleGetFunction(attention_gqa_batch_fp8)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnArgmax, _module, "argmax_kernel"), "ModuleGetFunction(argmax_kernel)");
-        CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRepetitionPenalty, _module, "apply_repetition_penalty_kernel"), "ModuleGetFunction(apply_repetition_penalty_kernel)");
-
-        // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
-        CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
-        CuDriver.Check(CuDriver.StreamCreate(out _streamV, 1), "StreamCreate(streamV)");
-        CuDriver.Check(CuDriver.EventCreate(out _eventNormDone, 0), "EventCreate(eventNormDone)");
-        CuDriver.Check(CuDriver.EventCreate(out _eventKDone, 0), "EventCreate(eventKDone)");
-        CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 0), "EventCreate(eventVDone)");
-
-        // 3. Allocate GPU VRAM scratch buffers (single token)
-        int maxAttnOut = Math.Max(_dim, _nHeads * _headDim);
-        _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-        _dNormX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-        _dQ = _gpu.AllocateDevice((nuint)(_nHeads * _headDim * sizeof(float)));
-        _dK = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
-        _dV = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
-        _dAttnOut = _gpu.AllocateDevice((nuint)(maxAttnOut * sizeof(float)));
-        _dAttnProj = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-        _dGate = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
-        _dUp = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
-        _dFfnAct = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
-        _dFfnOut = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-        _dLogits = _gpu.AllocateDevice((nuint)(_weights.VocabSize * sizeof(float)));
-        _dScoresBuf = _gpu.AllocateDevice((nuint)((long)_nHeads * _maxSeqLen * sizeof(float)));
-        _dBestToken = _gpu.AllocateDevice((nuint)sizeof(int));
-        _dBestLogit = _gpu.AllocateDevice((nuint)sizeof(float));
-        _dRecentTokens = _gpu.AllocateDevice((nuint)(1024 * sizeof(int)));
-
-        // 3b. Allocate GPU VRAM batch scratch buffers (prefill batch <= 32)
-        _dXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _dNormXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _dQBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
-        _dKBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
-        _dVBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
-        _dAttnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
-        _dAttnProjBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _dFfnActBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
-        _dFfnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
-        _dScoresBufBatch = _gpu.AllocateDevice((nuint)((long)MaxBatchSize * _nHeads * _maxSeqLen * sizeof(float)));
-        _hXBatch = new float[MaxBatchSize * _dim];
-
-        // 4. Allocate GPU VRAM KV Cache per layer with precision-specific byte footprint
-        _dKeyCache = new IntPtr[LayerCount];
-        _dValCache = new IntPtr[LayerCount];
         int elementBytes = KvPrecision switch
         {
             KvCachePrecision.Fp8 => 1,
             KvCachePrecision.Fp16 => 2,
             _ => 4
         };
-        nuint kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes);
-        for (int l = 0; l < LayerCount; l++)
-        {
-            _dKeyCache[l] = _gpu.AllocateDevice(kvBytes);
-            _dValCache[l] = _gpu.AllocateDevice(kvBytes);
-        }
+        nuint kvBytes = _allocateContiguousKvCache
+            ? (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes)
+            : 0;
+        _kvBytesPerLayer = kvBytes;
 
         _hX = new float[_dim];
-
-        // Allocate VRAM token embedding cache (4096 tokens * dim * 4 bytes)
-        if (StartLayer == 0)
-        {
-            nuint cacheBytes = (nuint)(EmbdCacheCapacity * _dim * sizeof(float));
-            if (CuDriver.MemAlloc(out _dEmbdCache, cacheBytes) == 0)
-            {
-                _embdCacheTokens = new int[EmbdCacheCapacity];
-                Array.Fill(_embdCacheTokens, -1);
-                _embdTokenToSlot = new System.Collections.Generic.Dictionary<int, int>(EmbdCacheCapacity);
-            }
-            CuDriver.MemHostAlloc(out _hXPinned, (nuint)(_dim * sizeof(float)), 0);
-        }
-
-        // 4. Upload model weights into GPU VRAM
-        double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
-        GlacierDiagnostics.LogInformation($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
-        var sw = Stopwatch.StartNew();
-
-        if (IsLastStage)
-        {
-            _dOutNormWeight = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-            _gpu.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (nuint)(_dim * sizeof(float)));
-
-            nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, _dim) * (nuint)_weights.VocabSize;
-            _dOutWeight = _gpu.AllocateDevice(outBytes);
-            _gpu.CopyToDevice(_dOutWeight, (IntPtr)_weights.OutWeight, outBytes);
-        }
-
+        _hXBatch = new float[MaxBatchSize * _dim];
+        _dKeyCache = new IntPtr[LayerCount];
+        _dValCache = new IntPtr[LayerCount];
         _layerWeights = new GpuLayerWeights[LayerCount];
-        for (int l = 0; l < LayerCount; l++)
+
+        try
         {
-            int modelLayer = StartLayer + l;
-            var lw = _weights.Layers[modelLayer];
+            _gpu.MakeCurrent();
 
-            nuint qDim = (nuint)(_nHeads * _headDim);
-            nuint kvDim = (nuint)(_nHeadsKv * _headDim);
+            // 1. Load compiled CUBIN kernel module for target GPU architecture
+            byte[] cubin = KernelCompiler.GetOrCompileKernels(_gpu.ArchString);
+            CuDriver.Check(CuDriver.ModuleLoadData(out _module, cubin), $"cuModuleLoadData(kernels.cubin, {_gpu.ArchString})");
 
-            nuint qBytes = (nuint)GgufTypes.GetRowBytes(lw.QType, _dim) * qDim;
-            nuint kBytes = (nuint)GgufTypes.GetRowBytes(lw.KType, _dim) * kvDim;
-            nuint vBytes = (nuint)GgufTypes.GetRowBytes(lw.VType, _dim) * kvDim;
-            nuint attnOutBytes = (nuint)GgufTypes.GetRowBytes(lw.AttnOutType, (int)qDim) * (nuint)_dim;
+            // 2. Retrieve kernel function handles (using fast vectorized kernels)
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4K, _module, "gemv_q4_k_fast"), "ModuleGetFunction(gemv_q4_k_fast)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ5K, _module, "gemv_q5_k"), "ModuleGetFunction(gemv_q5_k)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ3K, _module, "gemv_q3_k"), "ModuleGetFunction(gemv_q3_k)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvFp32, _module, "gemv_fp32"), "ModuleGetFunction(gemv_fp32)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBias, _module, "add_bias_kernel"), "ModuleGetFunction(add_bias_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddWeighted, _module, "vec_add_weighted_kernel"), "ModuleGetFunction(vec_add_weighted_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRope, _module, "rope_kernel"), "ModuleGetFunction(rope_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8, _module, "kv_cache_store_fp8"), "ModuleGetFunction(kv_cache_store_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormHeads, _module, "rms_norm_heads_kernel"), "ModuleGetFunction(rms_norm_heads_kernel)");
 
-            nuint ffnGateBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnGateType, _dim) * (nuint)_ffnDim;
-            nuint ffnUpBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnUpType, _dim) * (nuint)_ffnDim;
-            nuint ffnDownBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnDownType, _ffnDim) * (nuint)_dim;
+            // 2b. Retrieve batched prefill kernels
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatchHeads, _module, "rms_norm_batch_heads_kernel"), "ModuleGetFunction(rms_norm_batch_heads_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAddBiasBatch, _module, "add_bias_batch"), "ModuleGetFunction(add_bias_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddBatch, _module, "vec_add_batch"), "ModuleGetFunction(vec_add_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeBatch, _module, "rope_batch"), "ModuleGetFunction(rope_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchF16, _module, "kv_cache_store_batch_f16"), "ModuleGetFunction(kv_cache_store_batch_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchFp8, _module, "kv_cache_store_batch_fp8"), "ModuleGetFunction(kv_cache_store_batch_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchF16, _module, "attention_gqa_batch_f16"), "ModuleGetFunction(attention_gqa_batch_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchFp8, _module, "attention_gqa_batch_fp8"), "ModuleGetFunction(attention_gqa_batch_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreF16, _module, "paged_kv_cache_store_f16_kernel"), "ModuleGetFunction(paged_kv_cache_store_f16_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreBatchF16, _module, "paged_kv_cache_store_batch_f16_kernel"), "ModuleGetFunction(paged_kv_cache_store_batch_f16_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaF16, _module, "paged_attention_gqa_f16_kernel"), "ModuleGetFunction(paged_attention_gqa_f16_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaBatchF16, _module, "paged_attention_gqa_batch_f16_kernel"), "ModuleGetFunction(paged_attention_gqa_batch_f16_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnArgmax, _module, "argmax_kernel"), "ModuleGetFunction(argmax_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRepetitionPenalty, _module, "apply_repetition_penalty_kernel"), "ModuleGetFunction(apply_repetition_penalty_kernel)");
 
-            IntPtr dAttnNorm = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-            _gpu.CopyToDevice(dAttnNorm, (IntPtr)lw.AttnNormWeight, (nuint)(_dim * sizeof(float)));
+            // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
+            CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
+            CuDriver.Check(CuDriver.StreamCreate(out _streamV, 1), "StreamCreate(streamV)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventNormDone, 0), "EventCreate(eventNormDone)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventKDone, 0), "EventCreate(eventKDone)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 0), "EventCreate(eventVDone)");
 
-            IntPtr dQ = _gpu.AllocateDevice(qBytes);
-            _gpu.CopyToDevice(dQ, (IntPtr)lw.QWeight, qBytes);
-            IntPtr dQBias = IntPtr.Zero;
-            if (lw.QBias != null)
+            // 3. Allocate GPU VRAM scratch buffers (single token)
+            int maxAttnOut = Math.Max(_dim, _nHeads * _headDim);
+            _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+            _dNormX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+            _dQ = _gpu.AllocateDevice((nuint)(_nHeads * _headDim * sizeof(float)));
+            _dK = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
+            _dV = _gpu.AllocateDevice((nuint)(_nHeadsKv * _headDim * sizeof(float)));
+            _dAttnOut = _gpu.AllocateDevice((nuint)(maxAttnOut * sizeof(float)));
+            _dAttnProj = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+            _dGate = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
+            _dUp = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
+            _dFfnAct = _gpu.AllocateDevice((nuint)(_ffnDim * sizeof(float)));
+            _dFfnOut = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+            _dLogits = _gpu.AllocateDevice((nuint)(_weights.VocabSize * sizeof(float)));
+            _dBestToken = _gpu.AllocateDevice((nuint)sizeof(int));
+            _dBestLogit = _gpu.AllocateDevice((nuint)sizeof(float));
+            _dRecentTokens = _gpu.AllocateDevice((nuint)(1024 * sizeof(int)));
+
+            // 3b. Allocate GPU VRAM batch scratch buffers (prefill batch <= 32)
+            _dXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+            _dNormXBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+            _dQBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeads * _headDim * sizeof(float)));
+            _dKBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+            _dVBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _nHeadsKv * _headDim * sizeof(float)));
+            _dAttnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * maxAttnOut * sizeof(float)));
+            _dAttnProjBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+            _dFfnActBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _ffnDim * sizeof(float)));
+            _dFfnOutBatch = _gpu.AllocateDevice((nuint)(MaxBatchSize * _dim * sizeof(float)));
+
+            // 4. Allocate GPU VRAM KV Cache per layer with precision-specific byte footprint (skipped in PagedAttention pool mode)
+            if (_allocateContiguousKvCache)
             {
-                dQBias = _gpu.AllocateDevice(qDim * sizeof(float));
-                _gpu.CopyToDevice(dQBias, (IntPtr)lw.QBias, qDim * sizeof(float));
+                for (int l = 0; l < LayerCount; l++)
+                {
+                    _dKeyCache[l] = _gpu.AllocateDevice(kvBytes);
+                    _dValCache[l] = _gpu.AllocateDevice(kvBytes);
+                }
             }
 
-            IntPtr dK = _gpu.AllocateDevice(kBytes);
-            _gpu.CopyToDevice(dK, (IntPtr)lw.KWeight, kBytes);
-            IntPtr dKBias = IntPtr.Zero;
-            if (lw.KBias != null)
+            // Allocate VRAM token embedding cache (4096 tokens * dim * 4 bytes)
+            if (StartLayer == 0)
             {
-                dKBias = _gpu.AllocateDevice(kvDim * sizeof(float));
-                _gpu.CopyToDevice(dKBias, (IntPtr)lw.KBias, kvDim * sizeof(float));
+                nuint cacheBytes = (nuint)(EmbdCacheCapacity * _dim * sizeof(float));
+                if (CuDriver.MemAlloc(out _dEmbdCache, cacheBytes) == 0)
+                {
+                    _embdCacheTokens = new int[EmbdCacheCapacity];
+                    Array.Fill(_embdCacheTokens, -1);
+                    _embdTokenToSlot = new System.Collections.Generic.Dictionary<int, int>(EmbdCacheCapacity);
+                }
+                CuDriver.MemHostAlloc(out _hXPinned, (nuint)(_dim * sizeof(float)), 0);
             }
 
-            IntPtr dV = _gpu.AllocateDevice(vBytes);
-            _gpu.CopyToDevice(dV, (IntPtr)lw.VWeight, vBytes);
-            IntPtr dVBias = IntPtr.Zero;
-            if (lw.VBias != null)
+            // 5. Upload model weights into GPU VRAM
+            double modelGb = (double)new FileInfo(weights.Gguf.FilePath).Length / (1024 * 1024 * 1024);
+            GlacierDiagnostics.LogInformation($">> Uploading {modelGb:F2} GB model weights into {gpu.DeviceName} VRAM (Layers {StartLayer}..{StartLayer + LayerCount - 1})...");
+            var sw = Stopwatch.StartNew();
+
+            if (IsLastStage)
             {
-                dVBias = _gpu.AllocateDevice(kvDim * sizeof(float));
-                _gpu.CopyToDevice(dVBias, (IntPtr)lw.VBias, kvDim * sizeof(float));
+                _dOutNormWeight = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+                _gpu.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (nuint)(_dim * sizeof(float)));
+
+                nuint outBytes = (nuint)GgufTypes.GetRowBytes(_weights.OutType, _dim) * (nuint)_weights.VocabSize;
+                _dOutWeight = _gpu.AllocateDevice(outBytes);
+                _gpu.CopyToDevice(_dOutWeight, (IntPtr)_weights.OutWeight, outBytes);
             }
 
-            IntPtr dAttnQNorm = IntPtr.Zero;
-            if (lw.AttnQNormWeight != null)
+            for (int l = 0; l < LayerCount; l++)
             {
-                nuint qNormBytes = (nuint)(_headDim * sizeof(float));
-                dAttnQNorm = _gpu.AllocateDevice(qNormBytes);
-                _gpu.CopyToDevice(dAttnQNorm, (IntPtr)lw.AttnQNormWeight, qNormBytes);
+                int modelLayer = StartLayer + l;
+                var lw = _weights.Layers[modelLayer];
+
+                nuint qDim = (nuint)(_nHeads * _headDim);
+                nuint kvDim = (nuint)(_nHeadsKv * _headDim);
+
+                nuint qBytes = (nuint)GgufTypes.GetRowBytes(lw.QType, _dim) * qDim;
+                nuint kBytes = (nuint)GgufTypes.GetRowBytes(lw.KType, _dim) * kvDim;
+                nuint vBytes = (nuint)GgufTypes.GetRowBytes(lw.VType, _dim) * kvDim;
+                nuint attnOutBytes = (nuint)GgufTypes.GetRowBytes(lw.AttnOutType, (int)qDim) * (nuint)_dim;
+
+                nuint ffnGateBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnGateType, _dim) * (nuint)_ffnDim;
+                nuint ffnUpBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnUpType, _dim) * (nuint)_ffnDim;
+                nuint ffnDownBytes = (nuint)GgufTypes.GetRowBytes(lw.FfnDownType, _ffnDim) * (nuint)_dim;
+
+                IntPtr dAttnNorm = IntPtr.Zero;
+                IntPtr dQ = IntPtr.Zero;
+                IntPtr dQBias = IntPtr.Zero;
+                IntPtr dK = IntPtr.Zero;
+                IntPtr dKBias = IntPtr.Zero;
+                IntPtr dV = IntPtr.Zero;
+                IntPtr dVBias = IntPtr.Zero;
+                IntPtr dAttnQNorm = IntPtr.Zero;
+                IntPtr dAttnKNorm = IntPtr.Zero;
+                IntPtr dAttnOut = IntPtr.Zero;
+                IntPtr dFfnNorm = IntPtr.Zero;
+                IntPtr dFfnGate = IntPtr.Zero;
+                IntPtr dFfnUp = IntPtr.Zero;
+                IntPtr dFfnDown = IntPtr.Zero;
+
+                try
+                {
+                    dAttnNorm = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+                    _gpu.CopyToDevice(dAttnNorm, (IntPtr)lw.AttnNormWeight, (nuint)(_dim * sizeof(float)));
+
+                    dQ = _gpu.AllocateDevice(qBytes);
+                    _gpu.CopyToDevice(dQ, (IntPtr)lw.QWeight, qBytes);
+                    if (lw.QBias != null)
+                    {
+                        dQBias = _gpu.AllocateDevice(qDim * sizeof(float));
+                        _gpu.CopyToDevice(dQBias, (IntPtr)lw.QBias, qDim * sizeof(float));
+                    }
+
+                    dK = _gpu.AllocateDevice(kBytes);
+                    _gpu.CopyToDevice(dK, (IntPtr)lw.KWeight, kBytes);
+                    if (lw.KBias != null)
+                    {
+                        dKBias = _gpu.AllocateDevice(kvDim * sizeof(float));
+                        _gpu.CopyToDevice(dKBias, (IntPtr)lw.KBias, kvDim * sizeof(float));
+                    }
+
+                    dV = _gpu.AllocateDevice(vBytes);
+                    _gpu.CopyToDevice(dV, (IntPtr)lw.VWeight, vBytes);
+                    if (lw.VBias != null)
+                    {
+                        dVBias = _gpu.AllocateDevice(kvDim * sizeof(float));
+                        _gpu.CopyToDevice(dVBias, (IntPtr)lw.VBias, kvDim * sizeof(float));
+                    }
+
+                    if (lw.AttnQNormWeight != null)
+                    {
+                        nuint qNormBytes = (nuint)(_headDim * sizeof(float));
+                        dAttnQNorm = _gpu.AllocateDevice(qNormBytes);
+                        _gpu.CopyToDevice(dAttnQNorm, (IntPtr)lw.AttnQNormWeight, qNormBytes);
+                    }
+
+                    if (lw.AttnKNormWeight != null)
+                    {
+                        nuint kNormBytes = (nuint)(_headDim * sizeof(float));
+                        dAttnKNorm = _gpu.AllocateDevice(kNormBytes);
+                        _gpu.CopyToDevice(dAttnKNorm, (IntPtr)lw.AttnKNormWeight, kNormBytes);
+                    }
+
+                    dAttnOut = _gpu.AllocateDevice(attnOutBytes);
+                    _gpu.CopyToDevice(dAttnOut, (IntPtr)lw.AttnOutWeight, attnOutBytes);
+
+                    dFfnNorm = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
+                    _gpu.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (nuint)(_dim * sizeof(float)));
+
+                    dFfnGate = _gpu.AllocateDevice(ffnGateBytes);
+                    _gpu.CopyToDevice(dFfnGate, (IntPtr)lw.FfnGateWeight, ffnGateBytes);
+
+                    dFfnUp = _gpu.AllocateDevice(ffnUpBytes);
+                    _gpu.CopyToDevice(dFfnUp, (IntPtr)lw.FfnUpWeight, ffnUpBytes);
+
+                    dFfnDown = _gpu.AllocateDevice(ffnDownBytes);
+                    _gpu.CopyToDevice(dFfnDown, (IntPtr)lw.FfnDownWeight, ffnDownBytes);
+
+                    _layerWeights[l] = new GpuLayerWeights
+                    {
+                        AttnNormWeight = dAttnNorm,
+                        QWeight = dQ,
+                        QBias = dQBias,
+                        KWeight = dK,
+                        KBias = dKBias,
+                        VWeight = dV,
+                        VBias = dVBias,
+                        AttnOutWeight = dAttnOut,
+                        AttnQNormWeight = dAttnQNorm,
+                        AttnKNormWeight = dAttnKNorm,
+                        FfnNormWeight = dFfnNorm,
+                        FfnGateWeight = dFfnGate,
+                        FfnUpWeight = dFfnUp,
+                        FfnDownWeight = dFfnDown,
+                        QType = lw.QType,
+                        KType = lw.KType,
+                        VType = lw.VType,
+                        AttnOutType = lw.AttnOutType,
+                        FfnGateType = lw.FfnGateType,
+                        FfnUpType = lw.FfnUpType,
+                        FfnDownType = lw.FfnDownType
+                    };
+                }
+                catch
+                {
+                    _gpu.FreeDevice(dAttnNorm);
+                    _gpu.FreeDevice(dQ);
+                    _gpu.FreeDevice(dQBias);
+                    _gpu.FreeDevice(dK);
+                    _gpu.FreeDevice(dKBias);
+                    _gpu.FreeDevice(dV);
+                    _gpu.FreeDevice(dVBias);
+                    _gpu.FreeDevice(dAttnQNorm);
+                    _gpu.FreeDevice(dAttnKNorm);
+                    _gpu.FreeDevice(dAttnOut);
+                    _gpu.FreeDevice(dFfnNorm);
+                    _gpu.FreeDevice(dFfnGate);
+                    _gpu.FreeDevice(dFfnUp);
+                    _gpu.FreeDevice(dFfnDown);
+                    throw;
+                }
             }
 
-            IntPtr dAttnKNorm = IntPtr.Zero;
-            if (lw.AttnKNormWeight != null)
-            {
-                nuint kNormBytes = (nuint)(_headDim * sizeof(float));
-                dAttnKNorm = _gpu.AllocateDevice(kNormBytes);
-                _gpu.CopyToDevice(dAttnKNorm, (IntPtr)lw.AttnKNormWeight, kNormBytes);
-            }
-
-            IntPtr dAttnOut = _gpu.AllocateDevice(attnOutBytes);
-            _gpu.CopyToDevice(dAttnOut, (IntPtr)lw.AttnOutWeight, attnOutBytes);
-
-            IntPtr dFfnNorm = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
-            _gpu.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (nuint)(_dim * sizeof(float)));
-
-            IntPtr dFfnGate = _gpu.AllocateDevice(ffnGateBytes);
-            _gpu.CopyToDevice(dFfnGate, (IntPtr)lw.FfnGateWeight, ffnGateBytes);
-
-            IntPtr dFfnUp = _gpu.AllocateDevice(ffnUpBytes);
-            _gpu.CopyToDevice(dFfnUp, (IntPtr)lw.FfnUpWeight, ffnUpBytes);
-
-            IntPtr dFfnDown = _gpu.AllocateDevice(ffnDownBytes);
-            _gpu.CopyToDevice(dFfnDown, (IntPtr)lw.FfnDownWeight, ffnDownBytes);
-
-            _layerWeights[l] = new GpuLayerWeights
-            {
-                AttnNormWeight = dAttnNorm,
-                QWeight = dQ,
-                QBias = dQBias,
-                KWeight = dK,
-                KBias = dKBias,
-                VWeight = dV,
-                VBias = dVBias,
-                AttnOutWeight = dAttnOut,
-                AttnQNormWeight = dAttnQNorm,
-                AttnKNormWeight = dAttnKNorm,
-                FfnNormWeight = dFfnNorm,
-                FfnGateWeight = dFfnGate,
-                FfnUpWeight = dFfnUp,
-                FfnDownWeight = dFfnDown,
-                QType = lw.QType,
-                KType = lw.KType,
-                VType = lw.VType,
-                AttnOutType = lw.AttnOutType,
-                FfnGateType = lw.FfnGateType,
-                FfnUpType = lw.FfnUpType,
-                FfnDownType = lw.FfnDownType
-            };
+            sw.Stop();
+            GlacierDiagnostics.LogInformation($"   Weights uploaded to GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
         }
-
-        sw.Stop();
-        GlacierDiagnostics.LogInformation($"   Weights uploaded to GPU VRAM in {sw.ElapsedMilliseconds} ms ({sw.Elapsed.TotalSeconds:F2} s)!");
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     public void Dispose()
     {
         if (!_disposed)
         {
-            if (_eventNormDone != IntPtr.Zero) CuDriver.EventDestroy(_eventNormDone);
-            if (_eventKDone != IntPtr.Zero) CuDriver.EventDestroy(_eventKDone);
-            if (_eventVDone != IntPtr.Zero) CuDriver.EventDestroy(_eventVDone);
-            if (_streamK != IntPtr.Zero) CuDriver.StreamDestroy(_streamK);
-            if (_streamV != IntPtr.Zero) CuDriver.StreamDestroy(_streamV);
-
-            _gpu.FreeDevice(_dX);
-            _gpu.FreeDevice(_dNormX);
-            _gpu.FreeDevice(_dQ);
-            _gpu.FreeDevice(_dK);
-            _gpu.FreeDevice(_dV);
-            _gpu.FreeDevice(_dAttnOut);
-            _gpu.FreeDevice(_dAttnProj);
-            _gpu.FreeDevice(_dGate);
-            _gpu.FreeDevice(_dUp);
-            _gpu.FreeDevice(_dFfnAct);
-            _gpu.FreeDevice(_dFfnOut);
-            _gpu.FreeDevice(_dLogits);
-            _gpu.FreeDevice(_dScoresBuf);
-            _gpu.FreeDevice(_dBestToken);
-            _gpu.FreeDevice(_dBestLogit);
-            _gpu.FreeDevice(_dRecentTokens);
-            _gpu.FreeDevice(_dOutNormWeight);
-            _gpu.FreeDevice(_dOutWeight);
-
-            _gpu.FreeDevice(_dXBatch);
-            _gpu.FreeDevice(_dNormXBatch);
-            _gpu.FreeDevice(_dQBatch);
-            _gpu.FreeDevice(_dKBatch);
-            _gpu.FreeDevice(_dVBatch);
-            _gpu.FreeDevice(_dAttnOutBatch);
-            _gpu.FreeDevice(_dAttnProjBatch);
-            _gpu.FreeDevice(_dFfnActBatch);
-            _gpu.FreeDevice(_dFfnOutBatch);
-            _gpu.FreeDevice(_dScoresBufBatch);
-
-            if (_dEmbdCache != IntPtr.Zero)
+            if (_gpu != null && _gpu.Handle != IntPtr.Zero)
             {
-                _gpu.FreeDevice(_dEmbdCache);
-                _dEmbdCache = IntPtr.Zero;
+                CuDriver.CtxSetCurrent(_gpu.Handle);
             }
+
+            if (_eventNormDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventNormDone); _eventNormDone = IntPtr.Zero; }
+            if (_eventKDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventKDone); _eventKDone = IntPtr.Zero; }
+            if (_eventVDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventVDone); _eventVDone = IntPtr.Zero; }
+            if (_streamK != IntPtr.Zero) { CuDriver.StreamDestroy(_streamK); _streamK = IntPtr.Zero; }
+            if (_streamV != IntPtr.Zero) { CuDriver.StreamDestroy(_streamV); _streamV = IntPtr.Zero; }
+
+            if (_gpu != null && _gpu.Handle != IntPtr.Zero)
+            {
+                _gpu.FreeDevice(_dX); _dX = IntPtr.Zero;
+                _gpu.FreeDevice(_dNormX); _dNormX = IntPtr.Zero;
+                _gpu.FreeDevice(_dQ); _dQ = IntPtr.Zero;
+                _gpu.FreeDevice(_dK); _dK = IntPtr.Zero;
+                _gpu.FreeDevice(_dV); _dV = IntPtr.Zero;
+                _gpu.FreeDevice(_dAttnOut); _dAttnOut = IntPtr.Zero;
+                _gpu.FreeDevice(_dAttnProj); _dAttnProj = IntPtr.Zero;
+                _gpu.FreeDevice(_dGate); _dGate = IntPtr.Zero;
+                _gpu.FreeDevice(_dUp); _dUp = IntPtr.Zero;
+                _gpu.FreeDevice(_dFfnAct); _dFfnAct = IntPtr.Zero;
+                _gpu.FreeDevice(_dFfnOut); _dFfnOut = IntPtr.Zero;
+                _gpu.FreeDevice(_dLogits); _dLogits = IntPtr.Zero;
+                _gpu.FreeDevice(_dBestToken); _dBestToken = IntPtr.Zero;
+                _gpu.FreeDevice(_dBestLogit); _dBestLogit = IntPtr.Zero;
+                _gpu.FreeDevice(_dRecentTokens); _dRecentTokens = IntPtr.Zero;
+                _gpu.FreeDevice(_dOutNormWeight); _dOutNormWeight = IntPtr.Zero;
+                _gpu.FreeDevice(_dOutWeight); _dOutWeight = IntPtr.Zero;
+
+                _gpu.FreeDevice(_dXBatch); _dXBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dNormXBatch); _dNormXBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dQBatch); _dQBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dKBatch); _dKBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dVBatch); _dVBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dAttnOutBatch); _dAttnOutBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dAttnProjBatch); _dAttnProjBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dFfnActBatch); _dFfnActBatch = IntPtr.Zero;
+                _gpu.FreeDevice(_dFfnOutBatch); _dFfnOutBatch = IntPtr.Zero;
+
+                if (_dEmbdCache != IntPtr.Zero)
+                {
+                    _gpu.FreeDevice(_dEmbdCache);
+                    _dEmbdCache = IntPtr.Zero;
+                }
+
+                if (_dKeyCache != null)
+                {
+                    for (int l = 0; l < _dKeyCache.Length; l++)
+                    {
+                        if (_dKeyCache[l] != IntPtr.Zero) { _gpu.FreeDevice(_dKeyCache[l]); _dKeyCache[l] = IntPtr.Zero; }
+                        if (_dValCache[l] != IntPtr.Zero) { _gpu.FreeDevice(_dValCache[l]); _dValCache[l] = IntPtr.Zero; }
+                    }
+                }
+
+                if (_layerWeights != null)
+                {
+                    for (int l = 0; l < _layerWeights.Length; l++)
+                    {
+                        var lw = _layerWeights[l];
+                        if (lw != null)
+                        {
+                            _gpu.FreeDevice(lw.AttnNormWeight);
+                            _gpu.FreeDevice(lw.QWeight);
+                            if (lw.QBias != IntPtr.Zero) _gpu.FreeDevice(lw.QBias);
+                            _gpu.FreeDevice(lw.KWeight);
+                            if (lw.KBias != IntPtr.Zero) _gpu.FreeDevice(lw.KBias);
+                            _gpu.FreeDevice(lw.VWeight);
+                            if (lw.VBias != IntPtr.Zero) _gpu.FreeDevice(lw.VBias);
+                            _gpu.FreeDevice(lw.AttnOutWeight);
+                            if (lw.AttnQNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnQNormWeight);
+                            if (lw.AttnKNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnKNormWeight);
+                            _gpu.FreeDevice(lw.FfnNormWeight);
+                            _gpu.FreeDevice(lw.FfnGateWeight);
+                            _gpu.FreeDevice(lw.FfnUpWeight);
+                            _gpu.FreeDevice(lw.FfnDownWeight);
+                            _layerWeights[l] = null!;
+                        }
+                    }
+                }
+            }
+
             if (_hXPinned != IntPtr.Zero)
             {
                 CuDriver.MemFreeHost(_hXPinned);
                 _hXPinned = IntPtr.Zero;
             }
 
-            if (_dKeyCache != null)
+            if (_module != IntPtr.Zero)
             {
-                for (int l = 0; l < _dKeyCache.Length; l++)
-                {
-                    if (_dKeyCache[l] != IntPtr.Zero) _gpu.FreeDevice(_dKeyCache[l]);
-                    if (_dValCache[l] != IntPtr.Zero) _gpu.FreeDevice(_dValCache[l]);
-                }
-            }
-
-            if (_layerWeights != null)
-            {
-                for (int l = 0; l < _layerWeights.Length; l++)
-                {
-                    var lw = _layerWeights[l];
-                    if (lw != null)
-                    {
-                        _gpu.FreeDevice(lw.AttnNormWeight);
-                        _gpu.FreeDevice(lw.QWeight);
-                        if (lw.QBias != IntPtr.Zero) _gpu.FreeDevice(lw.QBias);
-                        _gpu.FreeDevice(lw.KWeight);
-                        if (lw.KBias != IntPtr.Zero) _gpu.FreeDevice(lw.KBias);
-                        _gpu.FreeDevice(lw.VWeight);
-                        if (lw.VBias != IntPtr.Zero) _gpu.FreeDevice(lw.VBias);
-                        _gpu.FreeDevice(lw.AttnOutWeight);
-                        if (lw.AttnQNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnQNormWeight);
-                        if (lw.AttnKNormWeight != IntPtr.Zero) _gpu.FreeDevice(lw.AttnKNormWeight);
-                        _gpu.FreeDevice(lw.FfnNormWeight);
-                        _gpu.FreeDevice(lw.FfnGateWeight);
-                        _gpu.FreeDevice(lw.FfnUpWeight);
-                        _gpu.FreeDevice(lw.FfnDownWeight);
-                    }
-                }
+                CuDriver.ModuleUnload(_module);
+                _module = IntPtr.Zero;
             }
 
             _disposed = true;

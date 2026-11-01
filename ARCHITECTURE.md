@@ -3,7 +3,7 @@
 **System:** `Glacier.Inference`  
 **Specification Standard:** Arc42 (Version 8.2) & ASD-STE100  
 **Target Platform:** .NET 10 (C# 13) / Native AOT  
-**Repository:** `c:\Users\spuri\source\repos\PolarsPlus\Glacier.Inference`  
+**Repository:** `https://github.com/ian-cowley/Glacier.Inference`  
 **Author:** Glacier Core Engineering Team  
 
 ---

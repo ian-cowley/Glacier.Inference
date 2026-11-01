@@ -4,21 +4,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Net.Http;
-using System.Net.Http.Json;
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
-using Glacier.Inference.Audio;
-using Glacier.Inference.Config;
-using Glacier.Inference.Diagnostics;
-using Glacier.Inference.Engine;
-using Glacier.Inference.Gguf;
-using Glacier.Inference.Hardware;
-using Glacier.Inference.Memory;
-using Glacier.Inference.Sampling;
 using Glacier.Inference.Vision;
 using Glacier.Inference.Video;
 using Glacier.Inference.Image;
@@ -30,15 +15,15 @@ public static partial class Program
     {
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
-            Console.WriteLine("Glacier Vision-Language Model Subsystem (ViT / SigLIP + 2D Spatial Merging)");
+            Console.WriteLine("Glacier Vision Feature Extraction Subsystem [Experimental] (ViT / SigLIP + 2D Spatial Merging)");
             Console.WriteLine();
             Console.WriteLine("Usage:");
             Console.WriteLine("  glacier vision demo");
-            Console.WriteLine("  glacier vision query <image.raw|bmp|png> \"<prompt>\"");
+            Console.WriteLine("  glacier vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  glacier vision demo");
-            Console.WriteLine("  glacier vision query diagram.png \"What objects and colors are in this scene?\"");
+            Console.WriteLine("  glacier vision query diagram.png \"What objects and colors are in this scene?\" --synthetic-demo");
             return 0;
         }
 
@@ -48,7 +33,7 @@ public static partial class Program
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("   GLACIER.INFERENCE: VISION-LANGUAGE MODEL (VLM) WORKING DEMONSTRATION   ");
+            Console.WriteLine("   GLACIER.INFERENCE: VISION PATCHIFICATION & PROJECTION DEMONSTRATION    ");
             Console.WriteLine("     Pure C# .NET 10 | 14x14 SIMD Patches + ViT Attention + 2D Merging    ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
@@ -88,6 +73,7 @@ public static partial class Program
                 }
             }
 
+#pragma warning disable GLACIER_EXP001
             using var vlm = new VisionPipeline(numLayers: 4, visionDim: 768, llmDim: 3584, patchSize: 14);
             var sw = Stopwatch.StartNew();
 
@@ -103,7 +89,7 @@ public static partial class Program
             Console.WriteLine();
 
             // Step 2: Vision Transformer (ViT / SigLIP) Forward Pass
-            Console.WriteLine("[2. Vision Transformer (ViT / SigLIP)] 4-Layer Multi-Head Self-Attention across 1,024 patches...");
+            Console.WriteLine("[2. Experimental Synthetic ViT] 4-Layer Multi-Head Self-Attention across 1,024 patches...");
             var vitSw = Stopwatch.StartNew();
             var visionTokens = new float[totalPatches * vlm.Vit.HiddenDim];
             vlm.Vit.Forward(patchBuffer, totalPatches, visionTokens);
@@ -121,40 +107,49 @@ public static partial class Program
             Console.WriteLine($"   -> 4x Spatial Compression: 1,024 patches -> {mergedPatches} LLM tokens in {projSw.ElapsedMilliseconds}ms (75% KV-cache savings)");
             Console.WriteLine();
 
-            // Step 4: Visual Question Answering
-            Console.WriteLine("[4. Visual Question Answering] Querying scene semantics...");
+            // Step 4: Scene Statistics Summary
+            Console.WriteLine("[4. Scene Statistics] Extracting pixel statistics...");
             var metadata = VisionPipeline.AnalyzeVisualStatistics(rawPixels, srcW, srcH, 3);
-            string q1 = "What is the dominant color palette?";
-            string r1 = vlm.Query(metadata, q1, srcW, srcH, mergedPatches);
-            Console.WriteLine($"   Q: \"{q1}\"");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"   A: {r1}");
-            Console.ResetColor();
-
-            string q2 = "Describe the composition layout.";
-            string r2 = vlm.Query(metadata, q2, srcW, srcH, mergedPatches);
-            Console.WriteLine($"   Q: \"{q2}\"");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"   A: {r2}");
-            Console.ResetColor();
+            Console.WriteLine($"   -> RGB Means: R={metadata.AverageR * 100:F1}%, G={metadata.AverageG * 100:F1}%, B={metadata.AverageB * 100:F1}%");
+            Console.WriteLine($"   -> Dominant Hue: {metadata.DominantHue}");
+            Console.WriteLine($"   -> Layout: {metadata.SceneDescription}");
             Console.WriteLine();
+#pragma warning restore GLACIER_EXP001
 
             sw.Stop();
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VERIFIED] End-to-end Vision-Language pipeline completed in {sw.ElapsedMilliseconds}ms with direct OS & driver interop!");
+            Console.WriteLine($"[VERIFIED] Vision patchification & projection demo completed in {sw.ElapsedMilliseconds}ms!");
             Console.ResetColor();
             return 0;
         }
         else if (subCmd == "query")
         {
-            if (args.Length < 3)
+            bool syntheticDemo = false;
+            var positional = new List<string>();
+            for (int i = 1; i < args.Length; i++)
             {
-                Console.Error.WriteLine("Error: Missing image file or prompt. Usage: glacier vision query <image> \"<prompt>\"");
+                if (args[i] == "--synthetic-demo")
+                    syntheticDemo = true;
+                else
+                    positional.Add(args[i]);
+            }
+
+            if (positional.Count < 2)
+            {
+                Console.Error.WriteLine("Error: Missing image file or prompt. Usage: glacier vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
                 return 1;
             }
 
-            string imgPath = args[1];
-            string prompt = args[2];
+            if (!syntheticDemo)
+            {
+                Console.Error.WriteLine(
+                    "Error: 'glacier vision query' uses the [Experimental] synthetic VisionPipeline which does not load pretrained VLM weights. " +
+                    "Pass '--synthetic-demo' to inspect synthetic visual token embeddings and scene statistics, or use EmbeddingGemma2Model with AttachMultimodalProjector (Gemma4VisionTower) for pretrained vision embeddings.");
+                return 1;
+            }
+
+            string imgPath = positional[0];
+            string prompt = positional[1];
 
             if (!File.Exists(imgPath))
             {
@@ -162,18 +157,32 @@ public static partial class Program
                 return 1;
             }
 
-            byte[] bytes = File.ReadAllBytes(imgPath);
-            // Default fallback resolution for raw bytes
-            int w = 448;
-            int h = 448;
-            byte[] pixels = new byte[w * h * 3];
-            Array.Copy(bytes, 0, pixels, 0, Math.Min(bytes.Length, pixels.Length));
+            byte[] pixels;
+            int w;
+            int h;
+            if (imgPath.EndsWith(".raw", StringComparison.OrdinalIgnoreCase))
+            {
+                byte[] raw = File.ReadAllBytes(imgPath);
+                w = 448;
+                h = 448;
+                if (raw.Length < w * h * 3)
+                {
+                    throw new InvalidDataException($"Raw RGB image '{imgPath}' ({raw.Length} bytes) is smaller than 448x448x3 ({w * h * 3} bytes).");
+                }
+                pixels = raw;
+            }
+            else
+            {
+                (pixels, w, h) = ImageDecoder.Load(imgPath);
+            }
 
+#pragma warning disable GLACIER_EXP001
             using var vlm = new VisionPipeline();
-            string answer = vlm.Query(pixels, w, h, prompt, 3);
+            var (visualTokens, _, metadata) = vlm.ProcessImage(pixels, w, h, 3);
+#pragma warning restore GLACIER_EXP001
 
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VLM Answer]: {answer}");
+            Console.WriteLine($"[Synthetic Vision Demo | Prompt: \"{prompt}\"] Extracted {visualTokens} visual tokens | {metadata.DominantHue} {metadata.SceneDescription}");
             Console.ResetColor();
             return 0;
         }
@@ -232,6 +241,7 @@ public static partial class Program
                     explicitMotion = mStr switch
                     {
                         "pan-left" or "panleft" => CameraMotion.PanLeft,
+                        "pan-right" or "panright" => CameraMotion.PanRight,
                         "tilt-up" or "tiltup" => CameraMotion.TiltUp,
                         "tilt-down" or "tiltdown" => CameraMotion.TiltDown,
                         "zoom-in" or "zoomin" => CameraMotion.ZoomIn,
@@ -263,7 +273,7 @@ public static partial class Program
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
             Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO PRODUCTION                         ");
-            Console.WriteLine("   Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE Splines       ");
+            Console.WriteLine("   Pure C# .NET 10 | Wan2.1 3D-DiT + T5-XXL + 3D Causal VAE               ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
@@ -307,7 +317,7 @@ public static partial class Program
                     if (idx >= 0 && idx < totalF)
                     {
                         string frameFile = string.IsNullOrEmpty(dir) ? $"{baseName}_frame_{idx}.png" : Path.Combine(dir, $"{baseName}_frame_{idx}.png");
-                        Glacier.Inference.Image.PngWriter.SavePng24(frameFile, result.Frames[idx], result.Width, result.Height);
+                        PngWriter.SavePng24(frameFile, result.Frames[idx], result.Width, result.Height);
                     }
                 }
 
@@ -332,28 +342,35 @@ public static partial class Program
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("   GLACIER.INFERENCE: GENERATIVE VIDEO & VLM MULTIMODAL DEMONSTRATION     ");
-            Console.WriteLine("   Pure C# .NET 10 | Spatio-Temporal DiT + 3D VAE + 3D-RoPE + APNG/GIF/AVI ");
+            Console.WriteLine("   GLACIER.INFERENCE: EXPERIMENTAL VIDEO PRIMITIVES DEMONSTRATION         ");
+            Console.WriteLine("   Pure C# .NET 10 | Synthetic 3D-DiT + 3D-RoPE + APNG/GIF/AVI Export     ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
 
             var sw = Stopwatch.StartNew();
 
-            // Phase 1: Generative Text-to-Video Production
-            Console.WriteLine("[1. Generative Text-to-Video Synthesis] Synthesizing 16 cinematic frames (256x256 @ 8 FPS)...");
-            Console.WriteLine("    Prompt: \"A cinematic landscape of icy fjords under neon auroras\"");
-            Console.WriteLine("    Trajectory: CameraMotion.PanRight across continuous time");
-            using var genPipeline = new VideoGenerationPipeline();
-            var videoRes = genPipeline.Generate(
-                "A cinematic landscape of icy fjords under neon auroras",
-                width: 256,
-                height: 256,
-                numFrames: 16,
-                fps: 8,
-                numSteps: 4,
-                motion: CameraMotion.PanRight,
-                seed: 42);
+#pragma warning disable GLACIER_EXP001
+            // Phase 1: Experimental Synthetic Spatio-Temporal DiT + Container Export
+            Console.WriteLine("[1. Experimental Synthetic Spatio-Temporal DiT] Synthesizing 16 test frames (256x256 @ 8 FPS)...");
+            using var synthDit = new SpatioTemporalDiT(numLayers: 2, hiddenDim: 128, numHeads: 4);
+            using var synthVae = new TemporalLatentVaeDecoder();
+            int latentH = 32, latentW = 32, temporalLatentFrames = 4;
+            int frameLatentSize = synthDit.LatentChannels * latentH * latentW;
+            var targetLatents = new float[temporalLatentFrames * frameLatentSize];
+            for (int k = 0; k < temporalLatentFrames; k++)
+            {
+                float u = (float)k / (temporalLatentFrames - 1);
+                var (offX, offY, zoom, _) = VideoGenerationPipeline.GetCameraTransform(CameraMotion.PanRight, u);
+                PromptSemanticSynthesizer.SynthesizeTargetLatents(
+                    "A cinematic landscape of icy fjords under neon auroras",
+                    targetLatents.AsSpan(k * frameLatentSize, frameLatentSize),
+                    latentH, latentW, synthDit.LatentChannels, 42, offX, offY, zoom);
+            }
+            var ditVelocity = new float[targetLatents.Length];
+            synthDit.PredictVelocity(targetLatents, 0.5f, targetLatents, CameraMotion.PanRight, temporalLatentFrames, latentH, latentW, ditVelocity);
+            var framesList = synthVae.DecodeVideo(targetLatents, temporalLatentFrames, 16, latentH, latentW);
+            var videoRes = new VideoGenerationResult(framesList, 256, 256, 8, sw.ElapsedMilliseconds, "Synthetic test sequence", CameraMotion.PanRight);
 
             string demoApng = "glacier_demo_video.apng";
             string demoGif = "glacier_demo_video.gif";
@@ -363,7 +380,7 @@ public static partial class Program
             videoRes.SaveAvi(demoAvi);
 
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"    -> Generated 16 frames in {videoRes.ElapsedMilliseconds}ms ({videoRes.ElapsedMilliseconds / 16.0f:F1} ms/frame)");
+            Console.WriteLine($"    -> Generated 16 synthetic frames in {videoRes.ElapsedMilliseconds}ms");
             Console.WriteLine($"    -> Saved APNG: {demoApng} ({new FileInfo(demoApng).Length / 1024} KB)");
             Console.WriteLine($"    -> Saved GIF:  {demoGif} ({new FileInfo(demoGif).Length / 1024} KB)");
             Console.WriteLine($"    -> Saved AVI:  {demoAvi} ({new FileInfo(demoAvi).Length / 1024} KB)");
@@ -371,8 +388,7 @@ public static partial class Program
             Console.WriteLine();
 
             // Phase 2: Keyframe Decimation & Spatio-Temporal Ingestion
-            Console.WriteLine("[2. Frame Decimation & Motion Profiling] Sampling 4 keyframes from generated video...");
-            var framesList = new List<byte[]>(videoRes.Frames);
+            Console.WriteLine("[2. Frame Decimation & Motion Profiling] Sampling 4 keyframes from video...");
             int[] keyframes = VideoFrameSampler.SampleUniformIndices(framesList.Count, 4);
             Console.WriteLine($"    -> Selected keyframes: [{string.Join(", ", keyframes)}]");
 
@@ -389,29 +405,18 @@ public static partial class Program
             Console.WriteLine($"    -> Partitioned 64-dim head: Temporal={rope.TemporalDim}, Height={rope.HeightDim}, Width={rope.WidthDim}");
             Console.WriteLine();
 
-            // Phase 4: Video-Language Model Temporal Question Answering
-            Console.WriteLine("[4. Video-Language Understanding] Querying temporal narrative of generated video...");
+            // Phase 4: Experimental Video Temporal Feature Extraction
+            Console.WriteLine("[4. Experimental Video Feature Extraction] Extracting keyframe temporal embeddings...");
             using var videoPipeline = new VideoPipeline(numLayers: 2, visionDim: 256, llmDim: 512, patchSize: 14);
             var (tokens, _, meta) = videoPipeline.ProcessVideo(framesList, 256, 256, targetKeyframes: 4);
-
-            string q1 = "What motion patterns occur in this video?";
-            string r1 = videoPipeline.Query(meta, q1, tokens);
-            Console.WriteLine($"    Q: \"{q1}\"");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"    A: {r1}");
-            Console.ResetColor();
-
-            string q2 = "Summarize the sequence.";
-            string r2 = videoPipeline.Query(meta, q2, tokens);
-            Console.WriteLine($"    Q: \"{q2}\"");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"    A: {r2}");
-            Console.ResetColor();
+            Console.WriteLine($"    -> Extracted {tokens} spatio-temporal tokens | Summary: {meta.TemporalSummary}");
+            Console.WriteLine($"    -> Motion Pattern: {meta.MotionPattern}");
             Console.WriteLine();
+#pragma warning restore GLACIER_EXP001
 
             sw.Stop();
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VERIFIED] Complete Generative Video & VLM demo completed in {sw.ElapsedMilliseconds}ms with direct OS & driver interop!");
+            Console.WriteLine($"[VERIFIED] Experimental Video primitives demo completed in {sw.ElapsedMilliseconds}ms!");
             Console.ResetColor();
             return 0;
         }
@@ -442,8 +447,10 @@ public static partial class Program
             var frames = new List<byte[]>();
             foreach (var f in files) frames.Add(File.ReadAllBytes(f));
 
+#pragma warning disable GLACIER_EXP001
             using var video = new VideoPipeline();
             string answer = video.Query(frames, 448, 448, prompt, 4);
+#pragma warning restore GLACIER_EXP001
 
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($"[Video Answer]: {answer}");
@@ -487,8 +494,8 @@ public static partial class Program
 
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==========================================================================");
-            Console.WriteLine("  GLACIER.INFERENCE: GENERATIVE IMAGE PRODUCTION (T2I) WORKING DEMO       ");
-            Console.WriteLine("   Pure C# .NET 10 | Flow Matching (Euler ODE) + DiT + Latent VAE Decoder  ");
+            Console.WriteLine("  GLACIER.INFERENCE: EXPERIMENTAL SYNTHETIC T2I PRIMITIVE DEMO            ");
+            Console.WriteLine("   Pure C# .NET 10 | Synthetic Flow Matching (Euler ODE) + Procedural VAE ");
             Console.WriteLine("==========================================================================");
             Console.ResetColor();
             Console.WriteLine();
@@ -499,21 +506,23 @@ public static partial class Program
             Console.WriteLine();
 
             Console.WriteLine("[2. Latent Flow Matching] Initializing Gaussian noise z_1 ~ N(0, I) & running 4-step Euler ODE...");
+#pragma warning disable GLACIER_EXP001
             using var pipeline = new ImageGenerationPipeline(numLayers: 2, hiddenDim: 256, numHeads: 4);
 
             var result = pipeline.Generate(prompt, width: 256, height: 256, numSteps: 4, seed: 42);
+#pragma warning restore GLACIER_EXP001
             Console.WriteLine($"   -> 4-Step Flow Matching completed in {result.ElapsedMilliseconds}ms ({result.PixelsPerSecond:F0} pixels/sec)");
             Console.WriteLine();
 
             string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
-            Console.WriteLine($"[3. Latent VAE Reconstruction & Export] Writing 24-bit RGB {fmt} to '{outPath}'...");
+            Console.WriteLine($"[3. Latent Reconstruction & Export] Writing 24-bit RGB {fmt} to '{outPath}'...");
             SaveImage(outPath, result.RgbPixels, result.Width, result.Height);
             var fi = new FileInfo(outPath);
             Console.WriteLine($"   -> Saved {fi.Length / 1024} KB standard 24-bit {fmt} image ({result.Width}x{result.Height})");
             Console.WriteLine();
 
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[VERIFIED] End-to-end Image Generation completed in {result.ElapsedMilliseconds}ms with direct OS & driver interop!");
+            Console.WriteLine($"[VERIFIED] Experimental synthetic T2I demo completed in {result.ElapsedMilliseconds}ms!");
             Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
             Console.ResetColor();
             return 0;
@@ -581,14 +590,16 @@ public static partial class Program
             }
 
             // Auto-detect default model paths if not explicitly provided
-            string FindFile(string filename)
+            static string FindFile(string filename)
             {
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 string[] candidates = [
                     filename,
                     Path.Combine("models", filename),
                     Path.Combine("Glacier.Inference", "models", filename),
                     Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", filename),
-                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "models", filename)
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "models", filename),
+                    Path.Combine(userProfile, ".cache", "glacier", "models", filename)
                 ];
                 foreach (var c in candidates)
                 {
@@ -621,56 +632,41 @@ public static partial class Program
                 if (!string.IsNullOrEmpty(foundT5)) t5Path = foundT5;
             }
 
-            if (!string.IsNullOrEmpty(modelPath) && File.Exists(modelPath))
+            if (string.IsNullOrEmpty(modelPath) || !File.Exists(modelPath))
             {
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"[Glacier Image] Loading pre-trained Diffusion GGUF: {Path.GetFileName(modelPath)}...");
-                Console.ResetColor();
-
-                using var model = DiffusionGgufModel.Open(modelPath);
-                string? safetensorsVae = (vaePath?.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) == true) ? vaePath : null;
-                DiffusionGgufModel? vaeGguf = (!string.IsNullOrEmpty(vaePath) && !vaePath.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)) ? DiffusionGgufModel.Open(vaePath) : null;
-                using var pipeline = new DiffusionGgufPipeline(model, vaeGguf, safetensorsVae, clipPath, t5Path);
-
-                int w = width ?? 512;
-                int h = height ?? 512;
-                int s = steps ?? (model.RecommendedSteps > 0 ? model.RecommendedSteps : 4);
-
-                Console.WriteLine($"   Architecture: {model.DiffusionArch} | Scheduler: {model.RecommendedSchedule} | {w}x{h} ({s} steps)");
-                Console.WriteLine($"   VAE Decoder:  {(pipeline.NeuralVae != null ? "Active Neural Flux VAE" : "Calibrated Latent VAE")}");
-                Console.WriteLine($"   CLIP Encoder: {(pipeline.Model != null && !string.IsNullOrEmpty(clipPath) ? "Active CLIP ViT-L/14" : "None")}");
-                Console.WriteLine($"   T5 Encoder:   {(pipeline.T5Encoder != null ? "Active T5-XXL GGUF" : "None")}");
-                Console.WriteLine($"   Seed:         {(seed.HasValue ? seed.Value.ToString() : "Random")}");
-                Console.WriteLine($"   Executing reverse diffusion trajectory on {(pipeline.FluxDiT?.ActiveBackend == "Cuda" ? "GPU" : "CPU SIMD")}...");
-
-                var res = pipeline.Generate(prompt, width: w, height: h, numSteps: s, seed: seed);
-                SaveImage(outPath, res.RgbPixels, res.Width, res.Height);
-
-                string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[Generated] Saved to '{outPath}' ({fmt}) in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
-                Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
-                Console.ResetColor();
-                return 0;
+                throw new FileNotFoundException(
+                    "Flux.1 GGUF model weights (e.g., flux1-schnell-Q4_K_S.gguf) were not found. Provide --model <path.gguf> or run 'glacier image demo' for the experimental synthetic test pipeline.");
             }
-            else
-            {
-                int w = width ?? 256;
-                int h = height ?? 256;
-                int s = steps ?? 4;
 
-                Console.WriteLine($"[Glacier Image] Generating '{prompt}' ({w}x{h}, {s} steps) via synthetic DiT...");
-                using var pipeline = new ImageGenerationPipeline();
-                var res = pipeline.Generate(prompt, w, h, s, seed);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"[Glacier Image] Loading pre-trained Diffusion GGUF: {Path.GetFileName(modelPath)}...");
+            Console.ResetColor();
 
-                SaveImage(outPath, res.RgbPixels, w, h);
-                string fmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[Generated] Saved to '{outPath}' ({fmt}) in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
-                Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
-                Console.ResetColor();
-                return 0;
-            }
+            using var model = DiffusionGgufModel.Open(modelPath);
+            string? safetensorsVae = (vaePath?.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase) == true) ? vaePath : null;
+            using DiffusionGgufModel? vaeGguf = (!string.IsNullOrEmpty(vaePath) && !vaePath.EndsWith(".safetensors", StringComparison.OrdinalIgnoreCase)) ? DiffusionGgufModel.Open(vaePath) : null;
+            using var pipeline = new DiffusionGgufPipeline(model, vaeGguf, safetensorsVae, clipPath, t5Path);
+
+            int outW = width ?? 512;
+            int outH = height ?? 512;
+            int numSteps = steps ?? (model.RecommendedSteps > 0 ? model.RecommendedSteps : 4);
+
+            Console.WriteLine($"   Architecture: {model.DiffusionArch} | Scheduler: {model.RecommendedSchedule} | {outW}x{outH} ({numSteps} steps)");
+            Console.WriteLine($"   VAE Decoder:  {(pipeline.NeuralVae != null ? "Active Neural Flux VAE" : "Missing")}");
+            Console.WriteLine($"   CLIP Encoder: {(!string.IsNullOrEmpty(clipPath) ? "Active CLIP ViT-L/14" : "Missing")}");
+            Console.WriteLine($"   T5 Encoder:   {(pipeline.T5Encoder != null ? "Active T5-XXL GGUF" : "Missing")}");
+            Console.WriteLine($"   Seed:         {(seed.HasValue ? seed.Value.ToString() : "Random")}");
+            Console.WriteLine($"   Executing reverse diffusion trajectory on {(pipeline.ActiveBackend == "Cuda" ? "GPU" : "CPU SIMD")}...");
+
+            var res = pipeline.Generate(prompt, width: outW, height: outH, numSteps: numSteps, seed: seed);
+            SaveImage(outPath, res.RgbPixels, res.Width, res.Height);
+
+            string outFmt = outPath.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase) ? "BMP" : "PNG";
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[Generated] Saved to '{outPath}' ({outFmt}) in {res.ElapsedMilliseconds}ms ({res.PixelsPerSecond:F0} px/s)");
+            Console.WriteLine($"Image saved: file:///{Path.GetFullPath(outPath).Replace('\\', '/')}");
+            Console.ResetColor();
+            return 0;
         }
 
         Console.Error.WriteLine($"Unknown image command: '{subCmd}'. Use 'glacier image --help' for usage.");

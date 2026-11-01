@@ -1,13 +1,15 @@
 namespace Glacier.Inference.Gpu;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// Manages the lifetime of a native AMD ROCm / HIP driver context on the target AMD Radeon / Instinct GPU.
-/// Uses zero external dependencies, communicating directly with amdhip64.dll on Windows and libamdhip64.so on Linux.
+/// Experimental native AMD ROCm / HIP driver context wrapper (amdhip64.dll / libamdhip64.so).
+/// Note: LLM compute dispatch currently uses Direct3D 12, Vulkan, or CPU; HIP compute kernels are experimental.
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class HipContext : IDisposable
 {
     private IntPtr _ctx;
@@ -72,7 +74,8 @@ public sealed class HipContext : IDisposable
             minor = min;
         }
         ComputeCapability = (major, minor);
-        ArchString = $"gfx{major}{minor}0";
+        ArchString = HipDriver.TryGetGcnArchName(dev)
+            ?? (minor >= 10 ? $"gfx{major}{minor}" : $"gfx{major}{minor}0");
 
         if (HipDriver.DeviceTotalMem(out nuint totalBytes, dev) == 0)
         {

@@ -7,7 +7,7 @@ using System.Text.Json.Serialization;
 /// <summary>
 /// Hardware vendor classifications.
 /// </summary>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(JsonStringEnumConverter<GpuVendor>))]
 public enum GpuVendor
 {
     Nvidia,

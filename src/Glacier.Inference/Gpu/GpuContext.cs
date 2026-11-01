@@ -18,6 +18,16 @@ public sealed class GpuContext : IDisposable
     public string ArchString { get; }
     public IntPtr Handle => _ctx;
 
+    /// <summary>
+    /// Binds this CUDA driver context to the current calling thread.
+    /// Required across async/await continuations that hop thread-pool threads.
+    /// </summary>
+    public void MakeCurrent()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        CuDriver.Check(CuDriver.CtxSetCurrent(_ctx), "cuCtxSetCurrent");
+    }
+
     public static bool IsSupported
     {
         get

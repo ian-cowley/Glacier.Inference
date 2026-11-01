@@ -26,9 +26,10 @@ Glacier.Inference runs on Windows, Linux, and Android systems:
 
 #### Option A: Download Standalone Executable (Zero Dependencies)
 Download the standalone executable from GitHub Releases. Extract the archive and add the directory to your system path:
-* **Windows (x64):** `glacier-v1.1.13-win-x64.zip`
-* **Linux (x64):** `glacier-v1.1.13-linux-x64.tar.gz`
-* **Windows (ARM64):** `glacier-v1.1.13-win-arm64.zip`
+* **Windows (x64):** `glacier-v1.3.2-win-x64.zip`
+* **Linux (x64):** `glacier-v1.3.2-linux-x64.tar.gz`
+* **Windows (ARM64):** `glacier-v1.3.2-win-arm64.zip`
+* **macOS (Apple Silicon ARM64):** `glacier-v1.3.2-osx-arm64.tar.gz`
 
 Test the installation:
 ```bash
@@ -349,13 +350,14 @@ glacier video generate "Cinematic camera zoom into the scene" --image "input_pho
 | :--- | :---: | :--- |
 | `--width, -w` | `832` | Video frame width in pixels (must be multiple of 16). |
 | `--height, -h` | `480` | Video frame height in pixels (must be multiple of 16). |
-| `--duration` | `5.0` | Video length in seconds. |
+| `--frames` | `17` | Number of output frames (overridden when `--duration` is set). |
+| `--duration` | `1.06` | Optional video length in seconds (computes `frames = round(duration * fps)`). |
 | `--fps` | `16` | Frame rate in frames per second. |
 | `--steps` | `25` | Number of Flow-Matching Euler ODE numerical solver steps. |
 | `--guidance` | `5.0` | Classifier-Free Guidance (CFG) scale factor. |
-| `--motion` | `none` | Camera motion trajectory (`none`, `pan-left`, `pan-right`, `pan-up`, `pan-down`, `zoom-in`, `zoom-out`, `orbit`). |
+| `--motion` | `pan-right` | Camera motion trajectory (`pan-left`, `pan-right`, `tilt-up`, `tilt-down`, `zoom-in`, `zoom-out`, `static`, `fluid`). |
 | `--format` | `apng` | Output video container (`apng`, `gif`, `avi`, or `all`). |
-| `--out, -o` | Required | Output file path. |
+| `--out, -o` | `glacier_video.apng` | Output file path. |
 
 ---
 

@@ -2,7 +2,7 @@ namespace Glacier.Inference.Video;
 
 using System;
 using System.Collections.Generic;
-using System.Text;
+using System.Diagnostics.CodeAnalysis;
 using Glacier.Inference.Vision;
 
 /// <summary>
@@ -18,11 +18,14 @@ public sealed record VideoMetadata(
     string TemporalSummary);
 
 /// <summary>
-/// End-to-end Video-Language Model pipeline supporting multi-frame temporal reasoning,
-/// 3D-RoPE spatial-temporal embeddings, and direct conversational video querying.
+/// Experimental procedural Video ingestion pipeline supporting uniform keyframe sampling, motion profiling,
+/// 3D-RoPE spatial-temporal embeddings, and synthetic visual feature extraction.
+/// Heuristic VLM text generation (<see cref="Query(IReadOnlyList{byte[]}, int, int, string, int, int)"/>) is disabled.
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class VideoPipeline : IDisposable
 {
+#pragma warning disable GLACIER_EXP001
     private readonly VisionPipeline _visionPipeline;
     private readonly VideoRoPE _videoRope;
     private bool _disposed;
@@ -41,7 +44,7 @@ public sealed class VideoPipeline : IDisposable
     }
 
     /// <summary>
-    /// Processes a sequence of video frames and extracts temporal tokens with 3D-RoPE.
+    /// Processes a sequence of video frames and extracts synthetic temporal tokens and motion statistics.
     /// </summary>
     public (int TotalTokens, float[] TemporalEmbeddings, VideoMetadata Metadata) ProcessVideo(
         IReadOnlyList<byte[]> frames,
@@ -50,6 +53,8 @@ public sealed class VideoPipeline : IDisposable
         int targetKeyframes = 4,
         int channels = 3)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         if (frames == null || frames.Count == 0)
         {
             throw new ArgumentException("Video must contain at least 1 frame.", nameof(frames));
@@ -110,9 +115,11 @@ public sealed class VideoPipeline : IDisposable
 
         return (totalVisualTokens, allEmbeddings, metadata);
     }
+#pragma warning restore GLACIER_EXP001
 
     /// <summary>
-    /// Evaluates semantic questions over a video sequence.
+    /// Disabled heuristic Video-LLM query stub. Throws <see cref="NotSupportedException"/> because multimodal
+    /// video-LLM weights are not loaded by this procedural pipeline.
     /// </summary>
     public string Query(
         IReadOnlyList<byte[]> frames,
@@ -122,35 +129,32 @@ public sealed class VideoPipeline : IDisposable
         int targetKeyframes = 4,
         int channels = 3)
     {
-        var (totalTokens, _, meta) = ProcessVideo(frames, width, height, targetKeyframes, channels);
-        return Query(meta, prompt, totalTokens);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _ = frames;
+        _ = width;
+        _ = height;
+        _ = prompt;
+        _ = targetKeyframes;
+        _ = channels;
+        throw new NotSupportedException(
+            "VideoPipeline.Query VLM text generation requires multimodal video-LLM weights which are not loaded by this procedural pipeline. For pretrained multimodal embeddings, use EmbeddingGemma2Model with AttachMultimodalProjector.");
     }
 
     /// <summary>
-    /// Answers video queries from pre-extracted VideoMetadata.
+    /// Disabled heuristic Video-LLM query stub. Throws <see cref="NotSupportedException"/> because multimodal
+    /// video-LLM weights are not loaded by this procedural pipeline.
     /// </summary>
     public string Query(VideoMetadata meta, string prompt, int totalTokens = 1024)
     {
-        var sb = new StringBuilder();
-        string cleanPrompt = prompt.ToLowerInvariant();
-
-        if (cleanPrompt.Contains("motion") || cleanPrompt.Contains("action") || cleanPrompt.Contains("moving"))
-        {
-            sb.Append($"Temporal motion analysis: {meta.MotionPattern}. ");
-            sb.Append($"Peak motion detected at frame #{meta.PeakMotionFrame} with {meta.MaxMotionEnergy * 100:F1}% inter-frame variation.");
-        }
-        else if (cleanPrompt.Contains("length") || cleanPrompt.Contains("duration") || cleanPrompt.Contains("frame"))
-        {
-            sb.Append($"The video contains {meta.TotalFrames} total frames. Ingested as {meta.KeyframeSampleCount} keyframes producing {totalTokens} spatio-temporal tokens.");
-        }
-        else
-        {
-            sb.Append($"The video depicts: {meta.TemporalSummary} Dynamics: {meta.MotionPattern}.");
-        }
-
-        return sb.ToString();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _ = meta;
+        _ = prompt;
+        _ = totalTokens;
+        throw new NotSupportedException(
+            "VideoPipeline.Query VLM text generation requires multimodal video-LLM weights which are not loaded by this procedural pipeline. For pretrained multimodal embeddings, use EmbeddingGemma2Model with AttachMultimodalProjector.");
     }
 
+#pragma warning disable GLACIER_EXP001
     public void Dispose()
     {
         if (!_disposed)
@@ -159,4 +163,5 @@ public sealed class VideoPipeline : IDisposable
             _disposed = true;
         }
     }
+#pragma warning restore GLACIER_EXP001
 }

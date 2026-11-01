@@ -1,14 +1,16 @@
 namespace Glacier.Inference.Video;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Image;
 
 /// <summary>
-/// Spatio-Temporal 3D Diffusion Transformer (3D-DiT) executing Flow-Matching velocity prediction.
-/// Features decoupled Spatial Self-Attention (intra-frame) and Temporal Cross-Attention (inter-frame),
-/// 3D Rotary Position Embeddings (3D-RoPE), and AdaLN-Zero camera motion trajectory conditioning.
+/// Experimental procedural Spatio-Temporal 3D Diffusion Transformer (3D-DiT) test primitive initialized
+/// with deterministic trigonometric weights for spatial-temporal attention and 3D-RoPE verification.
+/// (For pretrained neural video generation, use <c>WanDiT</c> via <c>VideoGenerationPipeline</c>.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public unsafe sealed class SpatioTemporalDiT : IDisposable
 {
     public const int DefaultHiddenDim = 256;

@@ -97,7 +97,9 @@ public sealed unsafe partial class FluxDiT : IDisposable
     private bool _doubleBlocksLoaded = false;
     private bool _singleBlocksLoaded = false;
     private bool _gpuWeightsResident => _gpu != null;
-    public string ActiveBackend => _gpu != null && _gpuWeightsResident ? "Cuda" : "Cpu";
+    public bool IsGpuAccelerated => _gpu != null && _gpuWeightsResident;
+    public string? GpuDeviceName => _gpu?.DeviceName;
+    public string ActiveBackend => IsGpuAccelerated ? "Cuda" : "Cpu";
 
     private sealed class DoubleBlockWeights
     {

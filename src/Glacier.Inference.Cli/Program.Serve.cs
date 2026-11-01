@@ -112,7 +112,7 @@ public static partial class Program
             if (!Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error: Unknown engine '{engineStr}'. Valid values: Auto, Cpu, BareMetal, DirectML.");
+                Console.WriteLine($"Error: Unknown engine '{engineStr}'. Valid values: Auto, Cpu, BareMetal, Vulkan, DirectML.");
                 Console.ResetColor();
                 return 1;
             }
@@ -158,8 +158,8 @@ public static partial class Program
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
-        var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
-        var app = CreateServeApp(session, modelPath, apiKey, host, port);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
+        await using var app = CreateServeApp(session, modelPath, apiKey, host, port);
 
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine($"\n>>> Glacier.Inference server running on http://{host}:{port}");
@@ -258,26 +258,26 @@ public static partial class Program
         }
 
         // 1. GET /api/tags (Ollama compatible tags list)
-        app.MapGet("/api/tags", () => Results.Json(new
+        app.MapGet("/api/tags", () => Results.Json(new OllamaTagsResponse
         {
-            models = new[]
-            {
-                new
+            Models =
+            [
+                new OllamaModelEntry
                 {
-                    name = modelName,
-                    model = modelName,
-                    modified_at = DateTime.UtcNow.ToString("o"),
-                    size = (long)new FileInfo(modelPath).Length,
-                    details = new
+                    Name = modelName,
+                    Model = modelName,
+                    ModifiedAt = DateTime.UtcNow.ToString("o"),
+                    Size = new FileInfo(modelPath).Length,
+                    Details = new OllamaModelDetails
                     {
-                        format = "gguf",
-                        family = session.Gguf.Architecture,
-                        parameter_size = paramSize,
-                        quantization_level = quantLevel
+                        Format = "gguf",
+                        Family = session.Gguf.Architecture,
+                        ParameterSize = paramSize,
+                        QuantizationLevel = quantLevel
                     }
                 }
-            }
-        }));
+            ]
+        }, InferenceCliJsonContext.Default.OllamaTagsResponse));
 
         // 2. POST /api/generate (Ollama streaming & non-streaming)
         app.MapPost("/api/generate", async (HttpContext ctx) =>
@@ -285,7 +285,7 @@ public static partial class Program
             JsonElement req;
             try
             {
-                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
+                req = await ctx.Request.ReadFromJsonAsync(InferenceCliJsonContext.Default.JsonElement, ctx.RequestAborted);
             }
             catch (JsonException)
             {
@@ -318,19 +318,19 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(prompt, options, formatChat: true, ct: ctx.RequestAborted);
-                    var respObj = new
+                    var respObj = new OllamaGenerateResponse
                     {
-                        model = modelName,
-                        created_at = DateTime.UtcNow.ToString("o"),
-                        response = result.Text,
-                        done = true,
-                        total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
-                        prompt_eval_count = result.Metrics.PromptTokens,
-                        prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
-                        eval_count = result.Metrics.GeneratedTokens,
-                        eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                        Model = modelName,
+                        CreatedAt = DateTime.UtcNow.ToString("o"),
+                        Response = result.Text,
+                        Done = true,
+                        TotalDuration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
+                        PromptEvalCount = result.Metrics.PromptTokens,
+                        PromptEvalDuration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
+                        EvalCount = result.Metrics.GeneratedTokens,
+                        EvalDuration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
                     };
-                    await ctx.Response.WriteAsJsonAsync(respObj, ctx.RequestAborted);
+                    await ctx.Response.WriteAsJsonAsync(respObj, InferenceCliJsonContext.Default.OllamaGenerateResponse, cancellationToken: ctx.RequestAborted);
                     return;
                 }
 
@@ -349,7 +349,7 @@ public static partial class Program
                             prompt,
                             options,
                             formatChat: true,
-                            onToken: token => channel.Writer.TryWrite(token),
+                            onTokenAsync: token => channel.Writer.WriteAsync(token, ctx.RequestAborted),
                             ct: ctx.RequestAborted);
                     }
                     finally
@@ -360,29 +360,29 @@ public static partial class Program
 
                 await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
                 {
-                    var chunk = new
+                    var chunk = new OllamaGenerateResponse
                     {
-                        model = modelName,
-                        created_at = DateTime.UtcNow.ToString("o"),
-                        response = token,
-                        done = false
+                        Model = modelName,
+                        CreatedAt = DateTime.UtcNow.ToString("o"),
+                        Response = token,
+                        Done = false
                     };
-                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk) + "\n", ctx.RequestAborted);
+                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk, InferenceCliJsonContext.Default.OllamaGenerateResponse) + "\n", ctx.RequestAborted);
                     await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 }
 
                 var genResult = await genTask;
-                var finalChunk = new
+                var finalChunk = new OllamaGenerateResponse
                 {
-                    model = modelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    response = "",
-                    done = true,
-                    total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
-                    eval_count = genResult.Metrics.GeneratedTokens,
-                    eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    Model = modelName,
+                    CreatedAt = DateTime.UtcNow.ToString("o"),
+                    Response = "",
+                    Done = true,
+                    TotalDuration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
+                    EvalCount = genResult.Metrics.GeneratedTokens,
+                    EvalDuration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
                 };
-                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk, InferenceCliJsonContext.Default.OllamaGenerateResponse) + "\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
             finally
@@ -397,7 +397,7 @@ public static partial class Program
             JsonElement req;
             try
             {
-                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
+                req = await ctx.Request.ReadFromJsonAsync(InferenceCliJsonContext.Default.JsonElement, ctx.RequestAborted);
             }
             catch (JsonException)
             {
@@ -432,29 +432,28 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
-                    var resp = new
+                    var resp = new OpenAiChatCompletionResponse
                     {
-                        id = completionId,
-                        @object = "chat.completion",
-                        created = createdTimestamp,
-                        model = modelName,
-                        choices = new[]
-                        {
-                            new
+                        Id = completionId,
+                        Created = createdTimestamp,
+                        Model = modelName,
+                        Choices =
+                        [
+                            new OpenAiChatChoice
                             {
-                                index = 0,
-                                message = new { role = "assistant", content = result.Text },
-                                finish_reason = result.FinishReason
+                                Index = 0,
+                                Message = new OllamaChatMessageDto { Role = "assistant", Content = result.Text },
+                                FinishReason = result.FinishReason
                             }
-                        },
-                        usage = new
+                        ],
+                        Usage = new OpenAiUsage
                         {
-                            prompt_tokens = result.Metrics.PromptTokens,
-                            completion_tokens = result.Metrics.GeneratedTokens,
-                            total_tokens = result.Metrics.PromptTokens + result.Metrics.GeneratedTokens
+                            PromptTokens = result.Metrics.PromptTokens,
+                            CompletionTokens = result.Metrics.GeneratedTokens,
+                            TotalTokens = result.Metrics.PromptTokens + result.Metrics.GeneratedTokens
                         }
                     };
-                    await ctx.Response.WriteAsJsonAsync(resp, ctx.RequestAborted);
+                    await ctx.Response.WriteAsJsonAsync(resp, InferenceCliJsonContext.Default.OpenAiChatCompletionResponse, cancellationToken: ctx.RequestAborted);
                     return;
                 }
 
@@ -475,7 +474,7 @@ public static partial class Program
                             formattedPrompt,
                             options,
                             formatChat: false,
-                            onToken: token => channel.Writer.TryWrite(token),
+                            onTokenAsync: token => channel.Writer.WriteAsync(token, ctx.RequestAborted),
                             ct: ctx.RequestAborted);
                     }
                     finally
@@ -485,65 +484,62 @@ public static partial class Program
                 });
 
                 // Initial chunk with assistant role
-                var initialChunk = new
+                var initialChunk = new OpenAiChatChunkResponse
                 {
-                    id = completionId,
-                    @object = "chat.completion.chunk",
-                    created = createdTimestamp,
-                    model = modelName,
-                    choices = new[]
-                    {
-                        new
+                    Id = completionId,
+                    Created = createdTimestamp,
+                    Model = modelName,
+                    Choices =
+                    [
+                        new OpenAiChatChunkChoice
                         {
-                            index = 0,
-                            delta = new { role = "assistant", content = "" },
-                            finish_reason = (string?)null
+                            Index = 0,
+                            Delta = new OpenAiChatDelta { Role = "assistant", Content = "" },
+                            FinishReason = null
                         }
-                    }
+                    ]
                 };
-                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(initialChunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(initialChunk, InferenceCliJsonContext.Default.OpenAiChatChunkResponse)}\n\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
 
                 await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
                 {
-                    var chunk = new
+                    var chunk = new OpenAiChatChunkResponse
                     {
-                        id = completionId,
-                        @object = "chat.completion.chunk",
-                        created = createdTimestamp,
-                        model = modelName,
-                        choices = new[]
-                        {
-                            new
+                        Id = completionId,
+                        Created = createdTimestamp,
+                        Model = modelName,
+                        Choices =
+                        [
+                            new OpenAiChatChunkChoice
                             {
-                                index = 0,
-                                delta = new { content = token },
-                                finish_reason = (string?)null
+                                Index = 0,
+                                Delta = new OpenAiChatDelta { Content = token },
+                                FinishReason = null
                             }
-                        }
+                        ]
                     };
-                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk)}\n\n", ctx.RequestAborted);
+                    await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(chunk, InferenceCliJsonContext.Default.OpenAiChatChunkResponse)}\n\n", ctx.RequestAborted);
                     await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 }
 
                 var genResult = await genTask;
-                var finalChunk = new
+                var finalChunk = new OpenAiChatChunkResponse
                 {
-                    id = completionId,
-                    @object = "chat.completion.chunk",
-                    created = createdTimestamp,
-                    model = modelName,
-                    choices = new[]
-                    {
-                        new
+                    Id = completionId,
+                    Created = createdTimestamp,
+                    Model = modelName,
+                    Choices =
+                    [
+                        new OpenAiChatChunkChoice
                         {
-                            index = 0,
-                            delta = new { },
-                            finish_reason = genResult.FinishReason
+                            Index = 0,
+                            Delta = new OpenAiChatDelta(),
+                            FinishReason = genResult.FinishReason
                         }
-                    }
+                    ]
                 };
-                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk)}\n\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(finalChunk, InferenceCliJsonContext.Default.OpenAiChatChunkResponse)}\n\n", ctx.RequestAborted);
                 await ctx.Response.WriteAsync("data: [DONE]\n\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
@@ -554,20 +550,17 @@ public static partial class Program
         });
 
         // 4. GET /v1/models (OpenAI models endpoint)
-        app.MapGet("/v1/models", () => Results.Json(new
+        app.MapGet("/v1/models", () => Results.Json(new OpenAiModelsResponse
         {
-            @object = "list",
-            data = new[]
-            {
-                new
+            Data =
+            [
+                new OpenAiModelEntry
                 {
-                    id = modelName,
-                    @object = "model",
-                    created = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    owned_by = "glacier"
+                    Id = modelName,
+                    Created = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                 }
-            }
-        }));
+            ]
+        }, InferenceCliJsonContext.Default.OpenAiModelsResponse));
 
         // 5. POST /api/chat (Ollama chat endpoint)
         app.MapPost("/api/chat", async (HttpContext ctx) =>
@@ -575,7 +568,7 @@ public static partial class Program
             JsonElement req;
             try
             {
-                req = await ctx.Request.ReadFromJsonAsync<JsonElement>(ctx.RequestAborted);
+                req = await ctx.Request.ReadFromJsonAsync(InferenceCliJsonContext.Default.JsonElement, ctx.RequestAborted);
             }
             catch (JsonException)
             {
@@ -608,19 +601,19 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
-                    var respObj = new
+                    var respObj = new OllamaChatResponse
                     {
-                        model = modelName,
-                        created_at = DateTime.UtcNow.ToString("o"),
-                        message = new { role = "assistant", content = result.Text },
-                        done = true,
-                        total_duration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
-                        prompt_eval_count = result.Metrics.PromptTokens,
-                        prompt_eval_duration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
-                        eval_count = result.Metrics.GeneratedTokens,
-                        eval_duration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                        Model = modelName,
+                        CreatedAt = DateTime.UtcNow.ToString("o"),
+                        Message = new OllamaChatMessageDto { Role = "assistant", Content = result.Text },
+                        Done = true,
+                        TotalDuration = (long)(result.Metrics.TotalDuration.TotalSeconds * 1e9),
+                        PromptEvalCount = result.Metrics.PromptTokens,
+                        PromptEvalDuration = (long)(result.Metrics.PromptEvalDuration.TotalSeconds * 1e9),
+                        EvalCount = result.Metrics.GeneratedTokens,
+                        EvalDuration = (long)(result.Metrics.GenerationDuration.TotalSeconds * 1e9)
                     };
-                    await ctx.Response.WriteAsJsonAsync(respObj, ctx.RequestAborted);
+                    await ctx.Response.WriteAsJsonAsync(respObj, InferenceCliJsonContext.Default.OllamaChatResponse, cancellationToken: ctx.RequestAborted);
                     return;
                 }
 
@@ -639,7 +632,7 @@ public static partial class Program
                             formattedPrompt,
                             options,
                             formatChat: false,
-                            onToken: token => channel.Writer.TryWrite(token),
+                            onTokenAsync: token => channel.Writer.WriteAsync(token, ctx.RequestAborted),
                             ct: ctx.RequestAborted);
                     }
                     finally
@@ -650,29 +643,29 @@ public static partial class Program
 
                 await foreach (var token in channel.Reader.ReadAllAsync(ctx.RequestAborted))
                 {
-                    var chunk = new
+                    var chunk = new OllamaChatResponse
                     {
-                        model = modelName,
-                        created_at = DateTime.UtcNow.ToString("o"),
-                        message = new { role = "assistant", content = token },
-                        done = false
+                        Model = modelName,
+                        CreatedAt = DateTime.UtcNow.ToString("o"),
+                        Message = new OllamaChatMessageDto { Role = "assistant", Content = token },
+                        Done = false
                     };
-                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk) + "\n", ctx.RequestAborted);
+                    await ctx.Response.WriteAsync(JsonSerializer.Serialize(chunk, InferenceCliJsonContext.Default.OllamaChatResponse) + "\n", ctx.RequestAborted);
                     await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
                 }
 
                 var genResult = await genTask;
-                var finalChunk = new
+                var finalChunk = new OllamaChatResponse
                 {
-                    model = modelName,
-                    created_at = DateTime.UtcNow.ToString("o"),
-                    message = new { role = "assistant", content = "" },
-                    done = true,
-                    total_duration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
-                    eval_count = genResult.Metrics.GeneratedTokens,
-                    eval_duration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
+                    Model = modelName,
+                    CreatedAt = DateTime.UtcNow.ToString("o"),
+                    Message = new OllamaChatMessageDto { Role = "assistant", Content = "" },
+                    Done = true,
+                    TotalDuration = (long)(genResult.Metrics.TotalDuration.TotalSeconds * 1e9),
+                    EvalCount = genResult.Metrics.GeneratedTokens,
+                    EvalDuration = (long)(genResult.Metrics.GenerationDuration.TotalSeconds * 1e9)
                 };
-                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk) + "\n", ctx.RequestAborted);
+                await ctx.Response.WriteAsync(JsonSerializer.Serialize(finalChunk, InferenceCliJsonContext.Default.OllamaChatResponse) + "\n", ctx.RequestAborted);
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
             finally

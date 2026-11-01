@@ -39,6 +39,7 @@ public class DiffusionGgufTests
         }
     }
 
+#pragma warning disable GLACIER_EXP001
     [Fact]
     public void DiffusionGgufPipeline_RunsEndToEndSyntheticFlow()
     {
@@ -55,6 +56,7 @@ public class DiffusionGgufTests
         Assert.Equal(w * h * 3, result.RgbPixels.Length);
         Assert.True(result.ElapsedMilliseconds >= 0);
     }
+#pragma warning restore GLACIER_EXP001
 
     [Fact]
     public void InspectFluxSchnellTensors()

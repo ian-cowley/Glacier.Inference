@@ -63,6 +63,7 @@ public class VideoTests
         }
     }
 
+#pragma warning disable GLACIER_EXP001
     [Fact]
     public void VideoPipeline_ProcessesMultiFrameSequence_AnswersQueries()
     {
@@ -99,12 +100,9 @@ public class VideoTests
         Assert.Equal(2, meta.KeyframeSampleCount);
         Assert.True(meta.AverageMotionEnergy > 0.0f);
 
-        // Query motion
-        string motionAnswer = pipeline.Query(meta, "Describe the motion in this video", tokens);
-        Assert.Contains("motion", motionAnswer, StringComparison.OrdinalIgnoreCase);
-
-        // Query frame count
-        string frameAnswer = pipeline.Query(meta, "How many frames are in the video?", tokens);
-        Assert.Contains("6", frameAnswer);
+        // Heuristic Video-LLM text generation stubs must fail fast until multimodal LLM weights are loaded
+        Assert.Throws<NotSupportedException>(() => pipeline.Query(meta, "Describe the motion in this video", tokens));
+        Assert.Throws<NotSupportedException>(() => pipeline.Query(frames, w, h, "How many frames are in the video?", 2));
     }
+#pragma warning restore GLACIER_EXP001
 }

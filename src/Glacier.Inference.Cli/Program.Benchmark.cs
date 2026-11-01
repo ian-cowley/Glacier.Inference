@@ -287,21 +287,24 @@ public static partial class Program
             try
             {
                 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
-                var reqBody = new
+                var reqBody = new OllamaBenchRequest
                 {
-                    model = targetOllamaModel,
-                    prompt = prompt,
-                    stream = false,
-                    options = new { num_predict = targetTokens, temperature = 0.7 }
+                    Model = targetOllamaModel,
+                    Prompt = prompt,
+                    Stream = false,
+                    Options = new OllamaBenchOptions { NumPredict = targetTokens, Temperature = 0.7 }
                 };
 
                 var oSw = Stopwatch.StartNew();
-                var resp = await http.PostAsJsonAsync($"{compareOllamaUrl.TrimEnd('/')}/api/generate", reqBody);
+                var resp = await http.PostAsJsonAsync(
+                    $"{compareOllamaUrl.TrimEnd('/')}/api/generate",
+                    reqBody,
+                    InferenceCliJsonContext.Default.OllamaBenchRequest);
                 oSw.Stop();
 
                 if (resp.IsSuccessStatusCode)
                 {
-                    var oJson = await resp.Content.ReadFromJsonAsync<JsonElement>();
+                    var oJson = await resp.Content.ReadFromJsonAsync(InferenceCliJsonContext.Default.JsonElement);
                     string oText = oJson.TryGetProperty("response", out var r) ? r.GetString() ?? "" : "";
                     long totalDurationNs = oJson.TryGetProperty("total_duration", out var td) ? td.GetInt64() : 0;
                     long promptDurationNs = oJson.TryGetProperty("prompt_eval_duration", out var pd) ? pd.GetInt64() : 0;

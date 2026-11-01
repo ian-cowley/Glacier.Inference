@@ -6,7 +6,7 @@ using System.Text.Json.Serialization;
 /// <summary>
 /// Execution engine options for model inference.
 /// </summary>
-[JsonConverter(typeof(JsonStringEnumConverter))]
+[JsonConverter(typeof(JsonStringEnumConverter<InferenceEngineType>))]
 public enum InferenceEngineType
 {
     /// <summary>

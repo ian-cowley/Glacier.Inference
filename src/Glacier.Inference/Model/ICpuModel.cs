@@ -63,6 +63,27 @@ public interface ICpuModel : IDisposable
     void PrefillPrompt(ReadOnlySpan<int> tokens, KVCache kvCache);
 
     /// <summary>
+    /// Resets any internal model state (such as recurrent SSM/GDN caches or model-owned KV caches)
+    /// between independent prompts or conversations.
+    /// </summary>
+    void ResetState();
+
+    /// <summary>
+    /// Byte size required to snapshot recurrent state (0 for pure attention models).
+    /// </summary>
+    long StateSnapshotBytes => 0;
+
+    /// <summary>
+    /// Saves internal recurrent state into <paramref name="destination"/> for speculative rollback.
+    /// </summary>
+    void SaveRecurrentState(Span<byte> destination) { }
+
+    /// <summary>
+    /// Restores internal recurrent state from <paramref name="source"/> after speculative draft rejection.
+    /// </summary>
+    void RestoreRecurrentState(ReadOnlySpan<byte> source) { }
+
+    /// <summary>
     /// Extracts a normalized embedding vector for the given token sequence.
     /// </summary>
     void ExtractEmbedding(

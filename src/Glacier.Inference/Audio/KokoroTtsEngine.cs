@@ -35,10 +35,11 @@ public enum KokoroVoice
 }
 
 /// <summary>
-/// Pure C# high-performance Text-to-Speech (TTS) synthesis engine based on the Kokoro architecture.
-/// Synthesizes 24kHz CD-quality human speech with physical glottal flow dynamics (Liljencrants-Fant),
-/// recursive digital biquad vocal tract resonators, G2P dialect phonology (USA &amp; British RP),
-/// pitch prosody contours, coarticulation smoothing, and zero native C++ runtime dependencies.
+/// Pure C# procedural Liljencrants-Fant glottal formant Text-to-Speech (TTS) synthesizer.
+/// Synthesizes 24kHz speech using physical glottal flow dynamics, recursive digital biquad vocal tract
+/// resonators, rule-based G2P dialect phonology (USA &amp; British RP), pitch prosody contours, and
+/// coarticulation smoothing with zero external runtime dependencies.
+/// (For neural SafeTensors TTS synthesis, use <c>KittenTtsEngine</c>.)
 /// </summary>
 public sealed class KokoroTtsEngine : IDisposable
 {

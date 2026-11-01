@@ -103,6 +103,28 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public ICpuModel? CpuModel => _cpuModel;
     public UniversalArchitecture Architecture => _weights.ArchitectureFamily;
     public int MaxSeqLen => _maxSeqLen;
+    public int VocabSize => _weights.VocabSize;
+    public bool SupportsLogitVerification => true;
+    public bool IsRingBufferEnabled => _kvCache?.IsRingBuffer == true && _cpuModel is not Gemma4Model;
+    public long StateSnapshotBytes => _cpuModel?.StateSnapshotBytes ?? 0;
+    public bool HasUnsnapshottableRecurrentState =>
+        StateSnapshotBytes == 0 &&
+        (_weights.IsHybridSsm ||
+         _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm ||
+#if !ANDROID
+         _d3d12Model is Qwen3HybridD3D12Model ||
+#endif
+         (_pipelineSession != null && _weights.IsHybridSsm));
+    public bool CanOverwriteKvFromPrefix =>
+        !IsRingBufferEnabled && StateSnapshotBytes == 0 && !HasUnsnapshottableRecurrentState;
+
+    private void ValidatePositionRange(int startPos, int count, string paramName)
+    {
+        if (startPos < 0)
+            throw new ArgumentOutOfRangeException(paramName, startPos, "Token position must be non-negative.");
+        if (count > 0 && !IsRingBufferEnabled && startPos + count > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(paramName, startPos, $"Sequence position {startPos + count - 1} exceeds configured MaxSeqLen ({_maxSeqLen}).");
+    }
 
     public InferenceSession(
         string modelPath,
@@ -286,12 +308,37 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     /// <summary>
     /// Generates text autoregressively with real-time token streaming callback.
     /// </summary>
-    public async Task<GenerationResult> GenerateAsync(
+    public Task<GenerationResult> GenerateAsync(
         string prompt,
         SamplingOptions? options = null,
         bool formatChat = true,
         Action<string>? onToken = null,
         CancellationToken ct = default)
+    {
+        return GenerateAsyncCore(prompt, options, formatChat, onToken, onTokenAsync: null, ct);
+    }
+
+    /// <summary>
+    /// Generates text autoregressively with an asynchronous backpressure-aware token streaming callback.
+    /// </summary>
+    public Task<GenerationResult> GenerateAsync(
+        string prompt,
+        SamplingOptions? options,
+        bool formatChat,
+        Func<string, ValueTask> onTokenAsync,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(onTokenAsync);
+        return GenerateAsyncCore(prompt, options, formatChat, onToken: null, onTokenAsync, ct);
+    }
+
+    private async Task<GenerationResult> GenerateAsyncCore(
+        string prompt,
+        SamplingOptions? options,
+        bool formatChat,
+        Action<string>? onToken,
+        Func<string, ValueTask>? onTokenAsync,
+        CancellationToken ct)
     {
         options ??= new SamplingOptions();
 
@@ -309,11 +356,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             };
         }
 
-        // Reset KV cache if active
-        if (_pipelineSession != null)
-            _pipelineSession.ResetKvCache();
-        else
-            _kvCache?.Reset();
+        ValidatePositionRange(0, promptTokens.Length, nameof(prompt));
+
+        // Reset KV cache and recurrent model state
+        ResetKvCache();
 
         var totalStopwatch = Stopwatch.StartNew();
         var promptStopwatch = Stopwatch.StartNew();
@@ -361,7 +407,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         char[] charBuf = new char[128];
 
         int currentPos = promptTokens.Length;
-        for (int step = 0; step < options.MaxTokens && currentPos < maxSeq; step++)
+        for (int step = 0; step < options.MaxTokens && (IsRingBufferEnabled || currentPos < maxSeq); step++)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -396,6 +442,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 string piece = new string(charBuf, 0, charsDecoded);
                 responseSb.Append(piece);
                 onToken?.Invoke(piece);
+                if (onTokenAsync != null)
+                {
+                    await onTokenAsync(piece).ConfigureAwait(false);
+                }
             }
 
             // Forward next token
@@ -415,6 +465,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             string piece = new string(charBuf, 0, flushChars);
             responseSb.Append(piece);
             onToken?.Invoke(piece);
+            if (onTokenAsync != null)
+            {
+                await onTokenAsync(piece).ConfigureAwait(false);
+            }
         }
 
         genStopwatch.Stop();
@@ -436,14 +490,15 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     }
 
     /// <summary>
-    /// Resets the key-value cache.
+    /// Resets the key-value cache and any recurrent model state across all active backends.
     /// </summary>
     public void ResetKvCache()
     {
-        if (_pipelineSession != null)
-            _pipelineSession.ResetKvCache();
-        else
-            _kvCache?.Reset();
+        _pipelineSession?.ResetKvCache();
+        _kvCache?.Reset();
+        _cpuModel?.ResetState();
+        _gpuModel?.ResetKvCache();
+        _d3d12Model?.ResetKvCache();
     }
 
     /// <summary>
@@ -452,6 +507,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public void Prefill(ReadOnlySpan<int> promptTokens)
     {
         if (promptTokens.IsEmpty) return;
+        ValidatePositionRange(0, promptTokens.Length, nameof(promptTokens));
         ResetKvCache();
 
         if (_pipelineSession != null)
@@ -501,6 +557,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens)
     {
         if (tokens.IsEmpty) return;
+        ValidatePositionRange(startPos, tokens.Length, nameof(startPos));
 
         if (_pipelineSession != null)
         {
@@ -524,9 +581,50 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
     }
 
+    public void CopyCurrentLogits(Span<float> destination)
+    {
+        if (destination.Length < _weights.VocabSize)
+            throw new ArgumentException($"Destination length {destination.Length} is smaller than vocabulary size {_weights.VocabSize}.", nameof(destination));
+
+        if (_gpuModel != null)
+        {
+            _gpuModel.CopyLogitsToHost(destination);
+        }
+        else
+        {
+            _logits.AsSpan(0, _weights.VocabSize).CopyTo(destination);
+        }
+    }
+
+    public void VerifyBatchLogits(ReadOnlySpan<int> tokens, int startPos, Span<float> batchLogitsOut)
+    {
+        if (tokens.IsEmpty) return;
+        ValidatePositionRange(startPos, tokens.Length, nameof(startPos));
+        if (batchLogitsOut.Length < tokens.Length * _weights.VocabSize)
+            throw new ArgumentException("batchLogitsOut buffer is too small.", nameof(batchLogitsOut));
+
+        if (_gpuModel != null)
+        {
+            _gpuModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut);
+        }
+        else
+        {
+            for (int t = 0; t < tokens.Length; t++)
+            {
+                ForwardToken(tokens[t], startPos + t, computeLogits: true);
+                _logits.AsSpan(0, _weights.VocabSize).CopyTo(batchLogitsOut.Slice(t * _weights.VocabSize, _weights.VocabSize));
+            }
+        }
+    }
+
+    public void SaveRecurrentState(Span<byte> destination) => _cpuModel?.SaveRecurrentState(destination);
+
+    public void RestoreRecurrentState(ReadOnlySpan<byte> snapshot) => _cpuModel?.RestoreRecurrentState(snapshot);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ForwardToken(int token, int pos, bool computeLogits)
     {
+        ValidatePositionRange(pos, 1, nameof(pos));
         if (_pipelineSession != null)
         {
             _pipelineSession.Forward(token, pos, computeLogits ? _logits.AsSpan() : Span<float>.Empty, computeLogits);
@@ -547,11 +645,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
     public void AttachLora(string loraPath)
     {
-        var lora = LoraAdapterWeights.Load(loraPath);
-        if (_cpuModel != null)
+        if (_cpuModel == null)
         {
-            _cpuModel.LoraWeights = lora;
+            throw new NotSupportedException(
+                "Runtime LoRA adapter attachment currently requires BackendPreference.Cpu; for GPU inference, merge the adapter offline with Glacier.Tune GgufMerger.");
         }
+
+        var lora = LoraAdapterWeights.Load(loraPath);
+        _cpuModel.LoraWeights = lora;
     }
 
     /// <summary>
@@ -583,11 +684,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         PoolingStrategy strategy = PoolingStrategy.LastToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-
-        if (_pipelineSession != null)
-            _pipelineSession.ResetKvCache();
-        else
-            _kvCache?.Reset();
+        ValidatePositionRange(0, tokens.Length, nameof(tokens));
+        ResetKvCache();
 
         if (_gpuModel != null)
         {

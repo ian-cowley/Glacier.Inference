@@ -1,19 +1,22 @@
 namespace Glacier.Inference.Vision;
 
 using System;
-using System.IO;
-using System.Text;
+using System.Diagnostics.CodeAnalysis;
 
 /// <summary>
-/// End-to-end Vision-Language Model pipeline linking image preprocessing,
-/// Vision Transformer (ViT / SigLIP), 2D spatial multimodal projection, and LLM text generation.
+/// Experimental procedural Vision pipeline linking image preprocessing, synthetic Vision Transformer
+/// (<see cref="VisionTransformer"/>), and 2D spatial multimodal projection (<see cref="MultimodalProjector"/>).
+/// Heuristic VLM text generation (<see cref="Query(ReadOnlySpan{byte}, int, int, string, int)"/>) is disabled;
+/// for pretrained multimodal vision embeddings, use <c>EmbeddingGemma2Model</c> with <c>AttachMultimodalProjector</c>.
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public sealed class VisionPipeline : IDisposable
 {
     public const int DefaultTargetWidth = 448;
     public const int DefaultTargetHeight = 448;
     public const int DefaultPatchSize = 14;
 
+#pragma warning disable GLACIER_EXP001
     private readonly VisionTransformer _vit;
     private readonly MultimodalProjector _projector;
     private bool _disposed;
@@ -37,7 +40,7 @@ public sealed class VisionPipeline : IDisposable
     }
 
     /// <summary>
-    /// Processes raw RGB/RGBA pixel data and produces projected LLM visual token embeddings.
+    /// Processes raw RGB/RGBA pixel data and produces projected synthetic visual token embeddings and scene statistics.
     /// </summary>
     public (int VisualTokenCount, float[] VisualEmbeddings, VisualMetadata Metadata) ProcessImage(
         ReadOnlySpan<byte> pixelData,
@@ -45,6 +48,8 @@ public sealed class VisionPipeline : IDisposable
         int height,
         int channels = 3)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         int targetW = DefaultTargetWidth;
         int targetH = DefaultTargetHeight;
         int patchSize = _vit.PatchSize;
@@ -57,7 +62,7 @@ public sealed class VisionPipeline : IDisposable
         var patchBuffer = new float[numPatches * _vit.PatchDim];
         VisionPreprocessor.ExtractPatches(pixelData, width, height, channels, targetW, targetH, patchSize, patchBuffer, useSigLipNorm: true);
 
-        // Compute basic image metadata for semantic reasoning
+        // Compute basic image metadata
         var metadata = AnalyzeVisualStatistics(pixelData, width, height, channels);
 
         // 2. Vision Transformer encoding: [1024, 768]
@@ -74,9 +79,11 @@ public sealed class VisionPipeline : IDisposable
 
         return (totalVisualTokens, llmVisualEmbeddings, metadata);
     }
+#pragma warning restore GLACIER_EXP001
 
     /// <summary>
-    /// Executes visual question answering or description over an image.
+    /// Disabled heuristic VLM query stub. Throws <see cref="NotSupportedException"/> because multimodal LLM weights
+    /// are not loaded by this procedural pipeline.
     /// </summary>
     public string Query(
         ReadOnlySpan<byte> pixelData,
@@ -85,12 +92,19 @@ public sealed class VisionPipeline : IDisposable
         string prompt,
         int channels = 3)
     {
-        var (tokenCount, _, meta) = ProcessImage(pixelData, width, height, channels);
-        return Query(meta, prompt, width, height, tokenCount);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _ = pixelData;
+        _ = width;
+        _ = height;
+        _ = prompt;
+        _ = channels;
+        throw new NotSupportedException(
+            "VisionPipeline.Query VLM text generation requires multimodal LLM weights which are not loaded by this procedural pipeline. For pretrained vision embeddings, use EmbeddingGemma2Model with AttachMultimodalProjector (Gemma4VisionTower).");
     }
 
     /// <summary>
-    /// Evaluates semantic visual queries from pre-extracted visual metadata and token embeddings.
+    /// Disabled heuristic VLM query stub. Throws <see cref="NotSupportedException"/> because multimodal LLM weights
+    /// are not loaded by this procedural pipeline.
     /// </summary>
     public string Query(
         VisualMetadata meta,
@@ -99,37 +113,18 @@ public sealed class VisionPipeline : IDisposable
         int height = DefaultTargetHeight,
         int tokenCount = 256)
     {
-        var sb = new StringBuilder();
-        string cleanPrompt = prompt.ToLowerInvariant();
-
-        if (cleanPrompt.Contains("color") || cleanPrompt.Contains("palette"))
-        {
-            sb.Append($"The image has a dominant color palette: R={meta.AverageR * 100:F0}%, G={meta.AverageG * 100:F0}%, B={meta.AverageB * 100:F0}%. ");
-            sb.Append(meta.DominantHue);
-        }
-        else if (cleanPrompt.Contains("text") || cleanPrompt.Contains("ocr") || cleanPrompt.Contains("read"))
-        {
-            if (meta.HighFrequencyEdgeRatio > 0.15f)
-            {
-                sb.Append("High-contrast textual/structural contours detected across the central visual field. Text pattern corresponds to typographic layout.");
-            }
-            else
-            {
-                sb.Append("No dense alphanumeric characters or signage detected in this region.");
-            }
-        }
-        else
-        {
-            sb.Append($"The visual input features an image of {width}x{height} resolution (resampled to 448x448 with {tokenCount} projected tokens). ");
-            sb.Append($"Scene visual complexity index: {meta.VisualComplexity:F2}. ");
-            sb.Append(meta.SceneDescription);
-        }
-
-        return sb.ToString();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _ = meta;
+        _ = prompt;
+        _ = width;
+        _ = height;
+        _ = tokenCount;
+        throw new NotSupportedException(
+            "VisionPipeline.Query VLM text generation requires multimodal LLM weights which are not loaded by this procedural pipeline. For pretrained vision embeddings, use EmbeddingGemma2Model with AttachMultimodalProjector (Gemma4VisionTower).");
     }
 
     /// <summary>
-    /// Computes lightweight statistical properties of the visual scene for grounded reasoning.
+    /// Computes lightweight statistical properties of raw pixel data.
     /// </summary>
     public static VisualMetadata AnalyzeVisualStatistics(ReadOnlySpan<byte> pixels, int width, int height, int channels)
     {
@@ -177,6 +172,7 @@ public sealed class VisionPipeline : IDisposable
         return new VisualMetadata(avgR, avgG, avgB, edgeRatio, edgeRatio * 10.0f, dominantHue, sceneDesc);
     }
 
+#pragma warning disable GLACIER_EXP001
     public void Dispose()
     {
         if (!_disposed)
@@ -186,6 +182,7 @@ public sealed class VisionPipeline : IDisposable
             _projector.Dispose();
         }
     }
+#pragma warning restore GLACIER_EXP001
 }
 
 public readonly record struct VisualMetadata(

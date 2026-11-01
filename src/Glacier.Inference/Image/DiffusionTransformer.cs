@@ -1,15 +1,17 @@
 namespace Glacier.Inference.Image;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using Glacier.Inference.Quant;
 
 /// <summary>
-/// Diffusion Transformer (DiT) backbone executing Flow-Matching velocity prediction.
-/// Features AdaLN-Zero (Adaptive LayerNorm) conditioning, spatial latent patchification (2x2),
-/// multi-head self-attention, and MLP feedforward blocks in pure C# .NET 10.
+/// Experimental procedural Diffusion Transformer (DiT) test primitive initialized with deterministic
+/// trigonometric weights for Flow-Matching ODE and spatial patchification verification.
+/// (For pretrained neural image generation, use <c>DiffusionGgufPipeline</c> with Flux.1 GGUF weights.)
 /// </summary>
+[Experimental("GLACIER_EXP001")]
 public unsafe sealed class DiffusionTransformer : IDisposable
 {
     public const int DefaultHiddenDim = 512;
