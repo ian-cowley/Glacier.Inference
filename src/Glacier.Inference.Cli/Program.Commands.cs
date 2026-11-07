@@ -5,8 +5,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using Glacier.Inference.Audio;
-using Glacier.Inference.Audio.Kitten;
+using Glacier.Media.Audio;
+using Glacier.Media.Audio.Kitten;
 using Glacier.Inference.Config;
 using Glacier.Inference.Hardware;
 

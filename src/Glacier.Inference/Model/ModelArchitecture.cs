@@ -69,9 +69,33 @@ public enum UniversalArchitecture
     Wan,
 
     /// <summary>
+    /// Looped (Latent Recurrent) Transformer architecture (e.g. NVIDIA Dory / Nemotron Looped 3.97B)
+    /// featuring 3-stage execution (Input, Recurrent N-loops, Output) and Last-Loop KV cache overwrite.
+    /// </summary>
+    LoopedTransformer,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
+}
+
+/// <summary>
+/// Topology parameters and execution schedule for a Looped (Latent Recurrent) Transformer.
+/// </summary>
+public sealed record LoopedTransformerTopology
+{
+    public int InputLayers { get; init; } = 16;
+    public int RecurrentLayers { get; init; } = 40;
+    public int OutputLayers { get; init; } = 16;
+    public int DefaultLoops { get; init; } = 2;
+    public int MaxLoops { get; init; } = 8;
+
+    public int RecurrentStart => InputLayers;
+    public int RecurrentEnd => InputLayers + RecurrentLayers - 1;
+    public int OutputStart => InputLayers + RecurrentLayers;
+    public int OutputEnd => InputLayers + RecurrentLayers + OutputLayers - 1;
+    public int TotalLayers => InputLayers + RecurrentLayers + OutputLayers;
 }
 
 /// <summary>
@@ -129,6 +153,15 @@ public static class ModelArchitectureDetector
             arch.StartsWith("gemma", StringComparison.OrdinalIgnoreCase))
         {
             return UniversalArchitecture.Gemma4;
+        }
+
+        if (string.Equals(arch, "dory", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arch, "nemotron-looped", StringComparison.OrdinalIgnoreCase) ||
+            arch.StartsWith("looped", StringComparison.OrdinalIgnoreCase) ||
+            (gguf?.Metadata != null && (gguf.Metadata.ContainsKey("llama.recurrent_block_count") ||
+                                       gguf.Metadata.ContainsKey("general.architecture") && gguf.Metadata["general.architecture"]?.ToString()?.Contains("looped", StringComparison.OrdinalIgnoreCase) == true)))
+        {
+            return UniversalArchitecture.LoopedTransformer;
         }
 
         if (HasSsmTensors(gguf))

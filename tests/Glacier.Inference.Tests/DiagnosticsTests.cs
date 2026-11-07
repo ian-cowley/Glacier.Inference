@@ -8,8 +8,8 @@ using Glacier.Inference.Config;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Hardware;
-using Glacier.Inference.Image.Gguf;
-using Glacier.Inference.Video;
+using Glacier.Media.Image.Gguf;
+using Glacier.Media.Video;
 using Xunit;
 
 [CollectionDefinition("SequentialDiagnostics", DisableParallelization = true)]

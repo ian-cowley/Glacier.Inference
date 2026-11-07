@@ -1,4 +1,4 @@
-namespace Glacier.Inference.Quant;
+﻿namespace Glacier.Inference.Quant;
 
 using System;
 using System.Numerics;
@@ -140,6 +140,83 @@ public static unsafe partial class QuantKernels
 
         for (; i < size; i++)
         {
+            float v = x[i];
+            sumSq += v * v;
+        }
+
+        float rms = 1.0f / MathF.Sqrt((sumSq / size) + eps);
+
+        i = 0;
+        if (weight != null)
+        {
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var vRms = Vector256.Create(rms);
+                int vecLimit = size - 8;
+                for (; i <= vecLimit; i += 8)
+                {
+                    var vx = Vector256.Load(x + i);
+                    var vw = Vector256.Load(weight + i);
+                    var vout = vx * vRms * vw;
+                    vout.Store(dst + i);
+                }
+            }
+
+            for (; i < size; i++)
+            {
+                dst[i] = x[i] * rms * weight[i];
+            }
+        }
+        else
+        {
+            if (Vector256.IsHardwareAccelerated)
+            {
+                var vRms = Vector256.Create(rms);
+                int vecLimit = size - 8;
+                for (; i <= vecLimit; i += 8)
+                {
+                    var vx = Vector256.Load(x + i);
+                    var vout = vx * vRms;
+                    vout.Store(dst + i);
+                }
+            }
+
+            for (; i < size; i++)
+            {
+                dst[i] = x[i] * rms;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fused Residual Anchor Addition + Root Mean Square Normalization for Looped Transformers:
+    /// x[i] += anchor[i]
+    /// dst[i] = (x[i] / sqrt(mean(x^2) + eps)) * (weight != null ? weight[i] : 1.0)
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void RMSNormWithAnchor(float* x, float* anchor, float* weight, float* dst, int size, float eps)
+    {
+        float sumSq = 0f;
+        int i = 0;
+
+        if (Vector256.IsHardwareAccelerated)
+        {
+            int vecLimit = size - 8;
+            var acc = Vector256<float>.Zero;
+            for (; i <= vecLimit; i += 8)
+            {
+                var vx = Vector256.Load(x + i);
+                var va = Vector256.Load(anchor + i);
+                var vSum = vx + va;
+                vSum.Store(x + i);
+                acc += vSum * vSum;
+            }
+            sumSq = Vector256.Sum(acc);
+        }
+
+        for (; i < size; i++)
+        {
+            x[i] += anchor[i];
             float v = x[i];
             sumSq += v * v;
         }

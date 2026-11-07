@@ -26,6 +26,12 @@
     <ProjectReference Include="..\..\src\Glacier.Inference\Glacier.Inference.csproj" />
     <ProjectReference Include="..\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" />
   </ItemGroup>
+  <ItemGroup Condition="Exists('../../../Glacier.Media/src/Glacier.Media/Glacier.Media.csproj') and '$(UseLocalProjectReferences)' != 'false'">
+    <ProjectReference Include="../../../Glacier.Media/src/Glacier.Media/Glacier.Media.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('../../../Glacier.Media/src/Glacier.Media/Glacier.Media.csproj') or '$(UseLocalProjectReferences)' == 'false'">
+    <PackageReference Include="Glacier.Media" Version="1.0.0" />
+  </ItemGroup>
 
 
   <ItemGroup>

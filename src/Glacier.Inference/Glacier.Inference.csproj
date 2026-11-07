@@ -13,7 +13,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.3.2</Version>
+    <Version>1.4.0</Version>
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
@@ -39,6 +39,8 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Glacier.Inference.Tests" />
     <InternalsVisibleTo Include="Glacier.Inference.Distributed" />
+    <InternalsVisibleTo Include="Glacier.Cluster" />
+    <InternalsVisibleTo Include="Glacier.Cluster.Tests" />
   </ItemGroup>
 </Project>
 

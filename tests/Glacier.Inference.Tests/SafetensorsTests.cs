@@ -40,7 +40,7 @@ public class SafetensorsTests
 
         if (File.Exists(path))
         {
-            using var vae = Glacier.Inference.Image.Flux.FluxVaeDecoder.Open(path);
+            using var vae = Glacier.Media.Image.Flux.FluxVaeDecoder.Open(path);
 
             int latentH = 8;
             int latentW = 8;

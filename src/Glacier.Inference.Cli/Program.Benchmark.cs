@@ -11,7 +11,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
-using Glacier.Inference.Audio;
+using Glacier.Media.Audio;
 using Glacier.Inference.Config;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Engine;
@@ -19,10 +19,10 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Sampling;
-using Glacier.Inference.Vision;
-using Glacier.Inference.Video;
-using Glacier.Inference.Image;
-using Glacier.Inference.Image.Gguf;
+using Glacier.Media.Vision;
+using Glacier.Media.Video;
+using Glacier.Media.Image;
+using Glacier.Media.Image.Gguf;
 
 public static partial class Program
 {

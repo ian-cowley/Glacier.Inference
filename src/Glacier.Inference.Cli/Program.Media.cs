@@ -4,10 +4,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using Glacier.Inference.Vision;
-using Glacier.Inference.Video;
-using Glacier.Inference.Image;
-using Glacier.Inference.Image.Gguf;
+using Glacier.Media.Vision;
+using Glacier.Media.Video;
+using Glacier.Media.Image;
+using Glacier.Media.Image.Gguf;
 
 public static partial class Program
 {
