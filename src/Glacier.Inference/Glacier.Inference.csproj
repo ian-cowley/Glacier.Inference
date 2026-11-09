@@ -13,7 +13,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
+    <PackageReleaseNotes>v1.5.0: Introduces HOPE (Hierarchical Optimizing Processing Ensemble) Continuum Memory System and Titans neural long-term memory architecture (arXiv:2512.24695, arXiv:2412.21137). Implements unmanaged 64-byte aligned AssociativeMemoryBlockHeader, multi-frequency clock recurrence (Token w0, FastChunk w1, SlowChunk w2, LongTerm w3), AVX-512 and AVX2 vectorized associative forward/adjoint-backward passes, spectral radius stability gating, surprise-driven gated memory consolidation, and zero-allocation speculative save/restore checkpoints.</PackageReleaseNotes>
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>

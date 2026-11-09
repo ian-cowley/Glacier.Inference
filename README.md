@@ -383,6 +383,14 @@ Glacier.Inference translates peer-reviewed deep learning and systems research in
    Lipman, Y., Chen, R. T. Q., Ben-Hamu, H., Nicklas, M., & Le, M. (2023). *Flow Matching for Generative Modeling*. International Conference on Learning Representations (ICLR 2023). [arXiv:2210.02747](https://arxiv.org/abs/2210.02747).  
    *Implementation:* Straight-line continuous probability flows and Euler ODE numerical solvers in `VideoGenerationPipeline` and `ImageGenerationPipeline`.
 
+8. **HOPE Architecture & Nested Learning Continuum Memory:**  
+   Behrouz, A., Razaviyayn, M., Zhong, P., & Mirrokni, V. (2025). *Nested Learning: The Illusion of Deep Learning Architecture*. Google Research. [arXiv:2512.24695](https://arxiv.org/abs/2512.24695).  
+   *Implementation:* Hierarchical multi-frequency clock recurrence ($\omega_0..\omega_3$), surprise-driven associative memory routing, and speculative rollback in `Glacier.Inference.Continuum.HopeContinuumHierarchy`.
+
+9. **Titans Long-Term Associative Neural Memory:**  
+   Behrouz, A., Santacroce, M., & Mirrokni, V. (2024). *Titans: Learning to Memorize at Test Time*. Google Research. [arXiv:2412.21137](https://arxiv.org/abs/2412.21137).  
+   *Implementation:* Coupled momentum neural associative memory with AVX-512/AVX2 SIMD acceleration, exact reverse-mode adjoint backprop, and spectral radius clamping in `TitansContinuumMemoryBlock`.
+
 ---
 
 ## License & Support
