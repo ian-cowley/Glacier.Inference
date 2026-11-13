@@ -1,0 +1,64 @@
+#version 450
+// Full-attention prep for one token (headDim = 256, one workgroup of 256 threads per head):
+//   q heads  : split interleaved [q|gate] -> RMSNorm(qNormW) -> partial NEOX RoPE -> qOut ; gate -> gateOut
+//   k heads  : RMSNorm(kNormW) -> partial NEOX RoPE -> kCache[kvHead][pos]
+//   v heads  : copy -> vCache[kvHead][pos]
+// workgroup id: [0,nQ) q heads, [nQ,nQ+nKv) k heads, [nQ+nKv,nQ+2nKv) v heads.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QF { float qFull[]; };   // [nQ][512]  (q 256 | gate 256)
+layout(std430, binding = 1) readonly buffer KR { float kRaw[]; };    // [nKv][256]
+layout(std430, binding = 2) readonly buffer VR { float vRaw[]; };    // [nKv][256]
+layout(std430, binding = 3) readonly buffer QN { float qNormW[]; };  // [256]
+layout(std430, binding = 4) readonly buffer KN { float kNormW[]; };  // [256]
+layout(std430, binding = 5) writeonly buffer QO { float qOut[]; };   // [nQ][256]
+layout(std430, binding = 6) writeonly buffer GO { float gateOut[]; };// [nQ][256]
+layout(std430, binding = 7) buffer KC { float kCache[]; };           // [nKv][maxSeq][256]
+layout(std430, binding = 8) buffer VC { float vCache[]; };           // [nKv][maxSeq][256]
+layout(push_constant) uniform PC { uint pos; uint nQ; uint nKv; uint maxSeq; uint ropeDim; float eps; float freqBase; } pc;
+shared float sh[256];
+shared float red[256];
+
+float rmsScale(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v * v;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) { if (t < o) red[t] += red[t + o]; barrier(); }
+    float r = inversesqrt(red[0] / 256.0 + pc.eps);
+    barrier();
+    return r;
+}
+
+float ropeApply(uint d) {
+    // sh[] holds the normalised head; returns rotated value for element d
+    uint half_ = pc.ropeDim / 2u;
+    if (d >= pc.ropeDim) return sh[d];
+    uint i = d % half_;
+    float freq = 1.0 / pow(pc.freqBase, float(2u * i) / float(pc.ropeDim));
+    float theta = float(pc.pos) * freq;
+    float c = cos(theta), s = sin(theta);
+    float a = sh[i], b = sh[i + half_];
+    return d < half_ ? a * c - b * s : a * s + b * c;
+}
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    if (w < pc.nQ) {
+        float q = qFull[w * 512u + d];
+        gateOut[w * 256u + d] = qFull[w * 512u + 256u + d];
+        float r = rmsScale(q);
+        sh[d] = q * r * qNormW[d];
+        barrier();
+        qOut[w * 256u + d] = ropeApply(d);
+    } else if (w < pc.nQ + pc.nKv) {
+        uint kh = w - pc.nQ;
+        float k = kRaw[kh * 256u + d];
+        float r = rmsScale(k);
+        sh[d] = k * r * kNormW[d];
+        barrier();
+        kCache[(kh * pc.maxSeq + pc.pos) * 256u + d] = ropeApply(d);
+    } else {
+        uint kh = w - pc.nQ - pc.nKv;
+        vCache[(kh * pc.maxSeq + pc.pos) * 256u + d] = vRaw[kh * 256u + d];
+    }
+}

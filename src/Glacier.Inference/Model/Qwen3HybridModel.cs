@@ -206,13 +206,13 @@ public sealed unsafe class Qwen3HybridModel : CpuModelBase
         }
 
         // 5. Recurrent DeltaNet associative state update across all heads
-        int headsPerGroup = _ssmHeads / _ssmGroupCount;
         int dState = _ssmStateDim;
         float* delta = stackalloc float[dState];
 
         for (int h = 0; h < _ssmHeads; h++)
         {
-            int g = h / headsPerGroup;
+            // llama.cpp maps V-head -> Q/K-head by tiling (iq1 = iv1 % nK), not by grouping (h / ratio).
+            int g = h % _ssmGroupCount;
             float* qHead = qPtr + g * dState;
             float* kHead = kPtr + g * dState;
             float* vHead = vPtr + h * dState;

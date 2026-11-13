@@ -138,7 +138,7 @@ Glacier.Inference executes all major open foundation model families with mathema
 | **Meta LLaMA 3 / 3.1 / 3.2 / 3.3** | Grouped-Query Attention (GQA), zero attention bias | Precomputed `rope_freqs.weight` scaling table across 128k context | GQA with SIMD SwiGLU FFN | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
 | **DeepSeek-V2 / V3 / R1** | Multi-Head Latent Attention (MLA) + MoE | Decoupled RoPE + Multi-scale YaRN ($mscaleBase$, $mscaleAllDim$) | 64 routed + 1 shared expert, low-rank KV | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` |
 | **Alibaba Qwen 2 & 2.5** | Dense & MoE GQA with per-head QKV bias | $10^6$ RoPE Base frequency with optional QK-Norm | Fused QKV projection with bias | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` |
-| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with 256-dim Head | Recurrent Associative Memory ($S_t$), Causal Conv1D, Q-Gate RMSNorm | `Qwen3.5-9B`, `Qwen3.6-27B-UD` |
+| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with 256-dim Head | Recurrent Associative Memory ($S_t$), Causal Conv1D, Q-Gate RMSNorm | `Qwen3.5-9B`, `Qwen3.6-27B-UD`; GPU: Direct3D 12 (Windows) and the Vulkan runner (Linux, see [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md)): `Qwen3.6-35B-A3B-UD-Q4_K_M` |
 | **Alibaba Wan 2.1 Video DiT (1.3B)** | 30-Block Spatio-Temporal Diffusion Transformer + 194-Tensor 3D Causal VAE | 3D-RoPE ($dim=64$) + QK-Norm + Self/Cross Attention | Flow-Matching Euler ODE ($shift=3.0$), 16-channel 3D VAE | `Wan2.1-T2V-1.3B-Q4_K_M.gguf` + `wan_2.1_vae.safetensors` |
 | **Black Forest Labs FLUX.1 (Schnell / Dev)** | 57-Block Diffusion Transformer (19 DoubleStream + 38 SingleStream) + Neural VAE | 3D Rotary Positional Embeddings (3D-RoPE) | In-VRAM Resident GEMM + FlashAttention-2 + GeLU Concat + Tiled VAE | `flux1-schnell-Q4_K_S.gguf` + `ae.safetensors` |
 | **Microsoft Phi-4 & Phi-3** | Fused Attention & Fused Gate/Up FFN | Fast NeOX RoPE ($base = 250,000$) | Fused `attn_qkv` GEMV + Fused `ffn_up` SwiGLU | `phi-4-Q4_K_M.gguf` (15B parameters) |
@@ -213,6 +213,22 @@ All benchmark figures represent empirical measurements on physical hardware. We 
 | **Neural VAE Decode (512x512)** | **121.2 s** (56% of total run) | **4.8 s** | **25.1x faster** | Pure CUDA tiled 3x3 conv + GroupNorm-SiLU |
 | **Total Turnaround (512x512)** | **227.8 s (3.8 min)** | **111.1 s (1.8 min)** | **> 2.0x overall** | Sub-2-minute pure C# image generation |
 | **1024x1024 VAE Decode (Tiled)** | **566.8 s (Monolithic)** | **22.6 s (Tiled VAE)** | **25.0x faster** | 2x2 grid of 544x544 tiles with feather blending |
+
+### 3.5 Benchmark 5: Linux Vulkan Runner, Qwen3.6-35B-A3B on AMD Radeon 890M
+
+Measured on a Ryzen AI 9 HX 370 mini PC (Radeon 890M, 62 GB LPDDR5X, Fedora 43, RADV). Model: `Qwen3.6-35B-A3B-UD-Q4_K_M` (20.6 GiB, hybrid Gated DeltaNet + 256-expert MoE). Decode only; prompt tokens are still processed one at a time.
+
+| Engine | Decode |
+| :--- | :---: |
+| Glacier CPU engine (24 threads, AVX-512) | 2.7 tok/s |
+| **Glacier Vulkan runner** (3 interleaved runs; individual CLI runs varied between 9.4 and 15.2) | **9.4 tok/s** |
+| llama.cpp Vulkan, same file (`tg64`) | 10.4 tok/s |
+| Glacier Vulkan runner, projections re-quantised Q8_0 → Q5_K | 12.3 tok/s (mean KLD 0.015, perplexity +0.4%) |
+| Glacier Vulkan runner, projections re-quantised Q8_0 → Q4_K | 13.0 tok/s (mean KLD 0.037, perplexity +1.5%) |
+
+With greedy decoding the Vulkan runner produced token-identical output to the CPU engine on this model and on the dense Qwen3.5-4B (`Q4_K_M`, single CLI run: CPU 1.9 tok/s, Vulkan 21.8 tok/s).
+
+Decode on this APU is bound by memory placement (the 1 GB BIOS frame-buffer carve-out streams at about 85 GB/s, system-memory GTT at about 16-30 GB/s), not by compute. The method, caveats and the full quality table are in [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
 
 ---
 
@@ -322,6 +338,14 @@ glacier run "models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf" --split "nvidia-rtx-
 ```
 The engine executes the first 14 layers on the NVIDIA discrete GPU and the remaining 14 layers on the AMD integrated APU.
 
+### 5.5 How to Run Qwen 3.5 / 3.6 on a Linux GPU (Vulkan)
+Install a Vulkan driver (on AMD, Mesa RADV; verify with `vulkaninfo --summary`), then run the model as usual:
+```bash
+glacier devices
+glacier run "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" "Hello" --device amd-890m --engine vulkan --ctx 2048
+```
+The banner reports the engine that was actually used (`Vulkan Compute (Qwen 3.5/3.6 Gated DeltaNet + MoE)`); if the model cannot run on the Vulkan runner (for example it contains `IQ4_XS` tensors) the log says why and the CPU engine is used. Details, supported weight types and tuning advice: [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
+
 ---
 
 ## 6. Reference: Complete Command Line Options
@@ -344,7 +368,7 @@ The engine executes the first 14 layers on the NVIDIA discrete GPU and the remai
 | Parameter Flag | Accepted Values | Default | Technical Description |
 | :--- | :--- | :--- | :--- |
 | `--device, -d` | `nvidia-rtx-4060`, `amd-890m`, `cpu`, `0` | `auto` | Specifies the target hardware compute device. |
-| `--engine` | `baremetal`, `directml`, `vulkan`, `cpu`, `auto` | `auto` | Selects the low-level compute hardware abstraction layer. |
+| `--engine` | `baremetal`, `directml`, `vulkan`, `cpu`, `auto` | `auto` | Selects the low-level compute hardware abstraction layer. On Linux, hybrid Qwen 3.5/3.6 models with Q4_K/Q5_K/Q6_K/Q8_0 weights run on the Vulkan runner on any hardware Vulkan GPU; other models fall back to the CPU engine. |
 | `--kv-precision` | `auto`, `fp16`, `fp8`, `fp32` | `auto` | Sets numeric precision for unmanaged Key-Value cache slots. |
 | `--ctx, -c` | Integer (e.g. `2048`, `4096`, `8192`) | `2048` | Specifies maximum token context sequence length. |
 | `--split` | String (e.g. `devA:16,devB:16`) | None | Distributes transformer blocks across multiple accelerators. |

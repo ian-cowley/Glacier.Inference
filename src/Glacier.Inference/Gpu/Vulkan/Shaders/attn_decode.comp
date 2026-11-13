@@ -1,0 +1,52 @@
+#version 450
+// Full-attention decode for one token: one workgroup (256 threads) per query head.
+//   scores[t] = q . K[t] * scale (t in [0,kvLen)) -> softmax -> out[d] = sum_t p[t] V[t][d] * sigmoid(gate[d])
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Q { float q[]; };          // [nHeads][256]
+layout(std430, binding = 1) readonly buffer G { float gate[]; };       // [nHeads][256]
+layout(std430, binding = 2) readonly buffer KC { float kCache[]; };    // [nKv][maxSeq][256]
+layout(std430, binding = 3) readonly buffer VC { float vCache[]; };    // [nKv][maxSeq][256]
+layout(std430, binding = 4) buffer SC { float scores[]; };             // [nHeads][maxSeq] scratch
+layout(std430, binding = 5) writeonly buffer O { float o[]; };         // [nHeads][256]
+layout(push_constant) uniform PC { uint kvLen; uint nHeads; uint nKv; uint maxSeq; float scale; } pc;
+shared float sq[256];
+shared float red[256];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint kvh = h / (pc.nHeads / pc.nKv);
+    sq[t] = q[h * 256u + t];
+    barrier();
+    uint sb = h * pc.maxSeq;
+    uint kb = kvh * pc.maxSeq * 256u;
+    float mx = -3.4e38;
+    for (uint p = t; p < pc.kvLen; p += 256u) {
+        float dot = 0.0;
+        uint ko = kb + p * 256u;
+        for (uint d = 0u; d < 256u; d++) dot += sq[d] * kCache[ko + d];
+        dot *= pc.scale;
+        scores[sb + p] = dot;
+        mx = max(mx, dot);
+    }
+    red[t] = mx;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (t < s) red[t] = max(red[t], red[t + s]); barrier(); }
+    float m = red[0];
+    barrier();
+    float sum = 0.0;
+    for (uint p = t; p < pc.kvLen; p += 256u) {
+        float e = exp(scores[sb + p] - m);
+        scores[sb + p] = e;
+        sum += e;
+    }
+    red[t] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (t < s) red[t] += red[t + s]; barrier(); }
+    float inv = 1.0 / red[0];
+    memoryBarrierBuffer();
+    barrier();
+    float acc = 0.0;
+    for (uint p = 0u; p < pc.kvLen; p++) acc += scores[sb + p] * vCache[kb + p * 256u + t];
+    float g = gate[h * 256u + t];
+    o[h * 256u + t] = acc * inv * (1.0 / (1.0 + exp(-g)));
+}

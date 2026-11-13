@@ -1,0 +1,28 @@
+#version 450
+// Per-group L2 normalisation of Q and K (state dim 128). Q is additionally scaled by 1/sqrt(128).
+// Matches CPU: inv = sumSq > 1e-12 ? 1/sqrt(sumSq + 1e-6) : 0   (Q: * 1/sqrt(dState))
+// Layout of buf: Q [nGroups*128] then K [nGroups*128] (then V, untouched).
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer B { float buf[]; };
+layout(push_constant) uniform PC { uint nGroups; } pc;
+shared float rq[128];
+shared float rk[128];
+void main() {
+    uint g = gl_WorkGroupID.x;
+    if (g >= pc.nGroups) return;
+    uint t = gl_LocalInvocationID.x;
+    uint qi = g * 128u + t;
+    uint ki = pc.nGroups * 128u + g * 128u + t;
+    float q = buf[qi], k = buf[ki];
+    rq[t] = q * q; rk[t] = k * k;
+    barrier();
+    for (uint o = 64u; o > 0u; o >>= 1) {
+        if (t < o) { rq[t] += rq[t + o]; rk[t] += rk[t + o]; }
+        barrier();
+    }
+    float sq = rq[0], sk = rk[0];
+    float invQ = sq > 1e-12 ? (1.0 / sqrt(sq + 1e-6)) * (1.0 / sqrt(128.0)) : 0.0;
+    float invK = sk > 1e-12 ? 1.0 / sqrt(sk + 1e-6) : 0.0;
+    buf[qi] = q * invQ;
+    buf[ki] = k * invK;
+}

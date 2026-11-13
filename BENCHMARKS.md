@@ -93,6 +93,17 @@ This machine was subjected to direct cross-engine testing on the same physical s
 | **Qwen3.6-27B-UD** *[Projected]* | **Hybrid GDN / SSM (64 Layers)** | `Q4_K_XL` | **16.39 GiB** | **Vulkan Hardware Tensor** | **94.43 tok/s** | 🚀 **4.97 tok/s** | Hardware tensor projection with cooperative matrix |
 | **Qwen-Coder-Latest** | Dense (Unquantized) | `F16` | **14.00 GiB** | **AMD ROCm / HIP Driver** | **36.00 tok/s** | **2.71 tok/s** | Full 16-bit unquantized float weights |
 
+**Measured with the Glacier Vulkan runner (`Qwen35VulkanModel`, Linux/RADV)** on this machine, decode only (prompt tokens are processed one at a time). The *Projected* Qwen3.6-27B row above is unrelated to these runs: the runner does not support that file's `IQ4_XS` tensors yet, so the 27B-UD still runs on the CPU engine.
+
+| Model | Architecture | Weights | Footprint | Engine | Generation Rate | Notes |
+| :--- | :--- | :---: | :---: | :--- | :---: | :--- |
+| **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE (256 experts, top-8) | `Q4_K_M` (Q8_0 projections) | 20.6 GiB | Host CPU (AVX-512 SIMD) | 2.7 tok/s | Pure C# CPU engine |
+| **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | `Q4_K_M` (Q8_0 projections) | 20.6 GiB | **Glacier Vulkan runner** | **9.4 tok/s** (9.2 to 9.6, 3 runs) | llama.cpp Vulkan on the same file: 10.4 tok/s (`tg64`) |
+| **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | projections re-quantised to `Q5_K` | 20.1 GiB | **Glacier Vulkan runner** | **12.3 tok/s** | Mean KLD 0.0149, perplexity +0.4%, top-1 agreement 94.0% vs original |
+| **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | projections re-quantised to `Q4_K` | 19.9 GiB | **Glacier Vulkan runner** | **13.0 tok/s** | Mean KLD 0.0367, perplexity +1.5%, top-1 agreement 90.8% vs original |
+
+Decode here is bound by where the weights live in unified memory (BIOS frame-buffer carve-out about 85 GB/s, system-memory GTT about 16-30 GB/s), not by compute. Methodology, quality measurements, and the experiments that did not change speed are in [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
+
 ---
 
 ### Machine D: Compact Node (AMD Radeon 680M 64GB Dual-Channel DDR5)

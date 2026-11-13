@@ -1,0 +1,20 @@
+#version 450
+// F32 mat-vec: y[row] = dot(W[row,:], x). One workgroup (64 threads) per row; vec4 loads. K must be a multiple of 4.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { vec4 w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint K; uint N; } pc;
+shared float partial[64];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.N) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint k4 = pc.K >> 2;
+    float acc = 0.0;
+    for (uint i = tid; i < k4; i += 64u) acc += dot(w4[row * k4 + i], x4[i]);
+    partial[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) partial[tid] += partial[tid + s]; barrier(); }
+    if (tid == 0u) y[row] = partial[0];
+}

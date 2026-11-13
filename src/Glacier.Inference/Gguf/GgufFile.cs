@@ -147,7 +147,9 @@ public sealed unsafe class GgufFile : IDisposable
 
         var fileInfo = new FileInfo(filePath);
         _fileLength = fileInfo.Length;
-        if (_fileLength == 0)
+        // On Linux/macOS FileInfo.Length of a symlink (e.g. HuggingFace snapshots -> blobs) is the link size, not the target size.
+        // FileStream.Length follows the link, so always prefer it.
+        if (_fileLength == 0 || fileInfo.LinkTarget != null)
         {
             try
             {

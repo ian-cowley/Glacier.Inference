@@ -1,0 +1,23 @@
+#version 450
+// RMSNorm over `rows` independent segments of length `size`: y = x * rsqrt(mean(x^2)+eps) * w[i]
+// One workgroup per row. x and y may alias (in-place safe: all reads precede writes via barrier).
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) buffer Wt { float wt[]; };
+layout(std430, binding = 2) buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint size; uint rows; float eps; } pc;
+shared float red[128];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.size;
+    float s = 0.0;
+    for (uint i = tid; i < pc.size; i += 128u) { float v = x[base + i]; s += v * v; }
+    red[tid] = s;
+    barrier();
+    for (uint o = 64u; o > 0u; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; barrier(); }
+    float r = inversesqrt(red[0] / float(pc.size) + pc.eps);
+    barrier();
+    for (uint i = tid; i < pc.size; i += 128u) { y[base + i] = x[base + i] * r * wt[i]; }
+}

@@ -181,7 +181,14 @@ The Hardware Abstraction Layer abstracts accelerator instruction dispatch:
 - **`D3D12ComputeEngine`:** Manages Direct3D 12 root signatures, pipeline state objects (PSOs), descriptor heaps, and command allocators. Executes Wave32 HLSL shaders.
 - **`CuDriver`:** Direct P/Invoke to `nvcuda.dll` managing `CUdevice`, `CUcontext`, `CUmodule`, and `CUfunction`. Streams compiled SASS machine code.
 - **`HipDriver`:** Interacts directly with `amdhip64.dll` on Windows and `/dev/kfd` on Linux.
-- **`VulkanComputeEngine`:** Pure C# bindings to `vulkan-1.dll` dispatching compiled SPIR-V compute kernels.
+- **`VulkanContext` / `VulkanCompute`:** Pure C# bindings to `vulkan-1.dll` / `libvulkan.so.1` (instance, device, host-visible storage buffers, descriptor sets, command recording) dispatching pre-compiled SPIR-V compute kernels that are embedded in the assembly.
+
+#### 5.2.4 `Glacier.Inference.Gpu.Qwen35VulkanModel`
+Cross-vendor Vulkan 1.1 inference runner for the Qwen 3.5 / 3.6 hybrid family (Gated DeltaNet + interleaved full attention, dense or MoE FFN). It is the GPU path on Linux, where Direct3D 12 does not exist:
+- **Plan, then replay:** weights are uploaded once and every dispatch of a token (embedding, all layers, output head) is pre-built as an op plan; a token records that plan into one command buffer and reads back only the logits.
+- **Kernels:** quantised mat-vec for Q4_K / Q5_K / Q6_K / Q8_0 (plus an indexed-expert variant for MoE), RMSNorm, Gated DeltaNet conv / L2 / recurrence, full attention (QK-norm, partial RoPE, KV cache, Q gate), MoE router + top-k + combine.
+- **Selection:** `InferenceSession` uses it on non-Windows platforms for a hybrid-SSM model when a hardware Vulkan device is present (`Qwen35VulkanModel.IsSupported`, `FindVulkanDevice`); otherwise it falls back to the CPU engine.
+- Details, kernel table, memory-placement findings and the shader build process: [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
 
 ---
 
@@ -361,6 +368,12 @@ On Windows systems, graphics drivers terminate compute passes that occupy displa
 * **Decision:** Partition rotary embeddings into temporal ($t$), vertical ($h$), and horizontal ($w$) coordinate components.
 * **Consequence:** Enables cinematic 832x480 widescreen video generation with consistent temporal motion.
 
+### ADR-007: Vulkan Compute Runner With Embedded SPIR-V for Linux and Cross-Vendor GPUs
+* **Status:** Accepted
+* **Context:** Direct3D 12 is Windows-only and the HIP path needs a ROCm install, so Qwen 3.5/3.6 hybrid models (which no existing GPU path covered on Linux) fell back to the CPU at under 3 tok/s on an AMD Radeon 890M.
+* **Decision:** Implement the full token forward pass as Vulkan 1.1 compute kernels (GLSL compiled to SPIR-V with `glslc`, checked in and embedded as assembly resources), driven by a pre-built op plan. Every kernel is validated against the CPU reference or a managed reference in `VulkanKernelTests`. Kernels avoid optional extensions (no cooperative matrix, no subgroup arithmetic) so they run on RADV, NVIDIA and Intel drivers.
+* **Consequence:** No native toolchain or ROCm install is needed at runtime, only a Vulkan driver. Decode on the Radeon 890M went from 2.7 tok/s (CPU) to about 9.4 tok/s for Qwen3.6-35B-A3B (individual runs vary up to about 15 tok/s). Prompt processing is still one token at a time. Decode speed is bounded by memory placement on unified-memory APUs (see risk R-4).
+
 ---
 
 ## 10. Quality Requirements
@@ -396,6 +409,7 @@ Quality Tree
 | **R-1** | **GPU Driver Divergence:** Future GPU driver updates might alter entry point signatures in `nvcuda.dll` or `amdhip64.dll`. | High | Maintain automated ABI verification tests; provide clean fallback to Direct3D 12 and CPU SIMD. |
 | **R-2** | **Extreme Quantization Precision Loss:** Low-bit models (e.g. `IQ1_S`, `Q2_K`) can exhibit perplexity degradation on complex reasoning tasks. | Medium | Provide dynamic precision fallback; recommend `Q4_K_M` or `Q8_0` for enterprise coding models. |
 | **R-3** | **Hardware Thermal Throttling on Mobile Devices:** Extended video diffusion generation causes thermal throttling on laptop and mobile hardware. | Low | Implement cooperative frame pacing and GPU clock monitoring via `GlacierDiagnostics`. |
+| **R-4** | **Unified-Memory Placement on APUs:** Measured on an AMD Radeon 890M (Linux, RADV), GPU buffers placed in the small UMA frame-buffer carve-out (about 0.9 GB usable) stream at about 85 GB/s, while buffers in system-memory GTT stream at about 16-30 GB/s once their data has left the CPU caches. Models far larger than the carve-out are therefore GTT-bound. | Medium | Allocate the most heavily read buffers first (output head), keep per-token traffic low (quantise dense projections to Q5_K/Q4_K), and raise the BIOS "UMA Frame Buffer Size" where available. See [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md). |
 
 ---
 

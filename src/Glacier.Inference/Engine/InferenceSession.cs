@@ -171,6 +171,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             Device = targetDevice;
             Engine = targetEngine;
 
+#if !ANDROID
+            if (_weights.IsHybridSsm && !OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
+                VulkanContext.IsSupported && !Qwen35VulkanModel.IsSupported(_weights, out string vulkanWhyNot))
+            {
+                GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanWhyNot}. Falling back to the CPU engine.");
+            }
+#endif
+
             if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
@@ -241,6 +249,35 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
+            else if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
+                     VulkanContext.IsSupported && Qwen35VulkanModel.IsSupported(_weights, out _) &&
+                     Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name) >= 0)
+            {
+                try
+                {
+                    var vkModel = new Qwen35VulkanModel(_weights, maxSeqLen, Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name));
+                    _d3d12Model = vkModel;
+                    _kvCache = null; // GPU maintains all KV / recurrent states in device-visible memory
+                    Engine = InferenceEngineType.Vulkan;
+                    ActiveDevice = $"{vkModel.DeviceName} [Engine: Vulkan Compute (Qwen 3.5/3.6 Gated DeltaNet{(_weights.IsMoe ? " + MoE" : "")}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                }
+                catch (Exception ex)
+                {
+                    GlacierDiagnostics.LogWarning($"Vulkan GPU init failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                    FallbackException = ex;
+                    var settings = GlacierSettings.Load();
+                    if (!settings.FallbackToCpu)
+                        throw new InvalidOperationException($"Failed to initialize Vulkan compute inference on {targetDevice.Name}: {ex.Message}", ex);
+
+                    _d3d12Model?.Dispose();
+                    _d3d12Model = null;
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                    Device = DeviceManager.ResolveDevice("cpu");
+                    Engine = InferenceEngineType.Cpu;
+                    ActiveDevice = $"{Device.Name} [Fallback from Vulkan | Arch: {_weights.ArchitectureFamily}]";
+                }
+            }
 #endif
             else
             {
@@ -254,7 +291,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                             : targetDevice.Vendor switch
                             {
                                 GpuVendor.Amd when !OperatingSystem.IsWindows() =>
-                                    $"GPU hardware acceleration on {targetDevice.Name} currently requires Direct3D 12 on Windows. On Linux, please specify '--device cpu'.",
+                                    $"GPU hardware acceleration on {targetDevice.Name} requires Direct3D 12 on Windows, or on Linux the Vulkan runner, which currently supports Qwen 3.5/3.6 hybrid models with Q4_K/Q5_K/Q6_K/Q8_0 weights and a working Vulkan driver. Specify '--device cpu' or enable CPU fallback.",
                                 GpuVendor.Nvidia =>
                                     $"Bare-metal SASS engine is not available for {targetDevice.Name} or requires an unsupported model architecture variant.",
                                 _ =>

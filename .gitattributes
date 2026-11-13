@@ -1,0 +1,7 @@
+# Vulkan shader sources and build script must keep LF line endings (the script runs under bash; glslc is happy either way)
+*.comp  text eol=lf
+*.glsl  text eol=lf
+*.sh    text eol=lf
+
+# Pre-compiled SPIR-V is embedded into the assembly: never touch or diff it as text
+*.spv   binary
