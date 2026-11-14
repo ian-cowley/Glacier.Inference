@@ -1,0 +1,48 @@
+#version 450
+// Gated DeltaNet recurrent state update, one workgroup per V-head, one thread per state row i (dState = 128).
+// V-head h uses Q/K group g = h % nK  (llama.cpp tiling).
+// State is stored TRANSPOSED on the GPU: St[h][j*128 + i] = S[i][j]  (coalesced across threads for fixed j).
+//   S' = decay * S;  kvMem_i = sum_j S'[i][j] k_j;  delta_i = (v_i - kvMem_i) * beta;
+//   S  = S' + delta_i * k_j;  y_i = sum_j S[i][j] q_j
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };   // conv+silu+l2 output: Q | K | V
+layout(std430, binding = 1) readonly buffer AL { float alpha[]; };  // [nV]  ssm_alpha projection
+layout(std430, binding = 2) readonly buffer BE { float betaIn[]; }; // [nV]  ssm_beta projection
+layout(std430, binding = 3) readonly buffer DT { float dtBias[]; }; // [nV]
+layout(std430, binding = 4) readonly buffer AW { float aW[]; };     // [nV]  (= -exp(A_log))
+layout(std430, binding = 5) buffer ST { float st[]; };              // [nV][128*128]
+layout(std430, binding = 6) writeonly buffer Y { float y[]; };      // [nV*128]
+layout(push_constant) uniform PC { uint nK; uint nV; } pc;
+shared float sq[128];
+shared float sk[128];
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.nV) return;
+    uint i = gl_LocalInvocationID.x;
+    uint g = h % pc.nK;
+    sq[i] = qkv[g * 128u + i];
+    sk[i] = qkv[pc.nK * 128u + g * 128u + i];
+    barrier();
+
+    float a = alpha[h] + dtBias[h];
+    float dt = a > 20.0 ? a : log(1.0 + exp(a));
+    float decay = exp(aW[h] * dt);
+    float beta = 1.0 / (1.0 + exp(-betaIn[h]));
+
+    uint base = h * 128u * 128u;
+    float kv = 0.0;
+    for (uint j = 0u; j < 128u; j++) {
+        float s = st[base + j * 128u + i] * decay;
+        st[base + j * 128u + i] = s;
+        kv += s * sk[j];
+    }
+    float v = qkv[2u * pc.nK * 128u + h * 128u + i];
+    float delta = (v - kv) * beta;
+    float dot = 0.0;
+    for (uint j = 0u; j < 128u; j++) {
+        float s = st[base + j * 128u + i] + delta * sk[j];
+        st[base + j * 128u + i] = s;
+        dot += s * sq[j];
+    }
+    y[h * 128u + i] = dot;
+}

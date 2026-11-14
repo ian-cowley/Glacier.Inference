@@ -197,6 +197,8 @@ public sealed unsafe partial class Qwen2GpuModel
             GgufType.Q3_K => _fnGemvQ3K,
             GgufType.Q6_K => _fnGemvQ6K,
             GgufType.Q8_0 => _fnGemvQ8_0,
+            GgufType.IQ4_XS => _fnGemvIQ4_XS,
+            GgufType.MXFP4 => _fnGemvMXFP4,
             GgufType.F32 => _fnGemvFp32,
             _ => throw new NotSupportedException($"GPU GEMV does not support type {type}")
         };

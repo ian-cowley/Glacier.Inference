@@ -1,0 +1,27 @@
+#version 450
+// MoE combine + residual: x[d] += sum_k topW[k]*down[k][d] + sigmoid(dot(normX, shexpGateW)) * shexpDown[d]
+// One workgroup of 256 threads.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer NX { float nx[]; };
+layout(std430, binding = 2) readonly buffer GW { float gw[]; };      // shared-expert gate vector [dim]
+layout(std430, binding = 3) readonly buffer D { float down[]; };     // [topK][dim]
+layout(std430, binding = 4) readonly buffer TW { float tw[]; };      // [topK]
+layout(std430, binding = 5) readonly buffer SD { float sdown[]; };   // [dim]
+layout(push_constant) uniform PC { uint dim; uint topK; uint hasShexpGate; } pc;
+shared float red[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float s = 0.0;
+    for (uint i = t; i < pc.dim; i += 256u) s += nx[i] * gw[i];
+    red[t] = s;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) { if (t < o) red[t] += red[t + o]; barrier(); }
+    float gate = pc.hasShexpGate != 0u ? 1.0 / (1.0 + exp(-red[0])) : 1.0;
+    for (uint d = t; d < pc.dim; d += 256u) {
+        float acc = 0.0;
+        for (uint k = 0u; k < pc.topK; k++) acc += tw[k] * down[k * pc.dim + d];
+        acc += gate * sdown[d];
+        x[d] += acc;
+    }
+}

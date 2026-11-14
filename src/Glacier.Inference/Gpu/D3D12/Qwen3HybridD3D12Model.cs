@@ -51,6 +51,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ2_0 = null!;
     private ID3D12PipelineState _psoGemvIQ2_XXS = null!;
     private ID3D12PipelineState _psoGemvIQ4_NL = null!;
+    private ID3D12PipelineState _psoGemvIQ4_XS = null!;
+    private ID3D12PipelineState _psoGemvMXFP4 = null!;
     private ID3D12PipelineState _psoGemvIQ3_S = null!;
     private ID3D12PipelineState _psoGemvTernary = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
@@ -309,6 +311,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         _psoGemvQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_0));
         _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
         _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
+        _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
+        _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
         _psoGemvIQ3_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
         _psoGemvTernary = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvTernary));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
@@ -865,6 +869,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             GgufType.Q2_0 => _psoGemvQ2_0,
             GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
             GgufType.IQ4_NL => _psoGemvIQ4_NL,
+            GgufType.IQ4_XS => _psoGemvIQ4_XS,
+            GgufType.MXFP4 => _psoGemvMXFP4,
             GgufType.IQ3_S => _psoGemvIQ3_S,
             GgufType.Ternary_1_58 or GgufType.PQ2_0 => _psoGemvTernary,
             _ => _psoGemvFp32
@@ -2288,6 +2294,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             _psoGemvQ2_0?.Dispose();
             _psoGemvIQ2_XXS?.Dispose();
             _psoGemvIQ4_NL?.Dispose();
+            _psoGemvIQ4_XS?.Dispose();
+            _psoGemvMXFP4?.Dispose();
             _psoGemvIQ3_S?.Dispose();
             _psoGemvTernary?.Dispose();
             _psoGemvFp32?.Dispose();

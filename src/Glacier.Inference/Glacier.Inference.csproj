@@ -30,6 +30,9 @@
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
     <EmbeddedResource Include="Gpu\Kernels\kernels.cubin" />
+    <!-- Pre-compiled Vulkan compute shaders (rebuild with Gpu/Vulkan/Shaders/build_shaders.sh) -->
+    <EmbeddedResource Include="Gpu\Vulkan\Shaders\*.spv" LogicalName="vkshader.%(Filename)%(Extension)" />
+    <None Include="Gpu\Vulkan\Shaders\*.comp;Gpu\Vulkan\Shaders\*.glsl;Gpu\Vulkan\Shaders\*.sh" />
   </ItemGroup>
 
   <ItemGroup>

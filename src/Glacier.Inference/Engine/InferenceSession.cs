@@ -171,6 +171,18 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             Device = targetDevice;
             Engine = targetEngine;
 
+#if !ANDROID
+            if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu && VulkanContext.IsSupported)
+            {
+                if (_weights.IsHybridSsm && !Qwen35VulkanModel.IsSupported(_weights, out string vulkanWhyNot))
+                    GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanWhyNot}. Falling back to the CPU engine.");
+                else if (_weights.ArchitectureFamily == UniversalArchitecture.Gemma4 && !Gemma4VulkanModel.IsSupported(_weights, out string vulkanGemmaWhyNot))
+                    GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanGemmaWhyNot}. Falling back to the CPU engine.");
+                else if (!_weights.IsHybridSsm && _weights.ArchitectureFamily != UniversalArchitecture.Gemma4 && !Qwen2VulkanModel.IsSupported(_weights, out string vulkanStdWhyNot))
+                    GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanStdWhyNot}. Falling back to the CPU engine.");
+            }
+#endif
+
             if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
@@ -241,6 +253,49 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
+            else if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
+                     VulkanContext.IsSupported &&
+                     (Qwen35VulkanModel.IsSupported(_weights, out _) || Gemma4VulkanModel.IsSupported(_weights, out _) || Mamba2VulkanModel.IsSupported(_weights, out _) || Qwen2VulkanModel.IsSupported(_weights, out _)) &&
+                     Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name) >= 0)
+            {
+                try
+                {
+                    int devIdx = Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name);
+                    ID3D12Model vkModel = _weights.IsHybridSsm
+                        ? new Qwen35VulkanModel(_weights, maxSeqLen, devIdx)
+                        : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                            ? new Gemma4VulkanModel(_weights, maxSeqLen, devIdx)
+                            : _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
+                                ? new Mamba2VulkanModel(_weights, maxSeqLen, devIdx)
+                                : new Qwen2VulkanModel(_weights, maxSeqLen, devIdx);
+                    _d3d12Model = vkModel;
+                    _kvCache = null; // GPU maintains all KV / recurrent states in device-visible memory
+                    Engine = InferenceEngineType.Vulkan;
+                    string modeDesc = _weights.IsHybridSsm
+                        ? $"Qwen 3.5/3.6 Gated DeltaNet{(_weights.IsMoe ? " + MoE" : "")}"
+                        : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                            ? $"Gemma 4 ISWA{(_weights.IsMoe ? " + Dual MoE" : "")}"
+                            : $"Standard Dense{(_weights.IsMoe ? " + MoE" : "")}";
+                    string vkName = vkModel is Qwen35VulkanModel m35 ? m35.DeviceName : vkModel is Gemma4VulkanModel mg4 ? mg4.DeviceName : ((Qwen2VulkanModel)vkModel).DeviceName;
+                    ActiveDevice = $"{vkName} [Engine: Vulkan Compute ({modeDesc}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                }
+                catch (Exception ex)
+                {
+                    GlacierDiagnostics.LogWarning($"Vulkan GPU init failed: {ex.GetType().FullName}: {ex.Message}", ex);
+                    FallbackException = ex;
+                    var settings = GlacierSettings.Load();
+                    if (!settings.FallbackToCpu)
+                        throw new InvalidOperationException($"Failed to initialize Vulkan compute inference on {targetDevice.Name}: {ex.Message}", ex);
+
+                    _d3d12Model?.Dispose();
+                    _d3d12Model = null;
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                    Device = DeviceManager.ResolveDevice("cpu");
+                    Engine = InferenceEngineType.Cpu;
+                    ActiveDevice = $"{Device.Name} [Fallback from Vulkan | Arch: {_weights.ArchitectureFamily}]";
+                }
+            }
 #endif
             else
             {
@@ -254,7 +309,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                             : targetDevice.Vendor switch
                             {
                                 GpuVendor.Amd when !OperatingSystem.IsWindows() =>
-                                    $"GPU hardware acceleration on {targetDevice.Name} currently requires Direct3D 12 on Windows. On Linux, please specify '--device cpu'.",
+                                    $"GPU hardware acceleration on {targetDevice.Name} requires Direct3D 12 on Windows, or on Linux the Vulkan runner, which currently supports Qwen 3.5/3.6 hybrid models with Q4_K/Q5_K/Q6_K/Q8_0 weights and a working Vulkan driver. Specify '--device cpu' or enable CPU fallback.",
                                 GpuVendor.Nvidia =>
                                     $"Bare-metal SASS engine is not available for {targetDevice.Name} or requires an unsupported model architecture variant.",
                                 _ =>

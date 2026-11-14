@@ -209,6 +209,66 @@ public class GgufFileTests
     }
 
     [Fact]
+    public void Open_FollowsSymlinks_AndUsesTargetFileLength()
+    {
+        // Regression: FileInfo.Length of a symlink is the size of the link itself on Linux/macOS (e.g. HuggingFace
+        // snapshots/<rev>/model.gguf -> ../../blobs/<sha>). The header bounds check used it as the file length and
+        // rejected every model opened through a symlink with "Header metadata counts exceed available bytes".
+        string dir = Path.Combine(Path.GetTempPath(), $"gguf_link_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        string target = Path.Combine(dir, "blob.gguf");
+        string link = Path.Combine(dir, "snapshot.gguf");
+        try
+        {
+            using (var ms = new MemoryStream())
+            using (var bw = new BinaryWriter(ms))
+            {
+                bw.Write(0x46554747U); // 'GGUF'
+                bw.Write(3U);          // Version 3
+                bw.Write(1UL);         // TensorCount = 1
+                bw.Write(1UL);         // MetadataKvCount = 1
+                string key = "general.architecture";
+                bw.Write((ulong)key.Length);
+                bw.Write(Encoding.UTF8.GetBytes(key));
+                bw.Write(8U);          // String
+                string val = "llama";
+                bw.Write((ulong)val.Length);
+                bw.Write(Encoding.UTF8.GetBytes(val));
+                string tName = "token_embd.weight";
+                bw.Write((ulong)tName.Length);
+                bw.Write(Encoding.UTF8.GetBytes(tName));
+                bw.Write(1U);          // nDims
+                bw.Write(4UL);         // 4 elements
+                bw.Write(0U);          // F32
+                bw.Write(0UL);         // offset
+                long rem = ms.Position % 32;
+                for (long i = 0; i < (rem == 0 ? 0 : 32 - rem); i++) bw.Write((byte)0);
+                for (int i = 0; i < 4; i++) bw.Write((float)i);
+                bw.Flush();
+                File.WriteAllBytes(target, ms.ToArray());
+            }
+
+            try
+            {
+                File.CreateSymbolicLink(link, target);
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                return; // symlinks unavailable here (e.g. Windows without developer mode / privilege)
+            }
+
+            using var gguf = GgufFile.Open(link);
+            Assert.Equal("llama", gguf.Architecture);
+            Assert.Equal(1UL, gguf.TensorCount);
+            Assert.True(gguf.Tensors.ContainsKey("token_embd.weight"));
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void InspectUniversalArchitectures()
     {
         string[] paths = [

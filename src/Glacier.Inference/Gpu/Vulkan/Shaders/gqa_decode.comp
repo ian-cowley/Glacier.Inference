@@ -1,0 +1,38 @@
+#version 450
+// Standard GQA decode for one token, one workgroup per Q head (supports headDim <= 256).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QO { float qOut[]; };    // [nQ][headDim]
+layout(std430, binding = 1) readonly buffer KC { float kCache[]; };  // [nKv][maxSeq][headDim]
+layout(std430, binding = 2) readonly buffer VC { float vCache[]; };  // [nKv][maxSeq][headDim]
+layout(std430, binding = 3) writeonly buffer AO { float outBuf[]; }; // [nQ][headDim]
+layout(push_constant) uniform PC { uint seqLen; uint nQ; uint nKv; uint maxSeq; uint headDim; float scale; } pc;
+shared float red[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint kh = h / (pc.nQ / pc.nKv);
+    uint kBase = kh * pc.maxSeq * pc.headDim;
+    float qv = (d < pc.headDim) ? (qOut[h * pc.headDim + d] * pc.scale) : 0.0;
+
+    float m = -1e30;
+    float l = 0.0;
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        uint off = kBase + t * pc.headDim + d;
+        red[d] = (d < pc.headDim) ? (qv * kCache[off]) : 0.0;
+        barrier();
+        for (uint o = 128u; o > 0u; o >>= 1) { if (d < o) red[d] += red[d + o]; barrier(); }
+        float s = red[0];
+        barrier();
+
+        float mNew = max(m, s);
+        float alpha = exp(m - mNew);
+        float p = exp(s - mNew);
+        l = l * alpha + p;
+        acc = acc * alpha + ((d < pc.headDim) ? (p * vCache[off]) : 0.0);
+        m = mNew;
+    }
+    if (d < pc.headDim)
+        outBuf[h * pc.headDim + d] = acc / l;
+}

@@ -38,6 +38,8 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ2_0 = null!;
     private ID3D12PipelineState _psoGemvIQ2_XXS = null!;
     private ID3D12PipelineState _psoGemvIQ4_NL = null!;
+    private ID3D12PipelineState _psoGemvIQ4_XS = null!;
+    private ID3D12PipelineState _psoGemvMXFP4 = null!;
     private ID3D12PipelineState _psoGemvIQ3_S = null!;
     private ID3D12PipelineState _psoGemvTernary = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
@@ -747,6 +749,8 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
             _psoGemvQ2_0?.Dispose();
             _psoGemvIQ2_XXS?.Dispose();
             _psoGemvIQ4_NL?.Dispose();
+            _psoGemvIQ4_XS?.Dispose();
+            _psoGemvMXFP4?.Dispose();
             _psoGemvIQ3_S?.Dispose();
             _psoGemvTernary?.Dispose();
             _psoGemvFp32?.Dispose();

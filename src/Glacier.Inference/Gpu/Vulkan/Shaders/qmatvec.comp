@@ -1,0 +1,194 @@
+#version 450
+// Quantised mat-vec: y[row] = dot(W[row,:], x). One workgroup (64 threads) per output row.
+// Compile with -DQTYPE=0 (Q4_K) | 1 (Q5_K) | 2 (Q6_K) | 3 (Q8_0); add -DMOE for the indexed-expert variant.
+//
+// Tuned layout: every thread owns 4 consecutive weights per block (one 32-bit load of quants), scales are decoded
+// once per block per thread, and x is read as vec4. Block/weight alignment: Q4_K/Q5_K blocks are 4-byte aligned;
+// Q6_K (210 B) and Q8_0 (34 B) are only 2-byte aligned and use funnel-shifted 32-bit loads.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+#ifdef MOE
+// MoE variant: workgroup (row, slot). Expert = idx[slot]; weights for that expert start at idx[slot]*sliceBytes.
+// x offset = slot*xStride floats (0 => shared input; must be a multiple of 4), y index = slot*N + row.
+layout(std430, binding = 3) readonly buffer IDX { uint idx[]; };
+layout(push_constant) uniform PC { uint K; uint N; uint sliceBytes; uint xStride; } pc;
+#else
+layout(push_constant) uniform PC { uint K; uint N; } pc;
+#endif
+
+shared float partial[64];
+
+// 32-bit load at an arbitrary byte offset (little endian).
+uint u32at(uint o) {
+    uint i = o >> 2, s = (o & 3u) * 8u;
+    uint a = w[i];
+    return s == 0u ? a : ((a >> s) | (w[i + 1u] << (32u - s)));
+}
+float halfAt(uint o) { return unpackHalf2x16(u32at(o) & 0xFFFFu).x; }
+float sbyteF(uint v, uint byteIdx) { return float(bitfieldExtract(int(v), int(byteIdx * 8u), 8)); }
+
+#if QTYPE == 0 || QTYPE == 1
+uint sbk(uint j, uint s0, uint s1, uint s2) {
+    uint word = j < 4u ? s0 : (j < 8u ? s1 : s2);
+    return (word >> ((j & 3u) * 8u)) & 0xFFu;
+}
+void scaleMin(uint j, uint s0, uint s1, uint s2, out float sc, out float mn) {
+    if (j < 4u) {
+        sc = float(sbk(j, s0, s1, s2) & 63u);
+        mn = float(sbk(j + 4u, s0, s1, s2) & 63u);
+    } else {
+        sc = float((sbk(j + 4u, s0, s1, s2) & 0x0Fu) | ((sbk(j - 4u, s0, s1, s2) >> 6) << 4));
+        mn = float((sbk(j + 4u, s0, s1, s2) >> 4) | ((sbk(j, s0, s1, s2) >> 6) << 4));
+    }
+}
+#endif
+
+void main() {
+#ifdef MOE
+    uint row = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y;
+    uint wbase = idx[slot] * pc.sliceBytes;
+    uint xo4 = (slot * pc.xStride) >> 2;
+    uint yo = slot * pc.N;
+#else
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * 32768u;
+    uint wbase = 0u, xo4 = 0u, yo = 0u;
+#endif
+    if (row >= pc.N) return;
+    uint t = gl_LocalInvocationID.x;
+    float acc = 0.0;
+
+#if QTYPE == 0 || QTYPE == 1
+    // 2 blocks per pass: threads 0..31 -> block A, 32..63 -> block B. Thread (g, lb) owns weights
+    // [g*64+lb .. +3] (low nibbles) and [g*64+32+lb .. +3] (high nibbles) of its block.
+    uint nb = pc.K / 256u;
+    uint u = t & 31u, g = u >> 3, lb = (u & 7u) * 4u;
+    for (uint blk = t >> 5; blk < nb; blk += 2u) {
+  #if QTYPE == 0
+        uint wi = (wbase + (row * nb + blk) * 144u) >> 2;
+  #else
+        uint wi = (wbase + (row * nb + blk) * 176u) >> 2;
+  #endif
+        vec2 dm = unpackHalf2x16(w[wi]);
+        uint s0 = w[wi + 1u], s1 = w[wi + 2u], s2 = w[wi + 3u];
+        float sc0, m0, sc1, m1;
+        scaleMin(2u * g, s0, s1, s2, sc0, m0);
+        scaleMin(2u * g + 1u, s0, s1, s2, sc1, m1);
+  #if QTYPE == 0
+        uint q = w[wi + 4u + u];
+        vec4 ql = vec4(float(q & 15u), float((q >> 8) & 15u), float((q >> 16) & 15u), float((q >> 24) & 15u));
+        vec4 qh = vec4(float((q >> 4) & 15u), float((q >> 12) & 15u), float((q >> 20) & 15u), float((q >> 28) & 15u));
+  #else
+        uint q = w[wi + 12u + u];
+        uint hb = w[wi + 4u + (u & 7u)];
+        uint sl = 2u * g, sh = 2u * g + 1u;
+        vec4 ql = vec4(float((q & 15u) + (((hb >> (sl)) & 1u) << 4)),
+                       float(((q >> 8) & 15u) + (((hb >> (8u + sl)) & 1u) << 4)),
+                       float(((q >> 16) & 15u) + (((hb >> (16u + sl)) & 1u) << 4)),
+                       float(((q >> 24) & 15u) + (((hb >> (24u + sl)) & 1u) << 4)));
+        vec4 qh = vec4(float(((q >> 4) & 15u) + (((hb >> (sh)) & 1u) << 4)),
+                       float(((q >> 12) & 15u) + (((hb >> (8u + sh)) & 1u) << 4)),
+                       float(((q >> 20) & 15u) + (((hb >> (16u + sh)) & 1u) << 4)),
+                       float(((q >> 28) & 15u) + (((hb >> (24u + sh)) & 1u) << 4)));
+  #endif
+        uint xb = xo4 + ((blk * 256u + g * 64u + lb) >> 2);
+        vec4 xl = x4[xb], xh = x4[xb + 8u];
+        float dl = dot(ql, xl), dh = dot(qh, xh);
+        float sxl = xl.x + xl.y + xl.z + xl.w, sxh = xh.x + xh.y + xh.z + xh.w;
+        acc += dm.x * (sc0 * dl + sc1 * dh) - dm.y * (m0 * sxl + m1 * sxh);
+    }
+#elif QTYPE == 2
+    // Q6_K: 16 threads per block (n = 128-weight half, lb = 4-weight lane), 4 blocks per pass.
+    uint nb = pc.K / 256u;
+    uint q16 = t & 15u, n = q16 >> 3, lb = (q16 & 7u) * 4u, is = lb >> 4;
+    for (uint blk = t >> 4; blk < nb; blk += 4u) {
+        uint b = wbase + (row * nb + blk) * 210u;
+        float d = halfAt(b + 208u);
+        uint ql0 = u32at(b + n * 64u + lb);
+        uint ql1 = u32at(b + n * 64u + 32u + lb);
+        uint qhw = u32at(b + 128u + n * 32u + lb);
+        uint scb = b + 192u + n * 8u + is;
+        uint sa = u32at(scb), sb = u32at(scb + 4u);
+        float sc0 = sbyteF(sa, 0u), sc2 = sbyteF(sa, 2u), sc4 = sbyteF(sb, 0u), sc6 = sbyteF(sb, 2u);
+        vec4 q1, q2, q3, q4;
+        for (uint i = 0u; i < 4u; i++) {
+            uint a = ql0 >> (8u * i), c = ql1 >> (8u * i), h = qhw >> (8u * i);
+            q1[i] = float(int((a & 15u) | ((h & 3u) << 4)) - 32);
+            q2[i] = float(int((c & 15u) | (((h >> 2) & 3u) << 4)) - 32);
+            q3[i] = float(int(((a >> 4) & 15u) | (((h >> 4) & 3u) << 4)) - 32);
+            q4[i] = float(int(((c >> 4) & 15u) | (((h >> 6) & 3u) << 4)) - 32);
+        }
+        uint xb = xo4 + ((blk * 256u + n * 128u + lb) >> 2);
+        acc += d * (sc0 * dot(q1, x4[xb]) + sc2 * dot(q2, x4[xb + 8u]) + sc4 * dot(q3, x4[xb + 16u]) + sc6 * dot(q4, x4[xb + 24u]));
+    }
+#elif QTYPE == 3
+    // Q8_0: 8 threads per 32-weight block (4 weights each), 8 blocks per pass.
+    uint nb = pc.K / 32u;
+    uint j = t & 7u;
+    for (uint blk = t >> 3; blk < nb; blk += 8u) {
+        uint b = wbase + (row * nb + blk) * 34u;
+        float d = halfAt(b);
+        uint q = u32at(b + 2u + 4u * j);
+        vec4 qv = vec4(bitfieldExtract(int(q), 0, 8), bitfieldExtract(int(q), 8, 8),
+                       bitfieldExtract(int(q), 16, 8), bitfieldExtract(int(q), 24, 8));
+        acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+    }
+#elif QTYPE == 4
+    // IQ4_XS: 256 elements = 136 bytes (f16 d, uint16 scales_h, uint8 scales_l[4], uint8 qs[128])
+    const int kvalues_iq4nl[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113);
+    uint nBlk = pc.K >> 8;
+    uint rowOff = wbase + row * nBlk * 136u;
+    uint sub = t >> 3;          // 0..7 (8 sub-blocks of 32)
+    uint lane = t & 7u;         // 0..7 (each thread reads 4 elements: 2 low nibbles + 2 high nibbles? No: 16 bytes per sub-block -> 2 bytes per thread = 4 nibbles)
+    for (uint blk = 0u; blk < nBlk; blk++) {
+        uint bo = rowOff + blk * 136u;
+        float d = halfAt(bo);
+        uint sh = u32at(bo + 2u) & 0xFFFFu;
+        uint sl = u32at(bo + 4u);
+        uint ls = (((sl >> (4u * sub)) & 0xFu) | (((sh >> (2u * sub)) & 3u) << 4));
+        float dl = d * float(int(ls) - 32);
+        uint qword = u32at(bo + 8u + sub * 16u + (lane & 3u) * 4u);
+        if (lane < 4u) {
+            vec4 qv = vec4(kvalues_iq4nl[qword & 0xFu], kvalues_iq4nl[(qword >> 8) & 0xFu],
+                           kvalues_iq4nl[(qword >> 16) & 0xFu], kvalues_iq4nl[(qword >> 24) & 0xFu]);
+            acc += dl * dot(qv, x4[xo4 + blk * 64u + sub * 8u + lane]);
+        } else {
+            vec4 qv = vec4(kvalues_iq4nl[(qword >> 4) & 0xFu], kvalues_iq4nl[(qword >> 12) & 0xFu],
+                           kvalues_iq4nl[(qword >> 20) & 0xFu], kvalues_iq4nl[(qword >> 28) & 0xFu]);
+            acc += dl * dot(qv, x4[xo4 + blk * 64u + sub * 8u + lane]);
+        }
+    }
+#elif QTYPE == 5
+    // MXFP4: 32 elements = 17 bytes (uint8 e E8M0, uint8 qs[16] 4-bit E2M1)
+    const float kvalues_mxfp4[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    uint nBlk = pc.K >> 5;
+    uint rowOff = wbase + row * nBlk * 17u;
+    uint j = t & 7u;            // 0..7 (4 elements per thread)
+    for (uint blk = t >> 3; blk < nBlk; blk += 8u) {
+        uint bo = rowOff + blk * 17u;
+        uint e = u32at(bo) & 0xFFu;
+        float d = (e == 0u) ? 0.0 : uintBitsToFloat(e << 23) * 0.5;
+        uint qword = u32at(bo + 1u + (j & 3u) * 4u);
+        if (j < 4u) {
+            vec4 qv = vec4(kvalues_mxfp4[qword & 0xFu], kvalues_mxfp4[(qword >> 8) & 0xFu],
+                           kvalues_mxfp4[(qword >> 16) & 0xFu], kvalues_mxfp4[(qword >> 24) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        } else {
+            vec4 qv = vec4(kvalues_mxfp4[(qword >> 4) & 0xFu], kvalues_mxfp4[(qword >> 12) & 0xFu],
+                           kvalues_mxfp4[(qword >> 20) & 0xFu], kvalues_mxfp4[(qword >> 28) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        }
+    }
+#endif
+
+    partial[t] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (t < s) partial[t] += partial[t + s];
+        barrier();
+    }
+    if (t == 0u) y[yo + row] = partial[0];
+}

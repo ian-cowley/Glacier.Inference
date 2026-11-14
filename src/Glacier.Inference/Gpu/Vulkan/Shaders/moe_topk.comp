@@ -1,0 +1,52 @@
+#version 450
+// MoE routing from precomputed router logits: softmax over all experts, parallel top-K (largest probability first,
+// lowest index wins ties - identical to the CPU SoftmaxTopK), optional renormalisation of the selected weights.
+// One workgroup, 256 threads (E <= 256, topK <= 16).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer LG { float logits[]; };   // [E]
+layout(std430, binding = 1) writeonly buffer OI { uint outIdx[]; };   // [topK]
+layout(std430, binding = 2) writeonly buffer OW { float outW[]; };    // [topK]
+layout(push_constant) uniform PC { uint E; uint topK; uint norm; } pc;
+shared float prob[256];
+shared float red[256];
+shared uint redI[256];
+shared float selW[16];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float z = t < pc.E ? logits[t] : -3.4e38;
+    red[t] = z;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (t < s) red[t] = max(red[t], red[t + s]); barrier(); }
+    float mx = red[0];
+    barrier();
+    float ep = t < pc.E ? exp(z - mx) : 0.0;
+    red[t] = ep;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (t < s) red[t] += red[t + s]; barrier(); }
+    float inv = red[0] > 0.0 ? 1.0 / red[0] : 1.0;
+    barrier();
+    prob[t] = ep * inv;
+    barrier();
+
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.topK; k++) {
+        red[t] = prob[t];
+        redI[t] = t;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) {
+                float ov = red[t + s]; uint oi = redI[t + s];
+                if (ov > red[t] || (ov == red[t] && oi < redI[t])) { red[t] = ov; redI[t] = oi; }
+            }
+            barrier();
+        }
+        float best = red[0];
+        uint bi = redI[0];
+        sum += best;
+        if (t == 0u) { outIdx[k] = bi; selW[k] = best; }
+        if (t == bi) prob[t] = -2.0;
+        barrier();
+    }
+    float invS = pc.norm != 0u ? (sum > 0.0 ? 1.0 / sum : 1.0 / float(pc.topK)) : 1.0;
+    if (t < pc.topK) outW[t] = selW[t] * invS;
+}

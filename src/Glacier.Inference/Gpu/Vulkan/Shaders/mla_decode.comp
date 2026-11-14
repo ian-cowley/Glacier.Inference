@@ -1,0 +1,37 @@
+#version 450
+// MLA attention decode for one token, one workgroup per Q head (kDim <= 256, vDim <= 256).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QO { float qOut[]; };    // [nQ][kDim]
+layout(std430, binding = 1) readonly buffer KC { float kCache[]; };  // [nQ][maxSeq][kDim]
+layout(std430, binding = 2) readonly buffer VC { float vCache[]; };  // [nQ][maxSeq][vDim]
+layout(std430, binding = 3) writeonly buffer AO { float outBuf[]; }; // [nQ][vDim]
+layout(push_constant) uniform PC { uint seqLen; uint nQ; uint maxSeq; uint kDim; uint vDim; float scale; } pc;
+shared float red[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint kBase = h * pc.maxSeq * pc.kDim;
+    uint vBase = h * pc.maxSeq * pc.vDim;
+    float qv = (d < pc.kDim) ? (qOut[h * pc.kDim + d] * pc.scale) : 0.0;
+
+    float m = -1e30;
+    float l = 0.0;
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.seqLen; t++) {
+        red[d] = (d < pc.kDim) ? (qv * kCache[kBase + t * pc.kDim + d]) : 0.0;
+        barrier();
+        for (uint o = 128u; o > 0u; o >>= 1) { if (d < o) red[d] += red[d + o]; barrier(); }
+        float s = red[0];
+        barrier();
+
+        float mNew = max(m, s);
+        float alpha = exp(m - mNew);
+        float p = exp(s - mNew);
+        l = l * alpha + p;
+        acc = acc * alpha + ((d < pc.vDim) ? (p * vCache[vBase + t * pc.vDim + d]) : 0.0);
+        m = mNew;
+    }
+    if (d < pc.vDim)
+        outBuf[h * pc.vDim + d] = acc / l;
+}

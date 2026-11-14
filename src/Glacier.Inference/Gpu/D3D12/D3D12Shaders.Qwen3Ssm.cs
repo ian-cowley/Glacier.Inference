@@ -142,8 +142,8 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (h >= num_heads) return;
 
     uint tid = gtid.x;
-    uint heads_per_group = num_heads / num_groups;
-    uint g = h / heads_per_group;
+    // llama.cpp maps V-head -> Q/K-head by tiling (h % num_groups), not grouping (h / ratio).
+    uint g = h % num_groups;
 
     // Load Q and K vectors for this group into shared memory
     s_q[tid] = q[g * state_dim + tid];

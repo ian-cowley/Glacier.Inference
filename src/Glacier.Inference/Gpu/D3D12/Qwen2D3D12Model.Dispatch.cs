@@ -51,6 +51,8 @@ public sealed unsafe partial class Qwen2D3D12Model
             GgufType.Q2_0 => _psoGemvQ2_0,
             GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
             GgufType.IQ4_NL => _psoGemvIQ4_NL,
+            GgufType.IQ4_XS => _psoGemvIQ4_XS,
+            GgufType.MXFP4 => _psoGemvMXFP4,
             GgufType.IQ3_S => _psoGemvIQ3_S,
             GgufType.Ternary_1_58 or GgufType.PQ2_0 => _psoGemvTernary,
             GgufType.F32 => _psoGemvFp32,

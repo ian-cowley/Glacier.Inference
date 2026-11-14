@@ -1,0 +1,79 @@
+#version 450
+// Standard GQA attention prep for one token (supports headDim <= 256, optional QK-norm, NEOX or interleaved RoPE).
+// workgroup id: [0,nQ) q heads, [nQ,nQ+nKv) k heads, [nQ+nKv,nQ+2nKv) v heads.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QR { float qRaw[]; };     // [nQ][headDim]
+layout(std430, binding = 1) readonly buffer KR { float kRaw[]; };     // [nKv][headDim]
+layout(std430, binding = 2) readonly buffer VR { float vRaw[]; };     // [nKv][headDim]
+layout(std430, binding = 3) readonly buffer QN { float qNormW[]; };   // [headDim] (unused if hasQkNorm==0)
+layout(std430, binding = 4) readonly buffer KN { float kNormW[]; };   // [headDim] (unused if hasQkNorm==0)
+layout(std430, binding = 5) writeonly buffer QO { float qOut[]; };    // [nQ][headDim]
+layout(std430, binding = 6) buffer KC { float kCache[]; };            // [nKv][maxSeq][headDim]
+layout(std430, binding = 7) buffer VC { float vCache[]; };            // [nKv][maxSeq][headDim]
+layout(push_constant) uniform PC {
+    uint pos; uint nQ; uint nKv; uint maxSeq;
+    uint headDim; uint ropeDim; uint hasQkNorm; uint isNeox;
+    float eps; float freqBase;
+} pc;
+shared float sh[256];
+shared float red[256];
+
+float rmsScale(float v, uint d) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = (d < pc.headDim) ? (v * v) : 0.0;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1) { if (t < o) red[t] += red[t + o]; barrier(); }
+    float r = inversesqrt(red[0] / float(pc.headDim) + pc.eps);
+    barrier();
+    return r;
+}
+
+float ropeApply(uint d) {
+    if (d >= pc.ropeDim) return sh[d];
+    uint half_ = pc.ropeDim / 2u;
+    if (pc.isNeox != 0u) {
+        uint i = d % half_;
+        float freq = 1.0 / pow(pc.freqBase, float(2u * i) / float(pc.ropeDim));
+        float theta = float(pc.pos) * freq;
+        float c = cos(theta), s = sin(theta);
+        float a = sh[i], b = sh[i + half_];
+        return d < half_ ? a * c - b * s : a * s + b * c;
+    } else {
+        uint pair = d / 2u;
+        float freq = 1.0 / pow(pc.freqBase, float(2u * pair) / float(pc.ropeDim));
+        float theta = float(pc.pos) * freq;
+        float c = cos(theta), s = sin(theta);
+        float a = sh[pair * 2u], b = sh[pair * 2u + 1u];
+        return (d & 1u) == 0u ? a * c - b * s : a * s + b * c;
+    }
+}
+
+void main() {
+    uint w = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    if (w < pc.nQ) {
+        float q = (d < pc.headDim) ? qRaw[w * pc.headDim + d] : 0.0;
+        if (pc.hasQkNorm != 0u) {
+            float r = rmsScale(q, d);
+            if (d < pc.headDim) sh[d] = q * r * qNormW[d];
+        } else {
+            if (d < pc.headDim) sh[d] = q;
+        }
+        barrier();
+        if (d < pc.headDim) qOut[w * pc.headDim + d] = ropeApply(d);
+    } else if (w < pc.nQ + pc.nKv) {
+        uint kh = w - pc.nQ;
+        float k = (d < pc.headDim) ? kRaw[kh * pc.headDim + d] : 0.0;
+        if (pc.hasQkNorm != 0u) {
+            float r = rmsScale(k, d);
+            if (d < pc.headDim) sh[d] = k * r * kNormW[d];
+        } else {
+            if (d < pc.headDim) sh[d] = k;
+        }
+        barrier();
+        if (d < pc.headDim) kCache[(kh * pc.maxSeq + pc.pos) * pc.headDim + d] = ropeApply(d);
+    } else {
+        uint kh = w - pc.nQ - pc.nKv;
+        if (d < pc.headDim) vCache[(kh * pc.maxSeq + pc.pos) * pc.headDim + d] = vRaw[kh * pc.headDim + d];
+    }
+}

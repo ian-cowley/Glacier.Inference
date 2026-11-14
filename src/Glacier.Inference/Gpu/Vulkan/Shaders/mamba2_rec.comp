@@ -1,0 +1,40 @@
+#version 450
+// Mamba-2 SSD recurrence for one token: one workgroup per head (headDim <= 256, stateDim <= 256).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer XBC { float xbc[]; };      // [dInner + 2 * nGroups * stateDim]
+layout(std430, binding = 1) readonly buffer ZB { float z[]; };           // [dInner]
+layout(std430, binding = 2) readonly buffer DTB { float dtIn[]; };       // [nHeads]
+layout(std430, binding = 3) readonly buffer A_ { float A[]; };           // [nHeads] (negative log-decay)
+layout(std430, binding = 4) readonly buffer D_ { float D[]; };           // [nHeads]
+layout(std430, binding = 5) readonly buffer DB_ { float dtBias[]; };     // [nHeads]
+layout(std430, binding = 6) buffer ST { float state[]; };                // [nHeads][headDim][stateDim]
+layout(std430, binding = 7) writeonly buffer YO { float yOut[]; };       // [dInner]
+layout(push_constant) uniform PC { uint nHeads; uint headDim; uint stateDim; uint nGroups; uint dInner; uint zOff; uint dtOff; } pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    if (h >= pc.nHeads || d >= pc.headDim) return;
+
+    uint g = h / (pc.nHeads / pc.nGroups);
+    uint bOff = pc.dInner + g * pc.stateDim;
+    uint cOff = pc.dInner + (pc.nGroups + g) * pc.stateDim;
+
+    float dtRaw = dtIn[pc.dtOff + h] + dtBias[h];
+    float dt = (dtRaw > 20.0) ? dtRaw : log(1.0 + exp(dtRaw));
+    float dA = exp(dt * A[h]);
+
+    float xVal = xbc[h * pc.headDim + d];
+    float acc = D[h] * xVal;
+    uint stBase = (h * pc.headDim + d) * pc.stateDim;
+
+    for (uint s = 0u; s < pc.stateDim; s++) {
+        float st = state[stBase + s] * dA + dt * xbc[bOff + s] * xVal;
+        state[stBase + s] = st;
+        acc += st * xbc[cOff + s];
+    }
+
+    float zv = z[pc.zOff + h * pc.headDim + d];
+    float siluZ = zv / (1.0 + exp(-zv));
+    yOut[h * pc.headDim + d] = acc * siluZ;
+}

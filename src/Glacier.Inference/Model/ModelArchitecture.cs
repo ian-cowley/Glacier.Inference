@@ -75,6 +75,16 @@ public enum UniversalArchitecture
     LoopedTransformer,
 
     /// <summary>
+    /// Mamba-2 / Hybrid Mamba-2 + Transformer + MoE (e.g. Nemotron 3 Nano, IBM Granite 4.0/4.1 Hybrid).
+    /// </summary>
+    Mamba2,
+
+    /// <summary>
+    /// Liquid AI LFM2 / LFM3 hybrid gated short-convolution + GQA architecture.
+    /// </summary>
+    Lfm2,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -162,6 +172,18 @@ public static class ModelArchitectureDetector
                                        gguf.Metadata.ContainsKey("general.architecture") && gguf.Metadata["general.architecture"]?.ToString()?.Contains("looped", StringComparison.OrdinalIgnoreCase) == true)))
         {
             return UniversalArchitecture.LoopedTransformer;
+        }
+
+        if (gguf.Metadata.TryGetValue("general.architecture", out var archObj))
+        {
+            string archStr = archObj?.ToString() ?? "";
+            if (archStr.Contains("nemotron_h", StringComparison.OrdinalIgnoreCase) ||
+                archStr.Contains("granitehybrid", StringComparison.OrdinalIgnoreCase) ||
+                archStr.Contains("mamba2", StringComparison.OrdinalIgnoreCase))
+                return UniversalArchitecture.Mamba2;
+            if (archStr.Contains("lfm2", StringComparison.OrdinalIgnoreCase) ||
+                archStr.Contains("lfm3", StringComparison.OrdinalIgnoreCase))
+                return UniversalArchitecture.Lfm2;
         }
 
         if (HasSsmTensors(gguf))

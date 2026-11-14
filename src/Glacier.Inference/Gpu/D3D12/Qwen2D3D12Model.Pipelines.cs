@@ -34,6 +34,8 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemvQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_0));
         _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
         _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
+        _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
+        _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
         _psoGemvIQ3_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
         _psoGemvTernary = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvTernary));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
