@@ -3,10 +3,10 @@
 # Run from this directory after editing any .comp / .glsl file, then commit the regenerated .spv files.
 set -e
 G="glslc --target-env=vulkan1.1 -O -I."
-for t in 0 1 2 3; do
+for t in 0 1 2 3 4 5 6 7; do
   $G -DQTYPE=$t qmatvec.comp -o qmatvec_q$t.spv
   $G -DMOE -DQTYPE=$t qmatvec.comp -o qmatvec_moe_q$t.spv
-  $G -DQTYPE=$t embed.comp -o embed_q$t.spv
+  if [ "$t" -lt 4 ]; then $G -DQTYPE=$t embed.comp -o embed_q$t.spv; fi
 done
 $G -DOP=0 elementwise.comp -o elementwise_swiglu.spv
 $G -DOP=1 elementwise.comp -o elementwise_add.spv

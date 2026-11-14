@@ -41,7 +41,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
     private bool _disposed;
 
     // Kernels
-    private readonly VulkanCompute.Kernel[] _kMv = new VulkanCompute.Kernel[6], _kMoe = new VulkanCompute.Kernel[6], _kEmbed = new VulkanCompute.Kernel[4];
+    private readonly VulkanCompute.Kernel[] _kMv = new VulkanCompute.Kernel[8], _kMoe = new VulkanCompute.Kernel[8], _kEmbed = new VulkanCompute.Kernel[4];
     private readonly VulkanCompute.Kernel _kF32, _kRms, _kSwi, _kAdd, _kConv, _kL2, _kRec, _kTopk, _kComb, _kPrep, _kDec;
 
     public string DeviceName => _ctx.DeviceName;
@@ -112,7 +112,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
     }
 
     private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0;
-    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4;
+    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL;
 
     private static int QIdx(GgufType t) => t switch
     {
@@ -122,6 +122,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         GgufType.Q8_0 => 3,
         GgufType.IQ4_XS => 4,
         GgufType.MXFP4 => 5,
+        GgufType.Q3_K => 6,
+        GgufType.IQ4_NL => 7,
         _ => throw new NotSupportedException($"Vulkan runner does not support weight type {t}.")
     };
 
@@ -140,7 +142,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         try
         {
             // ---- kernels ----
-            for (int t = 0; t < 6; t++)
+            for (int t = 0; t < 8; t++)
             {
                 _kMv[t] = _vk.LoadEmbedded($"qmatvec_q{t}", 3, 8);
                 _kMoe[t] = _vk.LoadEmbedded($"qmatvec_moe_q{t}", 4, 16);

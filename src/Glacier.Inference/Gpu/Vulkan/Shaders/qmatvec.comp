@@ -182,6 +182,53 @@ void main() {
             acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
         }
     }
+#elif QTYPE == 6
+    // Q3_K: 256 elements = 110 bytes (hmask[32], qs[64], scales[12], f16 d). 64 threads per block (4 weights each).
+    uint nb = pc.K >> 8;
+    uint n = t >> 5, u = t & 31u, j = u >> 3, sub = (u >> 2) & 1u, lb = (u & 3u) * 4u;
+    uint isIdx = n * 8u + j * 2u + sub;
+    uint shift = j * 2u, mBit = n * 4u + j;
+    for (uint blk = 0u; blk < nb; blk++) {
+        uint b = wbase + (row * nb + blk) * 110u;
+        float d = halfAt(b + 108u);
+        uint au0 = u32at(b + 96u), au1 = u32at(b + 100u), tmp = u32at(b + 104u);
+        uint a0 = (au0 & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+        uint a1 = (au1 & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+        uint a2 = ((au0 >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+        uint a3 = ((au1 >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+        uint scWord = (isIdx < 4u) ? a0 : ((isIdx < 8u) ? a1 : ((isIdx < 12u) ? a2 : a3));
+        float sc = float(bitfieldExtract(int(scWord), int((isIdx & 3u) * 8u), 8) - 32);
+        uint qword = u32at(b + 32u + n * 32u + sub * 16u + lb);
+        uint hmword = u32at(b + sub * 16u + lb);
+        vec4 qv;
+        for (uint i = 0u; i < 4u; i++) {
+            uint q2 = (qword >> (8u * i + shift)) & 3u;
+            uint hm = (hmword >> (8u * i + mBit)) & 1u;
+            qv[i] = float(int(q2) - (hm != 0u ? 0 : 4));
+        }
+        uint xb = xo4 + ((blk * 256u + n * 128u + j * 32u + sub * 16u + lb) >> 2);
+        acc += d * sc * dot(qv, x4[xb]);
+    }
+#elif QTYPE == 7
+    // IQ4_NL: 32 elements = 18 bytes (f16 d, uint8 qs[16]). 8 threads per block (4 weights each).
+    const int kvalues_iq4nl[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113);
+    uint nBlk = pc.K >> 5;
+    uint rowOff = wbase + row * nBlk * 18u;
+    uint j = t & 7u;
+    for (uint blk = t >> 3; blk < nBlk; blk += 8u) {
+        uint bo = rowOff + blk * 18u;
+        float d = halfAt(bo);
+        uint qword = u32at(bo + 2u + (j & 3u) * 4u);
+        if (j < 4u) {
+            vec4 qv = vec4(kvalues_iq4nl[qword & 0xFu], kvalues_iq4nl[(qword >> 8) & 0xFu],
+                           kvalues_iq4nl[(qword >> 16) & 0xFu], kvalues_iq4nl[(qword >> 24) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        } else {
+            vec4 qv = vec4(kvalues_iq4nl[(qword >> 4) & 0xFu], kvalues_iq4nl[(qword >> 12) & 0xFu],
+                           kvalues_iq4nl[(qword >> 20) & 0xFu], kvalues_iq4nl[(qword >> 28) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        }
+    }
 #endif
 
     partial[t] = acc;

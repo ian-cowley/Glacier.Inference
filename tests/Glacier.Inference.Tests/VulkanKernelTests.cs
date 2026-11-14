@@ -814,4 +814,70 @@ public unsafe class VulkanKernelTests
             }
         }
     }
+
+    [VulkanFact]
+    public void QMatVec_Q3K_And_IQ4NL_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(789);
+
+        int K = 512, N = 16;
+        var x = RandF(rng, K, 0.5f);
+        var gX = Up(vk, x);
+
+        // 1. Q3_K (256 elements = 110 bytes)
+        int nb3 = K / 256;
+        var q3Bytes = new byte[N * nb3 * 110];
+        rng.NextBytes(q3Bytes);
+        for (int i = 0; i < N * nb3; i++)
+        {
+            Half h = (Half)(0.02f * ((i % 7) + 1));
+            BitConverter.TryWriteBytes(q3Bytes.AsSpan(i * 110 + 108, 2), h);
+        }
+        var y3Ref = new float[N];
+        var deq = new float[K];
+        fixed (byte* pQ3 = q3Bytes)
+        fixed (float* pDeq = deq)
+        {
+            for (int r = 0; r < N; r++)
+            {
+                QuantKernels.DequantizeQ3_K((Quant.BlockQ3_K*)(pQ3 + r * nb3 * 110), pDeq, K);
+                float sum = 0f;
+                for (int c = 0; c < K; c++) sum += deq[c] * x[c];
+                y3Ref[r] = sum;
+            }
+            var gW3 = vk.AllocFrom(pQ3, q3Bytes.Length);
+            var gY3 = vk.Alloc(N * 4L);
+            var k3 = vk.LoadEmbedded("qmatvec_q6", 3, 8);
+            vk.Begin();
+            vk.Dispatch(k3, vk.MakeSet(k3, gW3, gX, gY3), new uint[] { (uint)K, (uint)N }, (uint)N);
+            vk.SubmitAndWait();
+            AssertClose(y3Ref, Down(gY3, N), 1e-3, 1e-4, "Q3_K qmatvec");
+        }
+
+        // 2. IQ4_NL (32 elements = 18 bytes)
+        int nb4 = K / 32;
+        var iq4Src = RandF(rng, N * K, 0.5f);
+        var iq4Bytes = new byte[N * nb4 * 18];
+        var y4Ref = new float[N];
+        fixed (float* pSrc = iq4Src)
+        fixed (float* pX = x)
+        fixed (byte* pIq4 = iq4Bytes)
+        {
+            for (int r = 0; r < N; r++)
+            {
+                var rowDst = (Quant.BlockIQ4_NL*)(pIq4 + r * nb4 * 18);
+                QuantKernels.QuantizeIQ4_NL(pSrc + r * K, rowDst, K);
+                y4Ref[r] = QuantKernels.VecDotIQ4_NL(rowDst, pX, K);
+            }
+            var gW4 = vk.AllocFrom(pIq4, iq4Bytes.Length);
+            var gY4 = vk.Alloc(N * 4L);
+            var k4 = vk.LoadEmbedded("qmatvec_q7", 3, 8);
+            vk.Begin();
+            vk.Dispatch(k4, vk.MakeSet(k4, gW4, gX, gY4), new uint[] { (uint)K, (uint)N }, (uint)N);
+            vk.SubmitAndWait();
+            AssertClose(y4Ref, Down(gY4, N), 1e-3, 1e-4, "IQ4_NL qmatvec");
+        }
+    }
 }

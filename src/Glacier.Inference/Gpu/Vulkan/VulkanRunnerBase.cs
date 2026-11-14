@@ -34,8 +34,8 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     private protected VulkanCompute.GBuf _dLogits = null!;
     private protected VulkanCompute.Kernel _pRmsNorm = null!, _pAdd = null!;
     private protected readonly VulkanCompute.Kernel[] _pEmbed = new VulkanCompute.Kernel[4];
-    private protected readonly VulkanCompute.Kernel[] _pQmv = new VulkanCompute.Kernel[6];
-    private protected readonly VulkanCompute.Kernel[] _pMoe = new VulkanCompute.Kernel[6];
+    private protected readonly VulkanCompute.Kernel[] _pQmv = new VulkanCompute.Kernel[8];
+    private protected readonly VulkanCompute.Kernel[] _pMoe = new VulkanCompute.Kernel[8];
 
     public string DeviceName => _ctx.DeviceName;
     public int MaxSeqLen => _maxSeqLen;
@@ -53,7 +53,7 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     {
         _pRmsNorm = _vk.LoadEmbedded("rmsnorm", 3, 12);
         _pAdd = _vk.LoadEmbedded("elementwise_add", 3, 4);
-        for (int q = 0; q < 6; q++)
+        for (int q = 0; q < 8; q++)
         {
             if (q < 4) _pEmbed[q] = _vk.LoadEmbedded($"embed_q{q}", 2, 8);
             _pQmv[q] = _vk.LoadEmbedded($"qmatvec_q{q}", 3, 8);
@@ -62,11 +62,12 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     }
 
     protected static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0;
-    protected static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4;
+    protected static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL;
 
     protected static int QIdx(GgufType t) => t switch
     {
-        GgufType.Q4_K => 0, GgufType.Q5_K => 1, GgufType.Q6_K => 2, GgufType.Q8_0 => 3, GgufType.IQ4_XS => 4, GgufType.MXFP4 => 5,
+        GgufType.Q4_K => 0, GgufType.Q5_K => 1, GgufType.Q6_K => 2, GgufType.Q8_0 => 3,
+        GgufType.IQ4_XS => 4, GgufType.MXFP4 => 5, GgufType.Q3_K => 6, GgufType.IQ4_NL => 7,
         _ => throw new NotSupportedException($"Unsupported Vulkan quant type {t}"),
     };
 
@@ -80,6 +81,8 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
         GgufType.Q8_0 => (elements / 32) * 34,
         GgufType.IQ4_XS => (elements / 256) * 136,
         GgufType.MXFP4 => (elements / 32) * 17,
+        GgufType.Q3_K => (elements / 256) * 110,
+        GgufType.IQ4_NL => (elements / 32) * 18,
         _ => throw new NotSupportedException($"Unsupported Vulkan quant type {t}"),
     };
 
