@@ -141,12 +141,26 @@ This is the dominant factor for decode speed once the kernels are tuned, and it 
 * Things that were tested and made **no difference**: GPU clocks (about 2.8 GHz and 94% busy during decode), pre-committing buffer
   pages, evicting the page cache, host-cached logits memory, buffer count and size, a 20 GB resident footprint, and free-memory
   fragmentation (`/proc/buddyinfo`).
+* **GTT memory type does not matter.** With the unified-heap option off, RADV exposes separate GTT types. The write-combined,
+  non-snooped type and the cached, snooped type both read at the same slow steady-state speed, so cache-coherency (snooping) overhead
+  is not the cause. Per 128 MB chunk the GTT speed is bimodal (mostly 15-17 GB/s, some chunks 50-78 GB/s), which points at how the
+  pages of each allocation are laid out, not at coherence.
+* **The IOMMU is not involved on the test machine.** The GPU's IOMMU group is `identity` (pass-through), so `amd_iommu=off` is
+  expected to change nothing there. (Check yours with `cat /sys/kernel/iommu_groups/$(basename $(readlink /sys/class/drm/card1/device/iommu_group))/type`.)
+* The `radv_enable_unified_heap_on_apu` driconf option hides the VRAM/GTT split (one heap, all types `DEVICE_LOCAL`); placement is then
+  decided by the kernel: carve-out first, GTT after. Without the option, Vulkan reports a small `DEVICE_LOCAL` heap (VRAM) and a
+  host-visible heap (GTT). Either way only the first ~0.9 GB of a 1 GB carve-out is usable for buffers.
 * Open question: one run reached 49.7 ms/token (about 20 tok/s) and could not be reproduced, and some CLI runs reported up to
   15 tok/s while the interleaved benchmark consistently gave about 9.4 tok/s. The cause of the run-to-run variation is not
   identified.
 
-**Practical advice:** if the BIOS offers a larger *UMA Frame Buffer Size* than 1 GB, use it; a bigger carve-out should let more
-of the weights sit in the fast region (not verified here). Prefer Q5_K/Q4_K projections where quality allows.
+**Practical advice:** the one lever that follows directly from the measurements is the BIOS *UMA Frame Buffer Size*. Look at which
+sizes your BIOS offers (the available range differs between models; do not assume a particular maximum) and choose the largest that
+leaves enough RAM for Linux and the page cache. The runner needs no change: the kernel fills the carve-out first, so more of the
+weights land in the fast region. Check the result with `cat /sys/class/drm/card1/device/mem_info_vram_total` and, after loading a
+model, `mem_info_vram_used` versus `mem_info_gtt_used`. This is **not verified** on a larger carve-out, because the test machine's
+BIOS was not changed; if every weight fits in the carve-out, the expectation from the kernel benchmarks is a decode rate several
+times higher than the GTT-bound figures above. Also prefer Q5_K/Q4_K projections where quality allows.
 
 ## 6. Diagnostics
 

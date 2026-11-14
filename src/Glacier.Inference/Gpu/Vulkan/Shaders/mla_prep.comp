@@ -1,0 +1,53 @@
+#version 450
+// MLA attention prep for one token:
+// workgroup id: [0, nQ) -> writes qOut[h], kCache[h][pos], vCache[h][pos]
+// Supports kDim <= 256, vDim <= 256.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QF { float qFull[]; };   // [nQ][qkNope + qkRope]
+layout(std430, binding = 1) readonly buffer KVB { float kvB[]; };    // [nQ][qkNope + vDim]
+layout(std430, binding = 2) readonly buffer KR { float kvA[]; };     // [kvLoraRank + qkRope]
+layout(std430, binding = 3) writeonly buffer QO { float qOut[]; };   // [nQ][qkNope + qkRope]
+layout(std430, binding = 4) buffer KC { float kCache[]; };           // [nQ][maxSeq][qkNope + qkRope]
+layout(std430, binding = 5) buffer VC { float vCache[]; };           // [nQ][maxSeq][vDim]
+layout(push_constant) uniform PC {
+    uint pos; uint nQ; uint maxSeq; uint qkNope; uint qkRope; uint vDim; uint kvLoraRank; uint isNeox; float freqBase;
+} pc;
+
+float ropeVal(float a, float b, uint pair, bool isSecond) {
+    float freq = 1.0 / pow(pc.freqBase, float(2u * pair) / float(pc.qkRope));
+    float theta = float(pc.pos) * freq;
+    float c = cos(theta), s = sin(theta);
+    return isSecond ? (a * s + b * c) : (a * c - b * s);
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint kDim = pc.qkNope + pc.qkRope;
+    uint kvStride = pc.qkNope + pc.vDim;
+
+    if (d < kDim) {
+        float qv = qFull[h * kDim + d];
+        float kv = (d < pc.qkNope) ? kvB[h * kvStride + d] : kvA[pc.kvLoraRank + d - pc.qkNope];
+        if (d >= pc.qkNope) {
+            uint rd = d - pc.qkNope;
+            uint half_ = pc.qkRope / 2u;
+            if (pc.isNeox != 0u) {
+                uint i = rd % half_;
+                bool sec = rd >= half_;
+                qv = ropeVal(qFull[h * kDim + pc.qkNope + i], qFull[h * kDim + pc.qkNope + i + half_], i, sec);
+                kv = ropeVal(kvA[pc.kvLoraRank + i], kvA[pc.kvLoraRank + i + half_], i, sec);
+            } else {
+                uint pair = rd / 2u;
+                bool sec = (rd & 1u) != 0u;
+                qv = ropeVal(qFull[h * kDim + pc.qkNope + pair * 2u], qFull[h * kDim + pc.qkNope + pair * 2u + 1u], pair, sec);
+                kv = ropeVal(kvA[pc.kvLoraRank + pair * 2u], kvA[pc.kvLoraRank + pair * 2u + 1u], pair, sec);
+            }
+        }
+        qOut[h * kDim + d] = qv;
+        kCache[(h * pc.maxSeq + pc.pos) * kDim + d] = kv;
+    }
+    if (d < pc.vDim) {
+        vCache[(h * pc.maxSeq + pc.pos) * pc.vDim + d] = kvB[h * kvStride + pc.qkNope + d];
+    }
+}

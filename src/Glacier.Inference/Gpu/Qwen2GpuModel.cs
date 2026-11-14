@@ -34,6 +34,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnGemvQ3K;
     private IntPtr _fnGemvQ6K;
     private IntPtr _fnGemvQ8_0;
+    private IntPtr _fnGemvIQ4_XS;
+    private IntPtr _fnGemvMXFP4;
     private IntPtr _fnGemvFp32;
     private IntPtr _fnSwigluFused;
     private IntPtr _fnRmsNorm;
@@ -234,6 +236,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ3K, _module, "gemv_q3_k"), "ModuleGetFunction(gemv_q3_k)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ4_XS, _module, "gemv_iq4_xs"), "ModuleGetFunction(gemv_iq4_xs)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvMXFP4, _module, "gemv_mxfp4"), "ModuleGetFunction(gemv_mxfp4)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvFp32, _module, "gemv_fp32"), "ModuleGetFunction(gemv_fp32)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");

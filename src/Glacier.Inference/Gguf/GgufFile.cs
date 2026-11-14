@@ -19,6 +19,8 @@ public sealed unsafe class GgufFile : IDisposable
     private const ulong MaxArrayElements = 1_000_000;
 
     private readonly MemoryMappedFile _mmf;
+    private readonly List<(MemoryMappedFile Mmf, MemoryMappedViewAccessor Acc, IntPtr BasePtr)> _extraShards = new();
+    private readonly Dictionary<string, IntPtr> _shardTensorPtrs = new();
     private readonly MemoryMappedViewAccessor _accessor;
     private byte* _basePointer;
     private readonly long _fileLength;
@@ -276,6 +278,9 @@ public sealed unsafe class GgufFile : IDisposable
                     throw new InvalidDataException($"Tensor '{tensor.Name}' bounds [{TensorDataOffset + tensor.Offset}..{endOffset}] exceed file size ({_fileLength}).");
                 }
             }
+
+            // 6. Load additional split-GGUF shards if present (-00001-of-0000N.gguf)
+            LoadExtraShards(filePath);
         }
         catch
         {
@@ -288,6 +293,8 @@ public sealed unsafe class GgufFile : IDisposable
     {
         ArgumentNullException.ThrowIfNull(tensor);
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_shardTensorPtrs.TryGetValue(tensor.Name, out IntPtr shardPtr))
+            return (byte*)shardPtr;
 
         ulong byteSize = tensor.GetByteSize();
         ulong endOffset = TensorDataOffset + tensor.Offset + byteSize;
@@ -461,7 +468,82 @@ public sealed unsafe class GgufFile : IDisposable
             }
             _accessor?.Dispose();
             _mmf?.Dispose();
+            foreach (var (mmf, acc, ptr) in _extraShards)
+            {
+                if (ptr != IntPtr.Zero) { try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { } }
+                acc.Dispose();
+                mmf.Dispose();
+            }
+            _extraShards.Clear();
             _disposed = true;
+        }
+    }
+
+    private void LoadExtraShards(string firstShardPath)
+    {
+        int splitCount = Metadata.TryGetValue("split.count", out var sc) ? Convert.ToInt32(sc) : 1;
+        if (splitCount <= 1) return;
+
+        var m = System.Text.RegularExpressions.Regex.Match(firstShardPath, @"^(.*-)(\d{5})(-of-)(\d{5})(\.gguf)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success) return;
+
+        string prefix = m.Groups[1].Value, mid = m.Groups[3].Value, totalStr = m.Groups[4].Value, ext = m.Groups[5].Value;
+        for (int s = 2; s <= splitCount; s++)
+        {
+            string shardPath = $"{prefix}{s:D5}{mid}{totalStr}{ext}";
+            if (!File.Exists(shardPath))
+                throw new FileNotFoundException($"Missing split-GGUF shard {s}/{splitCount}: {shardPath}", shardPath);
+
+            long shardLen = new FileInfo(shardPath).Length;
+            var mmf = MemoryMappedFile.CreateFromFile(shardPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            var acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            byte* basePtr = null;
+            acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            _extraShards.Add((mmf, acc, (IntPtr)basePtr));
+
+            byte* ptr = basePtr;
+            byte* endPtr = basePtr + shardLen;
+            uint magic = ReadUInt32(ref ptr, endPtr);
+            if (magic != 0x46554747) throw new InvalidDataException($"Invalid GGUF magic in shard {shardPath}.");
+            uint ver = ReadUInt32(ref ptr, endPtr);
+            if (ver < 2 || ver > 3) throw new NotSupportedException($"Unsupported GGUF version {ver} in shard {shardPath}.");
+
+            ulong tCount = ReadUInt64(ref ptr, endPtr);
+            ulong kvCount = ReadUInt64(ref ptr, endPtr);
+            uint shardAlign = Alignment;
+            for (ulong i = 0; i < kvCount; i++)
+            {
+                string key = ReadString(ref ptr, endPtr);
+                uint vType = ReadUInt32(ref ptr, endPtr);
+                object val = ReadValue(ref ptr, endPtr, (GgufValueType)vType, 0);
+                if (key == "general.alignment" && val is uint u32 && u32 > 0) shardAlign = u32;
+            }
+
+            var shardTensors = new List<GgufTensorInfo>((int)tCount);
+            for (ulong i = 0; i < tCount; i++)
+            {
+                string name = ReadString(ref ptr, endPtr);
+                uint nDims = ReadUInt32(ref ptr, endPtr);
+                ulong[] dims = new ulong[nDims];
+                for (uint d = 0; d < nDims; d++) dims[d] = ReadUInt64(ref ptr, endPtr);
+                var tType = (GgufType)ReadUInt32(ref ptr, endPtr);
+                ulong offset = ReadUInt64(ref ptr, endPtr);
+                var info = new GgufTensorInfo { Name = name, DimensionsCount = nDims, Dimensions = dims, Type = tType, Offset = offset };
+                shardTensors.Add(info);
+                Tensors[name] = info;
+                TensorList.Add(info);
+            }
+
+            ulong headerBytes = (ulong)(ptr - basePtr);
+            ulong rem = headerBytes % shardAlign;
+            ulong dataOff = rem == 0 ? headerBytes : headerBytes + (shardAlign - rem);
+            foreach (var t in shardTensors)
+            {
+                ulong endOff = dataOff + t.Offset + t.GetByteSize();
+                if (t.Offset > (ulong)shardLen || endOff < dataOff || endOff > (ulong)shardLen)
+                    throw new InvalidDataException($"Tensor '{t.Name}' bounds exceed shard {shardPath} size.");
+                _shardTensorPtrs[t.Name] = (IntPtr)(basePtr + dataOff + t.Offset);
+            }
         }
     }
 }

@@ -1,0 +1,31 @@
+#version 450
+// Mamba-2 causal 1D depthwise conv + SiLU for one token (supports arbitrary convKernel, typically 4).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer XBC { float xbc[]; };       // [convDim]
+layout(std430, binding = 1) readonly buffer CW { float convW[]; };      // [convDim][kernel]
+layout(std430, binding = 2) readonly buffer CB { float convB[]; };      // [convDim]
+layout(std430, binding = 3) buffer CS { float convState[]; };           // [convDim][kernel - 1]
+layout(std430, binding = 4) writeonly buffer XO { float xbcOut[]; };    // [convDim]
+layout(push_constant) uniform PC { uint convDim; uint kernel; } pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.convDim) return;
+    uint k1 = pc.kernel - 1u;
+    uint sOff = c * k1;
+    uint wOff = c * pc.kernel;
+
+    float sum = convB[c];
+    for (uint j = 0u; j < k1; j++) {
+        sum += convState[sOff + j] * convW[wOff + j];
+    }
+    float cur = xbc[c];
+    sum += cur * convW[wOff + k1];
+
+    for (uint j = 0u; j + 1u < k1; j++) {
+        convState[sOff + j] = convState[sOff + j + 1u];
+    }
+    if (k1 > 0u) convState[sOff + k1 - 1u] = cur;
+
+    xbcOut[c] = sum / (1.0 + exp(-sum));
+}

@@ -420,4 +420,252 @@ public unsafe class VulkanKernelTests
         }
         return o;
     }
+
+    private static float[] RandF(Random rng, int n, float scale)
+    {
+        var r = new float[n];
+        for (int i = 0; i < n; i++) r[i] = (float)(rng.NextDouble() * 2 - 1) * scale;
+        return r;
+    }
+
+    [VulkanFact]
+    public void Iq4Xs_And_Mxfp4_MatVec_MatchCpuReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(42);
+
+        // 1. IQ4_XS: K=256, M=4 -> 136 bytes/row
+        int[] iq4nl = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+        int kIq = 256, mIq = 4;
+        byte[] wIq = new byte[mIq * 136];
+        rng.NextBytes(wIq);
+        for (int r = 0; r < mIq; r++)
+        {
+            Half h = (Half)(0.05f * (r + 1));
+            BitConverter.TryWriteBytes(wIq.AsSpan(r * 136, 2), h);
+        }
+        var xIq = RandF(rng, kIq, 0.5f);
+        var refIq = new float[mIq];
+        for (int r = 0; r < mIq; r++)
+        {
+            int bo = r * 136;
+            float d = (float)BitConverter.ToHalf(wIq, bo);
+            ushort sh = BitConverter.ToUInt16(wIq, bo + 2);
+            uint sl = BitConverter.ToUInt32(wIq, bo + 4);
+            float sum = 0;
+            for (int sub = 0; sub < 8; sub++)
+            {
+                int ls = (int)(((sl >> (4 * sub)) & 0xFu) | (((sh >> (2 * sub)) & 3u) << 4));
+                float dl = d * (ls - 32);
+                for (int j = 0; j < 16; j++)
+                {
+                    byte q = wIq[bo + 8 + sub * 16 + j];
+                    sum += dl * (iq4nl[q & 0xF] * xIq[sub * 32 + j] + iq4nl[q >> 4] * xIq[sub * 32 + 16 + j]);
+                }
+            }
+            refIq[r] = sum;
+        }
+        var kQ4 = vk.LoadEmbedded("qmatvec_q4", 3, 8);
+        var gWIq = Up(vk, wIq); var gXIq = Up(vk, xIq); var gYIq = vk.Alloc(mIq * 4L);
+        vk.Begin();
+        vk.Dispatch(kQ4, vk.MakeSet(kQ4, gWIq, gXIq, gYIq), new uint[] { (uint)kIq, (uint)mIq }, (uint)mIq);
+        vk.SubmitAndWait();
+        AssertClose(refIq, Down(gYIq, mIq), 1e-3, 1e-4, "IQ4_XS matvec");
+
+        // 2. MXFP4: K=64 (2 blocks), M=4 -> 34 bytes/row
+        float[] mxfp4 = { 0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0f, -0.5f, -1, -1.5f, -2, -3, -4, -6 };
+        int kMx = 64, mMx = 4;
+        byte[] wMx = new byte[mMx * 2 * 17];
+        rng.NextBytes(wMx);
+        for (int r = 0; r < mMx; r++)
+            for (int b = 0; b < 2; b++)
+                wMx[(r * 2 + b) * 17] = (byte)(126 + (r + b) % 4);
+        var xMx = RandF(rng, kMx, 0.5f);
+        var refMx = new float[mMx];
+        for (int r = 0; r < mMx; r++)
+        {
+            float sum = 0;
+            for (int b = 0; b < 2; b++)
+            {
+                int bo = (r * 2 + b) * 17;
+                byte e = wMx[bo];
+                float d = e == 0 ? 0f : BitConverter.UInt32BitsToSingle((uint)e << 23) * 0.5f;
+                for (int j = 0; j < 16; j++)
+                {
+                    byte q = wMx[bo + 1 + j];
+                    sum += d * (mxfp4[q & 0xF] * xMx[b * 32 + j] + mxfp4[q >> 4] * xMx[b * 32 + 16 + j]);
+                }
+            }
+            refMx[r] = sum;
+        }
+        var kQ5 = vk.LoadEmbedded("qmatvec_q5", 3, 8);
+        var gWMx = Up(vk, wMx); var gXMx = Up(vk, xMx); var gYMx = vk.Alloc(mMx * 4L);
+        vk.Begin();
+        vk.Dispatch(kQ5, vk.MakeSet(kQ5, gWMx, gXMx, gYMx), new uint[] { (uint)kMx, (uint)mMx }, (uint)mMx);
+        vk.SubmitAndWait();
+        AssertClose(refMx, Down(gYMx, mMx), 1e-3, 1e-4, "MXFP4 matvec");
+    }
+
+    [VulkanFact]
+    public void StandardGqa_And_GeGlu_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(7);
+
+        int nQ = 4, nKv = 2, hd = 64, maxSeq = 8;
+        var qRaw = RandF(rng, nQ * hd, 0.5f);
+        var kRaw = RandF(rng, nKv * hd, 0.5f);
+        var vRaw = RandF(rng, nKv * hd, 0.5f);
+        var dummy = new float[hd];
+
+        var kPrep = vk.LoadEmbedded("gqa_prep", 8, 40);
+        var kDec = vk.LoadEmbedded("gqa_decode", 4, 24);
+        var kGe = vk.LoadEmbedded("elementwise_geglu", 3, 4);
+        var kSc = vk.LoadEmbedded("gemma4_scale", 2, 12);
+
+        var gQ = Up(vk, qRaw); var gK = Up(vk, kRaw); var gV = Up(vk, vRaw); var gDum = Up(vk, dummy);
+        var gQO = vk.Alloc(nQ * hd * 4L);
+        var gKC = vk.Alloc(nKv * maxSeq * hd * 4L);
+        var gVC = vk.Alloc(nKv * maxSeq * hd * 4L);
+        var gAO = vk.Alloc(nQ * hd * 4L);
+
+        vk.Begin();
+        vk.Dispatch(kPrep, vk.MakeSet(kPrep, gQ, gK, gV, gDum, gDum, gQO, gKC, gVC),
+            new uint[] { 0u, (uint)nQ, (uint)nKv, (uint)maxSeq, (uint)hd, (uint)hd, 0u, 1u, VulkanCompute.F(1e-6f), VulkanCompute.F(10000f) },
+            (uint)(nQ + 2 * nKv));
+        vk.Dispatch(kDec, vk.MakeSet(kDec, gQO, gKC, gVC, gAO),
+            new uint[] { 1u, (uint)nQ, (uint)nKv, (uint)maxSeq, (uint)hd, VulkanCompute.F(1f / MathF.Sqrt(hd)) },
+            (uint)nQ);
+        vk.SubmitAndWait();
+
+        // At pos=0 (seqLen=1), softmax weight is 1.0 so output == vRaw for each KV group
+        var outCpu = Down(gAO, nQ * hd);
+        for (int h = 0; h < nQ; h++)
+        {
+            int kh = h / (nQ / nKv);
+            for (int d = 0; d < hd; d++)
+                Assert.True(MathF.Abs(outCpu[h * hd + d] - vRaw[kh * hd + d]) < 1e-4f);
+        }
+
+        // GeGLU + gemma4_scale softcap
+        var ga = RandF(rng, 64, 1.0f); var gb = RandF(rng, 64, 1.0f);
+        var gGa = Up(vk, ga); var gGb = Up(vk, gb); var gGo = vk.Alloc(64 * 4L);
+        vk.Begin();
+        vk.Dispatch(kGe, vk.MakeSet(kGe, gGa, gGb, gGo), new uint[] { 64u }, 1);
+        vk.Dispatch(kSc, vk.MakeSet(kSc, gGo, gGo), new uint[] { 64u, 1u, VulkanCompute.F(30f) }, 1);
+        vk.SubmitAndWait();
+        var refGe = new float[64];
+        for (int i = 0; i < 64; i++)
+        {
+            float x = ga[i];
+            float g = 0.5f * x * (1f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x))) * gb[i];
+            refGe[i] = 30f * MathF.Tanh(g / 30f);
+        }
+        AssertClose(refGe, Down(gGo, 64), 1e-4, 1e-5, "GeGLU + softcap");
+    }
+
+    [VulkanFact]
+    public void Mamba2_Conv_And_Recurrence_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(19);
+
+        int nH = 4, hd = 16, sd = 8, nG = 2, dIn = nH * hd, kern = 4;
+        int convDim = dIn + 2 * nG * sd;
+        var xbc = RandF(rng, convDim, 0.5f);
+        var convW = RandF(rng, convDim * kern, 0.3f);
+        var convB = RandF(rng, convDim, 0.1f);
+        var convSt = new float[convDim * (kern - 1)];
+        var z = RandF(rng, dIn, 0.5f);
+        var dtIn = RandF(rng, nH, 0.5f);
+        var A = new float[nH]; for (int i = 0; i < nH; i++) A[i] = -0.5f - 0.1f * i;
+        var D = RandF(rng, nH, 0.5f);
+        var dtB = RandF(rng, nH, 0.1f);
+        var st = new float[nH * hd * sd];
+
+        var kConv = vk.LoadEmbedded("mamba2_conv", 5, 8);
+        var kRec = vk.LoadEmbedded("mamba2_rec", 8, 20);
+        var gXbc = Up(vk, xbc); var gCW = Up(vk, convW); var gCB = Up(vk, convB);
+        var gCSt = Up(vk, convSt); var gXbcO = vk.Alloc(convDim * 4L);
+        var gZ = Up(vk, z); var gDt = Up(vk, dtIn); var gA = Up(vk, A); var gD = Up(vk, D);
+        var gDtB = Up(vk, dtB); var gSt = Up(vk, st); var gY = vk.Alloc(dIn * 4L);
+
+        vk.Begin();
+        vk.Dispatch(kConv, vk.MakeSet(kConv, gXbc, gCW, gCB, gCSt, gXbcO), new uint[] { (uint)convDim, (uint)kern }, (uint)((convDim + 255) / 256));
+        vk.Dispatch(kRec, vk.MakeSet(kRec, gXbcO, gZ, gDt, gA, gD, gDtB, gSt, gY), new uint[] { (uint)nH, (uint)hd, (uint)sd, (uint)nG, (uint)dIn }, (uint)nH);
+        vk.SubmitAndWait();
+
+        var xbcRef = new float[convDim];
+        for (int c = 0; c < convDim; c++)
+        {
+            float s = convB[c] + xbc[c] * convW[c * kern + kern - 1];
+            xbcRef[c] = s / (1f + MathF.Exp(-s));
+        }
+        var yRef = new float[dIn];
+        for (int h = 0; h < nH; h++)
+        {
+            int g = h / (nH / nG);
+            float dtRaw = dtIn[h] + dtB[h];
+            float dt = dtRaw > 20f ? dtRaw : MathF.Log(1f + MathF.Exp(dtRaw));
+            for (int d = 0; d < hd; d++)
+            {
+                float xv = xbcRef[h * hd + d];
+                float acc = D[h] * xv;
+                for (int s = 0; s < sd; s++)
+                {
+                    float sv = dt * xbcRef[dIn + g * sd + s] * xv;
+                    acc += sv * xbcRef[dIn + (nG + g) * sd + s];
+                }
+                float zv = z[h * hd + d];
+                yRef[h * hd + d] = acc * (zv / (1f + MathF.Exp(-zv)));
+            }
+        }
+        AssertClose(yRef, Down(gY, dIn), 1e-4, 1e-5, "Mamba-2 conv+rec");
+    }
+
+    [VulkanFact]
+    public void Mla_And_DsaTopk_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(99);
+
+        int nQ = 2, maxSeq = 4, qkNope = 32, qkRope = 16, vDim = 32, kvRank = 16;
+        int kDim = qkNope + qkRope;
+        var qFull = RandF(rng, nQ * kDim, 0.5f);
+        var kvB = RandF(rng, nQ * (qkNope + vDim), 0.5f);
+        var kvA = RandF(rng, kvRank + qkRope, 0.5f);
+
+        var kPrep = vk.LoadEmbedded("mla_prep", 6, 36);
+        var kDec = vk.LoadEmbedded("mla_decode", 4, 24);
+        var kTop = vk.LoadEmbedded("dsa_topk", 4, 16);
+        var kSp = vk.LoadEmbedded("mla_sparse_decode", 5, 24);
+
+        var gQF = Up(vk, qFull); var gKvB = Up(vk, kvB); var gKvA = Up(vk, kvA);
+        var gQO = vk.Alloc(nQ * kDim * 4L);
+        var gKC = vk.Alloc(nQ * maxSeq * kDim * 4L);
+        var gVC = vk.Alloc(nQ * maxSeq * vDim * 4L);
+        var gAO = vk.Alloc(nQ * vDim * 4L);
+
+        vk.Begin();
+        vk.Dispatch(kPrep, vk.MakeSet(kPrep, gQF, gKvB, gKvA, gQO, gKC, gVC),
+            new uint[] { 0u, (uint)nQ, (uint)maxSeq, (uint)qkNope, (uint)qkRope, (uint)vDim, (uint)kvRank, 1u, VulkanCompute.F(10000f) }, (uint)nQ);
+        vk.Dispatch(kDec, vk.MakeSet(kDec, gQO, gKC, gVC, gAO),
+            new uint[] { 1u, (uint)nQ, (uint)maxSeq, (uint)kDim, (uint)vDim, VulkanCompute.F(1f / MathF.Sqrt(kDim)) }, (uint)nQ);
+        vk.SubmitAndWait();
+        var denseOut = Down(gAO, nQ * vDim);
+
+        // Verify DSA topk + mla_sparse_decode at seqLen=1 matches denseOut
+        var gIQ = Up(vk, RandF(rng, 2 * 8, 0.5f)); var gIK = Up(vk, RandF(rng, maxSeq * 8, 0.5f));
+        var gIW = Up(vk, RandF(rng, 2, 0.5f)); var gTopIdx = vk.Alloc(4L); var gSpO = vk.Alloc(nQ * vDim * 4L);
+        vk.Begin();
+        vk.Dispatch(kTop, vk.MakeSet(kTop, gIQ, gIK, gIW, gTopIdx), new uint[] { 1u, 2u, 8u, 1u }, 1);
+        vk.Dispatch(kSp, vk.MakeSet(kSp, gQO, gKC, gVC, gTopIdx, gSpO),
+            new uint[] { 1u, (uint)nQ, (uint)maxSeq, (uint)kDim, (uint)vDim, VulkanCompute.F(1f / MathF.Sqrt(kDim)) }, (uint)nQ);
+        vk.SubmitAndWait();
+        AssertClose(denseOut, Down(gSpO, nQ * vDim), 1e-5, 1e-6, "MLA sparse vs dense");
+    }
 }

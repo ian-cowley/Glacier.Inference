@@ -1,0 +1,30 @@
+#version 450
+// LFM2/LFM3 gated short-convolution for one token:
+// inProj[3*E] = [B (0..E) | C (E..2E) | x (2E..3E)]
+// bx = B * x -> causal depthwise 1D conv(kernel) -> out[d] = C * conv_out
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer IP { float inProj[]; };      // [3 * E]
+layout(std430, binding = 1) readonly buffer CW { float convW[]; };       // [E][kernel]
+layout(std430, binding = 2) buffer CS { float convState[]; };            // [E][kernel - 1]
+layout(std430, binding = 3) writeonly buffer YO { float yOut[]; };       // [E]
+layout(push_constant) uniform PC { uint E; uint kernel; } pc;
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= pc.E) return;
+    uint k1 = pc.kernel - 1u;
+    uint sOff = d * k1;
+    uint wOff = d * pc.kernel;
+
+    float cur = inProj[d] * inProj[2u * pc.E + d]; // B * x
+    float sum = cur * convW[wOff + k1];
+    for (uint j = 0u; j < k1; j++) {
+        sum += convState[sOff + j] * convW[wOff + j];
+    }
+    for (uint j = 0u; j + 1u < k1; j++) {
+        convState[sOff + j] = convState[sOff + j + 1u];
+    }
+    if (k1 > 0u) convState[sOff + k1 - 1u] = cur;
+
+    yOut[d] = inProj[pc.E + d] * sum; // C * conv_out
+}

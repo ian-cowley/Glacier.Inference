@@ -1,0 +1,13 @@
+#version 450
+// mode 0: o[i] = a[i] * param
+// mode 1: o[i] = param * tanh(a[i] / param)  (logit softcap)
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n; uint mode; float param; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float x = a[i];
+    o[i] = (pc.mode == 0u) ? (x * pc.param) : (pc.param * tanh(x / pc.param));
+}

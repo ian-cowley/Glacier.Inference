@@ -658,4 +658,91 @@ __global__ void gemv_fp32(
     }
 }
 
+__global__ void gemv_iq4_xs(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    static constexpr int kvalues_iq4nl[16] = { -127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 136;
+    float row_sum = 0.0f;
+
+    int sub = lane_id >> 2;   // 0..7 (8 sub-blocks of 32)
+    int qid = lane_id & 3;    // 0..3 (4 lanes per sub-block -> 4 bytes = 8 weights each)
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 136;
+        uint16_t dh = *(const uint16_t*)bo;
+        float d = __half2float(*(const __half*)&dh);
+        uint16_t sh = *(const uint16_t*)(bo + 2);
+        uint32_t sl = *(const uint32_t*)(bo + 4);
+        int ls = (int)(((sl >> (4 * sub)) & 0xFu) | (((sh >> (2 * sub)) & 3u) << 4));
+        float dl = d * (float)(ls - 32);
+
+        const uint8_t* qs = bo + 8 + sub * 16 + qid * 4;
+        const float* xb = x + blk * 256 + sub * 32 + qid * 4;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t q = qs[j];
+            row_sum += dl * (kvalues_iq4nl[q & 0xF] * xb[j] + kvalues_iq4nl[q >> 4] * xb[j + 16]);
+        }
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_mxfp4(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    static constexpr float kvalues_mxfp4[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 5;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 17;
+    float row_sum = 0.0f;
+
+    int blk_lane = lane_id & 3; // 0..3 (4 lanes per 32-weight block -> 4 bytes = 8 weights each)
+    for (int blk = lane_id >> 2; blk < nb; blk += 8) {
+        const uint8_t* bo = row_w + (size_t)blk * 17;
+        uint32_t e = bo[0];
+        uint32_t fbits = (e == 0u) ? 0u : (e << 23);
+        float d = __uint_as_float(fbits) * 0.5f;
+        const uint8_t* qs = bo + 1 + blk_lane * 4;
+        const float* xb = x + blk * 32 + blk_lane * 4;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            uint8_t q = qs[j];
+            row_sum += d * (kvalues_mxfp4[q & 0xF] * xb[j] + kvalues_mxfp4[q >> 4] * xb[j + 16]);
+        }
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
 } // extern "C"

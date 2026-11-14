@@ -755,6 +755,8 @@ public sealed unsafe class D3D12Context : IDisposable
                 GgufType.Q2_0 => D3D12Shaders.GemvQ2_0,
                 GgufType.IQ2_XXS => D3D12Shaders.GemvIQ2_XXS,
                 GgufType.IQ4_NL => D3D12Shaders.GemvIQ4_NL,
+                GgufType.IQ4_XS => D3D12Shaders.GemvIQ4_XS,
+                GgufType.MXFP4 => D3D12Shaders.GemvMXFP4,
                 GgufType.IQ3_S => D3D12Shaders.GemvIQ3_S,
                 GgufType.Ternary_1_58 or GgufType.PQ2_0 => D3D12Shaders.GemvTernary,
                 GgufType.F32 => D3D12Shaders.GemvFp32,

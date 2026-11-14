@@ -36,6 +36,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ6K = null!;
     private ID3D12PipelineState _psoGemvQ3K = null!;
     private ID3D12PipelineState _psoGemvQ8_0 = null!;
+    private ID3D12PipelineState _psoGemvIQ4_XS = null!;
+    private ID3D12PipelineState _psoGemvMXFP4 = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
 
     private ID3D12RootSignature _sigRmsNorm = null!;
@@ -165,6 +167,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
         _psoGemvQ3K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ3K));
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
+        _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
+        _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
 
         // 2. RMSNorm
@@ -531,6 +535,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             GgufType.Q6_K => _psoGemvQ6K,
             GgufType.Q3_K => _psoGemvQ3K,
             GgufType.Q8_0 => _psoGemvQ8_0,
+            GgufType.IQ4_XS => _psoGemvIQ4_XS,
+            GgufType.MXFP4 => _psoGemvMXFP4,
             GgufType.F32 => _psoGemvFp32,
             _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
         };
@@ -995,6 +1001,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             _psoGemvQ6K?.Dispose();
             _psoGemvQ3K?.Dispose();
             _psoGemvQ8_0?.Dispose();
+            _psoGemvIQ4_XS?.Dispose();
+            _psoGemvMXFP4?.Dispose();
             _psoGemvFp32?.Dispose();
 
             _sigRmsNorm?.Dispose();

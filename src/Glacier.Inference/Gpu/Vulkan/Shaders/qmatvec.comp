@@ -124,7 +124,7 @@ void main() {
         uint xb = xo4 + ((blk * 256u + n * 128u + lb) >> 2);
         acc += d * (sc0 * dot(q1, x4[xb]) + sc2 * dot(q2, x4[xb + 8u]) + sc4 * dot(q3, x4[xb + 16u]) + sc6 * dot(q4, x4[xb + 24u]));
     }
-#else
+#elif QTYPE == 3
     // Q8_0: 8 threads per 32-weight block (4 weights each), 8 blocks per pass.
     uint nb = pc.K / 32u;
     uint j = t & 7u;
@@ -135,6 +135,52 @@ void main() {
         vec4 qv = vec4(bitfieldExtract(int(q), 0, 8), bitfieldExtract(int(q), 8, 8),
                        bitfieldExtract(int(q), 16, 8), bitfieldExtract(int(q), 24, 8));
         acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+    }
+#elif QTYPE == 4
+    // IQ4_XS: 256 elements = 136 bytes (f16 d, uint16 scales_h, uint8 scales_l[4], uint8 qs[128])
+    const int kvalues_iq4nl[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113);
+    uint nBlk = pc.K >> 8;
+    uint rowOff = wbase + row * nBlk * 136u;
+    uint sub = t >> 3;          // 0..7 (8 sub-blocks of 32)
+    uint lane = t & 7u;         // 0..7 (each thread reads 4 elements: 2 low nibbles + 2 high nibbles? No: 16 bytes per sub-block -> 2 bytes per thread = 4 nibbles)
+    for (uint blk = 0u; blk < nBlk; blk++) {
+        uint bo = rowOff + blk * 136u;
+        float d = halfAt(bo);
+        uint sh = u32at(bo + 2u) & 0xFFFFu;
+        uint sl = u32at(bo + 4u);
+        uint ls = (((sl >> (4u * sub)) & 0xFu) | (((sh >> (2u * sub)) & 3u) << 4));
+        float dl = d * float(int(ls) - 32);
+        uint qword = u32at(bo + 8u + sub * 16u + (lane & 3u) * 4u);
+        if (lane < 4u) {
+            vec4 qv = vec4(kvalues_iq4nl[qword & 0xFu], kvalues_iq4nl[(qword >> 8) & 0xFu],
+                           kvalues_iq4nl[(qword >> 16) & 0xFu], kvalues_iq4nl[(qword >> 24) & 0xFu]);
+            acc += dl * dot(qv, x4[xo4 + blk * 64u + sub * 8u + lane]);
+        } else {
+            vec4 qv = vec4(kvalues_iq4nl[(qword >> 4) & 0xFu], kvalues_iq4nl[(qword >> 12) & 0xFu],
+                           kvalues_iq4nl[(qword >> 20) & 0xFu], kvalues_iq4nl[(qword >> 28) & 0xFu]);
+            acc += dl * dot(qv, x4[xo4 + blk * 64u + sub * 8u + lane]);
+        }
+    }
+#elif QTYPE == 5
+    // MXFP4: 32 elements = 17 bytes (uint8 e E8M0, uint8 qs[16] 4-bit E2M1)
+    const float kvalues_mxfp4[16] = float[16](0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    uint nBlk = pc.K >> 5;
+    uint rowOff = wbase + row * nBlk * 17u;
+    uint j = t & 7u;            // 0..7 (4 elements per thread)
+    for (uint blk = t >> 3; blk < nBlk; blk += 8u) {
+        uint bo = rowOff + blk * 17u;
+        uint e = u32at(bo) & 0xFFu;
+        float d = (e == 0u) ? 0.0 : uintBitsToFloat(e << 23) * 0.5;
+        uint qword = u32at(bo + 1u + (j & 3u) * 4u);
+        if (j < 4u) {
+            vec4 qv = vec4(kvalues_mxfp4[qword & 0xFu], kvalues_mxfp4[(qword >> 8) & 0xFu],
+                           kvalues_mxfp4[(qword >> 16) & 0xFu], kvalues_mxfp4[(qword >> 24) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        } else {
+            vec4 qv = vec4(kvalues_mxfp4[(qword >> 4) & 0xFu], kvalues_mxfp4[(qword >> 12) & 0xFu],
+                           kvalues_mxfp4[(qword >> 20) & 0xFu], kvalues_mxfp4[(qword >> 28) & 0xFu]);
+            acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+        }
     }
 #endif
 

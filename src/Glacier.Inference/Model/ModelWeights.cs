@@ -46,6 +46,8 @@ public sealed unsafe class LayerWeights
     public GgufType SsmBetaType { get; init; }
     public float* SsmDtBias { get; init; }
     public float* SsmNormWeight { get; init; }
+    public float* SsmDWeight { get; init; }
+    public float* SsmConv1dBias { get; init; }
     public byte* SsmOutWeight { get; init; }
     public GgufType SsmOutType { get; init; }
 
@@ -63,6 +65,15 @@ public sealed unsafe class LayerWeights
     public float* AttnQANormWeight { get; init; }
     public byte* AttnQBWeight { get; init; }
     public GgufType AttnQBType { get; init; }
+
+    // DeepSeek Sparse Attention (DSA) Lightning Indexer
+    public bool IsDsa { get; init; }
+    public byte* AttnIdxQWeight { get; init; }
+    public GgufType AttnIdxQType { get; init; }
+    public byte* AttnIdxKWeight { get; init; }
+    public GgufType AttnIdxKType { get; init; }
+    public byte* AttnIdxWWeight { get; init; }
+    public GgufType AttnIdxWType { get; init; }
 
     // Optional QK-norm
     public float* AttnQNormWeight { get; init; }
@@ -159,6 +170,13 @@ public sealed unsafe class ModelWeights
     public int RopeDimensionCount => Gguf.RopeDimensionCount;
     public int QkNopeHeadDim => Gguf.QkNopeHeadDim;
     public bool IsMla => Gguf.IsMla;
+    public bool IsDsa => Layers.Length > 0 && Layers[0].IsDsa;
+    public int DsaTopK => Gguf.Metadata.TryGetValue("deepseek2.indexer.top_k", out var tk) ? Convert.ToInt32(tk)
+        : Gguf.Metadata.TryGetValue("glm4.indexer.top_k", out var gk) ? Convert.ToInt32(gk) : 2048;
+    public int DsaIndexHeadCount => Gguf.Metadata.TryGetValue("deepseek2.indexer.head_count", out var hc) ? Convert.ToInt32(hc)
+        : Gguf.Metadata.TryGetValue("glm4.indexer.head_count", out var ghc) ? Convert.ToInt32(ghc) : 32;
+    public int DsaIndexHeadDim => Gguf.Metadata.TryGetValue("deepseek2.indexer.head_dim", out var hd) ? Convert.ToInt32(hd)
+        : Gguf.Metadata.TryGetValue("glm4.indexer.head_dim", out var ghd) ? Convert.ToInt32(ghd) : 128;
     public int LeadingDenseBlockCount => Gguf.LeadingDenseBlockCount;
     public float RopeFreqBase { get; }
     public float RmsNormEps { get; }
@@ -710,6 +728,27 @@ public sealed unsafe class ModelWeights
                 isSwa = (l + 1) % 6 != 0;
             }
 
+            float* ssmConv1dBias = null, ssmDWeight = null;
+            if (gguf.TryGetTensor($"blk.{l}.ssm_conv1d.bias", out var scbT) && scbT != null) ssmConv1dBias = (float*)gguf.GetTensorPointer(scbT);
+            if (gguf.TryGetTensor($"blk.{l}.ssm_d", out var sdT) && sdT != null) ssmDWeight = (float*)gguf.GetTensorPointer(sdT);
+            if (qkvWeight == null && gguf.TryGetTensor($"blk.{l}.ssm_in.weight", out var ssmInT) && ssmInT != null)
+            { qkvWeight = gguf.GetTensorPointer(ssmInT); qkvType = ssmInT.Type; }
+            if (qkvWeight == null && gguf.TryGetTensor($"blk.{l}.shortconv.in_proj.weight", out var scInT) && scInT != null)
+            { qkvWeight = gguf.GetTensorPointer(scInT); qkvType = scInT.Type; }
+            if (ssmConv1dWeight == null && gguf.TryGetTensor($"blk.{l}.shortconv.conv.weight", out var scConvT) && scConvT != null)
+            { ssmConv1dWeight = (float*)gguf.GetTensorPointer(scConvT); }
+            if (ssmOutWeight == null && gguf.TryGetTensor($"blk.{l}.shortconv.out_proj.weight", out var scOutT) && scOutT != null)
+            { ssmOutWeight = gguf.GetTensorPointer(scOutT); ssmOutType = scOutT.Type; }
+
+            byte* idxQWeight = null, idxKWeight = null, idxWWeight = null;
+            GgufType idxQType = GgufType.F32, idxKType = GgufType.F32, idxWType = GgufType.F32;
+            if ((gguf.TryGetTensor($"blk.{l}.indexer_q.weight", out var iqT) || gguf.TryGetTensor($"blk.{l}.attn_idx_q.weight", out iqT)) && iqT != null)
+            { idxQWeight = gguf.GetTensorPointer(iqT); idxQType = iqT.Type; }
+            if ((gguf.TryGetTensor($"blk.{l}.indexer_k.weight", out var ikT) || gguf.TryGetTensor($"blk.{l}.attn_idx_k.weight", out ikT)) && ikT != null)
+            { idxKWeight = gguf.GetTensorPointer(ikT); idxKType = ikT.Type; }
+            if ((gguf.TryGetTensor($"blk.{l}.indexer_w.weight", out var iwT) || gguf.TryGetTensor($"blk.{l}.attn_idx_w.weight", out iwT)) && iwT != null)
+            { idxWWeight = gguf.GetTensorPointer(iwT); idxWType = iwT.Type; }
+
             int headsKv = HeadCountKv;
             if (gguf.HeadCountKvPattern != null && l < gguf.HeadCountKvPattern.Length)
             {
@@ -757,6 +796,13 @@ public sealed unsafe class ModelWeights
                 AttnQANormWeight = qANormWeight,
                 AttnQBWeight = qBWeight,
                 AttnQBType = qBType,
+                IsDsa = idxQWeight != null && idxKWeight != null && idxWWeight != null,
+                AttnIdxQWeight = idxQWeight,
+                AttnIdxQType = idxQType,
+                AttnIdxKWeight = idxKWeight,
+                AttnIdxKType = idxKType,
+                AttnIdxWWeight = idxWWeight,
+                AttnIdxWType = idxWType,
                 AttnOutWeight = attnOutWeight!,
                 AttnOutType = attnOutType,
                 AttnOutBias = attnOutB,
@@ -775,6 +821,8 @@ public sealed unsafe class ModelWeights
                 SsmBetaType = ssmBetaType,
                 SsmDtBias = ssmDtBias,
                 SsmNormWeight = ssmNormWeight,
+                SsmDWeight = ssmDWeight,
+                SsmConv1dBias = ssmConv1dBias,
                 SsmOutWeight = ssmOutWeight,
                 SsmOutType = ssmOutType,
                 FfnNormWeight = (float*)gguf.GetTensorPointer(ffnNorm!),
