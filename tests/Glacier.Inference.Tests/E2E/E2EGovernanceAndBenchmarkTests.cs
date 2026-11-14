@@ -221,6 +221,7 @@ public class E2EGovernanceAndBenchmarkTests
     [Fact]
     public void ZeroGcAssertion_CollectionCountZeroAcrossGen012()
     {
+        _ = GC.GetAllocatedBytesForCurrentThread(); // warm up runtime counter
         // Thread-level allocation guarantee
         long bytesStart = GC.GetAllocatedBytesForCurrentThread();
 

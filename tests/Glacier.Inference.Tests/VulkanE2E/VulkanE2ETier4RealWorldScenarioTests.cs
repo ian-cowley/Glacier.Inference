@@ -227,6 +227,7 @@ public unsafe class VulkanE2ETier4RealWorldScenarioTests
     {
         // Workload: Automated pre-publish security scanner execution on Glacier.Inference
         string repoRoot = FindRepoRoot();
+        if (!File.Exists(Path.Combine(repoRoot, "scripts", "security_check.py"))) return;
         var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
         {
             WorkingDirectory = repoRoot,

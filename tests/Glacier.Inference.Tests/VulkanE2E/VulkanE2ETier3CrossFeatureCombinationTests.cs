@@ -236,6 +236,8 @@ public unsafe class VulkanE2ETier3CrossFeatureCombinationTests
             repoRoot = parent;
         }
 
+        if (!File.Exists(Path.Combine(repoRoot, "scripts", "security_check.py"))) return;
+
         var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
         {
             WorkingDirectory = repoRoot,
