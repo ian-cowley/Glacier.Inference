@@ -498,12 +498,24 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
 
     public void Dispose()
     {
-        if (!_disposed)
+        if (_disposed) return;
+        if (_gpu != null || _module != IntPtr.Zero || _hXPinned != IntPtr.Zero ||
+            _eventNormDone != IntPtr.Zero || _eventKDone != IntPtr.Zero || _eventVDone != IntPtr.Zero ||
+            _streamK != IntPtr.Zero || _streamV != IntPtr.Zero)
         {
-            if (_gpu != null && _gpu.Handle != IntPtr.Zero)
-            {
-                CuDriver.CtxSetCurrent(_gpu.Handle);
-            }
+            DisposeCudaResources();
+        }
+        _disposed = true;
+        GC.SuppressFinalize(this);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void DisposeCudaResources()
+    {
+        if (_gpu != null && _gpu.Handle != IntPtr.Zero)
+        {
+            CuDriver.CtxSetCurrent(_gpu.Handle);
+        }
 
             if (_eventNormDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventNormDone); _eventNormDone = IntPtr.Zero; }
             if (_eventKDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventKDone); _eventKDone = IntPtr.Zero; }
@@ -594,10 +606,6 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
                 CuDriver.ModuleUnload(_module);
                 _module = IntPtr.Zero;
             }
-
-            _disposed = true;
-        }
-        GC.SuppressFinalize(this);
     }
 
     ~Qwen2GpuModel()
