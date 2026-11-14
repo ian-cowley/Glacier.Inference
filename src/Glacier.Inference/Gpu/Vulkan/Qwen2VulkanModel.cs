@@ -25,24 +25,33 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
         if (w.ArchitectureFamily == UniversalArchitecture.Gemma4) { reason = "Gemma 4 is not yet supported on Vulkan"; return false; }
         if (w.IsMla && (w.QkNopeHeadDim + w.RopeDimensionCount > 256 || w.ValueDim > 256)) { reason = "MLA head dim > 256"; return false; }
         if (!w.IsMla && (w.HeadDim > 256 || w.ValueDim != w.HeadDim)) { reason = $"unsupported head dim {w.HeadDim}/{w.ValueDim}"; return false; }
-        if (w.HasRopeFreqs) { reason = "custom RoPE frequency table"; return false; }
         if (w.HeadCount % w.HeadCountKv != 0) { reason = "head count not divisible by KV head count"; return false; }
 
         foreach (var l in w.Layers)
         {
-            if (l.HasFusedQkv) { reason = "fused QKV not yet supported on Vulkan"; return false; }
-            if (l.HasFusedGateUp) { reason = "fused gate/up FFN not yet supported on Vulkan"; return false; }
-            if (l.QBias != null || l.KBias != null || l.VBias != null || l.AttnOutBias != null) { reason = "attention biases not yet supported on Vulkan"; return false; }
+            if (l.HasFusedQkv && !IsKernelType(l.QkvType)) { reason = $"fused QKV uses unsupported weight type {l.QkvType}"; return false; }
+            if (l.HasFusedGateUp && !IsKernelType(l.FfnUpType)) { reason = $"fused gate/up FFN uses unsupported weight type {l.FfnUpType}"; return false; }
 
             (string Name, bool Present, GgufType T)[] mats =
             {
-                ("attn_q", l.QWeight != null, l.QType), ("attn_k", l.KWeight != null, l.KType),
-                ("attn_v", l.VWeight != null, l.VType), ("attn_output", l.AttnOutWeight != null, l.AttnOutType),
-                ("attn_kv_a_mqa", l.AttnKvAMqaWeight != null, l.AttnKvAMqaType), ("attn_kv_b", l.AttnKvBWeight != null, l.AttnKvBType),
-                ("shortconv_in", l.QkvWeight != null, l.QkvType), ("shortconv_out", l.SsmOutWeight != null, l.SsmOutType),
-                ("ffn_gate", l.FfnGateWeight != null, l.FfnGateType), ("ffn_up", l.FfnUpWeight != null, l.FfnUpType), ("ffn_down", l.FfnDownWeight != null, l.FfnDownType),
-                ("ffn_gate_exps", l.FfnGateExpsWeight != null, l.FfnGateExpsType), ("ffn_up_exps", l.FfnUpExpsWeight != null, l.FfnUpExpsType), ("ffn_down_exps", l.FfnDownExpsWeight != null, l.FfnDownExpsType),
-                ("ffn_gate_shexp", l.FfnGateShexpWeight != null, l.FfnGateShexpType), ("ffn_up_shexp", l.FfnUpShexpWeight != null, l.FfnUpShexpType), ("ffn_down_shexp", l.FfnDownShexpWeight != null, l.FfnDownShexpType),
+                ("attn_qkv", l.HasFusedQkv && l.QkvWeight != null, l.QkvType),
+                ("attn_q", !l.HasFusedQkv && l.QWeight != null, l.QType),
+                ("attn_k", !l.HasFusedQkv && l.KWeight != null, l.KType),
+                ("attn_v", !l.HasFusedQkv && l.VWeight != null, l.VType),
+                ("attn_output", l.AttnOutWeight != null, l.AttnOutType),
+                ("attn_kv_a_mqa", l.AttnKvAMqaWeight != null, l.AttnKvAMqaType),
+                ("attn_kv_b", l.AttnKvBWeight != null, l.AttnKvBType),
+                ("shortconv_in", !l.HasFusedQkv && l.QkvWeight != null, l.QkvType),
+                ("shortconv_out", l.SsmOutWeight != null, l.SsmOutType),
+                ("ffn_gate", !l.HasFusedGateUp && l.FfnGateWeight != null, l.FfnGateType),
+                ("ffn_up", l.FfnUpWeight != null, l.FfnUpType),
+                ("ffn_down", l.FfnDownWeight != null, l.FfnDownType),
+                ("ffn_gate_exps", l.FfnGateExpsWeight != null, l.FfnGateExpsType),
+                ("ffn_up_exps", l.FfnUpExpsWeight != null, l.FfnUpExpsType),
+                ("ffn_down_exps", l.FfnDownExpsWeight != null, l.FfnDownExpsType),
+                ("ffn_gate_shexp", l.FfnGateShexpWeight != null, l.FfnGateShexpType),
+                ("ffn_up_shexp", l.FfnUpShexpWeight != null, l.FfnUpShexpType),
+                ("ffn_down_shexp", l.FfnDownShexpWeight != null, l.FfnDownShexpType),
             };
             foreach (var (name, present, t) in mats)
                 if (present && !IsKernelType(t)) { reason = $"tensor '{name}' uses unsupported weight type {t} (supported: Q4_K, Q5_K, Q6_K, Q8_0)"; return false; }
@@ -166,7 +175,7 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
             {
                 K = _pEmbed[QIdx(_w.EmbdType)],
                 Set = _vk.MakeSet(_pEmbed[QIdx(_w.EmbdType)], _dEmbd, _dX),
-                Push = [0u, (uint)E],
+                Push = [(uint)E, 0u],
                 Gx = (uint)((E + 255) / 256),
                 Patch = Patch.Token,
             });
@@ -203,6 +212,11 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                     var mlaVCache = _vk.Alloc((long)nQ * _maxSeqLen * mlaVDim * 4);
 
                     AddQmv(_layerOps, l.QType, dQ, _dNorm, _dQ, E, qDim);
+                    if (l.QBias != null)
+                    {
+                        var dQBias = UploadFloats(l.QBias, qDim);
+                        AddVec(_layerOps, _pAdd, _dQ, dQBias, _dQ, qDim);
+                    }
                     AddQmv(_layerOps, l.AttnKvAMqaType, dKvAMqa, _dNorm, dKvA!, E, kvMqaDim);
                     AddRmsNorm(_layerOps, dKvA!, dKvANorm, dKvNormBuf!, _w.KvLoraRank, eps);
                     AddQmv(_layerOps, l.AttnKvBType, dKvBW, dKvNormBuf!, dKvB!, _w.KvLoraRank, decompKvDim);
@@ -257,20 +271,66 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                         });
                     }
                     AddQmv(_layerOps, l.AttnOutType, dAttnOut, _dAttnOut, _dProj, attnOutDim, E);
+                    if (l.AttnOutBias != null)
+                    {
+                        var dAttnOutBias = UploadFloats(l.AttnOutBias, E);
+                        AddVec(_layerOps, _pAdd, _dProj, dAttnOutBias, _dProj, E);
+                    }
                 }
                 else
                 {
                     var dQNorm = l.AttnQNormWeight != null ? UploadFloats(l.AttnQNormWeight, hd) : _dDummyNorm;
                     var dKNorm = l.AttnKNormWeight != null ? UploadFloats(l.AttnKNormWeight, hd) : _dDummyNorm;
-                    var dQ = UploadBytes(l.QWeight, GgufTypeSize(l.QType, (long)qDim * E));
-                    var dK = UploadBytes(l.KWeight, GgufTypeSize(l.KType, (long)kvDim * E));
-                    var dV = UploadBytes(l.VWeight, GgufTypeSize(l.VType, (long)kvDim * E));
                     var kCache = _vk.Alloc(kvBytes);
                     var vCache = _vk.Alloc(kvBytes);
 
-                    AddQmv(_layerOps, l.QType, dQ, _dNorm, _dQ, E, qDim);
-                    AddQmv(_layerOps, l.KType, dK, _dNorm, _dK, E, kvDim);
-                    AddQmv(_layerOps, l.VType, dV, _dNorm, _dV, E, kvDim);
+                    if (l.HasFusedQkv)
+                    {
+                        long rowBytes = GgufTypes.GetRowBytes(l.QkvType, E);
+                        var dQ = UploadBytes(l.QkvWeight, (long)qDim * rowBytes);
+                        var dK = UploadBytes(l.QkvWeight + (long)qDim * rowBytes, (long)kvDim * rowBytes);
+                        var dV = UploadBytes(l.QkvWeight + (long)(qDim + kvDim) * rowBytes, (long)kvDim * rowBytes);
+
+                        AddQmv(_layerOps, l.QkvType, dQ, _dNorm, _dQ, E, qDim);
+                        AddQmv(_layerOps, l.QkvType, dK, _dNorm, _dK, E, kvDim);
+                        AddQmv(_layerOps, l.QkvType, dV, _dNorm, _dV, E, kvDim);
+
+                        if (l.QkvBias != null)
+                        {
+                            var dQBias = UploadFloats(l.QkvBias, qDim); AddVec(_layerOps, _pAdd, _dQ, dQBias, _dQ, qDim);
+                            var dKBias = UploadFloats(l.QkvBias + qDim, kvDim); AddVec(_layerOps, _pAdd, _dK, dKBias, _dK, kvDim);
+                            var dVBias = UploadFloats(l.QkvBias + qDim + kvDim, kvDim); AddVec(_layerOps, _pAdd, _dV, dVBias, _dV, kvDim);
+                        }
+                        else
+                        {
+                            if (l.QBias != null) { var dQBias = UploadFloats(l.QBias, qDim); AddVec(_layerOps, _pAdd, _dQ, dQBias, _dQ, qDim); }
+                            if (l.KBias != null) { var dKBias = UploadFloats(l.KBias, kvDim); AddVec(_layerOps, _pAdd, _dK, dKBias, _dK, kvDim); }
+                            if (l.VBias != null) { var dVBias = UploadFloats(l.VBias, kvDim); AddVec(_layerOps, _pAdd, _dV, dVBias, _dV, kvDim); }
+                        }
+                    }
+                    else
+                    {
+                        var dQ = UploadBytes(l.QWeight, GgufTypeSize(l.QType, (long)qDim * E));
+                        var dK = UploadBytes(l.KWeight, GgufTypeSize(l.KType, (long)kvDim * E));
+                        var dV = UploadBytes(l.VWeight, GgufTypeSize(l.VType, (long)kvDim * E));
+
+                        AddQmv(_layerOps, l.QType, dQ, _dNorm, _dQ, E, qDim);
+                        AddQmv(_layerOps, l.KType, dK, _dNorm, _dK, E, kvDim);
+                        AddQmv(_layerOps, l.VType, dV, _dNorm, _dV, E, kvDim);
+
+                        if (l.QkvBias != null)
+                        {
+                            var dQBias = UploadFloats(l.QkvBias, qDim); AddVec(_layerOps, _pAdd, _dQ, dQBias, _dQ, qDim);
+                            var dKBias = UploadFloats(l.QkvBias + qDim, kvDim); AddVec(_layerOps, _pAdd, _dK, dKBias, _dK, kvDim);
+                            var dVBias = UploadFloats(l.QkvBias + qDim + kvDim, kvDim); AddVec(_layerOps, _pAdd, _dV, dVBias, _dV, kvDim);
+                        }
+                        else
+                        {
+                            if (l.QBias != null) { var dQBias = UploadFloats(l.QBias, qDim); AddVec(_layerOps, _pAdd, _dQ, dQBias, _dQ, qDim); }
+                            if (l.KBias != null) { var dKBias = UploadFloats(l.KBias, kvDim); AddVec(_layerOps, _pAdd, _dK, dKBias, _dK, kvDim); }
+                            if (l.VBias != null) { var dVBias = UploadFloats(l.VBias, kvDim); AddVec(_layerOps, _pAdd, _dV, dVBias, _dV, kvDim); }
+                        }
+                    }
 
                     uint hasQkNorm = (l.AttnQNormWeight != null && l.AttnKNormWeight != null) ? 1u : 0u;
                     _layerOps.Add(new Op
@@ -290,6 +350,11 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                         Patch = Patch.KvLen,
                     });
                     AddQmv(_layerOps, l.AttnOutType, dAttnOut, _dAttnOut, _dProj, qDim, E);
+                    if (l.AttnOutBias != null)
+                    {
+                        var dAttnOutBias = UploadFloats(l.AttnOutBias, E);
+                        AddVec(_layerOps, _pAdd, _dProj, dAttnOutBias, _dProj, E);
+                    }
                 }
                 AddVec(_layerOps, _pAdd, _dX, _dProj, _dX, E);
 
@@ -334,14 +399,39 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                 }
                 else
                 {
-                    var dGate = UploadBytes(l.FfnGateWeight, GgufTypeSize(l.FfnGateType, (long)ffnDim * E));
-                    var dUp = UploadBytes(l.FfnUpWeight, GgufTypeSize(l.FfnUpType, (long)ffnDim * E));
-                    var dDown = UploadBytes(l.FfnDownWeight, GgufTypeSize(l.FfnDownType, (long)E * ffnDim));
-                    AddQmv(_layerOps, l.FfnGateType, dGate, _dNorm, _dGate, E, ffnDim);
-                    AddQmv(_layerOps, l.FfnUpType, dUp, _dNorm, _dUp, E, ffnDim);
-                    AddVec(_layerOps, _pSwiGlu, _dGate, _dUp, _dGate, ffnDim);
-                    AddQmv(_layerOps, l.FfnDownType, dDown, _dGate, _dProj, ffnDim, E);
-                    AddVec(_layerOps, _pAdd, _dX, _dProj, _dX, E);
+                    if (l.HasFusedGateUp)
+                    {
+                        long rowBytes = GgufTypes.GetRowBytes(l.FfnUpType, E);
+                        var dGate = UploadBytes(l.FfnUpWeight, (long)ffnDim * rowBytes);
+                        var dUp = UploadBytes(l.FfnUpWeight + (long)ffnDim * rowBytes, (long)ffnDim * rowBytes);
+                        var dDown = UploadBytes(l.FfnDownWeight, GgufTypeSize(l.FfnDownType, (long)E * ffnDim));
+                        AddQmv(_layerOps, l.FfnUpType, dGate, _dNorm, _dGate, E, ffnDim);
+                        AddQmv(_layerOps, l.FfnUpType, dUp, _dNorm, _dUp, E, ffnDim);
+                        if (l.FfnUpBias != null)
+                        {
+                            var dGateBias = UploadFloats(l.FfnUpBias, ffnDim); AddVec(_layerOps, _pAdd, _dGate, dGateBias, _dGate, ffnDim);
+                            var dUpBias = UploadFloats(l.FfnUpBias + ffnDim, ffnDim); AddVec(_layerOps, _pAdd, _dUp, dUpBias, _dUp, ffnDim);
+                        }
+                        AddVec(_layerOps, _pSwiGlu, _dGate, _dUp, _dGate, ffnDim);
+                        AddQmv(_layerOps, l.FfnDownType, dDown, _dGate, _dProj, ffnDim, E);
+                        AddVec(_layerOps, _pAdd, _dX, _dProj, _dX, E);
+                    }
+                    else
+                    {
+                        var dGate = UploadBytes(l.FfnGateWeight, GgufTypeSize(l.FfnGateType, (long)ffnDim * E));
+                        var dUp = UploadBytes(l.FfnUpWeight, GgufTypeSize(l.FfnUpType, (long)ffnDim * E));
+                        var dDown = UploadBytes(l.FfnDownWeight, GgufTypeSize(l.FfnDownType, (long)E * ffnDim));
+                        AddQmv(_layerOps, l.FfnGateType, dGate, _dNorm, _dGate, E, ffnDim);
+                        AddQmv(_layerOps, l.FfnUpType, dUp, _dNorm, _dUp, E, ffnDim);
+                        if (l.FfnUpBias != null)
+                        {
+                            var dGateBias = UploadFloats(l.FfnUpBias, ffnDim); AddVec(_layerOps, _pAdd, _dGate, dGateBias, _dGate, ffnDim);
+                            var dUpBias = UploadFloats(l.FfnUpBias + ffnDim, ffnDim); AddVec(_layerOps, _pAdd, _dUp, dUpBias, _dUp, ffnDim);
+                        }
+                        AddVec(_layerOps, _pSwiGlu, _dGate, _dUp, _dGate, ffnDim);
+                        AddQmv(_layerOps, l.FfnDownType, dDown, _dGate, _dProj, ffnDim, E);
+                        AddVec(_layerOps, _pAdd, _dX, _dProj, _dX, E);
+                    }
                 }
             }
 

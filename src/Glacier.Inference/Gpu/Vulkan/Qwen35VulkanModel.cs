@@ -41,7 +41,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
     private bool _disposed;
 
     // Kernels
-    private readonly VulkanCompute.Kernel[] _kMv = new VulkanCompute.Kernel[8], _kMoe = new VulkanCompute.Kernel[8], _kEmbed = new VulkanCompute.Kernel[4];
+    private readonly VulkanCompute.Kernel[] _kMv = new VulkanCompute.Kernel[12], _kMoe = new VulkanCompute.Kernel[12], _kEmbed = new VulkanCompute.Kernel[12];
     private readonly VulkanCompute.Kernel _kF32, _kRms, _kSwi, _kAdd, _kConv, _kL2, _kRec, _kTopk, _kComb, _kPrep, _kDec;
 
     public string DeviceName => _ctx.DeviceName;
@@ -82,13 +82,11 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         if (w.HeadDim != HeadDim || w.ValueDim != HeadDim) { reason = $"attention head dim {w.HeadDim}/{w.ValueDim} != {HeadDim}"; return false; }
         if (w.SsmStateSize != StateDim || w.SsmConvKernel != ConvKernel) { reason = "unsupported SSM state size or conv kernel"; return false; }
         if (w.SsmTimeStepRank * StateDim != w.SsmInnerSize) { reason = "SSM inner size != heads * state dim"; return false; }
-        if (w.HasRopeFreqs) { reason = "custom RoPE frequency table"; return false; }
         if (w.HeadCount % w.HeadCountKv != 0) { reason = "head count not divisible by KV head count"; return false; }
         foreach (var l in w.Layers)
         {
-            if (l.QBias != null || l.KBias != null || l.VBias != null || l.AttnOutBias != null) { reason = "attention biases"; return false; }
             if (!l.IsGdn && !l.HasQGate) { reason = "full-attention layer without Q gate"; return false; }
-            if (!l.IsMoe && l.HasFusedGateUp) { reason = "fused gate/up FFN"; return false; }
+            if (!l.IsMoe && l.HasFusedGateUp && !IsKernelType(l.FfnUpType)) { reason = $"fused gate/up FFN uses unsupported weight type {l.FfnUpType}"; return false; }
 
             // Weight matrices must use a quantisation type that has a Vulkan kernel. Checked here, before any GPU memory is
             // allocated, so that unsupported files fail fast and fall back to the CPU engine.
@@ -111,8 +109,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         return true;
     }
 
-    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0;
-    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL;
+    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
+    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16;
 
     private static int QIdx(GgufType t) => t switch
     {
@@ -124,8 +122,17 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         GgufType.MXFP4 => 5,
         GgufType.Q3_K => 6,
         GgufType.IQ4_NL => 7,
+        GgufType.Q2_K => 8,
+        GgufType.Q4_0 => 9,
+        GgufType.F16 => 10,
         _ => throw new NotSupportedException($"Vulkan runner does not support weight type {t}.")
     };
+
+    private static bool HasEmbeddedShader(string name)
+    {
+        using Stream? s = typeof(VulkanCompute).Assembly.GetManifestResourceStream($"vkshader.{name}.spv");
+        return s != null;
+    }
 
     public Qwen35VulkanModel(ModelWeights weights, int maxSeqLen, int deviceOrdinal = 0)
     {
@@ -142,11 +149,11 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         try
         {
             // ---- kernels ----
-            for (int t = 0; t < 8; t++)
+            for (int t = 0; t < 12; t++)
             {
-                _kMv[t] = _vk.LoadEmbedded($"qmatvec_q{t}", 3, 8);
-                _kMoe[t] = _vk.LoadEmbedded($"qmatvec_moe_q{t}", 4, 16);
-                if (t < 4) _kEmbed[t] = _vk.LoadEmbedded($"embed_q{t}", 2, 8);
+                if (HasEmbeddedShader($"qmatvec_q{t}")) _kMv[t] = _vk.LoadEmbedded($"qmatvec_q{t}", 3, 8);
+                if (HasEmbeddedShader($"qmatvec_moe_q{t}")) _kMoe[t] = _vk.LoadEmbedded($"qmatvec_moe_q{t}", 4, 16);
+                if (HasEmbeddedShader($"embed_q{t}")) _kEmbed[t] = _vk.LoadEmbedded($"embed_q{t}", 2, 8);
             }
             _kF32 = _vk.LoadEmbedded("f32_matvec", 3, 8);
             _kRms = _vk.LoadEmbedded("rmsnorm", 3, 12);
@@ -311,6 +318,11 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 _states.Add((convState, recState));
 
                 _layerOps.Add(Mv(qkv, gNorm, gQkv));
+                if (L.QkvBias != null)
+                {
+                    var qkvBias = UploadF32(L.QkvBias, ch);
+                    _layerOps.Add(Add(gQkv, qkvBias, ch));
+                }
                 _layerOps.Add(Mv(gate, gNorm, gZ));
                 _layerOps.Add(MvF32(alphaW, dim, nV, gNorm, gAlpha));
                 _layerOps.Add(MvF32(betaW, dim, nV, gNorm, gBeta));
@@ -336,6 +348,21 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 _layerOps.Add(Mv(qW, gNorm, gQFull));
                 _layerOps.Add(Mv(kW, gNorm, gK));
                 _layerOps.Add(Mv(vW, gNorm, gV));
+                if (L.QBias != null)
+                {
+                    var qBias = UploadF32(L.QBias, 2 * qDim);
+                    _layerOps.Add(Add(gQFull, qBias, 2 * qDim));
+                }
+                if (L.KBias != null)
+                {
+                    var kBias = UploadF32(L.KBias, kvDim);
+                    _layerOps.Add(Add(gK, kBias, kvDim));
+                }
+                if (L.VBias != null)
+                {
+                    var vBias = UploadF32(L.VBias, kvDim);
+                    _layerOps.Add(Add(gV, vBias, kvDim));
+                }
                 _layerOps.Add(new Op
                 {
                     Name = "attn_prep", K = _kPrep, Set = _vk.MakeSet(_kPrep, gQFull, gK, gV, qNorm, kNorm, gQ, gGate, kCache, vCache),
@@ -349,6 +376,11 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                     Gx = (uint)nH, Patch = Patch.KvLen
                 });
                 _layerOps.Add(Mv(oW, gAttnOut, gProj));
+                if (L.AttnOutBias != null)
+                {
+                    var oBias = UploadF32(L.AttnOutBias, dim);
+                    _layerOps.Add(Add(gProj, oBias, dim));
+                }
                 _layerOps.Add(Add(gX, gProj, dim));
             }
 
@@ -396,14 +428,43 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
             }
             else
             {
-                var gW = UploadMat(L.FfnGateWeight, L.FfnGateType, dim, ffn);
-                var uW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
-                var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
-                _layerOps.Add(Mv(gW, gNorm, gGateOut));
-                _layerOps.Add(Mv(uW, gNorm, gUpOut));
-                _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
-                _layerOps.Add(Mv(dW, gAct, gProj));
-                _layerOps.Add(Add(gX, gProj, dim));
+                if (L.HasFusedGateUp)
+                {
+                    long rowBytes = GgufTypes.GetRowBytes(L.FfnUpType, dim);
+                    var gW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
+                    var uW = UploadMat(L.FfnUpWeight + (long)ffn * rowBytes, L.FfnUpType, dim, ffn);
+                    var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
+                    _layerOps.Add(Mv(gW, gNorm, gGateOut));
+                    _layerOps.Add(Mv(uW, gNorm, gUpOut));
+                    if (L.FfnUpBias != null)
+                    {
+                        var gBias = UploadF32(L.FfnUpBias, ffn);
+                        _layerOps.Add(Add(gGateOut, gBias, ffn));
+                        var uBias = UploadF32(L.FfnUpBias + ffn, ffn);
+                        _layerOps.Add(Add(gUpOut, uBias, ffn));
+                    }
+                    _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
+                    _layerOps.Add(Mv(dW, gAct, gProj));
+                    _layerOps.Add(Add(gX, gProj, dim));
+                }
+                else
+                {
+                    var gW = UploadMat(L.FfnGateWeight, L.FfnGateType, dim, ffn);
+                    var uW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
+                    var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
+                    _layerOps.Add(Mv(gW, gNorm, gGateOut));
+                    _layerOps.Add(Mv(uW, gNorm, gUpOut));
+                    if (L.FfnUpBias != null)
+                    {
+                        var gBias = UploadF32(L.FfnUpBias, ffn);
+                        _layerOps.Add(Add(gGateOut, gBias, ffn));
+                        var uBias = UploadF32(L.FfnUpBias + ffn, ffn);
+                        _layerOps.Add(Add(gUpOut, uBias, ffn));
+                    }
+                    _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
+                    _layerOps.Add(Mv(dW, gAct, gProj));
+                    _layerOps.Add(Add(gX, gProj, dim));
+                }
             }
         }
 

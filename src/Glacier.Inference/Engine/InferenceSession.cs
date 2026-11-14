@@ -86,11 +86,13 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public InferenceEngineType Engine { get; private set; }
     public string ActiveDevice { get; private set; }
     public string ActiveBackend =>
+        Engine == InferenceEngineType.Vulkan ? "Vulkan" :
         _gpuModel != null ? "Cuda" :
         _d3d12Model != null ? "Direct3D12" :
         (_pipelineSession != null && _pipelineSession.Stages.Count > 0
             ? (_pipelineSession.Stages[0].Engine == InferenceEngineType.BareMetal ? "Cuda"
                : _pipelineSession.Stages[0].Engine == InferenceEngineType.DirectML ? "Direct3D12"
+               : _pipelineSession.Stages[0].Engine == InferenceEngineType.Vulkan ? "Vulkan"
                : "Cpu")
             : "Cpu");
     public Exception? FallbackException { get; private set; }
@@ -174,12 +176,25 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 #if !ANDROID
             if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu && VulkanContext.IsSupported)
             {
-                if (_weights.IsHybridSsm && !Qwen35VulkanModel.IsSupported(_weights, out string vulkanWhyNot))
-                    GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanWhyNot}. Falling back to the CPU engine.");
-                else if (_weights.ArchitectureFamily == UniversalArchitecture.Gemma4 && !Gemma4VulkanModel.IsSupported(_weights, out string vulkanGemmaWhyNot))
-                    GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanGemmaWhyNot}. Falling back to the CPU engine.");
-                else if (!_weights.IsHybridSsm && _weights.ArchitectureFamily != UniversalArchitecture.Gemma4 && !Qwen2VulkanModel.IsSupported(_weights, out string vulkanStdWhyNot))
+                if (_weights.ArchitectureFamily == UniversalArchitecture.Mamba2)
+                {
+                    if (!Mamba2VulkanModel.IsSupported(_weights, out string vulkanMambaWhyNot))
+                        GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanMambaWhyNot}. Falling back to the CPU engine.");
+                }
+                else if (_weights.IsHybridSsm)
+                {
+                    if (!Qwen35VulkanModel.IsSupported(_weights, out string vulkanWhyNot))
+                        GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanWhyNot}. Falling back to the CPU engine.");
+                }
+                else if (_weights.ArchitectureFamily == UniversalArchitecture.Gemma4)
+                {
+                    if (!Gemma4VulkanModel.IsSupported(_weights, out string vulkanGemmaWhyNot))
+                        GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanGemmaWhyNot}. Falling back to the CPU engine.");
+                }
+                else if (!Qwen2VulkanModel.IsSupported(_weights, out string vulkanStdWhyNot))
+                {
                     GlacierDiagnostics.LogInformation($"[Vulkan GPU] Not used for this model: {vulkanStdWhyNot}. Falling back to the CPU engine.");
+                }
             }
 #endif
 
@@ -255,28 +270,30 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             }
             else if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
                      VulkanContext.IsSupported &&
-                     (Qwen35VulkanModel.IsSupported(_weights, out _) || Gemma4VulkanModel.IsSupported(_weights, out _) || Mamba2VulkanModel.IsSupported(_weights, out _) || Qwen2VulkanModel.IsSupported(_weights, out _)) &&
+                     (Mamba2VulkanModel.IsSupported(_weights, out _) || Qwen35VulkanModel.IsSupported(_weights, out _) || Gemma4VulkanModel.IsSupported(_weights, out _) || Qwen2VulkanModel.IsSupported(_weights, out _)) &&
                      Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name) >= 0)
             {
                 try
                 {
                     int devIdx = Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name);
-                    ID3D12Model vkModel = _weights.IsHybridSsm
-                        ? new Qwen35VulkanModel(_weights, maxSeqLen, devIdx)
-                        : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
-                            ? new Gemma4VulkanModel(_weights, maxSeqLen, devIdx)
-                            : _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
-                                ? new Mamba2VulkanModel(_weights, maxSeqLen, devIdx)
+                    ID3D12Model vkModel = _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
+                        ? new Mamba2VulkanModel(_weights, maxSeqLen, devIdx)
+                        : _weights.IsHybridSsm
+                            ? new Qwen35VulkanModel(_weights, maxSeqLen, devIdx)
+                            : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                                ? new Gemma4VulkanModel(_weights, maxSeqLen, devIdx)
                                 : new Qwen2VulkanModel(_weights, maxSeqLen, devIdx);
                     _d3d12Model = vkModel;
                     _kvCache = null; // GPU maintains all KV / recurrent states in device-visible memory
                     Engine = InferenceEngineType.Vulkan;
-                    string modeDesc = _weights.IsHybridSsm
-                        ? $"Qwen 3.5/3.6 Gated DeltaNet{(_weights.IsMoe ? " + MoE" : "")}"
-                        : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
-                            ? $"Gemma 4 ISWA{(_weights.IsMoe ? " + Dual MoE" : "")}"
-                            : $"Standard Dense{(_weights.IsMoe ? " + MoE" : "")}";
-                    string vkName = vkModel is Qwen35VulkanModel m35 ? m35.DeviceName : vkModel is Gemma4VulkanModel mg4 ? mg4.DeviceName : ((Qwen2VulkanModel)vkModel).DeviceName;
+                    string modeDesc = _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
+                        ? $"Mamba-2 Hybrid SSM{(_weights.IsMoe ? " + MoE" : "")}"
+                        : _weights.IsHybridSsm
+                            ? $"Qwen 3.5/3.6 Gated DeltaNet{(_weights.IsMoe ? " + MoE" : "")}"
+                            : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                                ? $"Gemma 4 ISWA{(_weights.IsMoe ? " + Dual MoE" : "")}"
+                                : $"Standard Dense{(_weights.IsMoe ? " + MoE" : "")}";
+                    string vkName = vkModel is VulkanRunnerBase vrb ? vrb.DeviceName : vkModel is Qwen35VulkanModel m35 ? m35.DeviceName : targetDevice.Name;
                     ActiveDevice = $"{vkName} [Engine: Vulkan Compute ({modeDesc}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
                 }
                 catch (Exception ex)
@@ -302,10 +319,12 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 var settings = GlacierSettings.Load();
                 if (!settings.FallbackToCpu && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu)
                 {
-                    string reason = _weights.IsHybridSsm
-                        ? $"Model uses Qwen 3.5/3.6 Gated DeltaNet (Hybrid SSM) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
-                        : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
-                            ? $"Model uses Google Gemma 4 (ISWA + Dual MoE) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
+                    string reason = _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
+                        ? $"Model uses Mamba-2 (Hybrid SSM) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
+                        : _weights.IsHybridSsm
+                            ? $"Model uses Qwen 3.5/3.6 Gated DeltaNet (Hybrid SSM) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
+                            : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                                ? $"Model uses Google Gemma 4 (ISWA + Dual MoE) architecture which executes via high-performance multi-threaded SIMD AVX2/AVX-512 engine. Specify '--device cpu' or enable CPU fallback."
                             : targetDevice.Vendor switch
                             {
                                 GpuVendor.Amd when !OperatingSystem.IsWindows() =>
@@ -330,8 +349,10 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 string prefix = targetDevice.Vendor != GpuVendor.Cpu
                     ? $"{cpuDeviceName} [Fallback from {targetDevice.Name} | "
                     : $"{targetDevice.Name} [";
-                ActiveDevice = _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
-                    ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (Gemma 4 ISWA + Dual MoE)]"
+                ActiveDevice = _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
+                    ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (Mamba-2 Hybrid SSM)]"
+                    : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
+                        ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (Gemma 4 ISWA + Dual MoE)]"
                     : _weights.IsMla
                         ? $"{prefix}Engine: Multi-threaded SIMD AVX2/AVX-512 (DeepSeek MLA)]"
                         : _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm

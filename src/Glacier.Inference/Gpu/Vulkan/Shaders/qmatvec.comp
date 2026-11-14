@@ -229,6 +229,65 @@ void main() {
             acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
         }
     }
+#elif QTYPE == 8
+    // Q2_K: 256 elements = 84 bytes (scales[16], qs[64], f16 d, f16 dmin). 64 threads per block (4 weights each).
+    uint nb = pc.K >> 8;
+    uint step = t >> 5;           // 0 or 1 (128 elements per half)
+    uint u = t & 31u;             // 0..31 within half
+    uint j = u >> 3;              // 0..3 (shift factor)
+    uint sub = (u & 7u) >> 2;     // 0 (lanes 0..3, elements 0..15) or 1 (lanes 4..7, elements 16..31)
+    uint lb = (u & 7u) * 4u;      // 0, 4, 8, 12, 16, 20, 24, 28
+    uint isIdx = step * 8u + j * 2u + sub;
+    uint shift = j * 2u;
+    for (uint blk = 0u; blk < nb; blk++) {
+        uint b = wbase + (row * nb + blk) * 84u;
+        vec2 dm = unpackHalf2x16(u32at(b + 80u));
+        float d = dm.x, dmin = dm.y;
+        uint scWord = u32at(b + (isIdx & ~3u));
+        uint scByte = (scWord >> ((isIdx & 3u) * 8u)) & 0xFFu;
+        float dl = d * float(scByte & 0x0Fu);
+        float ml = dmin * float(scByte >> 4);
+        uint qword = u32at(b + 16u + step * 32u + lb);
+        vec4 qv = vec4(float((qword >> shift) & 3u),
+                       float((qword >> (8u + shift)) & 3u),
+                       float((qword >> (16u + shift)) & 3u),
+                       float((qword >> (24u + shift)) & 3u));
+        vec4 xl = x4[xo4 + blk * 64u + t];
+        acc += dl * dot(qv, xl) - ml * (xl.x + xl.y + xl.z + xl.w);
+    }
+#elif QTYPE == 9
+    // Q4_0: 32 elements = 18 bytes (f16 d, uint8 qs[16]). 8 threads per block (4 weights each).
+    uint nBlk = pc.K >> 5;
+    uint rowOff = wbase + row * nBlk * 18u;
+    uint j = t & 7u;
+    for (uint blk = t >> 3; blk < nBlk; blk += 8u) {
+        uint bo = rowOff + blk * 18u;
+        float d = halfAt(bo);
+        uint qword = u32at(bo + 2u + (j & 3u) * 4u);
+        vec4 qv;
+        if (j < 4u) {
+            qv = vec4(float(int(qword & 0xFu) - 8),
+                      float(int((qword >> 8) & 0xFu) - 8),
+                      float(int((qword >> 16) & 0xFu) - 8),
+                      float(int((qword >> 24) & 0xFu) - 8));
+        } else {
+            qv = vec4(float(int((qword >> 4) & 0xFu) - 8),
+                      float(int((qword >> 12) & 0xFu) - 8),
+                      float(int((qword >> 20) & 0xFu) - 8),
+                      float(int((qword >> 28) & 0xFu) - 8));
+        }
+        acc += d * dot(qv, x4[xo4 + blk * 8u + j]);
+    }
+#elif QTYPE == 10
+    // F16: 16-bit floats (2 bytes per element). 64 threads per row; 4 weights (2 uints) per thread.
+    uint k4 = pc.K >> 2;
+    uint rowOff = wbase + row * pc.K * 2u;
+    for (uint i = t; i < k4; i += 64u) {
+        uint bo = rowOff + i * 8u;
+        vec2 f01 = unpackHalf2x16(u32at(bo));
+        vec2 f23 = unpackHalf2x16(u32at(bo + 4u));
+        acc += dot(vec4(f01, f23), x4[xo4 + i]);
+    }
 #endif
 
     partial[t] = acc;

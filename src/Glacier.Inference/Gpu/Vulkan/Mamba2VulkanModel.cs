@@ -14,7 +14,6 @@ public sealed unsafe class Mamba2VulkanModel : VulkanRunnerBase
         reason = "";
         if (w.ArchitectureFamily != UniversalArchitecture.Mamba2) { reason = "not a Mamba-2 model"; return false; }
         if (w.HeadDim > 256 || w.ValueDim != w.HeadDim) { reason = $"unsupported head dim {w.HeadDim}/{w.ValueDim}"; return false; }
-        if (w.HasRopeFreqs) { reason = "custom RoPE frequency table"; return false; }
 
         foreach (var l in w.Layers)
         {
@@ -92,7 +91,7 @@ public sealed unsafe class Mamba2VulkanModel : VulkanRunnerBase
             var dOutNorm = UploadFloats(_w.OutNormWeight, E);
             var dOutput = UploadBytes(_w.OutWeight, GgufTypeSize(_w.OutType, (long)_vocab * E));
 
-            _embedOps.Add(new Op { K = _pEmbed[QIdx(_w.EmbdType)], Set = _vk.MakeSet(_pEmbed[QIdx(_w.EmbdType)], dEmbd, dX), Push = [0u, (uint)E], Gx = (uint)((E + 255) / 256), Patch = Patch.Token });
+            _embedOps.Add(new Op { K = _pEmbed[QIdx(_w.EmbdType)], Set = _vk.MakeSet(_pEmbed[QIdx(_w.EmbdType)], dEmbd, dX), Push = [(uint)E, 0u], Gx = (uint)((E + 255) / 256), Patch = Patch.Token });
 
             int ssmHeads = _w.SsmTimeStepRank, ssmD = _w.SsmInnerSize, ssmHd = ssmHeads > 0 ? ssmD / ssmHeads : 0;
             int ssmSd = _w.SsmStateSize, ssmG = _w.SsmGroupCount;
