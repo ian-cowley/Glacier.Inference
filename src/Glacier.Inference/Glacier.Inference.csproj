@@ -13,7 +13,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.6.0</Version>
+    <Version>1.7.0</Version>
     <PackageReleaseNotes>v1.6.0: Adds full Linux/AMD/Intel Vulkan 1.1 compute runners (Dense/MoE/MLA/DSA/Gemma4/Mamba2/LFM2/Qwen3.5-3.6), 11-quant + F16 matrix (Q2_K, Q3_K, Q4_0, Q4_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, MXFP4, F16), attention biases, fused QKV/GateUp slicing, custom RoPE frequency tables, Split-GGUF shard loading with missing split.count fallback, symlinked GGUF support, and NextN/MTP trailing-layer trimming.</PackageReleaseNotes>
 
     <Authors>Ian Cowley</Authors>
