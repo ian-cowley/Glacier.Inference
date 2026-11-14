@@ -668,4 +668,150 @@ public unsafe class VulkanKernelTests
         vk.SubmitAndWait();
         AssertClose(denseOut, Down(gSpO, nQ * vDim), 1e-5, 1e-6, "MLA sparse vs dense");
     }
+
+    [VulkanFact]
+    public void Mamba2_PackedOffsets_And_MultiStep_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(123);
+
+        int nH = 4, hd = 8, sd = 6, nG = 2, dIn = nH * hd, kern = 4;
+        int convDim = dIn + 2 * nG * sd;
+        int projDim = dIn + convDim + nH;
+        uint zOff = 0u, inOff = (uint)dIn, dtOff = (uint)(dIn + convDim);
+
+        var convW = RandF(rng, convDim * kern, 0.3f);
+        var convB = RandF(rng, convDim, 0.1f);
+        var convSt = new float[convDim * (kern - 1)];
+        var A = new float[nH]; for (int i = 0; i < nH; i++) A[i] = -0.4f - 0.15f * i;
+        var D = RandF(rng, nH, 0.5f);
+        var dtB = RandF(rng, nH, 0.1f);
+        var st = new float[nH * hd * sd];
+
+        var kConv = vk.LoadEmbedded("mamba2_conv", 5, 12);
+        var kRec = vk.LoadEmbedded("mamba2_rec", 8, 28);
+        var gProj = vk.Alloc(projDim * 4L);
+        var gCW = Up(vk, convW); var gCB = Up(vk, convB);
+        var gCSt = vk.Alloc(convSt.Length * 4L); gCSt.Zero();
+        var gXbcO = vk.Alloc(convDim * 4L);
+        var gA = Up(vk, A); var gD = Up(vk, D); var gDtB = Up(vk, dtB);
+        var gSt = vk.Alloc(st.Length * 4L); gSt.Zero();
+        var gY = vk.Alloc(dIn * 4L);
+
+        var convSet = vk.MakeSet(kConv, gProj, gCW, gCB, gCSt, gXbcO);
+        var recSet = vk.MakeSet(kRec, gXbcO, gProj, gProj, gA, gD, gDtB, gSt, gY);
+
+        for (int step = 0; step < 3; step++)
+        {
+            var proj = RandF(rng, projDim, 0.5f);
+            fixed (float* pProj = proj) gProj.UploadFrom(pProj, proj.Length * 4L);
+
+            vk.Begin();
+            vk.Dispatch(kConv, convSet, new uint[] { (uint)convDim, (uint)kern, inOff }, (uint)((convDim + 255) / 256));
+            vk.Dispatch(kRec, recSet, new uint[] { (uint)nH, (uint)hd, (uint)sd, (uint)nG, (uint)dIn, zOff, dtOff }, (uint)nH);
+            vk.SubmitAndWait();
+
+            int k1 = kern - 1;
+            var xbcRef = new float[convDim];
+            for (int c = 0; c < convDim; c++)
+            {
+                float sum = convB[c];
+                for (int j = 0; j < k1; j++) sum += convSt[c * k1 + j] * convW[c * kern + j];
+                float cur = proj[inOff + c];
+                sum += cur * convW[c * kern + k1];
+                for (int j = 0; j + 1 < k1; j++) convSt[c * k1 + j] = convSt[c * k1 + j + 1];
+                convSt[c * k1 + k1 - 1] = cur;
+                xbcRef[c] = sum / (1f + MathF.Exp(-sum));
+            }
+
+            var yRef = new float[dIn];
+            for (int h = 0; h < nH; h++)
+            {
+                int g = h / (nH / nG);
+                float dtRaw = proj[dtOff + h] + dtB[h];
+                float dt = dtRaw > 20f ? dtRaw : MathF.Log(1f + MathF.Exp(dtRaw));
+                float dA = MathF.Exp(dt * A[h]);
+                for (int d = 0; d < hd; d++)
+                {
+                    float xv = xbcRef[h * hd + d];
+                    float acc = D[h] * xv;
+                    int stBase = (h * hd + d) * sd;
+                    for (int s = 0; s < sd; s++)
+                    {
+                        float sv = st[stBase + s] * dA + dt * xbcRef[dIn + g * sd + s] * xv;
+                        st[stBase + s] = sv;
+                        acc += sv * xbcRef[dIn + (nG + g) * sd + s];
+                    }
+                    float zv = proj[zOff + h * hd + d];
+                    yRef[h * hd + d] = acc * (zv / (1f + MathF.Exp(-zv)));
+                }
+            }
+
+            AssertClose(yRef, Down(gY, dIn), 1e-4, 1e-5, $"Mamba-2 packed multi-step {step}");
+        }
+    }
+
+    [VulkanFact]
+    public void DsaTopk_MultiStep_CacheAppend_MatchReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(456);
+
+        int maxSeq = 6, nIdxH = 2, idxD = 8, topK = 2;
+        var kTop = vk.LoadEmbedded("dsa_topk", 5, 16);
+        var gIQ = vk.Alloc(nIdxH * idxD * 4L);
+        var gIKCache = vk.Alloc(maxSeq * idxD * 4L); gIKCache.Zero();
+        var gIW = vk.Alloc(nIdxH * 4L);
+        var gTopIdx = vk.Alloc(topK * 4L);
+        var gIKCur = vk.Alloc(idxD * 4L);
+        var topSet = vk.MakeSet(kTop, gIQ, gIKCache, gIW, gTopIdx, gIKCur);
+
+        var kCacheRef = new float[maxSeq * idxD];
+        for (int seqLen = 1; seqLen <= 4; seqLen++)
+        {
+            var q = RandF(rng, nIdxH * idxD, 0.5f);
+            var w = RandF(rng, nIdxH, 0.5f);
+            var kCur = RandF(rng, idxD, 0.5f);
+            Array.Copy(kCur, 0, kCacheRef, (seqLen - 1) * idxD, idxD);
+
+            fixed (float* pQ = q) gIQ.UploadFrom(pQ, q.Length * 4L);
+            fixed (float* pW = w) gIW.UploadFrom(pW, w.Length * 4L);
+            fixed (float* pK = kCur) gIKCur.UploadFrom(pK, kCur.Length * 4L);
+
+            vk.Begin();
+            vk.Dispatch(kTop, topSet, new uint[] { (uint)seqLen, (uint)nIdxH, (uint)idxD, (uint)topK }, 1);
+            vk.SubmitAndWait();
+
+            int k = Math.Min(topK, seqLen);
+            var gpuTop = new uint[k];
+            fixed (uint* pTop = gpuTop) gTopIdx.DownloadTo(pTop, gpuTop.Length * 4L);
+
+            var scores = new float[seqLen];
+            for (int pos = 0; pos < seqLen; pos++)
+            {
+                float s = 0f;
+                for (int h = 0; h < nIdxH; h++)
+                {
+                    float dot = 0f;
+                    for (int d = 0; d < idxD; d++) dot += q[h * idxD + d] * kCacheRef[pos * idxD + d];
+                    s += MathF.Max(dot, 0f) * w[h];
+                }
+                scores[pos] = s;
+            }
+
+            for (int i = 0; i < k; i++)
+            {
+                float best = -1e30f;
+                uint bestIdx = 0;
+                for (uint pos = 0; pos < (uint)seqLen; pos++)
+                {
+                    if (scores[pos] > best) { best = scores[pos]; bestIdx = pos; }
+                }
+                Assert.Equal(bestIdx, gpuTop[i]);
+                scores[bestIdx] = -1e30f;
+            }
+        }
+    }
 }
