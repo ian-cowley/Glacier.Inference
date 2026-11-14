@@ -586,16 +586,16 @@ public unsafe class VulkanKernelTests
         var dtB = RandF(rng, nH, 0.1f);
         var st = new float[nH * hd * sd];
 
-        var kConv = vk.LoadEmbedded("mamba2_conv", 5, 8);
-        var kRec = vk.LoadEmbedded("mamba2_rec", 8, 20);
+        var kConv = vk.LoadEmbedded("mamba2_conv", 5, 12);
+        var kRec = vk.LoadEmbedded("mamba2_rec", 8, 28);
         var gXbc = Up(vk, xbc); var gCW = Up(vk, convW); var gCB = Up(vk, convB);
         var gCSt = Up(vk, convSt); var gXbcO = vk.Alloc(convDim * 4L);
         var gZ = Up(vk, z); var gDt = Up(vk, dtIn); var gA = Up(vk, A); var gD = Up(vk, D);
         var gDtB = Up(vk, dtB); var gSt = Up(vk, st); var gY = vk.Alloc(dIn * 4L);
 
         vk.Begin();
-        vk.Dispatch(kConv, vk.MakeSet(kConv, gXbc, gCW, gCB, gCSt, gXbcO), new uint[] { (uint)convDim, (uint)kern }, (uint)((convDim + 255) / 256));
-        vk.Dispatch(kRec, vk.MakeSet(kRec, gXbcO, gZ, gDt, gA, gD, gDtB, gSt, gY), new uint[] { (uint)nH, (uint)hd, (uint)sd, (uint)nG, (uint)dIn }, (uint)nH);
+        vk.Dispatch(kConv, vk.MakeSet(kConv, gXbc, gCW, gCB, gCSt, gXbcO), new uint[] { (uint)convDim, (uint)kern, 0u }, (uint)((convDim + 255) / 256));
+        vk.Dispatch(kRec, vk.MakeSet(kRec, gXbcO, gZ, gDt, gA, gD, gDtB, gSt, gY), new uint[] { (uint)nH, (uint)hd, (uint)sd, (uint)nG, (uint)dIn, 0u, 0u }, (uint)nH);
         vk.SubmitAndWait();
 
         var xbcRef = new float[convDim];
@@ -641,7 +641,7 @@ public unsafe class VulkanKernelTests
 
         var kPrep = vk.LoadEmbedded("mla_prep", 6, 36);
         var kDec = vk.LoadEmbedded("mla_decode", 4, 24);
-        var kTop = vk.LoadEmbedded("dsa_topk", 4, 16);
+        var kTop = vk.LoadEmbedded("dsa_topk", 5, 16);
         var kSp = vk.LoadEmbedded("mla_sparse_decode", 5, 24);
 
         var gQF = Up(vk, qFull); var gKvB = Up(vk, kvB); var gKvA = Up(vk, kvA);
@@ -659,10 +659,10 @@ public unsafe class VulkanKernelTests
         var denseOut = Down(gAO, nQ * vDim);
 
         // Verify DSA topk + mla_sparse_decode at seqLen=1 matches denseOut
-        var gIQ = Up(vk, RandF(rng, 2 * 8, 0.5f)); var gIK = Up(vk, RandF(rng, maxSeq * 8, 0.5f));
+        var gIQ = Up(vk, RandF(rng, 2 * 8, 0.5f)); var gIK = vk.Alloc(maxSeq * 8 * 4L); var gIKCur = Up(vk, RandF(rng, 8, 0.5f));
         var gIW = Up(vk, RandF(rng, 2, 0.5f)); var gTopIdx = vk.Alloc(4L); var gSpO = vk.Alloc(nQ * vDim * 4L);
         vk.Begin();
-        vk.Dispatch(kTop, vk.MakeSet(kTop, gIQ, gIK, gIW, gTopIdx), new uint[] { 1u, 2u, 8u, 1u }, 1);
+        vk.Dispatch(kTop, vk.MakeSet(kTop, gIQ, gIK, gIW, gTopIdx, gIKCur), new uint[] { 1u, 2u, 8u, 1u }, 1);
         vk.Dispatch(kSp, vk.MakeSet(kSp, gQO, gKC, gVC, gTopIdx, gSpO),
             new uint[] { 1u, (uint)nQ, (uint)maxSeq, (uint)kDim, (uint)vDim, VulkanCompute.F(1f / MathF.Sqrt(kDim)) }, (uint)nQ);
         vk.SubmitAndWait();

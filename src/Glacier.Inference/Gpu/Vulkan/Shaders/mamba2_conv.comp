@@ -6,7 +6,7 @@ layout(std430, binding = 1) readonly buffer CW { float convW[]; };      // [conv
 layout(std430, binding = 2) readonly buffer CB { float convB[]; };      // [convDim]
 layout(std430, binding = 3) buffer CS { float convState[]; };           // [convDim][kernel - 1]
 layout(std430, binding = 4) writeonly buffer XO { float xbcOut[]; };    // [convDim]
-layout(push_constant) uniform PC { uint convDim; uint kernel; } pc;
+layout(push_constant) uniform PC { uint convDim; uint kernel; uint inOff; } pc;
 
 void main() {
     uint c = gl_GlobalInvocationID.x;
@@ -19,7 +19,7 @@ void main() {
     for (uint j = 0u; j < k1; j++) {
         sum += convState[sOff + j] * convW[wOff + j];
     }
-    float cur = xbc[c];
+    float cur = xbc[pc.inOff + c];
     sum += cur * convW[wOff + k1];
 
     for (uint j = 0u; j + 1u < k1; j++) {

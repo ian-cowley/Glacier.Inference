@@ -9,7 +9,7 @@ layout(std430, binding = 4) readonly buffer D_ { float D[]; };           // [nHe
 layout(std430, binding = 5) readonly buffer DB_ { float dtBias[]; };     // [nHeads]
 layout(std430, binding = 6) buffer ST { float state[]; };                // [nHeads][headDim][stateDim]
 layout(std430, binding = 7) writeonly buffer YO { float yOut[]; };       // [dInner]
-layout(push_constant) uniform PC { uint nHeads; uint headDim; uint stateDim; uint nGroups; uint dInner; } pc;
+layout(push_constant) uniform PC { uint nHeads; uint headDim; uint stateDim; uint nGroups; uint dInner; uint zOff; uint dtOff; } pc;
 
 void main() {
     uint h = gl_WorkGroupID.x;
@@ -20,7 +20,7 @@ void main() {
     uint bOff = pc.dInner + g * pc.stateDim;
     uint cOff = pc.dInner + (pc.nGroups + g) * pc.stateDim;
 
-    float dtRaw = dtIn[h] + dtBias[h];
+    float dtRaw = dtIn[pc.dtOff + h] + dtBias[h];
     float dt = (dtRaw > 20.0) ? dtRaw : log(1.0 + exp(dtRaw));
     float dA = exp(dt * A[h]);
 
@@ -34,7 +34,7 @@ void main() {
         acc += st * xbc[cOff + s];
     }
 
-    float zv = z[h * pc.headDim + d];
+    float zv = z[pc.zOff + h * pc.headDim + d];
     float siluZ = zv / (1.0 + exp(-zv));
     yOut[h * pc.headDim + d] = acc * siluZ;
 }

@@ -106,11 +106,12 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 l.IsGdn && !(l.SsmBetaType == GgufType.F32 || IsKernelType(l.SsmBetaType)))
             { reason = "ssm_alpha / ssm_beta use an unsupported weight type"; return false; }
         }
-        if (!IsKernelType(w.EmbdType)) { reason = $"token embedding uses unsupported weight type {w.EmbdType}"; return false; }
+        if (!IsEmbedKernelType(w.EmbdType)) { reason = $"token embedding uses unsupported weight type {w.EmbdType}"; return false; }
         if (!IsKernelType(w.OutType)) { reason = $"output head uses unsupported weight type {w.OutType}"; return false; }
         return true;
     }
 
+    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0;
     private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4;
 
     private static int QIdx(GgufType t) => t switch

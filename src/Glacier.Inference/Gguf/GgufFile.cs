@@ -481,11 +481,11 @@ public sealed unsafe class GgufFile : IDisposable
 
     private void LoadExtraShards(string firstShardPath)
     {
-        int splitCount = Metadata.TryGetValue("split.count", out var sc) ? Convert.ToInt32(sc) : 1;
-        if (splitCount <= 1) return;
-
         var m = System.Text.RegularExpressions.Regex.Match(firstShardPath, @"^(.*-)(\d{5})(-of-)(\d{5})(\.gguf)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         if (!m.Success) return;
+
+        int splitCount = Metadata.TryGetValue("split.count", out var sc) ? Convert.ToInt32(sc) : int.Parse(m.Groups[4].Value);
+        if (splitCount <= 1) return;
 
         string prefix = m.Groups[1].Value, mid = m.Groups[3].Value, totalStr = m.Groups[4].Value, ext = m.Groups[5].Value;
         for (int s = 2; s <= splitCount; s++)
