@@ -224,7 +224,10 @@ public sealed unsafe class ModelWeights
     {
         Gguf = gguf;
 
-        BlockCount = gguf.BlockCount;
+        int blockCount = gguf.BlockCount;
+        while (blockCount > 0 && gguf.TryGetTensor($"blk.{blockCount - 1}.nextn.eh_proj.weight", out var nextnProj) && nextnProj != null)
+            blockCount--;
+        BlockCount = blockCount;
         ContextLength = gguf.ContextLength;
         EmbeddingLength = gguf.EmbeddingLength;
         FeedForwardLength = gguf.FeedForwardLength;
