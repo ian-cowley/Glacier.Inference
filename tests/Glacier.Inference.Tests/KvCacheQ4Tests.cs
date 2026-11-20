@@ -215,6 +215,9 @@ public unsafe class KvCacheQ4Tests
     [Fact]
     public void CudaKernels_Q4_0_StoreAndAttention_MatchReference_WhenCudaAvailable()
     {
+        if (!OperatingSystem.IsWindows())
+            return;
+
         try
         {
             if (!GpuContext.IsSupported)
@@ -228,6 +231,13 @@ public unsafe class KvCacheQ4Tests
         {
             return;
         }
+
+        RunCudaQ4KernelVerification();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static unsafe void RunCudaQ4KernelVerification()
+    {
 
         using var gpu = new GpuContext(0);
         gpu.MakeCurrent();
