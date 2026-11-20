@@ -34,20 +34,22 @@ public sealed class CpuPipelineStage : IPipelineStage
         int layerCount,
         bool isFirstStage,
         bool isLastStage,
-        int maxSeqLen = 4096)
+        int maxSeqLen = 4096,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
     {
         _device = device;
         _engine = InferenceEngineType.Cpu;
         _isFirstStage = isFirstStage;
         _isLastStage = isLastStage;
         int resolvedLayers = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
-        _kvCache = new KVCache(resolvedLayers, weights.HeadCountKv, weights.HeadDim, maxSeqLen, weights.ValueDim);
+        _kvCache = new KVCache(resolvedLayers, weights.HeadCountKv, weights.HeadDim, maxSeqLen, weights.ValueDim, precision: kvPrecision);
         _model = CpuModelFactory.Create(
             weights,
             maxSeqLen: maxSeqLen,
             startLayer: startLayer,
             layerCount: resolvedLayers,
-            isLastStage: isLastStage);
+            isLastStage: isLastStage,
+            kvPrecision: kvPrecision);
     }
 
     public void ForwardStage(

@@ -233,6 +233,56 @@ public static unsafe partial class QuantKernels
     }
 
     /// <summary>
+    /// Computes dot product between IEEE BF16 row and float vector x of length k.
+    /// Hardware-accelerated with AVX2/FMA BF16 widening + scalar fallback.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotBF16(ushort* row, float* x, int k)
+    {
+        float sum = 0f;
+        int i = 0;
+
+        if (Avx2.IsSupported && k >= 16)
+        {
+            var acc0 = Vector256<float>.Zero;
+            var acc1 = Vector256<float>.Zero;
+            int limit16 = k - 16;
+            for (; i <= limit16; i += 16)
+            {
+                var vr0 = Avx2.ShiftLeftLogical(Avx2.ConvertToVector256Int32(Vector128.Load(row + i)), 16).AsSingle();
+                var vr1 = Avx2.ShiftLeftLogical(Avx2.ConvertToVector256Int32(Vector128.Load(row + i + 8)), 16).AsSingle();
+                var vx0 = Vector256.Load(x + i);
+                var vx1 = Vector256.Load(x + i + 8);
+                if (Fma.IsSupported)
+                {
+                    acc0 = Fma.MultiplyAdd(vx0, vr0, acc0);
+                    acc1 = Fma.MultiplyAdd(vx1, vr1, acc1);
+                }
+                else
+                {
+                    acc0 += vx0 * vr0;
+                    acc1 += vx1 * vr1;
+                }
+            }
+            sum += Vector256.Sum(acc0 + acc1);
+        }
+
+        if (Avx2.IsSupported && (k - i) >= 8)
+        {
+            var vr = Avx2.ShiftLeftLogical(Avx2.ConvertToVector256Int32(Vector128.Load(row + i)), 16).AsSingle();
+            var vx = Vector256.Load(x + i);
+            sum += Vector256.Dot(vx, vr);
+            i += 8;
+        }
+
+        for (; i < k; i++)
+        {
+            sum += BitConverter.UInt32BitsToSingle((uint)row[i] << 16) * x[i];
+        }
+        return sum;
+    }
+
+    /// <summary>
     /// Computes dot product between FP32 row and float vector x of length k.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]

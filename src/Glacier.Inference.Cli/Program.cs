@@ -65,6 +65,8 @@ public static partial class Program
                 "bench" => await RunBenchAsync(cmdArgs),
                 "run" => await RunChatAsync(cmdArgs),
                 "serve" => await RunServeAsync(cmdArgs),
+                "eval-kl" => RunEvalKl(cmdArgs),
+                "bounce" => await RunBounceAsync(cmdArgs),
                 "voice" => RunVoice(cmdArgs),
                 "vision" => RunVision(cmdArgs),
                 "video" => RunVideo(cmdArgs),
@@ -117,6 +119,8 @@ public static partial class Program
         Console.WriteLine("  bench   <model.gguf> [options]       Run speed & comparative benchmark");
         Console.WriteLine("  run     <model.gguf> [prompt]        Interactive streaming chat or single prompt");
         Console.WriteLine("  serve   <model.gguf> [options]       Start Ollama & OpenAI compatible HTTP server");
+        Console.WriteLine("  eval-kl <cand.gguf> --ref <ref.gguf> Evaluate KL divergence D_KL(P_ref || Q_cand) vs reference");
+        Console.WriteLine("  bounce  --primary <url> [options]    3-Machine Peer Critic + Compiler Bounce Proxy");
         Console.WriteLine("  voice   <voices|tts|stt|demo>        KittenTTS Neural Speech Synthesis & Formant TTS + Whisper STT");
         Console.WriteLine("  vision  <demo|query> [options]       [Experimental] Synthetic VisionPipeline patchification & analysis");
         Console.WriteLine("  video   <generate|demo|query>        Generative video production (DiT+VAE) & temporal reasoning");
@@ -125,7 +129,7 @@ public static partial class Program
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto safe selection)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto adaptive)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto adaptive)");
         Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU pipeline split (e.g. 'auto', 'nvidia-rtx-4060:14,amd-890m:14')");
         Console.WriteLine();
@@ -158,6 +162,9 @@ public static partial class Program
                 break;
             case "serve":
                 PrintServeHelp();
+                break;
+            case "eval-kl":
+                PrintEvalKlHelp();
                 break;
             case "voice":
                 PrintVoiceHelp();
@@ -359,8 +366,19 @@ public static partial class Program
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
+        Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7; 0 for greedy)");
+        Console.WriteLine("  --raw                                Skip chat template wrapping for the benchmark prompt");
+        Console.WriteLine("  --ple-io <auto|direct|mmap>          PLE table transport mode (default: auto)");
+        Console.WriteLine("  --host-arena-gib <float>             Host-RAM Expert Arena cap in GiB (0 = disable, default: auto)");
+        Console.WriteLine("  --tiered-moe                         Force GPU+CPU Hosted MoE expert slot pooling on D3D12");
+        Console.WriteLine("  --speculative <off|lookup|mtp|dflash|adaptive> Speculative decoding mode (default: off)");
+        Console.WriteLine("  --draft-model <path>                 Detached MTP/NextN sidecar GGUF path");
+        Console.WriteLine("  --draft-tokens <int>                 Max speculative draft tokens per round (default: auto 2 MoE / 4 dense)");
+        Console.WriteLine("  --dflash-steps <int>                 DFlash block-diffusion refinement steps (default: 3)");
+        Console.WriteLine("  --draft-vocab <full|lang|path.gdvb>  Draft vocabulary subset mode or binary file (default: full)");
+        Console.WriteLine("  --moe-tail-skip <int>                Minimum MoE rank for speculative verify tail skipping (default: 0 = exact)");
         Console.WriteLine("  --compare-ollama <url>               Ollama base URL for side-by-side comparison");
         Console.WriteLine("                                       (e.g. http://127.0.0.1:11434 or http://remote-host:11434)");
         Console.WriteLine("  --compare-model <name>               Ollama model tag to query (default: qwen2.5:7b-instruct-32k)");
@@ -393,12 +411,21 @@ public static partial class Program
         Console.WriteLine("  [prompt]                             Single-shot prompt. If omitted, launches interactive REPL.");
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  -n, --tokens, --max-tokens <count>   Maximum tokens to generate per response (default: 512)");
-        Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7)");
+        Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7; 0 for greedy)");
         Console.WriteLine("  --top-p <float>                      Top-p nucleus sampling cutoff (default: 0.9)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
+        Console.WriteLine("  --ple-io <auto|direct|mmap>          PLE table transport mode (default: auto)");
+        Console.WriteLine("  --host-arena-gib <float>             Host-RAM Expert Arena cap in GiB (0 = disable, default: auto)");
+        Console.WriteLine("  --tiered-moe                         Force GPU+CPU Hosted MoE expert slot pooling on D3D12");
+        Console.WriteLine("  --speculative <off|lookup|mtp|dflash|adaptive> Speculative decoding mode (default: off)");
+        Console.WriteLine("  --draft-model <path>                 Detached MTP/NextN sidecar GGUF path");
+        Console.WriteLine("  --draft-tokens <int>                 Max speculative draft tokens per round (default: auto 2 MoE / 4 dense)");
+        Console.WriteLine("  --dflash-steps <int>                 DFlash block-diffusion refinement steps (default: 3)");
+        Console.WriteLine("  --draft-vocab <full|lang|path.gdvb>  Draft vocabulary subset mode or binary file (default: full)");
+        Console.WriteLine("  --moe-tail-skip <int>                Minimum MoE rank for speculative verify tail skipping (default: 0 = exact)");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("Interactive REPL Commands:");
@@ -430,14 +457,19 @@ public static partial class Program
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|fp32>  KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
+        Console.WriteLine("  --max-think-tokens <auto|off|0|N>    Cap <think> tokens & auto-close (default: auto)");
+        Console.WriteLine("  --sleep-memory                       Enable pillar-16 HOPE+MemEx sleep consolidation");
+        Console.WriteLine("  --sleep-budget <tokens>              Sleep memory context budget in tokens (default: 400)");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("HTTP API Endpoints:");
         Console.WriteLine("  POST /api/generate                   Ollama generation (supports streaming ndjson & non-streaming)");
         Console.WriteLine("  POST /api/chat                       Ollama multi-turn chat format");
         Console.WriteLine("  GET  /api/tags                       Ollama model tags listing");
+        Console.WriteLine("  GET  /api/sleep/status               Sleep consolidation telemetry & trace stats");
+        Console.WriteLine("  POST /api/sleep/trigger              Trigger immediate offline sleep consolidation cycle");
         Console.WriteLine("  POST /v1/chat/completions            OpenAI-compatible chat completions");
         Console.WriteLine("  GET  /v1/models                      OpenAI-compatible model list");
         Console.WriteLine();

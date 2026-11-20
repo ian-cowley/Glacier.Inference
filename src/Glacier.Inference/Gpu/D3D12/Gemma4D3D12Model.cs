@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
 using Vortice.Direct3D;
@@ -26,6 +27,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
     private readonly int _expertUsedCount;
     private readonly int _slidingWindow;
     private readonly float _finalLogitSoftcapping;
+    private readonly float _attnLogitSoftcapping;
     private readonly float _embeddingScale;
     private readonly int _maxSeqLen;
 
@@ -35,7 +37,16 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ5K = null!;
     private ID3D12PipelineState _psoGemvQ6K = null!;
     private ID3D12PipelineState _psoGemvQ3K = null!;
+    private ID3D12PipelineState _psoGemvQ4_0 = null!;
+    private ID3D12PipelineState _psoGemvQ5_0 = null!;
     private ID3D12PipelineState _psoGemvQ8_0 = null!;
+    private ID3D12PipelineState _psoGemvQ2_K = null!;
+    private ID3D12PipelineState _psoGemvIQ2_XXS = null!;
+    private ID3D12PipelineState _psoGemvIQ2_XS = null!;
+    private ID3D12PipelineState _psoGemvIQ2_S = null!;
+    private ID3D12PipelineState _psoGemvIQ3_XXS = null!;
+    private ID3D12PipelineState _psoGemvIQ3_S = null!;
+    private ID3D12PipelineState _psoGemvIQ4_NL = null!;
     private ID3D12PipelineState _psoGemvIQ4_XS = null!;
     private ID3D12PipelineState _psoGemvMXFP4 = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
@@ -121,15 +132,36 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
 
     private ID3D12Resource? _dOutNormWeight;
     private ID3D12Resource? _dOutWeight;
+    private ID3D12Resource _dUnitOnesWeight = null!;
+    private ID3D12Resource? _dRopeFreqs;
     private bool _disposed;
 
     public D3D12Context Context => _ctx;
     public ModelWeights Weights => _weights;
+    public KvCachePrecision KvPrecision { get; }
+    public long TotalKvCacheBytes { get; private set; }
+    public ulong EffectiveVramReserveBytes { get; }
 
-    public Gemma4D3D12Model(D3D12Context ctx, ModelWeights weights, int maxSeqLen = 4096)
+    public Gemma4D3D12Model(
+        D3D12Context ctx,
+        ModelWeights weights,
+        int maxSeqLen = 4096,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        ulong? explicitVramReserveBytes = null)
     {
         _ctx = ctx;
         _weights = weights;
+        EffectiveVramReserveBytes = Glacier.Inference.Memory.WddmVramGuard.ResolveModelSafetyReserveBytes(
+            ctx.DedicatedVideoMemory,
+            OperatingSystem.IsWindows(),
+            ctx.IsUnifiedMemoryArchitecture,
+            explicitVramReserveBytes);
+        KvPrecision = kvPrecision switch
+        {
+            KvCachePrecision.Auto => KvCachePrecision.Fp16,
+            KvCachePrecision.Fp8 => KvCachePrecision.Fp16,
+            _ => kvPrecision
+        };
         _dim = weights.EmbeddingLength;
         _sharedFfnDim = weights.FeedForwardLength;
         _expertFfnDim = weights.ExpertFeedForwardLength > 0 ? weights.ExpertFeedForwardLength : 704;
@@ -137,6 +169,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _expertUsedCount = weights.ExpertUsedCount > 0 ? weights.ExpertUsedCount : 8;
         _slidingWindow = weights.SlidingWindow > 0 ? weights.SlidingWindow : 1024;
         _finalLogitSoftcapping = weights.FinalLogitSoftcapping;
+        _attnLogitSoftcapping = weights.AttnLogitSoftcapping > 0f
+            ? weights.AttnLogitSoftcapping
+            : (weights.Gguf.Architecture.StartsWith("gemma", StringComparison.OrdinalIgnoreCase) ? 50.0f : 0f);
         _embeddingScale = MathF.Sqrt(_dim);
         _maxSeqLen = maxSeqLen;
 
@@ -166,7 +201,16 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _psoGemvQ5K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ5K));
         _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
         _psoGemvQ3K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ3K));
+        _psoGemvQ4_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ4_0));
+        _psoGemvQ5_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ5_0));
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
+        _psoGemvQ2_K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_K));
+        _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
+        _psoGemvIQ2_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XS));
+        _psoGemvIQ2_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_S));
+        _psoGemvIQ3_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_XXS));
+        _psoGemvIQ3_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
+        _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
         _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
         _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
@@ -195,7 +239,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         // 3. GeLU-GLU
         var geluParams = new RootParameter[]
         {
-            new RootParameter(new RootConstants(0, 0, 1), ShaderVisibility.All),
+            new RootParameter(new RootConstants(0, 0, 2), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All)
@@ -222,15 +266,16 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _sigVecAddWeighted = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, vecAddWeightedParams));
         _psoVecAddWeighted = _ctx.CreatePipelineState(_sigVecAddWeighted, _ctx.CompileShader(D3D12Shaders.VecAddWeighted));
 
-        // 5. RoPE
+        // 5. RoPE (with optional rope_freqs for dense layers)
         var ropeParams = new RootParameter[]
         {
-            new RootParameter(new RootConstants(0, 0, 6), ShaderVisibility.All),
+            new RootParameter(new RootConstants(0, 0, 7), ShaderVisibility.All),
+            new RootParameter(RootParameterType.ShaderResourceView, new RootDescriptor(0, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All)
         };
         _sigRope = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, ropeParams));
-        _psoRope = _ctx.CreatePipelineState(_sigRope, _ctx.CompileShader(D3D12Shaders.RoPE));
+        _psoRope = _ctx.CreatePipelineState(_sigRope, _ctx.CompileShader(D3D12Shaders.Gemma4RoPE));
 
         // 6. KV Store
         var kvStoreParams = new RootParameter[]
@@ -241,20 +286,32 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string kvShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.KvCacheStoreQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.KvCacheStoreF16,
+            _ => D3D12Shaders.Gemma4KvCacheStore
+        };
         _sigKvStore = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreParams));
-        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(D3D12Shaders.Gemma4KvCacheStore));
+        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(kvShader));
 
         // 7. SWA Attention
         var swaParams = new RootParameter[]
         {
-            new RootParameter(new RootConstants(0, 0, 7), ShaderVisibility.All),
+            new RootParameter(new RootConstants(0, 0, 8), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(0, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(1, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string swaShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.Gemma4SwaAttentionQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.Gemma4SwaAttentionF16,
+            _ => D3D12Shaders.Gemma4SwaAttention
+        };
         _sigSwaAttention = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, swaParams));
-        _psoSwaAttention = _ctx.CreatePipelineState(_sigSwaAttention, _ctx.CompileShader(D3D12Shaders.Gemma4SwaAttention));
+        _psoSwaAttention = _ctx.CreatePipelineState(_sigSwaAttention, _ctx.CompileShader(swaShader));
 
         // 8. ScaleAndMul
         var scaleAndMulParams = new RootParameter[]
@@ -341,12 +398,14 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _pUploadEmbedding = (float*)pUpload;
 
         // KV Cache per layer (sized for alternating SWA vs Dense layers)
+        TotalKvCacheBytes = 0;
         for (int l = 0; l < _weights.BlockCount; l++)
         {
             var layer = _weights.Layers[l];
             int headsKv = layer.HeadsKv;
             int headDim = layer.HeadDim;
-            ulong kvBytes = (ulong)((long)headsKv * _maxSeqLen * headDim * sizeof(float));
+            ulong kvBytes = Qwen2D3D12Model.ComputeD3D12KvLayerBytes(headsKv, headDim, _maxSeqLen, KvPrecision);
+            TotalKvCacheBytes += (long)kvBytes * 2L;
 
             _dKeyCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
             _dValCache[l] = _ctx.CreateDeviceBuffer(kvBytes);
@@ -511,6 +570,27 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         _ctx.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (ulong)(_dim * sizeof(float)));
 
         _dOutWeight = UploadTensor(_weights.OutType, (IntPtr)_weights.OutWeight, _weights.VocabSize, _dim);
+
+        // Unit ones buffer for unweighted RMSNorm (V-norm, router input norm, or optional norm fallbacks)
+        int unitOnesCount = Math.Max(_dim, 512);
+        float[] unitOnes = new float[unitOnesCount];
+        Array.Fill(unitOnes, 1.0f);
+        _dUnitOnesWeight = _ctx.CreateDeviceBuffer((ulong)(unitOnesCount * sizeof(float)));
+        fixed (float* pOnes = unitOnes)
+        {
+            _ctx.CopyToDevice(_dUnitOnesWeight, (IntPtr)pOnes, (ulong)(unitOnesCount * sizeof(float)));
+        }
+
+        if (_weights.RopeFreqsWeight != null &&
+            _weights.Gguf.TryGetTensor("rope_freqs.weight", out var rfTensor) &&
+            rfTensor != null &&
+            rfTensor.Dimensions.Length > 0 &&
+            rfTensor.Dimensions[0] > 0)
+        {
+            ulong rfBytes = rfTensor.Dimensions[0] * sizeof(float);
+            _dRopeFreqs = _ctx.CreateDeviceBuffer(rfBytes);
+            _ctx.CopyToDevice(_dRopeFreqs, (IntPtr)_weights.RopeFreqsWeight, rfBytes);
+        }
     }
 
     private ID3D12Resource UploadTensor(GgufType type, IntPtr hostPtr, int rows, int cols)
@@ -534,10 +614,19 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             GgufType.Q5_K => _psoGemvQ5K,
             GgufType.Q6_K => _psoGemvQ6K,
             GgufType.Q3_K => _psoGemvQ3K,
+            GgufType.Q4_0 => _psoGemvQ4_0,
+            GgufType.Q5_0 => _psoGemvQ5_0,
             GgufType.Q8_0 => _psoGemvQ8_0,
+            GgufType.Q2_K => _psoGemvQ2_K,
+            GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
+            GgufType.IQ2_XS => _psoGemvIQ2_XS,
+            GgufType.IQ2_S => _psoGemvIQ2_S,
+            GgufType.IQ3_XXS => _psoGemvIQ3_XXS,
+            GgufType.IQ3_S => _psoGemvIQ3_S,
+            GgufType.IQ4_NL => _psoGemvIQ4_NL,
             GgufType.IQ4_XS => _psoGemvIQ4_XS,
             GgufType.MXFP4 => _psoGemvMXFP4,
-            GgufType.F32 => _psoGemvFp32,
+            GgufType.F32 or GgufType.F16 or GgufType.BF16 => _psoGemvFp32,
             _ => throw new NotSupportedException($"Direct3D 12 GEMV does not support tensor quantization type {type}.")
         };
         cmdList.SetPipelineState(pso);
@@ -576,20 +665,39 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         *(float*)(&pConsts[1]) = eps;
         cmdList.SetComputeRoot32BitConstants(0, 2, (IntPtr)pConsts, 0);
 
-        cmdList.SetComputeRootShaderResourceView(1, weight?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
+        cmdList.SetComputeRootShaderResourceView(1, weight?.GPUVirtualAddress ?? _dUnitOnesWeight.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(2, x.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(3, dst.GPUVirtualAddress);
 
         cmdList.Dispatch(1, 1, 1);
     }
 
-    private void DispatchGeluGLU(ID3D12GraphicsCommandList cmdList, ID3D12Resource gate, ID3D12Resource up, ID3D12Resource dst, int size)
+    private void DispatchRmsNormHeads(ID3D12GraphicsCommandList cmdList, ID3D12Resource x, ID3D12Resource? weight, int nHeads, int headDim, float eps)
+    {
+        cmdList.SetComputeRootSignature(_sigRmsNormHeads);
+        cmdList.SetPipelineState(_psoRmsNormHeads);
+
+        uint* pConsts = stackalloc uint[3];
+        pConsts[0] = (uint)headDim;
+        pConsts[1] = (uint)nHeads;
+        *(float*)(&pConsts[2]) = eps;
+        cmdList.SetComputeRoot32BitConstants(0, 3, (IntPtr)pConsts, 0);
+
+        cmdList.SetComputeRootShaderResourceView(1, weight?.GPUVirtualAddress ?? _dUnitOnesWeight.GPUVirtualAddress);
+        cmdList.SetComputeRootUnorderedAccessView(2, x.GPUVirtualAddress);
+
+        cmdList.Dispatch((uint)nHeads, 1, 1);
+    }
+
+    private void DispatchGeluGLU(ID3D12GraphicsCommandList cmdList, ID3D12Resource gate, ID3D12Resource up, ID3D12Resource dst, int size, uint upOffset = 0)
     {
         cmdList.SetComputeRootSignature(_sigGeluGLU);
         cmdList.SetPipelineState(_psoGeluGLU);
 
-        uint pConst = (uint)size;
-        cmdList.SetComputeRoot32BitConstants(0, 1, (IntPtr)(&pConst), 0);
+        uint* pConsts = stackalloc uint[2];
+        pConsts[0] = (uint)size;
+        pConsts[1] = upOffset;
+        cmdList.SetComputeRoot32BitConstants(0, 2, (IntPtr)pConsts, 0);
 
         cmdList.SetComputeRootUnorderedAccessView(1, gate.GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(2, up.GPUVirtualAddress);
@@ -645,9 +753,9 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         int* selectedIndices = stackalloc int[maxTopK];
         float* selectedWeights = stackalloc float[maxTopK];
 
-        uint* ropeConsts = stackalloc uint[6];
+        uint* ropeConsts = stackalloc uint[7];
         uint* kvConsts = stackalloc uint[4];
-        uint* swaConsts = stackalloc uint[7];
+        uint* swaConsts = stackalloc uint[8];
         uint* smConsts = stackalloc uint[3];
         uint* lConsts = stackalloc uint[2];
 
@@ -681,19 +789,28 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             DispatchGemv(cmd, lw.QType, _dQ, _dAttnIn, lw.QWeight.GPUVirtualAddress, _dim, totalQDim);
             DispatchGemv(cmd, lw.KType, _dK, _dAttnIn, lw.KWeight.GPUVirtualAddress, _dim, totalKvDim);
 
-            // V Projection (or copy from K if absent)
+            // V Projection (or copy un-normalized K if absent)
             if (lMeta.VWeight != null)
             {
                 DispatchGemv(cmd, lw.VType, _dV, _dAttnIn, lw.VWeight.GPUVirtualAddress, _dim, totalKvDim);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
             }
             else
             {
+                cmd.ResourceBarrierUnorderedAccessView(null!);
                 DispatchVecAddWeighted(cmd, _dK, _dV, 1.0f, totalKvDim, accumulate: 0);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
             }
+
+            // Per-head Q-norm, K-norm, and unweighted V-norm (matching Gemma4Model)
+            DispatchRmsNormHeads(cmd, _dQ, lw.AttnQNormWeight, nHeads, headDim, _weights.RmsNormEps);
+            DispatchRmsNormHeads(cmd, _dK, lw.AttnKNormWeight, headsKv, headDim, _weights.RmsNormEps);
+            DispatchRmsNormHeads(cmd, _dV, null, headsKv, headDim, _weights.RmsNormEps);
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // RoPE on Q and K
             float freqBase = isSwa ? _weights.RopeFreqBaseSwa : _weights.RopeFreqBase;
+            bool useRopeFreqs = !isSwa && _dRopeFreqs != null;
             cmd.SetComputeRootSignature(_sigRope);
             cmd.SetPipelineState(_psoRope);
             ropeConsts[0] = (uint)nHeads;
@@ -702,9 +819,11 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             ropeConsts[3] = (uint)pos;
             *(float*)(&ropeConsts[4]) = freqBase;
             *(float*)(&ropeConsts[5]) = 1.0f;
-            cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)ropeConsts, 0);
-            cmd.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
-            cmd.SetComputeRootUnorderedAccessView(2, _dK.GPUVirtualAddress);
+            ropeConsts[6] = useRopeFreqs ? 1u : 0u;
+            cmd.SetComputeRoot32BitConstants(0, 7, (IntPtr)ropeConsts, 0);
+            cmd.SetComputeRootShaderResourceView(1, useRopeFreqs ? _dRopeFreqs!.GPUVirtualAddress : _dUnitOnesWeight.GPUVirtualAddress);
+            cmd.SetComputeRootUnorderedAccessView(2, _dQ.GPUVirtualAddress);
+            cmd.SetComputeRootUnorderedAccessView(3, _dK.GPUVirtualAddress);
             cmd.Dispatch(((uint)((nHeads + headsKv) * (headDim / 2)) + 255) / 256, 1, 1);
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
@@ -720,10 +839,25 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             cmd.SetComputeRootUnorderedAccessView(2, _dV.GPUVirtualAddress);
             cmd.SetComputeRootUnorderedAccessView(3, _dKeyCache[l].GPUVirtualAddress);
             cmd.SetComputeRootUnorderedAccessView(4, _dValCache[l].GPUVirtualAddress);
-            cmd.Dispatch(((uint)totalKvDim + 255) / 256, 1, 1);
+            if (KvPrecision == KvCachePrecision.Q4_0)
+            {
+                uint nb = (uint)((headDim + 31) / 32);
+                uint numPairs = (nb + 1) / 2;
+                cmd.Dispatch((uint)headsKv * numPairs, 1, 1);
+            }
+            else if (KvPrecision == KvCachePrecision.Fp16)
+            {
+                uint totalHalf = (uint)(headsKv * ((headDim + 1) / 2));
+                cmd.Dispatch((totalHalf + 127) / 128, 1, 1);
+            }
+            else
+            {
+                cmd.Dispatch(((uint)totalKvDim + 255) / 256, 1, 1);
+            }
             cmd.ResourceBarrierUnorderedAccessView(null!);
 
             // SWA Attention
+            float attnScale = headDim > 0 ? (1.0f / MathF.Sqrt(headDim)) : 1.0f;
             cmd.SetComputeRootSignature(_sigSwaAttention);
             cmd.SetPipelineState(_psoSwaAttention);
             swaConsts[0] = (uint)nHeads;
@@ -731,9 +865,10 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             swaConsts[2] = (uint)headDim;
             swaConsts[3] = (uint)_maxSeqLen;
             swaConsts[4] = (uint)pos;
-            *(float*)(&swaConsts[5]) = 1.0f; // attn_scale = 1.0 for Gemma 4
+            *(float*)(&swaConsts[5]) = attnScale;
             swaConsts[6] = isSwa ? (uint)_slidingWindow : 0u;
-            cmd.SetComputeRoot32BitConstants(0, 7, (IntPtr)swaConsts, 0);
+            *(float*)(&swaConsts[7]) = _attnLogitSoftcapping;
+            cmd.SetComputeRoot32BitConstants(0, 8, (IntPtr)swaConsts, 0);
             cmd.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
             cmd.SetComputeRootUnorderedAccessView(2, _dKeyCache[l].GPUVirtualAddress);
             cmd.SetComputeRootUnorderedAccessView(3, _dValCache[l].GPUVirtualAddress);
@@ -816,8 +951,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
                 _ctx.BeginCommands();
                 cmd = _ctx.CommandList;
 
-                ulong gateUpSliceBytes = (ulong)(2 * _expertFfnDim) * (ulong)GgufTypes.GetRowBytes(lw.FfnGateUpExpsType, _dim);
-                ulong downSliceBytes = (ulong)_dim * (ulong)GgufTypes.GetRowBytes(lw.FfnDownExpsType, _expertFfnDim);
+                ulong gateUpSliceBytes = D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnGateUpExpsType, 2 * _expertFfnDim, _dim);
+                ulong downSliceBytes = D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnDownExpsType, _dim, _expertFfnDim);
 
                 for (int k = 0; k < _expertUsedCount; k++)
                 {
@@ -831,8 +966,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
                     DispatchGemv(cmd, lw.FfnGateUpExpsType, _dExpertGateUp, _dMoeNorm, expGateUpAddr, _dim, 2 * _expertFfnDim);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                    // GeLU-GLU
-                    DispatchGeluGLU(cmd, _dExpertGateUp, _dExpertGateUp, _dExpertAct, _expertFfnDim);
+                    // GeLU-GLU: gate is [0 .. _expertFfnDim), up is [_expertFfnDim .. 2 * _expertFfnDim)
+                    DispatchGeluGLU(cmd, _dExpertGateUp, _dExpertGateUp, _dExpertAct, _expertFfnDim, upOffset: (uint)_expertFfnDim);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
 
                     // Down GEMV
@@ -987,6 +1122,8 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
 
             _dOutNormWeight?.Dispose();
             _dOutWeight?.Dispose();
+            _dUnitOnesWeight?.Dispose();
+            _dRopeFreqs?.Dispose();
 
             for (int l = 0; l < _dKeyCache.Length; l++)
             {
@@ -1000,7 +1137,16 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
             _psoGemvQ5K?.Dispose();
             _psoGemvQ6K?.Dispose();
             _psoGemvQ3K?.Dispose();
+            _psoGemvQ4_0?.Dispose();
+            _psoGemvQ5_0?.Dispose();
             _psoGemvQ8_0?.Dispose();
+            _psoGemvQ2_K?.Dispose();
+            _psoGemvIQ2_XXS?.Dispose();
+            _psoGemvIQ2_XS?.Dispose();
+            _psoGemvIQ2_S?.Dispose();
+            _psoGemvIQ3_XXS?.Dispose();
+            _psoGemvIQ3_S?.Dispose();
+            _psoGemvIQ4_NL?.Dispose();
             _psoGemvIQ4_XS?.Dispose();
             _psoGemvMXFP4?.Dispose();
             _psoGemvFp32?.Dispose();

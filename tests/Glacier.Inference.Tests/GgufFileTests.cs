@@ -269,6 +269,55 @@ public class GgufFileTests
     }
 
     [Fact]
+    public void GetRowBytes_UnalignedOrNegativeQuantizedCount_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => GgufTypes.GetRowBytes(GgufType.IQ2_XS, 100));
+        Assert.Throws<ArgumentException>(() => GgufTypes.GetRowBytes(GgufType.Q4_K, 300));
+        Assert.Throws<ArgumentException>(() => GgufTypes.GetRowBytes(GgufType.Q8_0, 16));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GgufTypes.GetRowBytes(GgufType.IQ2_XS, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GgufTypes.GetRowBytes(GgufType.F32, -4));
+        Assert.Equal(74L, GgufTypes.GetRowBytes(GgufType.IQ2_XS, 256));
+    }
+
+    [Fact]
+    public void Open_ThrowsInvalidDataException_WhenQuantizedTensorInnerDimNotBlockAligned()
+    {
+        string tempPath = Path.Combine(Path.GetTempPath(), $"gguf_unaligned_iq2xs_{Guid.NewGuid():N}.gguf");
+        try
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms);
+
+            // Header: 1 tensor [100, 64] IQ2_XS (total elements = 6400, divisible by 256, but inner dim 100 is not)
+            bw.Write(0x46554747U); // 'GGUF'
+            bw.Write(3U);          // version 3
+            bw.Write(1UL);         // tensorCount
+            bw.Write(0UL);         // kvCount
+
+            string tName = "blk.0.attn_q.weight";
+            bw.Write((ulong)tName.Length);
+            bw.Write(Encoding.UTF8.GetBytes(tName));
+            bw.Write(2U);                    // nDims = 2
+            bw.Write(100UL);                 // dim0 = 100 (not divisible by 256)
+            bw.Write(64UL);                  // dim1 = 64
+            bw.Write((uint)GgufType.IQ2_XS); // IQ2_XS (blockSize = 256, blockBytes = 74)
+            bw.Write(0UL);                   // offset
+
+            long rem = ms.Position % 32;
+            for (long i = 0; i < (rem == 0 ? 0 : 32 - rem); i++) bw.Write((byte)0);
+            bw.Write(new byte[1850]); // enough bytes for (6400 / 256) * 74 = 1850
+            bw.Flush();
+
+            File.WriteAllBytes(tempPath, ms.ToArray());
+            Assert.Throws<InvalidDataException>(() => GgufFile.Open(tempPath));
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
+
+    [Fact]
     public void InspectUniversalArchitectures()
     {
         string[] paths = [

@@ -84,6 +84,53 @@ public interface ICpuModel : IDisposable
     void RestoreRecurrentState(ReadOnlySpan<byte> source) { }
 
     /// <summary>
+    /// Minimum sorted expert rank eligible for speculative/verify MoE tail skipping (0 disables skipping).
+    /// When set above 0, experts at ranks &gt;= <see cref="MoeTailSkipMinRank"/> whose normalized
+    /// routing weight falls below a small fraction of the top-1 weight are skipped during batched verify.
+    /// </summary>
+    int MoeTailSkipMinRank { get => 0; set { } }
+
+    /// <summary>
+    /// True if the model implements batched multi-token speculative verification (<see cref="VerifyBatch"/>
+    /// and <see cref="VerifyBatchLogits"/>).
+    /// </summary>
+    bool SupportsBatchVerification => false;
+
+    /// <summary>
+    /// True if <see cref="VerifyBatch"/> and <see cref="VerifyBatchLogits"/> capture exact post-token
+    /// recurrent state snapshots into <c>perStepSnapshots</c>, eliminating rejection rollback replay.
+    /// </summary>
+    bool SupportsPerStepVerificationSnapshots => false;
+
+    /// <summary>
+    /// Executes batched multi-token verification and outputs the greedy argmax token ID for each token step.
+    /// When <paramref name="perStepSnapshots"/> is provided, step <c>t</c> (<c>0 &lt;= t &lt; perStepSnapshots.Length</c>)
+    /// receives the exact post-token recurrent state snapshot needed if token <c>t + 1</c> is rejected.
+    /// </summary>
+    void VerifyBatch(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<int> greedyTokens,
+        KVCache? kvCache = null,
+        byte[][]? perStepSnapshots = null)
+        => throw new NotSupportedException("VerifyBatch is not implemented for this model.");
+
+    /// <summary>
+    /// Executes batched multi-token verification and writes each step's vocabulary logits into
+    /// <paramref name="logitsOut"/> with row stride <paramref name="vocabStride"/>.
+    /// When <paramref name="perStepSnapshots"/> is provided, step <c>t</c> (<c>0 &lt;= t &lt; perStepSnapshots.Length</c>)
+    /// receives the exact post-token recurrent state snapshot needed if token <c>t + 1</c> is rejected.
+    /// </summary>
+    void VerifyBatchLogits(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<float> logitsOut,
+        int vocabStride,
+        KVCache? kvCache = null,
+        byte[][]? perStepSnapshots = null)
+        => throw new NotSupportedException("VerifyBatchLogits is not implemented for this model.");
+
+    /// <summary>
     /// Extracts a normalized embedding vector for the given token sequence.
     /// </summary>
     void ExtractEmbedding(

@@ -51,12 +51,12 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
 
     protected void LoadBaseKernels(bool loadMoe)
     {
-        _pRmsNorm = _vk.LoadEmbedded("rmsnorm", 3, 12);
-        _pAdd = _vk.LoadEmbedded("elementwise_add", 3, 4);
+        _pRmsNorm = _vk.LoadEmbedded("rmsnorm", 3, 12, writeBindingMask: 1u << 2);
+        _pAdd = _vk.LoadEmbedded("elementwise_add", 3, 4, writeBindingMask: 1u << 0);
         for (int q = 0; q < 12; q++)
         {
-            if (HasEmbeddedShader($"embed_q{q}")) _pEmbed[q] = _vk.LoadEmbedded($"embed_q{q}", 2, 8);
-            if (HasEmbeddedShader($"qmatvec_q{q}")) _pQmv[q] = _vk.LoadEmbedded($"qmatvec_q{q}", 3, 8);
+            if (HasEmbeddedShader($"embed_q{q}")) _pEmbed[q] = _vk.LoadEmbedded($"embed_q{q}", 2, 8, writeBindingMask: 1u << 1);
+            if (HasEmbeddedShader($"qmatvec_q{q}")) _pQmv[q] = _vk.LoadEmbedded($"qmatvec_q{q}", 3, 8, writeBindingMask: 1u << 2);
             if (loadMoe && HasEmbeddedShader($"qmatvec_moe_q{q}")) _pMoe[q] = _vk.LoadEmbedded($"qmatvec_moe_q{q}", 4, 16);
         }
     }
@@ -67,14 +67,14 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
         return s != null;
     }
 
-    protected static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
-    protected static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16;
+    protected static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.BF16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
+    protected static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16 or GgufType.BF16;
 
     protected static int QIdx(GgufType t) => t switch
     {
         GgufType.Q4_K => 0, GgufType.Q5_K => 1, GgufType.Q6_K => 2, GgufType.Q8_0 => 3,
         GgufType.IQ4_XS => 4, GgufType.MXFP4 => 5, GgufType.Q3_K => 6, GgufType.IQ4_NL => 7,
-        GgufType.Q2_K => 8, GgufType.Q4_0 => 9, GgufType.F16 => 10,
+        GgufType.Q2_K => 8, GgufType.Q4_0 => 9, GgufType.F16 => 10, GgufType.BF16 => 11,
         _ => throw new NotSupportedException($"Unsupported Vulkan quant type {t}"),
     };
 
@@ -93,6 +93,7 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
         GgufType.Q2_K => (elements / 256) * 84,
         GgufType.Q4_0 => (elements / 32) * 18,
         GgufType.F16 => elements * 2,
+        GgufType.BF16 => elements * 2,
         _ => throw new NotSupportedException($"Unsupported Vulkan quant type {t}"),
     };
 
@@ -106,7 +107,8 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     private protected void AddQmv(List<Op> list, GgufType t, VulkanCompute.GBuf w, VulkanCompute.GBuf x, VulkanCompute.GBuf y, int k, int m)
     {
         var kern = _pQmv[QIdx(t)];
-        list.Add(new Op { K = kern, Set = _vk.MakeSet(kern, w, x, y), Push = [(uint)k, (uint)m], Gx = (uint)Math.Min(m, 32768), Gy = (uint)((m + 32767) / 32768) });
+        int groups = (m + 3) / 4;
+        list.Add(new Op { K = kern, Set = _vk.MakeSet(kern, w, x, y), Push = [(uint)k, (uint)m], Gx = (uint)Math.Min(groups, 32768), Gy = (uint)((groups + 32767) / 32768) });
     }
 
     private protected void AddVec(List<Op> list, VulkanCompute.Kernel kern, VulkanCompute.GBuf a, VulkanCompute.GBuf b, VulkanCompute.GBuf o, int n) =>
@@ -115,7 +117,8 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     private protected void AddMoeMv(List<Op> list, GgufType t, VulkanCompute.GBuf w, VulkanCompute.GBuf idx, VulkanCompute.GBuf x, VulkanCompute.GBuf y, int k, int m, long sliceBytes, int xStride, int topK)
     {
         var kern = _pMoe[QIdx(t)];
-        list.Add(new Op { K = kern, Set = _vk.MakeSet(kern, w, idx, x, y), Push = [(uint)k, (uint)m, (uint)(sliceBytes / 4), (uint)xStride], Gx = (uint)Math.Min(m, 32768), Gy = (uint)topK });
+        int groups = (m + 3) / 4;
+        list.Add(new Op { K = kern, Set = _vk.MakeSet(kern, w, idx, x, y), Push = [(uint)k, (uint)m, (uint)(sliceBytes / 4), (uint)xStride], Gx = (uint)Math.Min(groups, 32768), Gy = (uint)topK });
     }
 
     public void ResetKvCache()

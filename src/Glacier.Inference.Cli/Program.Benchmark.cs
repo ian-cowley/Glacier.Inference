@@ -18,7 +18,9 @@ using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
+using Glacier.Inference.Model;
 using Glacier.Inference.Sampling;
+using Glacier.Inference.Tokenizer;
 using Glacier.Media.Vision;
 using Glacier.Media.Video;
 using Glacier.Media.Image;
@@ -77,14 +79,16 @@ public static partial class Program
         Console.WriteLine($"Embedding Dimension:    {gguf.EmbeddingLength}");
         Console.WriteLine($"Feed-Forward Dimension: {gguf.FeedForwardLength}");
         Console.WriteLine($"Attention Query Heads:  {gguf.HeadCount}");
-        Console.WriteLine($"Attention KV Heads:     {gguf.HeadCountKv} (Group ratio: {gguf.HeadCount / gguf.HeadCountKv}x)");
-        Console.WriteLine($"Head Dimension:         {gguf.EmbeddingLength / gguf.HeadCount}");
+        string kvGroupRatio = gguf.HeadCountKv > 0 ? $"{gguf.HeadCount / gguf.HeadCountKv}x" : "N/A";
+        Console.WriteLine($"Attention KV Heads:     {gguf.HeadCountKv} (Group ratio: {kvGroupRatio})");
+        Console.WriteLine($"Head Dimension:         {gguf.HeadDim}");
         Console.WriteLine($"Context Window:         {gguf.ContextLength:N0} tokens");
         Console.WriteLine($"RoPE Base Frequency:    {gguf.RopeFreqBase}");
         Console.WriteLine($"RMSNorm Epsilon:        {gguf.RmsNormEps}");
         Console.WriteLine($"EOS Token ID:           {gguf.EosTokenId}");
         Console.WriteLine($"Total Tensors:          {gguf.TensorCount}");
         Console.WriteLine($"Metadata Key-Values:    {gguf.MetadataKvCount}");
+        PrintInspectExtensions(gguf);
 
         ulong totalParamBytes = 0;
         foreach (var t in gguf.TensorList)
@@ -193,6 +197,17 @@ public static partial class Program
         string? engineStr = null;
         string? kvPrecisionStr = null;
         string? split = null;
+        string? pleIoStr = null;
+        double? hostArenaGib = null;
+        bool? tieredMoeOverride = null;
+        string? speculativeStr = null;
+        string? draftModelPath = null;
+        int? draftTokens = null;
+        int dflashSteps = new SpeculativeOptions().DFlashDiffusionSteps;
+        string? draftVocabStr = "full";
+        int moeTailSkip = 0;
+        float temperature = 0.7f;
+        bool rawPrompt = false;
         int maxSeqLen = 2048;
 
         for (int i = 0; i < args.Length; i++)
@@ -215,6 +230,28 @@ public static partial class Program
                 kvPrecisionStr = args[++i];
             else if (args[i] == "--split" && i + 1 < args.Length)
                 split = args[++i];
+            else if (args[i] == "--ple-io" && i + 1 < args.Length)
+                pleIoStr = args[++i];
+            else if (args[i] == "--host-arena-gib" && i + 1 < args.Length && double.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+                hostArenaGib = Math.Max(0.0, arenaGib);
+            else if (args[i] == "--tiered-moe")
+                tieredMoeOverride = true;
+            else if (args[i] == "--speculative" && i + 1 < args.Length)
+                speculativeStr = args[++i];
+            else if (args[i] == "--draft-model" && i + 1 < args.Length)
+                draftModelPath = args[++i];
+            else if (args[i] == "--draft-tokens" && i + 1 < args.Length && int.TryParse(args[++i], out int dt))
+                draftTokens = Math.Max(0, dt);
+            else if (args[i] == "--dflash-steps" && i + 1 < args.Length && int.TryParse(args[++i], out int dfs))
+                dflashSteps = Math.Max(1, dfs);
+            else if (args[i] == "--draft-vocab" && i + 1 < args.Length)
+                draftVocabStr = args[++i];
+            else if (args[i] == "--moe-tail-skip" && i + 1 < args.Length && int.TryParse(args[++i], out int mts))
+                moeTailSkip = Math.Max(0, mts);
+            else if ((args[i] == "--temp" || args[i] == "--temperature") && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float tempVal))
+                temperature = tempVal;
+            else if (args[i] == "--raw")
+                rawPrompt = true;
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
             else if (!args[i].StartsWith("-") && modelPath == null)
@@ -238,10 +275,12 @@ public static partial class Program
         }
 
         KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
         {
             kvPrecision = parsedPrecision;
         }
+
+        PleIoMode pleIoMode = ParsePleIoMode(pleIoStr);
 
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine("=======================================================================");
@@ -253,29 +292,49 @@ public static partial class Program
         Console.WriteLine($"Prompt:       \"{prompt}\"");
         Console.WriteLine($"Context Len:  {maxSeqLen}");
         Console.WriteLine($"KV Precision: {kvPrecision}");
+        Console.WriteLine($"PLE I/O:      {pleIoMode}");
+        Console.WriteLine($"Temperature:  {temperature:F2} (Raw={rawPrompt})");
+        if (!string.IsNullOrWhiteSpace(speculativeStr) || !string.IsNullOrWhiteSpace(draftModelPath))
+            Console.WriteLine($"Speculative:  mode={speculativeStr ?? "adaptive"}, draftTokens={draftTokens?.ToString() ?? "auto"}, vocab={draftVocabStr ?? "full"}{(moeTailSkip > 0 ? $", tailSkip={moeTailSkip}" : "")}{(!string.IsNullOrWhiteSpace(draftModelPath) ? $", sidecar={Path.GetFileName(draftModelPath)}" : "")}");
         if (!string.IsNullOrEmpty(split))
             Console.WriteLine($"Pipeline Split: {split}");
         if (!string.IsNullOrEmpty(compareOllamaUrl))
             Console.WriteLine($"Comparative:  Ollama at {compareOllamaUrl}");
         Console.WriteLine();
 
+        var hwSnapshot = HardwareRuntimeProfiler.CaptureSnapshot();
+        ulong? hostArenaBudgetBytes = hostArenaGib.HasValue ? (ulong)(hostArenaGib.Value * 1024.0 * 1024 * 1024) : null;
+        Console.WriteLine($">> Hardware Profile: {HardwareRuntimeProfiler.FormatSummaryLine(hwSnapshot)}");
         Console.WriteLine(">> Loading model into zero-copy virtual address space...");
         var loadSw = Stopwatch.StartNew();
-        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split, pleIoMode: pleIoMode, hostArenaBudgetBytes: hostArenaBudgetBytes, tieredMoe: tieredMoeOverride);
         loadSw.Stop();
+        var hwPolicy = HardwareRuntimeProfiler.RecommendPolicy(hwSnapshot, session.Weights);
+        int resolvedDraftTokens = draftTokens ?? hwPolicy.RecommendedMtpDraftTokens;
+        session.MoeTailSkipMinRank = moeTailSkip;
         Console.WriteLine($"   Cold load completed in: {loadSw.ElapsedMilliseconds} ms ({loadSw.Elapsed.TotalSeconds:F2} s)");
         Console.WriteLine($"   Execution Device: {session.ActiveDevice}");
 
+        using var draftBundle = CreateDraftBundle(session, speculativeStr, draftModelPath, draftVocabStr, resolvedDraftTokens, dflashSteps);
         Console.WriteLine("\n>> Running Glacier.Inference...");
-        var options = new SamplingOptions { MaxTokens = targetTokens, Temperature = 0.7f };
-        var glacierResult = await session.GenerateAsync(prompt, options, formatChat: true);
+        var options = CreateSamplingOptions(targetTokens, temperature);
+        var (glacierText, _, glacierMetrics, specMetrics) = await ExecuteGenerationAsync(
+            session,
+            draftBundle.Provider,
+            prompt,
+            options,
+            resolvedDraftTokens,
+            formatChat: !rawPrompt,
+            onToken: null,
+            dflashSteps: dflashSteps).ConfigureAwait(false);
 
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"   Output: \"{glacierResult.Text.Trim()}\"");
+        Console.WriteLine($"   Output: \"{glacierText.Trim()}\"");
         Console.ResetColor();
-        Console.WriteLine($"   Prompt Rate:     {glacierResult.Metrics.PromptTokensPerSecond:F2} tokens/sec ({glacierResult.Metrics.PromptEvalDuration.TotalMilliseconds:F1} ms)");
-        Console.WriteLine($"   Generation Rate: {glacierResult.Metrics.GenerationTokensPerSecond:F2} tokens/sec ({glacierResult.Metrics.GenerationDuration.TotalMilliseconds:F1} ms)");
-        Console.WriteLine($"   Total Time:      {glacierResult.Metrics.TotalDuration.TotalSeconds:F2} s");
+        Console.WriteLine($"   Prompt Rate:     {glacierMetrics.PromptTokensPerSecond:F2} tokens/sec ({glacierMetrics.PromptEvalDuration.TotalMilliseconds:F1} ms)");
+        Console.WriteLine($"   Generation Rate: {glacierMetrics.GenerationTokensPerSecond:F2} tokens/sec ({glacierMetrics.GenerationDuration.TotalMilliseconds:F1} ms)");
+        Console.WriteLine($"   Total Time:      {glacierMetrics.TotalDuration.TotalSeconds:F2} s");
+        PrintSessionTelemetry(session, specMetrics, draftBundle.Adaptive, hwSnapshot, hwPolicy, resolvedDraftTokens);
 
         if (!string.IsNullOrEmpty(compareOllamaUrl))
         {
@@ -292,7 +351,7 @@ public static partial class Program
                     Model = targetOllamaModel,
                     Prompt = prompt,
                     Stream = false,
-                    Options = new OllamaBenchOptions { NumPredict = targetTokens, Temperature = 0.7 }
+                    Options = new OllamaBenchOptions { NumPredict = targetTokens, Temperature = temperature }
                 };
 
                 var oSw = Stopwatch.StartNew();
@@ -340,9 +399,9 @@ public static partial class Program
                         }
                     }
 
-                    double gGenTps = glacierResult.Metrics.GenerationTokensPerSecond;
-                    double gPromptTps = glacierResult.Metrics.PromptTokensPerSecond;
-                    double gWallSec = glacierResult.Metrics.TotalDuration.TotalSeconds;
+                    double gGenTps = glacierMetrics.GenerationTokensPerSecond;
+                    double gPromptTps = glacierMetrics.PromptTokensPerSecond;
+                    double gWallSec = glacierMetrics.TotalDuration.TotalSeconds;
                     double oWallSec = oSw.Elapsed.TotalSeconds;
 
                     PrintSummaryRow("Runtime", "Pure C# .NET 10 Native AOT", "Go + C++ CUDA / llama.cpp", true, "Direct Hardware Acceleration");
@@ -363,7 +422,7 @@ public static partial class Program
                         PrintSummaryRow("Generation Rate", $"{gGenTps:F1} t/s", $"{oGenTps:F1} t/s", genFaster, genFaster ? $"+{genDiff:F1}% FASTER" : $"{genDiff:F1}% (Near Parity)");
                     }
 
-                    PrintSummaryRow("Generated Tokens", $"{glacierResult.Metrics.GeneratedTokens}", $"{evalCount}", false);
+                    PrintSummaryRow("Generated Tokens", $"{glacierMetrics.GeneratedTokens}", $"{evalCount}", false);
 
                     if (oWallSec > 0)
                     {
@@ -404,6 +463,15 @@ public static partial class Program
         string? engineStr = null;
         string? kvPrecisionStr = null;
         string? split = null;
+        string? pleIoStr = null;
+        double? hostArenaGib = null;
+        bool? tieredMoeOverride = null;
+        string? speculativeStr = null;
+        string? draftModelPath = null;
+        int? draftTokens = null;
+        int dflashSteps = new SpeculativeOptions().DFlashDiffusionSteps;
+        string? draftVocabStr = "full";
+        int moeTailSkip = 0;
         string? loraPath = null;
         int maxSeqLen = 2048;
         int maxTokens = 512;
@@ -430,6 +498,24 @@ public static partial class Program
                 kvPrecisionStr = args[++i];
             else if (args[i] == "--split" && i + 1 < args.Length)
                 split = args[++i];
+            else if (args[i] == "--ple-io" && i + 1 < args.Length)
+                pleIoStr = args[++i];
+            else if (args[i] == "--host-arena-gib" && i + 1 < args.Length && double.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+                hostArenaGib = Math.Max(0.0, arenaGib);
+            else if (args[i] == "--tiered-moe")
+                tieredMoeOverride = true;
+            else if (args[i] == "--speculative" && i + 1 < args.Length)
+                speculativeStr = args[++i];
+            else if (args[i] == "--draft-model" && i + 1 < args.Length)
+                draftModelPath = args[++i];
+            else if (args[i] == "--draft-tokens" && i + 1 < args.Length && int.TryParse(args[++i], out int dt))
+                draftTokens = Math.Max(0, dt);
+            else if (args[i] == "--dflash-steps" && i + 1 < args.Length && int.TryParse(args[++i], out int dfs))
+                dflashSteps = Math.Max(1, dfs);
+            else if (args[i] == "--draft-vocab" && i + 1 < args.Length)
+                draftVocabStr = args[++i];
+            else if (args[i] == "--moe-tail-skip" && i + 1 < args.Length && int.TryParse(args[++i], out int mts))
+                moeTailSkip = Math.Max(0, mts);
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
                 maxSeqLen = cLen;
             else if ((args[i] == "-n" || args[i] == "--tokens" || args[i] == "--max-tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int tok))
@@ -470,16 +556,21 @@ public static partial class Program
         }
 
         KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
         {
             kvPrecision = parsedPrecision;
         }
 
+        PleIoMode pleIoMode = ParsePleIoMode(pleIoStr);
+
+        var hwSnapshot = HardwareRuntimeProfiler.CaptureSnapshot();
+        ulong? hostArenaBudgetBytes = hostArenaGib.HasValue ? (ulong)(hostArenaGib.Value * 1024.0 * 1024 * 1024) : null;
+        Console.WriteLine($"Hardware Profile: {HardwareRuntimeProfiler.FormatSummaryLine(hwSnapshot)}");
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference...");
+        Console.WriteLine($"Loading {Path.GetFileName(modelPath)} into Glacier.Inference (PLE I/O: {pleIoMode})...");
         Console.ResetColor();
 
-        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
+        using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split, pleIoMode: pleIoMode, hostArenaBudgetBytes: hostArenaBudgetBytes, tieredMoe: tieredMoeOverride);
         if (!string.IsNullOrEmpty(loraPath))
         {
             session.AttachLora(loraPath);
@@ -487,9 +578,15 @@ public static partial class Program
             Console.WriteLine($">> Attached Pure C# LoRA Adapter: {Path.GetFileName(loraPath)} (Rank={session.CpuModel?.LoraWeights?.Rank}, Alpha={session.CpuModel?.LoraWeights?.Alpha})");
             Console.ResetColor();
         }
+
+        var hwPolicy = HardwareRuntimeProfiler.RecommendPolicy(hwSnapshot, session.Weights);
+        int resolvedDraftTokens = draftTokens ?? hwPolicy.RecommendedMtpDraftTokens;
+        session.MoeTailSkipMinRank = moeTailSkip;
+
+        using var draftBundle = CreateDraftBundle(session, speculativeStr, draftModelPath, draftVocabStr, resolvedDraftTokens, dflashSteps);
         Console.WriteLine($"Model ready on {session.ActiveDevice}.\n");
 
-        var options = new SamplingOptions { MaxTokens = maxTokens, Temperature = temperature, TopP = topP };
+        var options = CreateSamplingOptions(maxTokens, temperature, topP);
 
         // Single-shot prompt mode
         if (!string.IsNullOrEmpty(initialPrompt))
@@ -498,13 +595,21 @@ public static partial class Program
             Console.WriteLine($">>> {initialPrompt}\n");
             Console.ResetColor();
 
-            var result = await session.GenerateAsync(
+            var (_, finishReason, metrics, specMetrics) = await ExecuteGenerationAsync(
+                session,
+                draftBundle.Provider,
                 initialPrompt,
                 options,
+                resolvedDraftTokens,
                 formatChat: !rawPrompt,
-                onToken: t => Console.Write(t));
+                onToken: t => Console.Write(t),
+                dflashSteps: dflashSteps).ConfigureAwait(false);
 
-            Console.WriteLine($"\n\n[{result.Metrics.GenerationTokensPerSecond:F1} tokens/sec | {result.Metrics.GeneratedTokens} tokens | {result.FinishReason}]");
+            Console.WriteLine($"\n\n[{metrics.GenerationTokensPerSecond:F1} tokens/sec | {metrics.GeneratedTokens} tokens | {finishReason}]");
+            if (session.PleTable != null || session.ExpertArena != null || specMetrics != null || session.D3D12Model is Glacier.Inference.Gpu.D3D12.Qwen3HybridD3D12Model)
+            {
+                PrintSessionTelemetry(session, specMetrics, draftBundle.Adaptive, hwSnapshot, hwPolicy, resolvedDraftTokens);
+            }
             return 0;
         }
 
@@ -528,19 +633,313 @@ public static partial class Program
             }
 
             Console.ForegroundColor = ConsoleColor.White;
-            var result = await session.GenerateAsync(
+            var (_, _, metrics, _) = await ExecuteGenerationAsync(
+                session,
+                draftBundle.Provider,
                 line,
                 options,
-                formatChat: true,
-                onToken: t => Console.Write(t));
+                resolvedDraftTokens,
+                formatChat: !rawPrompt,
+                onToken: t => Console.Write(t),
+                dflashSteps: dflashSteps).ConfigureAwait(false);
             Console.ResetColor();
 
             Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"\n[{result.Metrics.GenerationTokensPerSecond:F1} tokens/sec | {result.Metrics.GeneratedTokens} tokens]");
+            Console.WriteLine($"\n[{metrics.GenerationTokensPerSecond:F1} tokens/sec | {metrics.GeneratedTokens} tokens]");
             Console.ResetColor();
         }
 
         return 0;
+    }
+
+    private static void PrintInspectExtensions(GgufFile gguf)
+    {
+        if (gguf.IsMoe)
+        {
+            Console.WriteLine($"MoE Experts:            {gguf.ExpertCount} (Active: {gguf.ExpertUsedCount}, Expert FFN: {gguf.ExpertFeedForwardLength})");
+            int sharedFfn = (int)gguf.GetMetadataUInt32($"{gguf.Architecture}.expert_shared_feed_forward_length",
+                gguf.GetMetadataUInt32("expert_shared_feed_forward_length", 0));
+            if (sharedFfn > 0)
+                Console.WriteLine($"Shared Expert FFN:      {sharedFfn}");
+        }
+
+        int hcCount = gguf.HyperConnectionCount;
+        if (hcCount == 0 && gguf.TryGetTensor("blk.0.hc_attn_inject.weight", out var hcInj) && hcInj != null && hcInj.Dimensions.Length >= 2)
+            hcCount = (int)hcInj.Dimensions[1];
+        if (hcCount == 0 && gguf.TryGetTensor("blk.0.hc_attn_norm.weight", out var hcNorm) && hcNorm != null)
+        {
+            if (hcNorm.Dimensions.Length >= 2)
+                hcCount = (int)hcNorm.Dimensions[1];
+            else if (gguf.EmbeddingLength > 0 && hcNorm.ElementCount > (ulong)gguf.EmbeddingLength && hcNorm.ElementCount % (ulong)gguf.EmbeddingLength == 0)
+                hcCount = (int)(hcNorm.ElementCount / (ulong)gguf.EmbeddingLength);
+        }
+
+        int hcLowRank = gguf.HyperConnectionLowRank;
+        if (hcLowRank == 0 && gguf.TryGetTensor("blk.0.hc_attn_down.weight", out var hcDown) && hcDown != null && hcDown.Dimensions.Length >= 2)
+            hcLowRank = (int)hcDown.Dimensions[1];
+        if (hcLowRank == 0 && hcCount > 0 && gguf.TryGetTensor("blk.0.hc_attn_down_inject.weight", out var hcDownInj) && hcDownInj != null && hcDownInj.Dimensions.Length >= 2)
+        {
+            int nLo = (int)hcDownInj.Dimensions[1] - hcCount;
+            if (nLo > 0) hcLowRank = nLo;
+        }
+
+        if (hcCount > 0 || gguf.Tensors.ContainsKey("blk.0.hc_attn_norm.weight"))
+            Console.WriteLine($"Hyper-Connections:      {hcCount} streams (low-rank: {hcLowRank})");
+
+        if (gguf.AttentionCompressRatios != null || gguf.TensorList.Any(t => t.Name.EndsWith(".indexer.q_proj.weight", StringComparison.Ordinal)))
+            Console.WriteLine($"QSA Sparse Indexer:     heads={gguf.IndexerHeadCount}, key_dim={gguf.IndexerKeyLength}, top_k={gguf.IndexerTopK}");
+
+        if (gguf.PleLayers is { Length: > 0 } || gguf.Tensors.ContainsKey("per_layer_token_embd.weight"))
+            Console.WriteLine($"PLE N-gram Table:       ngram={gguf.PleNgramSize}, heads/ngram={gguf.PleHeadsPerNgram}, dim={gguf.PleRowDim}, source={gguf.PleTableFilePath ?? "(inline)"}");
+
+        var nextnTensors = gguf.TensorList
+            .Where(t => t.Name.EndsWith(".nextn.eh_proj.weight", StringComparison.Ordinal) ||
+                        t.Name.EndsWith(".nextn.fc_emb.weight", StringComparison.Ordinal) ||
+                        t.Name == "mtp.eh_proj.weight" ||
+                        t.Name == "mtp.fc_emb.weight")
+            .Select(t => t.Name)
+            .ToList();
+        if (nextnTensors.Count > 0)
+            Console.WriteLine($"NextN / MTP Block:      {string.Join(", ", nextnTensors)}");
+    }
+
+    private static PleIoMode ParsePleIoMode(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return PleIoMode.Auto;
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "auto" => PleIoMode.Auto,
+            "direct" or "directio" or "direct-io" => PleIoMode.DirectIo,
+            "mmap" or "memorymapped" or "memory-mapped" => PleIoMode.MemoryMapped,
+            _ => throw new ArgumentException($"Unsupported --ple-io mode '{value}'. Expected 'auto', 'direct', or 'mmap'.", nameof(value))
+        };
+    }
+
+    private static SamplingOptions CreateSamplingOptions(int maxTokens, float temperature, float topP = 0.9f)
+    {
+        if (temperature <= Sampler.GreedyTemperatureThreshold)
+        {
+            return new SamplingOptions
+            {
+                MaxTokens = maxTokens,
+                Temperature = 0f,
+                TopP = 1.0f,
+                TopK = 1,
+                RepetitionPenalty = 1.0f,
+                EnableReasoningLoopGuard = false
+            };
+        }
+
+        return new SamplingOptions
+        {
+            MaxTokens = maxTokens,
+            Temperature = temperature,
+            TopP = topP
+        };
+    }
+
+    private static DraftVocabularySubset? ResolveDraftVocabularySubset(BpeTokenizer tokenizer, string? draftVocabStr)
+    {
+        if (string.IsNullOrWhiteSpace(draftVocabStr) || draftVocabStr.Equals("full", StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (draftVocabStr.Equals("lang", StringComparison.OrdinalIgnoreCase))
+            return DraftVocabularySubset.FromLanguageFilter(tokenizer);
+        return DraftVocabularySubset.LoadBinary(draftVocabStr);
+    }
+
+    private sealed class CliDraftBundle : IDisposable
+    {
+        public IDraftProvider? Provider { get; init; }
+        public AdaptiveCompositeDraftProvider? Adaptive { get; init; }
+        public MtpDraftProvider? Mtp { get; init; }
+        public DFlashDraftProvider? DFlash { get; init; }
+        public PromptLookupDraftProvider? Lookup { get; init; }
+
+        public void Dispose()
+        {
+            Adaptive?.Dispose();
+            Mtp?.Dispose();
+            DFlash?.Dispose();
+            Lookup?.Dispose();
+        }
+    }
+
+    private static CliDraftBundle CreateDraftBundle(
+        InferenceSession session,
+        string? speculativeStr,
+        string? draftModelPath,
+        string? draftVocabStr,
+        int maxDraftTokens,
+        int dflashSteps = 3)
+    {
+        string mode = string.IsNullOrWhiteSpace(speculativeStr)
+            ? (!string.IsNullOrWhiteSpace(draftModelPath) ? "adaptive" : "off")
+            : speculativeStr.Trim().ToLowerInvariant();
+
+        if (mode is "off" or "none")
+            return new CliDraftBundle();
+
+        DraftVocabularySubset? subset = ResolveDraftVocabularySubset(session.Tokenizer, draftVocabStr);
+
+        MtpDraftProvider? CreateMtp()
+        {
+            if (session.HiddenStateSource is not IHiddenStateSource trunk)
+            {
+                if (!string.IsNullOrWhiteSpace(draftModelPath) || mode == "mtp")
+                    throw new InvalidOperationException("MTP speculative decoding requires an active hidden-state runtime (CPU, Direct3D 12, or Vulkan).");
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(draftModelPath))
+                return MtpDraftProvider.LoadFromSidecar(trunk, session.Weights, session.MaxSeqLen, draftModelPath, subset);
+
+            return MtpDraftProvider.TryCreateFromModel(trunk, session.Weights, session.MaxSeqLen, subset);
+        }
+
+        DFlashDraftProvider? CreateDFlash(bool allowWeightFreeFallback)
+        {
+            var dflashOpts = new DFlashOptions
+            {
+                BlockSize = Math.Max(1, maxDraftTokens),
+                DiffusionSteps = Math.Max(1, dflashSteps)
+            };
+
+            if (session.HiddenStateSource is IHiddenStateSource trunk)
+            {
+                if (!string.IsNullOrWhiteSpace(draftModelPath) && mode == "dflash")
+                {
+                    return DFlashDraftProvider.LoadFromSidecar(trunk, session.Weights, draftModelPath, dflashOpts, subset);
+                }
+
+                DFlashDraftProvider? embedded = DFlashDraftProvider.TryCreateFromModel(trunk, session.Weights, dflashOpts, subset);
+                if (embedded != null)
+                    return embedded;
+
+                return allowWeightFreeFallback ? DFlashDraftProvider.CreateContextConditioned(trunk, dflashOpts) : null;
+            }
+
+            return allowWeightFreeFallback ? new DFlashDraftProvider(dflashOpts) : null;
+        }
+
+        switch (mode)
+        {
+            case "lookup":
+            {
+                var lookup = new PromptLookupDraftProvider(minMatchLength: 2, maxMatchLength: 4);
+                return new CliDraftBundle { Provider = lookup, Lookup = lookup };
+            }
+            case "mtp":
+            {
+                var mtp = CreateMtp() ?? throw new InvalidOperationException("No embedded NextN/MTP block or --draft-model sidecar available for --speculative mtp.");
+                return new CliDraftBundle { Provider = mtp, Mtp = mtp };
+            }
+            case "dflash":
+            {
+                var dflash = CreateDFlash(allowWeightFreeFallback: true)!;
+                return new CliDraftBundle { Provider = dflash, DFlash = dflash };
+            }
+            case "adaptive":
+            {
+                var lookup = new PromptLookupDraftProvider(minMatchLength: 2, maxMatchLength: 4);
+                var mtp = CreateMtp();
+                var dflash = CreateDFlash(allowWeightFreeFallback: true);
+                var policy = new CostGatedDraftPolicy(
+                    maxMtpDraftTokens: Math.Max(1, maxDraftTokens),
+                    maxLookupDraftTokens: Math.Max(2, maxDraftTokens))
+                {
+                    MaxDFlashDraftTokens = Math.Max(1, maxDraftTokens)
+                };
+                var adaptive = new AdaptiveCompositeDraftProvider(lookup, mtp, policy, ownsProviders: false, dflashProvider: dflash);
+                return new CliDraftBundle { Provider = adaptive, Adaptive = adaptive, Mtp = mtp, DFlash = dflash, Lookup = lookup };
+            }
+            default:
+                throw new ArgumentException($"Unsupported --speculative mode '{speculativeStr}'. Expected off, lookup, mtp, dflash, or adaptive.", nameof(speculativeStr));
+        }
+    }
+
+    private static async Task<(string Text, string FinishReason, GenerationMetrics Metrics, SpeculativeMetrics? SpecMetrics)> ExecuteGenerationAsync(
+        InferenceSession session,
+        IDraftProvider? draftProvider,
+        string prompt,
+        SamplingOptions samplingOptions,
+        int maxDraftTokens,
+        bool formatChat,
+        Action<string>? onToken,
+        int dflashSteps = 3)
+    {
+        if (draftProvider != null)
+        {
+            using var specEngine = new SpeculativeEngine(session, draftProvider);
+            var specResult = await specEngine.GenerateAsync(
+                prompt,
+                new SpeculativeOptions
+                {
+                    MaxTokens = samplingOptions.MaxTokens,
+                    MaxDraftTokens = maxDraftTokens,
+                    MinNgramMatch = 2,
+                    MaxNgramMatch = 4,
+                    Sampling = samplingOptions,
+                    DFlashDiffusionSteps = Math.Max(1, dflashSteps)
+                },
+                formatChat: formatChat,
+                onToken: onToken).ConfigureAwait(false);
+            return (specResult.Text, specResult.FinishReason, specResult.Metrics, specResult.SpeculativeMetrics);
+        }
+
+        var result = await session.GenerateAsync(prompt, samplingOptions, formatChat: formatChat, onToken: onToken).ConfigureAwait(false);
+        return (result.Text, result.FinishReason, result.Metrics, null);
+    }
+
+    private static void PrintSessionTelemetry(
+        InferenceSession session,
+        SpeculativeMetrics? specMetrics,
+        AdaptiveCompositeDraftProvider? adaptive,
+        HardwareRuntimeSnapshot? hwSnapshot = null,
+        HardwareExecutionPolicy? hwPolicy = null,
+        int? resolvedDraftTokens = null)
+    {
+        if (hwSnapshot != null)
+        {
+            string tailTag = session.MoeTailSkipMinRank > 0 ? $" | MoeTailSkipRank={session.MoeTailSkipMinRank}" : "";
+            string draftTag = resolvedDraftTokens.HasValue ? $" | MtpDraft={resolvedDraftTokens.Value}" : "";
+            string recTag = hwPolicy != null ? $" (Rec={hwPolicy.RecommendedMtpDraftTokens})" : "";
+            Console.WriteLine($"   Hardware Profile: {HardwareRuntimeProfiler.FormatSummaryLine(hwSnapshot)}{draftTag}{recTag}{tailTag}");
+        }
+
+        using var proc = Process.GetCurrentProcess();
+        proc.Refresh();
+        double workingSetMb = proc.WorkingSet64 / (1024.0 * 1024.0);
+        double privateMb = proc.PrivateMemorySize64 / (1024.0 * 1024.0);
+        double virtualGb = proc.VirtualMemorySize64 / (1024.0 * 1024.0 * 1024.0);
+        Console.WriteLine($"   Process Memory:  WorkingSet={workingSetMb:F1} MB | PrivateBytes={privateMb:F1} MB | Virtual={virtualGb:F2} GB");
+
+        if (session.ExpertArena != null)
+        {
+            var arena = session.ExpertArena;
+            double arenaGiB = arena.AllocatedBytes / (1024.0 * 1024.0 * 1024.0);
+            Console.WriteLine($"   Host Expert Arena: {arena.ResidentMoeLayers}/{arena.TotalMoeLayers} MoE layers in RAM ({arenaGiB:F2} GiB, {arena.LoadBandwidthGBps:F1} GB/s, Unbuffered={arena.UsedUnbufferedIo})");
+        }
+
+        if (session.D3D12Model is Glacier.Inference.Gpu.D3D12.Qwen3HybridD3D12Model qhD3d && qhD3d.TieredMoe)
+        {
+            Console.WriteLine($"   D3D12 Hosted MoE:  Slots={qhD3d.ActiveHostedMoeSlots}/{qhD3d.HostedMoeSlotCapacity} | GPU Hits={qhD3d.GpuExpertHitCount:N0} | PCIe Xfers={qhD3d.GpuExpertTransferCount:N0} | CPU Overflow={qhD3d.CpuExpertOverflowCount:N0} | GPU Ratio={qhD3d.GpuExpertExecutionRatio:P1}");
+        }
+
+        if (session.PleTable != null)
+        {
+            var ple = session.PleTable;
+            Console.WriteLine($"   PLE Table I/O:   Mode={ple.IoMode} | Unbuffered={ple.IsUnbufferedHandleActive} | CacheHits={ple.CacheHits:N0} | CacheMisses={ple.CacheMisses:N0} | PhysicalPages={ple.PhysicalPagesIssued:N0}");
+        }
+
+        if (specMetrics != null)
+        {
+            Console.WriteLine($"   Speculative:     Steps={specMetrics.SpeculativeSteps} | Proposed={specMetrics.DraftTokensProposed} | Accepted={specMetrics.DraftTokensAccepted} ({specMetrics.AcceptanceRate:P1}) | AvgTok/Step={specMetrics.AverageTokensPerStep:F2} | Speedup={specMetrics.EstimatedSpeedup:F2}x | SerialFallback={specMetrics.SerialFallbackSteps}");
+        }
+
+        if (adaptive != null)
+        {
+            Console.WriteLine($"   Adaptive Routes: PromptLookupRounds={adaptive.PromptLookupRounds} | MtpRounds={adaptive.MtpRounds} | DFlashRounds={adaptive.DFlashRounds} | SerialBypassRounds={adaptive.SerialBypassRounds}");
+        }
     }
 
     // =========================================================================

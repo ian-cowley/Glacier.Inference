@@ -28,13 +28,13 @@ float rmsScale(float v) {
     return r;
 }
 
-float ropeApply(uint d) {
+float ropeApply(uint d, uint pos) {
     // sh[] holds the normalised head; returns rotated value for element d
     uint half_ = pc.ropeDim / 2u;
     if (d >= pc.ropeDim) return sh[d];
     uint i = d % half_;
     float freq = 1.0 / pow(pc.freqBase, float(2u * i) / float(pc.ropeDim));
-    float theta = float(pc.pos) * freq;
+    float theta = float(pos) * freq;
     float c = cos(theta), s = sin(theta);
     float a = sh[i], b = sh[i + half_];
     return d < half_ ? a * c - b * s : a * s + b * c;
@@ -42,23 +42,29 @@ float ropeApply(uint d) {
 
 void main() {
     uint w = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint pos = pc.pos + b;
     uint d = gl_LocalInvocationID.x;
     if (w < pc.nQ) {
-        float q = qFull[w * 512u + d];
-        gateOut[w * 256u + d] = qFull[w * 512u + 256u + d];
+        uint qRawOff = (b * pc.nQ + w) * 512u;
+        uint qOutOff = (b * pc.nQ + w) * 256u;
+        float q = qFull[qRawOff + d];
+        gateOut[qOutOff + d] = qFull[qRawOff + 256u + d];
         float r = rmsScale(q);
         sh[d] = q * r * qNormW[d];
         barrier();
-        qOut[w * 256u + d] = ropeApply(d);
+        qOut[qOutOff + d] = ropeApply(d, pos);
     } else if (w < pc.nQ + pc.nKv) {
         uint kh = w - pc.nQ;
-        float k = kRaw[kh * 256u + d];
+        uint kvRawOff = (b * pc.nKv + kh) * 256u;
+        float k = kRaw[kvRawOff + d];
         float r = rmsScale(k);
         sh[d] = k * r * kNormW[d];
         barrier();
-        kCache[(kh * pc.maxSeq + pc.pos) * 256u + d] = ropeApply(d);
+        kCache[(kh * pc.maxSeq + pos) * 256u + d] = ropeApply(d, pos);
     } else {
         uint kh = w - pc.nQ - pc.nKv;
-        vCache[(kh * pc.maxSeq + pc.pos) * 256u + d] = vRaw[kh * 256u + d];
+        uint kvRawOff = (b * pc.nKv + kh) * 256u;
+        vCache[(kh * pc.maxSeq + pos) * 256u + d] = vRaw[kvRawOff + d];
     }
 }

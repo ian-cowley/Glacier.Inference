@@ -1,17 +1,31 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
-// Embedding gather: x[i] = dequant(table[token][i]) for i in [0, dim). One workgroup of 256 threads.
+// Embedding gather: x[i] = dequant(table[token][i]) for i in [0, dim). One workgroup of 256 threads per token.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) writeonly buffer X { float x[]; };
+#ifdef BATCH
+layout(std430, binding = 2) readonly buffer TOK { uint tokens[]; };
+layout(push_constant) uniform PC { uint dim; uint B; } pc;
+#else
 layout(push_constant) uniform PC { uint dim; uint token; } pc;
+#endif
 
 #include "qdq.glsl"
 
 void main() {
     uint nb = pc.dim / BLK;
+#ifdef BATCH
+    uint b = gl_WorkGroupID.x;
+    if (b >= pc.B) return;
+    uint tok = tokens[b];
+    uint xBase = b * pc.dim;
+#else
+    uint tok = pc.token;
+    uint xBase = 0u;
+#endif
     for (uint i = gl_LocalInvocationID.x; i < pc.dim; i += 256u) {
         uint blk = i / BLK, e = i % BLK;
-        x[i] = dq((pc.token * nb + blk) * BYTES, e);
+        x[xBase + i] = dq((tok * nb + blk) * BYTES, e);
     }
 }

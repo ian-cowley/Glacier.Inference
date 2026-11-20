@@ -7,6 +7,7 @@ using System;
 /// </summary>
 public interface ID3D12Model : IDisposable
 {
+    Glacier.Inference.Memory.KvCachePrecision KvPrecision => Glacier.Inference.Memory.KvCachePrecision.Fp32;
     void Forward(int token, int pos, Span<float> logits, bool computeLogits = true);
     void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true);
     void ForwardStage(int token, int pos, ReadOnlySpan<float> inputX, Span<float> outputX, Span<float> logits, bool computeLogits)

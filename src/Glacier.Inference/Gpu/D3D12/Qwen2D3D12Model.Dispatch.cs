@@ -46,10 +46,16 @@ public sealed unsafe partial class Qwen2D3D12Model
             GgufType.Q5_K => _psoGemvQ5K,
             GgufType.Q6_K => _psoGemvQ6K,
             GgufType.Q3_K => _psoGemvQ3K,
+            GgufType.Q4_0 => _psoGemvQ4_0,
+            GgufType.Q5_0 => _psoGemvQ5_0,
             GgufType.Q8_0 => _psoGemvQ8_0,
             GgufType.Q2_K => _psoGemvQ2_K,
             GgufType.Q2_0 => _psoGemvQ2_0,
+            GgufType.GgmlQ2_0 => _psoGemvGgmlQ2_0,
             GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
+            GgufType.IQ2_XS => _psoGemvIQ2_XS,
+            GgufType.IQ2_S => _psoGemvIQ2_S,
+            GgufType.IQ3_XXS => _psoGemvIQ3_XXS,
             GgufType.IQ4_NL => _psoGemvIQ4_NL,
             GgufType.IQ4_XS => _psoGemvIQ4_XS,
             GgufType.MXFP4 => _psoGemvMXFP4,
@@ -183,9 +189,15 @@ public sealed unsafe partial class Qwen2D3D12Model
         cmdList.SetComputeRootUnorderedAccessView(3, _dKeyCache[layerIdx].GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, _dValCache[layerIdx].GPUVirtualAddress);
 
-        if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Fp16)
+        if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Q4_0)
         {
-            uint totalHalf = (uint)(_nHeadsKv * (_headDim / 2));
+            uint nb = (uint)((_headDim + 31) / 32);
+            uint numPairs = (nb + 1) / 2;
+            cmdList.Dispatch((uint)_nHeadsKv * numPairs, 1, 1);
+        }
+        else if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Fp16)
+        {
+            uint totalHalf = (uint)(_nHeadsKv * ((_headDim + 1) / 2));
             cmdList.Dispatch((totalHalf + 127) / 128, 1, 1);
         }
         else
@@ -275,12 +287,26 @@ public sealed unsafe partial class Qwen2D3D12Model
             cmdList.SetPipelineState(_psoGemmQ2_KBatch);
         else if (type == GgufType.Q2_0)
             cmdList.SetPipelineState(_psoGemmQ2_0Batch);
+        else if (type == GgufType.GgmlQ2_0)
+            cmdList.SetPipelineState(_psoGemmGgmlQ2_0Batch);
         else if (type == GgufType.IQ2_XXS)
             cmdList.SetPipelineState(_psoGemmIQ2_XXSBatch);
+        else if (type == GgufType.IQ2_XS)
+            cmdList.SetPipelineState(_psoGemmIQ2_XSBatch);
+        else if (type == GgufType.IQ2_S)
+            cmdList.SetPipelineState(_psoGemmIQ2_SBatch);
+        else if (type == GgufType.IQ3_XXS)
+            cmdList.SetPipelineState(_psoGemmIQ3_XXSBatch);
         else if (type == GgufType.IQ4_NL)
             cmdList.SetPipelineState(_psoGemmIQ4_NLBatch);
+        else if (type == GgufType.IQ4_XS)
+            cmdList.SetPipelineState(_psoGemmIQ4_XSBatch);
         else if (type == GgufType.IQ3_S)
             cmdList.SetPipelineState(_psoGemmIQ3_SBatch);
+        else if (type == GgufType.Q4_0)
+            cmdList.SetPipelineState(_psoGemmQ4_0Batch);
+        else if (type == GgufType.Q5_0)
+            cmdList.SetPipelineState(_psoGemmQ5_0Batch);
         else if (type is GgufType.Ternary_1_58 or GgufType.PQ2_0)
             cmdList.SetPipelineState(_psoGemmTernaryBatch);
         else
@@ -375,8 +401,22 @@ public sealed unsafe partial class Qwen2D3D12Model
         cmdList.SetComputeRootUnorderedAccessView(3, _dKeyCache[layerIdx].GPUVirtualAddress);
         cmdList.SetComputeRootUnorderedAccessView(4, _dValCache[layerIdx].GPUVirtualAddress);
 
-        uint total = (uint)(batchSize * _nHeadsKv * _headDim);
-        cmdList.Dispatch((total + 255) / 256, 1, 1);
+        if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Q4_0)
+        {
+            uint nb = (uint)((_headDim + 31) / 32);
+            uint numPairs = (nb + 1) / 2;
+            cmdList.Dispatch((uint)_nHeadsKv * numPairs, (uint)batchSize, 1);
+        }
+        else if (KvPrecision == Glacier.Inference.Memory.KvCachePrecision.Fp16)
+        {
+            uint totalHalf = (uint)(batchSize * _nHeadsKv * ((_headDim + 1) / 2));
+            cmdList.Dispatch((totalHalf + 255) / 256, 1, 1);
+        }
+        else
+        {
+            uint total = (uint)(batchSize * _nHeadsKv * _headDim);
+            cmdList.Dispatch((total + 255) / 256, 1, 1);
+        }
     }
 
     private void DispatchAttentionBatch(ID3D12GraphicsCommandList cmdList, int layerIdx, int startPos, int batchSize)

@@ -34,8 +34,19 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnGemvQ3K;
     private IntPtr _fnGemvQ6K;
     private IntPtr _fnGemvQ8_0;
+    private IntPtr _fnGemvQ2_K;
+    private IntPtr _fnGemvQ4_0;
+    private IntPtr _fnGemvQ5_0;
+    private IntPtr _fnGemvIQ2_XXS;
+    private IntPtr _fnGemvIQ2_XS;
+    private IntPtr _fnGemvIQ2_S;
+    private IntPtr _fnGemvIQ3_XXS;
+    private IntPtr _fnGemvIQ3_S;
+    private IntPtr _fnGemvIQ4_NL;
     private IntPtr _fnGemvIQ4_XS;
     private IntPtr _fnGemvMXFP4;
+    private IntPtr _fnGemvF16;
+    private IntPtr _fnGemvBf16;
     private IntPtr _fnGemvFp32;
     private IntPtr _fnSwigluFused;
     private IntPtr _fnRmsNorm;
@@ -57,6 +68,7 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnGemmQ4KBatch;
     private IntPtr _fnGemmQ6KBatch;
     private IntPtr _fnGemmQ8_0Batch;
+    private IntPtr _fnGemmFp32Batch;
     private IntPtr _fnGemmSwigluBatch;
     private IntPtr _fnRmsNormBatch;
     private IntPtr _fnRmsNormBatchHeads;
@@ -66,9 +78,13 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnKvCacheStoreBatch;
     private IntPtr _fnKvCacheStoreBatchF16;
     private IntPtr _fnKvCacheStoreBatchFp8;
+    private IntPtr _fnKvCacheStoreBatchQ4_0;
     private IntPtr _fnAttentionGqaBatch;
     private IntPtr _fnAttentionGqaBatchF16;
     private IntPtr _fnAttentionGqaBatchFp8;
+    private IntPtr _fnAttentionGqaBatchQ4_0;
+    private IntPtr _fnKvCacheStoreQ4_0;
+    private IntPtr _fnAttentionGqaQ4_0;
     private IntPtr _fnPagedKvStoreF16;
     private IntPtr _fnPagedKvStoreBatchF16;
     private IntPtr _fnPagedAttnGqaF16;
@@ -79,6 +95,9 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     public KvCachePrecision KvPrecision { get; }
     private readonly bool _allocateContiguousKvCache;
     private readonly nuint _kvBytesPerLayer;
+
+    public long KvCacheBytesPerLayer => (long)_kvBytesPerLayer;
+    public long TotalKvCacheBytes => (long)_kvBytesPerLayer * 2L * LayerCount;
 
     // CUDA Non-Blocking Streams and Events for Concurrent Projections
     private IntPtr _streamK;
@@ -205,15 +224,25 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             KvPrecision = kvPrecision;
         }
 
-        int elementBytes = KvPrecision switch
+        nuint kvBytes = 0;
+        if (_allocateContiguousKvCache)
         {
-            KvCachePrecision.Fp8 => 1,
-            KvCachePrecision.Fp16 => 2,
-            _ => 4
-        };
-        nuint kvBytes = _allocateContiguousKvCache
-            ? (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes)
-            : 0;
+            if (KvPrecision == KvCachePrecision.Q4_0)
+            {
+                long blocksPerHead = (_headDim + 31) / 32;
+                kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * blocksPerHead * 18L);
+            }
+            else
+            {
+                int elementBytes = KvPrecision switch
+                {
+                    KvCachePrecision.Fp8 => 1,
+                    KvCachePrecision.Fp16 => 2,
+                    _ => 4
+                };
+                kvBytes = (nuint)((long)_nHeadsKv * _maxSeqLen * _headDim * elementBytes);
+            }
+        }
         _kvBytesPerLayer = kvBytes;
 
         _hX = new float[_dim];
@@ -236,9 +265,25 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ3K, _module, "gemv_q3_k"), "ModuleGetFunction(gemv_q3_k)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ6K, _module, "gemv_q6_k_fast"), "ModuleGetFunction(gemv_q6_k_fast)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ8_0, _module, "gemv_q8_0"), "ModuleGetFunction(gemv_q8_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ2_K, _module, "gemv_q2_k"), "ModuleGetFunction(gemv_q2_k)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ4_0, _module, "gemv_q4_0"), "ModuleGetFunction(gemv_q4_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvQ5_0, _module, "gemv_q5_0"), "ModuleGetFunction(gemv_q5_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ2_XXS, _module, "gemv_iq2_xxs"), "ModuleGetFunction(gemv_iq2_xxs)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ2_XS, _module, "gemv_iq2_xs"), "ModuleGetFunction(gemv_iq2_xs)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ2_S, _module, "gemv_iq2_s"), "ModuleGetFunction(gemv_iq2_s)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ3_XXS, _module, "gemv_iq3_xxs"), "ModuleGetFunction(gemv_iq3_xxs)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ3_S, _module, "gemv_iq3_s"), "ModuleGetFunction(gemv_iq3_s)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ4_NL, _module, "gemv_iq4_nl"), "ModuleGetFunction(gemv_iq4_nl)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvIQ4_XS, _module, "gemv_iq4_xs"), "ModuleGetFunction(gemv_iq4_xs)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvMXFP4, _module, "gemv_mxfp4"), "ModuleGetFunction(gemv_mxfp4)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvF16, _module, "gemv_f16"), "ModuleGetFunction(gemv_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvBf16, _module, "gemv_bf16"), "ModuleGetFunction(gemv_bf16)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemvFp32, _module, "gemv_fp32"), "ModuleGetFunction(gemv_fp32)");
+
+            // Upload shared IQ2 lattice codebooks into module device globals
+            UploadModuleGlobalUlongArray(_module, "g_iq2xxs_grid", QuantKernels.Iq2xxsGrid);
+            UploadModuleGlobalUlongArray(_module, "g_iq2xs_grid", QuantKernels.Iq2xsGrid);
+            UploadModuleGlobalUlongArray(_module, "g_iq2s_grid", QuantKernels.Iq2sGrid);
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwigluFused, _module, "gemv_q4_k_swiglu_fused"), "ModuleGetFunction(gemv_q4_k_swiglu_fused)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNorm, _module, "rms_norm_kernel"), "ModuleGetFunction(rms_norm_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnSwiglu, _module, "swiglu_kernel"), "ModuleGetFunction(swiglu_kernel)");
@@ -249,15 +294,18 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8, _module, "kv_cache_store_fp8"), "ModuleGetFunction(kv_cache_store_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreQ4_0, _module, "kv_cache_store_q4_0"), "ModuleGetFunction(kv_cache_store_q4_0)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaQ4_0, _module, "attention_gqa_q4_0"), "ModuleGetFunction(attention_gqa_q4_0)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormHeads, _module, "rms_norm_heads_kernel"), "ModuleGetFunction(rms_norm_heads_kernel)");
 
             // 2b. Retrieve batched prefill kernels
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ4KBatch, _module, "gemm_q4_k_batch"), "ModuleGetFunction(gemm_q4_k_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ6KBatch, _module, "gemm_q6_k_batch"), "ModuleGetFunction(gemm_q6_k_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmQ8_0Batch, _module, "gemm_q8_0_batch"), "ModuleGetFunction(gemm_q8_0_batch)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmFp32Batch, _module, "gemm_fp32_batch"), "ModuleGetFunction(gemm_fp32_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnGemmSwigluBatch, _module, "gemm_q4_k_swiglu_batch"), "ModuleGetFunction(gemm_q4_k_swiglu_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatch, _module, "rms_norm_batch"), "ModuleGetFunction(rms_norm_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormBatchHeads, _module, "rms_norm_batch_heads_kernel"), "ModuleGetFunction(rms_norm_batch_heads_kernel)");
@@ -267,9 +315,11 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatch, _module, "kv_cache_store_batch"), "ModuleGetFunction(kv_cache_store_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchF16, _module, "kv_cache_store_batch_f16"), "ModuleGetFunction(kv_cache_store_batch_f16)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchFp8, _module, "kv_cache_store_batch_fp8"), "ModuleGetFunction(kv_cache_store_batch_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreBatchQ4_0, _module, "kv_cache_store_batch_q4_0"), "ModuleGetFunction(kv_cache_store_batch_q4_0)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatch, _module, "attention_gqa_batch"), "ModuleGetFunction(attention_gqa_batch)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchF16, _module, "attention_gqa_batch_f16"), "ModuleGetFunction(attention_gqa_batch_f16)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchFp8, _module, "attention_gqa_batch_fp8"), "ModuleGetFunction(attention_gqa_batch_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaBatchQ4_0, _module, "attention_gqa_batch_q4_0"), "ModuleGetFunction(attention_gqa_batch_q4_0)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreF16, _module, "paged_kv_cache_store_f16_kernel"), "ModuleGetFunction(paged_kv_cache_store_f16_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreBatchF16, _module, "paged_kv_cache_store_batch_f16_kernel"), "ModuleGetFunction(paged_kv_cache_store_batch_f16_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaF16, _module, "paged_attention_gqa_f16_kernel"), "ModuleGetFunction(paged_attention_gqa_f16_kernel)");

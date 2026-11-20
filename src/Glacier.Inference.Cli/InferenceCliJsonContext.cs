@@ -260,6 +260,129 @@ public sealed class OllamaBenchOptions
     public double Temperature { get; init; }
 }
 
+public sealed class BounceStatusResponse
+{
+    [JsonPropertyName("primary_endpoint")]
+    public required string PrimaryEndpoint { get; init; }
+
+    [JsonPropertyName("critic_endpoint")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CriticEndpoint { get; init; }
+
+    [JsonPropertyName("compiler_bounce_enabled")]
+    public bool CompilerBounceEnabled { get; init; }
+
+    [JsonPropertyName("max_repairs")]
+    public int MaxRepairs { get; init; }
+
+    [JsonPropertyName("total_requests")]
+    public long TotalRequests { get; init; }
+
+    [JsonPropertyName("bypassed_requests")]
+    public long BypassedRequests { get; init; }
+
+    [JsonPropertyName("critic_assisted_requests")]
+    public long CriticAssistedRequests { get; init; }
+
+    [JsonPropertyName("critic_fallbacks")]
+    public long CriticFallbacks { get; init; }
+
+    [JsonPropertyName("verifier_checks")]
+    public long VerifierChecks { get; init; }
+
+    [JsonPropertyName("verifier_first_pass_ok")]
+    public long VerifierFirstPassOk { get; init; }
+
+    [JsonPropertyName("repair_attempts")]
+    public long RepairAttempts { get; init; }
+
+    [JsonPropertyName("repairs_succeeded")]
+    public long RepairsSucceeded { get; init; }
+}
+
+public sealed class BounceChatPayload
+{
+    [JsonPropertyName("model")]
+    public required string Model { get; init; }
+
+    [JsonPropertyName("messages")]
+    public required OllamaChatMessageDto[] Messages { get; init; }
+
+    [JsonPropertyName("temperature")]
+    public double Temperature { get; init; }
+
+    [JsonPropertyName("max_tokens")]
+    public int MaxTokens { get; init; }
+
+    [JsonPropertyName("stream")]
+    public bool Stream { get; init; }
+
+    [JsonPropertyName("chat_template_kwargs")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public BounceChatTemplateKwargs? ChatTemplateKwargs { get; init; }
+}
+
+public sealed class BounceChatTemplateKwargs
+{
+    [JsonPropertyName("enable_thinking")]
+    public bool EnableThinking { get; init; }
+}
+
+public sealed class KlDivergenceCliReport
+{
+    [JsonPropertyName("passed")]
+    public bool Passed { get; init; }
+
+    [JsonPropertyName("mean_kl_divergence")]
+    public double MeanKlDivergence { get; init; }
+
+    [JsonPropertyName("max_kl_divergence")]
+    public double MaxKlDivergence { get; init; }
+
+    [JsonPropertyName("min_kl_divergence")]
+    public double MinKlDivergence { get; init; }
+
+    [JsonPropertyName("top1_agreement_rate")]
+    public double Top1AgreementRate { get; init; }
+
+    [JsonPropertyName("top1_matches")]
+    public int Top1Matches { get; init; }
+
+    [JsonPropertyName("token_count")]
+    public int TokenCount { get; init; }
+
+    [JsonPropertyName("vocab_size")]
+    public int VocabSize { get; init; }
+
+    [JsonPropertyName("threshold")]
+    public double Threshold { get; init; }
+
+    [JsonPropertyName("max_kl_threshold")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? MaxKlThreshold { get; init; }
+
+    [JsonPropertyName("min_top1_agreement")]
+    public double MinTop1Agreement { get; init; }
+
+    [JsonPropertyName("has_non_finite_quantized_values")]
+    public bool HasNonFiniteQuantizedValues { get; init; }
+
+    [JsonPropertyName("failure_reason")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? FailureReason { get; init; }
+
+    [JsonPropertyName("reference_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ReferenceDevice { get; init; }
+
+    [JsonPropertyName("candidate_device")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CandidateDevice { get; init; }
+
+    [JsonPropertyName("duration_ms")]
+    public double DurationMs { get; init; }
+}
+
 [JsonSerializable(typeof(JsonElement))]
 [JsonSerializable(typeof(OllamaTagsResponse))]
 [JsonSerializable(typeof(OllamaGenerateResponse))]
@@ -268,6 +391,10 @@ public sealed class OllamaBenchOptions
 [JsonSerializable(typeof(OpenAiChatCompletionResponse))]
 [JsonSerializable(typeof(OpenAiChatChunkResponse))]
 [JsonSerializable(typeof(OllamaBenchRequest))]
+[JsonSerializable(typeof(SleepStatusResponse))]
+[JsonSerializable(typeof(BounceStatusResponse))]
+[JsonSerializable(typeof(BounceChatPayload))]
+[JsonSerializable(typeof(KlDivergenceCliReport))]
 public partial class InferenceCliJsonContext : JsonSerializerContext
 {
 }

@@ -296,7 +296,7 @@ public sealed unsafe class VulkanContext : IDisposable
         _commandBuffer = cmdBufs[0];
     }
 
-    public uint FindMemoryType(uint typeFilter, uint properties)
+    public bool TryFindMemoryType(uint typeFilter, uint properties, uint avoidProperties, out uint memTypeIndex)
     {
         fixed (byte* pTypes = _memProps.memoryTypes)
         {
@@ -305,17 +305,37 @@ public sealed unsafe class VulkanContext : IDisposable
             {
                 if ((typeFilter & (1u << (int)i)) != 0)
                 {
-                    if ((types[i].propertyFlags & properties) == properties)
+                    uint flags = types[i].propertyFlags;
+                    if ((flags & properties) == properties && (flags & avoidProperties) == 0)
                     {
-                        return i;
+                        memTypeIndex = i;
+                        return true;
                     }
                 }
             }
+        }
+        memTypeIndex = 0;
+        return false;
+    }
+
+    public uint FindMemoryType(uint typeFilter, uint properties)
+    {
+        if (TryFindMemoryType(typeFilter, properties, 0u, out uint idx))
+        {
+            return idx;
         }
         throw new InvalidOperationException($"Failed to find suitable memory type for flags {properties}");
     }
 
     public void CreateBuffer(ulong size, uint usage, uint memProperties, out IntPtr buffer, out IntPtr memory)
+        => CreateBufferPreferred(size, usage, out buffer, out memory, (memProperties, 0u));
+
+    public void CreateBufferPreferred(
+        ulong size,
+        uint usage,
+        out IntPtr buffer,
+        out IntPtr memory,
+        params ReadOnlySpan<(uint Required, uint Avoid)> preferences)
     {
         var bufInfo = new VulkanDriver.VkBufferCreateInfo
         {
@@ -330,20 +350,50 @@ public sealed unsafe class VulkanContext : IDisposable
             throw new InvalidOperationException($"vkCreateBuffer failed for {size} bytes: code {res}");
 
         VulkanDriver.GetBufferMemoryRequirements(_device, buffer, out var memReqs);
-        uint memTypeIndex = FindMemoryType(memReqs.memoryTypeBits, memProperties);
 
-        var allocInfo = new VulkanDriver.VkMemoryAllocateInfo
+        memory = IntPtr.Zero;
+        int lastAllocRes = -1;
+        bool matchedAny = false;
+        uint testedMask = 0u;
+
+        foreach (var (req, avoid) in preferences)
         {
-            sType = VulkanDriver.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            allocationSize = memReqs.size,
-            memoryTypeIndex = memTypeIndex
-        };
+            if (!TryFindMemoryType(memReqs.memoryTypeBits, req, avoid, out uint memTypeIndex))
+            {
+                continue;
+            }
 
-        int allocRes = VulkanDriver.AllocateMemory(_device, ref allocInfo, IntPtr.Zero, out memory);
-        if (allocRes != 0)
+            uint bit = 1u << (int)memTypeIndex;
+            if ((testedMask & bit) != 0u)
+            {
+                continue;
+            }
+            testedMask |= bit;
+            matchedAny = true;
+
+            var allocInfo = new VulkanDriver.VkMemoryAllocateInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                allocationSize = memReqs.size,
+                memoryTypeIndex = memTypeIndex
+            };
+
+            lastAllocRes = VulkanDriver.AllocateMemory(_device, ref allocInfo, IntPtr.Zero, out memory);
+            if (lastAllocRes == 0)
+            {
+                break;
+            }
+            memory = IntPtr.Zero;
+        }
+
+        if (memory == IntPtr.Zero)
         {
             VulkanDriver.DestroyBuffer(_device, buffer, IntPtr.Zero);
-            throw new InvalidOperationException($"vkAllocateMemory failed for {memReqs.size} bytes: code {allocRes}");
+            if (!matchedAny)
+            {
+                throw new InvalidOperationException($"Failed to find suitable memory type for buffer ({size} bytes).");
+            }
+            throw new InvalidOperationException($"vkAllocateMemory failed for {memReqs.size} bytes: code {lastAllocRes}");
         }
 
         int bindRes = VulkanDriver.BindBufferMemory(_device, buffer, memory, 0);

@@ -243,6 +243,73 @@ __global__ void kv_cache_store_fp8(
 }
 
 // =========================================================================
+// 8d. Packed 4-Bit (Q4_0) KV Cache Store Kernel (1 warp per 32-elem BlockQ4_0)
+// =========================================================================
+__device__ __forceinline__ void quantize_warp_q4_0(float val, int lane_id, BlockQ4_0* dst_blk) {
+    float amax = isfinite(val) ? fabsf(val) : (isinf(val) ? 458528.0f : 0.0f);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+    amax = fminf(amax, 458528.0f);
+
+    half dh = __float2half(amax / 7.0f);
+    float d_quant = __half2float(dh);
+    if (!isfinite(d_quant)) {
+        d_quant = 65504.0f;
+        dh = __float2half(65504.0f);
+    }
+    float inv_d = (d_quant > 0.0f) ? (1.0f / d_quant) : 0.0f;
+
+    int q;
+    if (isnan(val)) {
+        q = 8;
+    } else if (isinf(val)) {
+        q = (val > 0.0f) ? 15 : 0;
+    } else {
+        q = (d_quant > 0.0f) ? (__float2int_rn(val * inv_d) + 8) : 8;
+        q = min(max(q, 0), 15);
+    }
+
+    int q_hi = __shfl_down_sync(0xffffffff, q, 16);
+    if (lane_id < 16) {
+        dst_blk->qs[lane_id] = (uint8_t)((q & 0x0F) | ((q_hi & 0x0F) << 4));
+    }
+    if (lane_id == 0) {
+        dst_blk->d = dh;
+    }
+}
+
+__global__ void kv_cache_store_q4_0(
+    BlockQ4_0* __restrict__ k_cache,
+    BlockQ4_0* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    if (pos < 0 || pos >= max_seq_len) return;
+    int blocks_per_head = (head_dim + 31) >> 5;
+    int total_blocks = n_heads_kv * blocks_per_head;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int h = warp_id / blocks_per_head;
+    int b = warp_id % blocks_per_head;
+    int d = b * 32 + lane_id;
+
+    float k_val = (d < head_dim) ? k[(size_t)h * head_dim + d] : 0.0f;
+    float v_val = (d < head_dim) ? v[(size_t)h * head_dim + d] : 0.0f;
+
+    size_t dst_idx = ((size_t)h * max_seq_len + pos) * blocks_per_head + b;
+    quantize_warp_q4_0(k_val, lane_id, &k_cache[dst_idx]);
+    quantize_warp_q4_0(v_val, lane_id, &v_cache[dst_idx]);
+}
+
+// =========================================================================
 // 13. Batched RMSNorm Kernel
 // =========================================================================
 __global__ void rms_norm_batch(
@@ -448,6 +515,44 @@ __global__ void kv_cache_store_batch_fp8(
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = __nv_fp8_e4m3(k[idx]);
     v_cache[offset] = __nv_fp8_e4m3(v[idx]);
+}
+
+// =========================================================================
+// 17d-q4. Batched Packed 4-Bit (Q4_0) KV Cache Store Kernel
+// =========================================================================
+__global__ void kv_cache_store_batch_q4_0(
+    BlockQ4_0* __restrict__ k_cache,
+    BlockQ4_0* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int start_pos,
+    int batch_size
+) {
+    int blocks_per_head = (head_dim + 31) >> 5;
+    int blocks_per_token = n_heads_kv * blocks_per_head;
+    int total_blocks = batch_size * blocks_per_token;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int t = warp_id / blocks_per_token;
+    int rem = warp_id % blocks_per_token;
+    int h = rem / blocks_per_head;
+    int b = rem % blocks_per_head;
+    int pos = start_pos + t;
+    if (pos < 0 || pos >= max_seq_len) return;
+
+    int d = b * 32 + lane_id;
+    size_t src_idx = ((size_t)t * n_heads_kv + h) * head_dim + d;
+    float k_val = (d < head_dim) ? k[src_idx] : 0.0f;
+    float v_val = (d < head_dim) ? v[src_idx] : 0.0f;
+
+    size_t dst_idx = ((size_t)h * max_seq_len + pos) * blocks_per_head + b;
+    quantize_warp_q4_0(k_val, lane_id, &k_cache[dst_idx]);
+    quantize_warp_q4_0(v_val, lane_id, &v_cache[dst_idx]);
 }
 
 // =========================================================================

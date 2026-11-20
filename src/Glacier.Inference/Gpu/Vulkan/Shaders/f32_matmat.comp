@@ -1,0 +1,49 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// F32 batched mat-mat: Y[b, row] = dot(W[row,:], X[b,:]). Four rows x TILE_B=8 tokens per workgroup (64x4 threads).
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer W { vec4 w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint K; uint N; uint B; } pc;
+
+shared float partial[4][64];
+
+void main() {
+    uint ly = gl_LocalInvocationID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x * 4u + ly;
+    uint bBase = gl_WorkGroupID.y * 8u;
+    uint bCnt = pc.B > bBase ? min(8u, pc.B - bBase) : 0u;
+    uint k4 = pc.K >> 2;
+
+    float acc[8];
+    for (uint bi = 0u; bi < 8u; bi++) acc[bi] = 0.0;
+
+    if (row < pc.N && bCnt > 0u) {
+        uint rowBase = row * k4;
+        for (uint i = tid; i < k4; i += 64u) {
+            vec4 wv = w4[rowBase + i];
+            for (uint bi = 0u; bi < bCnt; bi++) acc[bi] += dot(wv, x4[(bBase + bi) * k4 + i]);
+        }
+    }
+
+    if (gl_SubgroupSize == 64u) {
+        for (uint bi = 0u; bi < bCnt; bi++) {
+            float s = subgroupAdd(acc[bi]);
+            if (tid == 0u && row < pc.N) y[(bBase + bi) * pc.N + row] = s;
+        }
+    } else {
+        for (uint bi = 0u; bi < bCnt; bi++) {
+            partial[ly][tid] = acc[bi];
+            barrier();
+            for (uint s = 32u; s > 0u; s >>= 1) {
+                if (tid < s) partial[ly][tid] += partial[ly][tid + s];
+                barrier();
+            }
+            if (tid == 0u && row < pc.N) y[(bBase + bi) * pc.N + row] = partial[ly][0];
+            barrier();
+        }
+    }
+}

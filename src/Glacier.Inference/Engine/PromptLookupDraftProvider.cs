@@ -22,8 +22,20 @@ public sealed class PromptLookupDraftProvider : IDraftProvider
     }
 
     /// <inheritdoc />
-    public int Draft(ReadOnlySpan<int> tokens, int maxDraftTokens, Span<int> draftTokens)
+    public int Draft(ReadOnlySpan<int> tokens, int maxDraftTokens, Span<int> draftTokens) =>
+        DraftWithMatchLength(tokens, maxDraftTokens, draftTokens, out _);
+
+    /// <summary>
+    /// Searches the suffix history for the longest N-gram match in <c>[minMatchLength, maxMatchLength]</c>,
+    /// writes continuation candidate tokens to <paramref name="draftTokens"/>, and outputs the matched N-gram length.
+    /// </summary>
+    public int DraftWithMatchLength(
+        ReadOnlySpan<int> tokens,
+        int maxDraftTokens,
+        Span<int> draftTokens,
+        out int matchedNgramLength)
     {
+        matchedNgramLength = 0;
         if (tokens.Length <= _minMatchLength || maxDraftTokens <= 0 || draftTokens.IsEmpty)
         {
             return 0;
@@ -46,6 +58,7 @@ public sealed class PromptLookupDraftProvider : IDraftProvider
                     {
                         int count = Math.Min(maxDraftTokens, Math.Min(available, draftTokens.Length));
                         tokens.Slice(followStart, count).CopyTo(draftTokens);
+                        matchedNgramLength = l;
                         return count;
                     }
                 }

@@ -42,10 +42,13 @@ public static unsafe class VulkanDriver
     public const uint VK_SHADER_STAGE_COMPUTE_BIT = 0x00000020;
     public const int VK_DESCRIPTOR_TYPE_STORAGE_BUFFER = 7;
     public const int VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER = 6;
+    public const uint VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD = 0x00000080;
     public const int VK_PIPELINE_BIND_POINT_COMPUTE = 1;
     public const uint VK_ACCESS_SHADER_READ_BIT = 0x00000020;
     public const uint VK_ACCESS_SHADER_WRITE_BIT = 0x00000040;
+    public const uint VK_ACCESS_HOST_READ_BIT = 0x00002000;
     public const uint VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800;
+    public const uint VK_PIPELINE_STAGE_HOST_BIT = 0x00004000;
 
     static VulkanDriver()
     {

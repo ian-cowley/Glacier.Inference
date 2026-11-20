@@ -2,18 +2,20 @@ namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
 using Vortice.Direct3D12;
 
 /// <summary>
-/// Direct3D 12 GPU inference runtime for hybrid SSM / attention models.
-/// Accelerates Gated DeltaNet (linear attention SSM with recurrent associative memory)
-/// interleaved with full quadratic multi-head attention on Direct3D 12 hardware.
+/// Direct3D 12 GPU inference runtime for hybrid SSM / attention / qwen4exp Hosted-MoE models.
+/// Accelerates Gated DeltaNet (linear attention SSM with recurrent associative memory),
+/// multi-stream Hyper-Connections, PLE overlap, QSA sparse attention, and VRAM/DDR4 Co-Scheduled MoE.
 /// </summary>
-public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
+public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenStateSource
 {
     private readonly D3D12Context _ctx;
     private readonly ModelWeights _weights;
@@ -49,12 +51,19 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemvQ8_0 = null!;
     private ID3D12PipelineState _psoGemvQ2_K = null!;
     private ID3D12PipelineState _psoGemvQ2_0 = null!;
+    private ID3D12PipelineState _psoGemvGgmlQ2_0 = null!;
     private ID3D12PipelineState _psoGemvIQ2_XXS = null!;
+    private ID3D12PipelineState _psoGemvIQ2_XS = null!;
+    private ID3D12PipelineState _psoGemvIQ2_S = null!;
+    private ID3D12PipelineState _psoGemvIQ3_XXS = null!;
     private ID3D12PipelineState _psoGemvIQ4_NL = null!;
+    private ID3D12PipelineState _psoGemvQ4_0 = null!;
+    private ID3D12PipelineState _psoGemvQ5_0 = null!;
     private ID3D12PipelineState _psoGemvIQ4_XS = null!;
     private ID3D12PipelineState _psoGemvMXFP4 = null!;
     private ID3D12PipelineState _psoGemvIQ3_S = null!;
     private ID3D12PipelineState _psoGemvTernary = null!;
+    private ID3D12PipelineState _psoGemvBf16 = null!;
     private ID3D12PipelineState _psoGemvFp32 = null!;
 
     private ID3D12RootSignature _sigSwiglu = null!;
@@ -103,10 +112,18 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
     private ID3D12PipelineState _psoGemmQ5KBatch = null!;
     private ID3D12PipelineState _psoGemmQ2_KBatch = null!;
     private ID3D12PipelineState _psoGemmQ2_0Batch = null!;
+    private ID3D12PipelineState _psoGemmGgmlQ2_0Batch = null!;
     private ID3D12PipelineState _psoGemmIQ2_XXSBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ2_XSBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ2_SBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ3_XXSBatch = null!;
+    private ID3D12PipelineState _psoGemmQ4_0Batch = null!;
+    private ID3D12PipelineState _psoGemmQ5_0Batch = null!;
     private ID3D12PipelineState _psoGemmIQ4_NLBatch = null!;
+    private ID3D12PipelineState _psoGemmIQ4_XSBatch = null!;
     private ID3D12PipelineState _psoGemmIQ3_SBatch = null!;
     private ID3D12PipelineState _psoGemmTernaryBatch = null!;
+    private ID3D12PipelineState _psoGemmBf16Batch = null!;
 
     private ID3D12RootSignature _sigRmsNormBatch = null!;
     private ID3D12PipelineState _psoRmsNormBatch = null!;
@@ -224,6 +241,11 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
     public int LayerCount { get; }
     public bool IsLastStage { get; }
     public bool TieredMoe => _tieredMoe;
+    public KvCachePrecision KvPrecision { get; }
+    public ulong EffectiveVramReserveBytes { get; }
+    public ulong KvCacheBytesPerLayer { get; private set; }
+    public long TotalKvCacheBytes { get; private set; }
+    private readonly ulong? _explicitVramReserveBytes;
 
     public Qwen3HybridD3D12Model(
         D3D12Context ctx,
@@ -232,11 +254,26 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         int startLayer = 0,
         int layerCount = -1,
         bool isLastStage = true,
-        bool? tieredMoe = null)
+        bool? tieredMoe = null,
+        PleIoMode pleIoMode = PleIoMode.Auto,
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        ulong? explicitVramReserveBytes = null)
     {
         _ctx = ctx;
         _weights = weights;
         _maxSeqLen = maxSeqLen;
+        _explicitVramReserveBytes = explicitVramReserveBytes;
+        KvPrecision = kvPrecision switch
+        {
+            KvCachePrecision.Auto => KvCachePrecision.Fp16,
+            KvCachePrecision.Fp8 => KvCachePrecision.Fp16,
+            _ => kvPrecision
+        };
+        EffectiveVramReserveBytes = WddmVramGuard.ResolveModelSafetyReserveBytes(
+            ctx.DedicatedVideoMemory,
+            OperatingSystem.IsWindows(),
+            ctx.IsUnifiedMemoryArchitecture,
+            explicitVramReserveBytes);
         StartLayer = startLayer;
         LayerCount = layerCount < 0 ? weights.BlockCount - startLayer : layerCount;
         IsLastStage = isLastStage;
@@ -263,13 +300,40 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         {
             int expertFfnDim = weights.ExpertFeedForwardLength;
             int numExperts = weights.ExpertCount;
-            long gateSlice = (long)expertFfnDim * GgufTypes.GetRowBytes(weights.Layers[startLayer].FfnGateExpsType, _dim);
-            long upSlice = (long)expertFfnDim * GgufTypes.GetRowBytes(weights.Layers[startLayer].FfnUpExpsType, _dim);
-            long downSlice = (long)_dim * GgufTypes.GetRowBytes(weights.Layers[startLayer].FfnDownExpsType, expertFfnDim);
-            ulong totalExpertBytes = (ulong)(LayerCount * (long)numExperts * (gateSlice + upSlice + downSlice));
+            ulong totalExpertBytes = 0;
 
-            ulong vram = ctx.TotalAccessibleMemory;
-            _tieredMoe = vram > 0 && totalExpertBytes + 350_000_000UL > vram;
+            for (int l = 0; l < LayerCount; l++)
+            {
+                var mlw = weights.Layers[startLayer + l];
+                if (mlw == null || !mlw.IsMoe) continue;
+
+                ulong sliceBytes;
+                if (mlw.FfnGateUpExpsWeight != null && mlw.FfnGateExpsWeight == null)
+                {
+                    sliceBytes =
+                        2UL * GetHybridAlignedBytes(mlw.FfnGateUpExpsType, expertFfnDim, _dim) +
+                        GetHybridAlignedBytes(mlw.FfnDownExpsType, _dim, expertFfnDim);
+                }
+                else
+                {
+                    sliceBytes =
+                        GetHybridAlignedBytes(mlw.FfnGateExpsType, expertFfnDim, _dim) +
+                        GetHybridAlignedBytes(mlw.FfnUpExpsType, expertFfnDim, _dim) +
+                        GetHybridAlignedBytes(mlw.FfnDownExpsType, _dim, expertFfnDim);
+                }
+
+                totalExpertBytes += (ulong)numExperts * sliceBytes;
+            }
+
+            // Estimate non-expert dense trunk + KV/GDN state + LM head to keep full-model residency safely inside WDDM budget
+            ulong trunkOverheadBytes =
+                GetHybridAlignedBytes(weights.OutType, _vocabSize, _dim) +
+                (ulong)LayerCount * (ulong)_dim * (ulong)_dim * 12UL +
+                384UL * 1024 * 1024;
+
+            var vramSnap = ctx.QueryVramHeadroom(_explicitVramReserveBytes);
+            ulong budgetVram = vramSnap.SafeAvailableBytes > 0 ? vramSnap.SafeAvailableBytes : ctx.TotalAccessibleMemory;
+            _tieredMoe = budgetVram > 0 && (totalExpertBytes + trunkOverheadBytes) > budgetVram;
         }
         else
         {
@@ -277,13 +341,14 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         }
 
         string archLabel = !string.IsNullOrWhiteSpace(weights.Gguf.Architecture) ? weights.Gguf.Architecture : weights.ArchitectureFamily.ToString();
-        Glacier.Inference.Diagnostics.GlacierDiagnostics.LogInformation($"[Direct3D 12 {archLabel}] Arch: '{weights.Gguf.Architecture}', Layers: {StartLayer}..{StartLayer + LayerCount - 1}, Heads: {_nHeads}/{_headsKv}, HeadDim: {_headDim}, RopeDim: {_ropeDim}, SsmHeads: {_ssmHeads}, ConvChannels: {_gdnConvChannels}, IsMoe: {weights.IsMoe}, TieredMoe: {_tieredMoe}");
+        Glacier.Inference.Diagnostics.GlacierDiagnostics.LogInformation($"[Direct3D 12 {archLabel}] Arch: '{weights.Gguf.Architecture}', Layers: {StartLayer}..{StartLayer + LayerCount - 1}, Heads: {_nHeads}/{_headsKv}, HeadDim: {_headDim}, RopeDim: {_ropeDim}, SsmState: {_ssmStateDim}, SsmHeads: {_ssmHeads}, ConvChannels: {_gdnConvChannels}, HC: {weights.HyperConnectionCount}x{weights.HyperConnectionLowRank}, PLE: {(weights.PleHashConfig != null)}, IsMoe: {weights.IsMoe}, TieredMoe: {_tieredMoe}");
 
         _dConvState = new ID3D12Resource[LayerCount];
         _dSsmState = new ID3D12Resource[LayerCount];
         _dKeyCache = new ID3D12Resource[LayerCount];
         _dValCache = new ID3D12Resource[LayerCount];
 
+        InitQwen4ExpFeatures(pleIoMode);
         InitPipelines();
         AllocateBuffers();
         UploadWeights();
@@ -309,12 +374,19 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
         _psoGemvQ2_K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_K));
         _psoGemvQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_0));
+        _psoGemvGgmlQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvGgmlQ2_0));
         _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
+        _psoGemvIQ2_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XS));
+        _psoGemvIQ2_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_S));
+        _psoGemvIQ3_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_XXS));
         _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
+        _psoGemvQ4_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ4_0));
+        _psoGemvQ5_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ5_0));
         _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
         _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
         _psoGemvIQ3_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_S));
         _psoGemvTernary = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvTernary));
+        _psoGemvBf16 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvBf16));
         _psoGemvFp32 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvFp32));
 
         // 2. RMSNorm
@@ -387,8 +459,14 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string kvShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.KvCacheStoreQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.KvCacheStoreF16,
+            _ => D3D12Shaders.KvCacheStore
+        };
         _sigKvStore = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreParams));
-        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(D3D12Shaders.KvCacheStore));
+        _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(kvShader));
 
         // 8. FlashAttention / AttentionGqa (256-wide)
         var attnParams = new RootParameter[]
@@ -399,8 +477,14 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
+        string attnShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.Qwen3AttentionQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.Qwen3AttentionF16,
+            _ => D3D12Shaders.Qwen3Attention
+        };
         _sigFlashAttn = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnParams));
-        _psoFlashAttn = _ctx.CreatePipelineState(_sigFlashAttn, _ctx.CompileShader(D3D12Shaders.Qwen3Attention));
+        _psoFlashAttn = _ctx.CreatePipelineState(_sigFlashAttn, _ctx.CompileShader(attnShader));
 
         // 9. SSM Conv1d Pipeline
         var sigConv1dParams = new RootParameter[]
@@ -493,10 +577,18 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         _psoGemmQ5KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5KBatch));
         _psoGemmQ2_KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_KBatch));
         _psoGemmQ2_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_0Batch));
+        _psoGemmGgmlQ2_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmGgmlQ2_0Batch));
         _psoGemmIQ2_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XXSBatch));
+        _psoGemmIQ2_XSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XSBatch));
+        _psoGemmIQ2_SBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_SBatch));
+        _psoGemmIQ3_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ3_XXSBatch));
+        _psoGemmQ4_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ4_0Batch));
+        _psoGemmQ5_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5_0Batch));
         _psoGemmIQ4_NLBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ4_NLBatch));
+        _psoGemmIQ4_XSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ4_XSBatch));
         _psoGemmIQ3_SBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ3_SBatch));
         _psoGemmTernaryBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmTernaryBatch));
+        _psoGemmBf16Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmBf16Batch));
 
         // 16. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
         var rmsNormBatchParams = new RootParameter[]
@@ -508,6 +600,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         };
         _sigRmsNormBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, rmsNormBatchParams));
         _psoRmsNormBatch = _ctx.CreatePipelineState(_sigRmsNormBatch, _ctx.CompileShader(D3D12Shaders.RmsNormBatch));
+
+        InitQwen4ExpPipelines();
     }
 
     private void AllocateBuffers()
@@ -544,7 +638,9 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             }
             else
             {
-                ulong kvLayerBytes = (ulong)(_headsKv * _headDim * _maxSeqLen * sizeof(float));
+                ulong kvLayerBytes = Qwen2D3D12Model.ComputeD3D12KvLayerBytes(_headsKv, _headDim, _maxSeqLen, KvPrecision);
+                KvCacheBytesPerLayer = kvLayerBytes;
+                TotalKvCacheBytes += (long)kvLayerBytes * 2L;
                 _dKeyCache[l] = _ctx.CreateDeviceBuffer(kvLayerBytes);
                 _dValCache[l] = _ctx.CreateDeviceBuffer(kvLayerBytes);
             }
@@ -576,9 +672,7 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             _dExpertDownOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
             _dFfnOut = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
 
-            int shexpFfnDim = expertFfnDim * 2;
-            if (_weights.Gguf.TryGetTensor($"blk.{StartLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                shexpFfnDim = (int)tShexp.Dimensions[1];
+            int shexpFfnDim = ResolveSharedExpertFfnDim(StartLayer, expertFfnDim);
 
             _dShexpGate = _ctx.CreateDeviceBuffer((ulong)(shexpFfnDim * sizeof(float)));
             _dShexpUp = _ctx.CreateDeviceBuffer((ulong)(shexpFfnDim * sizeof(float)));
@@ -622,6 +716,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         void* pRbLogits = null;
         _readbackLogits.Map(0, null, &pRbLogits);
         _pReadbackLogits = (float*)pRbLogits;
+
+        AllocateQwen4ExpBuffers();
     }
 
     private void UploadWeights()
@@ -638,8 +734,12 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             var lw = _weights.Layers[modelLayer];
             bool isGdn = lw.IsGdn;
 
-            var dAttnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
-            _ctx.CopyToDevice(dAttnNorm, (IntPtr)lw.AttnNormWeight, (ulong)(_dim * sizeof(float)));
+            ID3D12Resource? dAttnNorm = null;
+            if (lw.AttnNormWeight != null)
+            {
+                dAttnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+                _ctx.CopyToDevice(dAttnNorm, (IntPtr)lw.AttnNormWeight, (ulong)(_dim * sizeof(float)));
+            }
 
             ID3D12Resource? dQ = null;
             ID3D12Resource? dK = null;
@@ -660,14 +760,19 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             if (isGdn)
             {
                 // Gated DeltaNet layer
-                dQkv = UploadTensor(lw.QkvType, (IntPtr)lw.QkvWeight, _gdnConvChannels, _dim);
-                dAttnGate = UploadTensor(lw.AttnGateType, (IntPtr)lw.AttnGateWeight, _ssmInnerSize, _dim);
+                dQkv = UploadHybridTensor(lw.QkvType, (IntPtr)lw.QkvWeight, _gdnConvChannels, _dim);
+                dAttnGate = UploadHybridTensor(lw.AttnGateType, (IntPtr)lw.AttnGateWeight, _ssmInnerSize, _dim);
+
+                if (lw.SsmConv1dWeight == null)
+                {
+                    throw new InvalidDataException($"Missing SsmConv1dWeight for GDN layer {modelLayer}.");
+                }
 
                 dSsmConv1d = _ctx.CreateDeviceBuffer((ulong)(_gdnConvChannels * _ssmConvKernel * sizeof(float)));
                 _ctx.CopyToDevice(dSsmConv1d, (IntPtr)lw.SsmConv1dWeight, (ulong)(_gdnConvChannels * _ssmConvKernel * sizeof(float)));
 
-                dSsmAlpha = UploadTensor(lw.SsmAlphaType, (IntPtr)lw.SsmAlphaWeight, _ssmHeads, _dim);
-                dSsmBeta = UploadTensor(lw.SsmBetaType, (IntPtr)lw.SsmBetaWeight, _ssmHeads, _dim);
+                dSsmAlpha = UploadHybridTensor(lw.SsmAlphaType, (IntPtr)lw.SsmAlphaWeight, _ssmHeads, _dim);
+                dSsmBeta = UploadHybridTensor(lw.SsmBetaType, (IntPtr)lw.SsmBetaWeight, _ssmHeads, _dim);
 
                 if (lw.SsmDtBias != null)
                 {
@@ -687,19 +792,19 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                     _ctx.CopyToDevice(dSsmNorm, (IntPtr)lw.SsmNormWeight, (ulong)(_ssmStateDim * sizeof(float)));
                 }
 
-                dSsmOut = UploadTensor(lw.SsmOutType, (IntPtr)lw.SsmOutWeight, _dim, _ssmInnerSize);
+                dSsmOut = UploadHybridTensor(lw.SsmOutType, (IntPtr)lw.SsmOutWeight, _dim, _ssmInnerSize);
             }
             else
             {
-                // Standard full attention layer
+                // Standard / QSA attention layer
                 int qDim = _nHeads * _headDim;
                 int kvDim = _headsKv * _headDim;
                 int qTargetRows = lw.HasQGate ? 2 * qDim : qDim;
 
-                dQ = UploadTensor(lw.QType, (IntPtr)lw.QWeight, qTargetRows, _dim);
-                dK = UploadTensor(lw.KType, (IntPtr)lw.KWeight, kvDim, _dim);
-                dV = UploadTensor(lw.VType, (IntPtr)lw.VWeight, kvDim, _dim);
-                dAttnOut = UploadTensor(lw.AttnOutType, (IntPtr)lw.AttnOutWeight, _dim, qDim);
+                dQ = UploadHybridTensor(lw.QType, (IntPtr)lw.QWeight, qTargetRows, _dim);
+                dK = UploadHybridTensor(lw.KType, (IntPtr)lw.KWeight, kvDim, _dim);
+                dV = UploadHybridTensor(lw.VType, (IntPtr)lw.VWeight, kvDim, _dim);
+                dAttnOut = UploadHybridTensor(lw.AttnOutType, (IntPtr)lw.AttnOutWeight, _dim, qDim);
 
                 if (lw.AttnQNormWeight != null)
                 {
@@ -714,9 +819,43 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                 }
             }
 
+            // Optional Multi-Stream Hyper-Connections
+            ID3D12Resource? dHcAttnNorm = null, dHcAttnDown = null, dHcAttnUp = null, dHcAttnInject = null;
+            ID3D12Resource? dHcFfnNorm = null, dHcFfnDown = null, dHcFfnUp = null, dHcFfnInject = null;
+            if (_hasHc && lw.HasHyperConnections)
+            {
+                if (lw.HcAttnNormWeight != null)
+                {
+                    dHcAttnNorm = _ctx.CreateDeviceBuffer((ulong)(_hcDim * sizeof(float)));
+                    _ctx.CopyToDevice(dHcAttnNorm, (IntPtr)lw.HcAttnNormWeight, (ulong)(_hcDim * sizeof(float)));
+                }
+                dHcAttnDown = UploadHybridTensor(lw.HcAttnDownType, (IntPtr)lw.HcAttnDownWeight, _hcLowRank, _hcDim);
+                dHcAttnUp = UploadHybridTensor(lw.HcAttnUpType, (IntPtr)lw.HcAttnUpWeight, _hcDim, _hcLowRank);
+                if (lw.HcAttnInjectWeight != null)
+                {
+                    dHcAttnInject = UploadHybridTensor(lw.HcAttnInjectType, (IntPtr)lw.HcAttnInjectWeight, _hcCount, _hcDim);
+                }
+
+                if (lw.HcFfnNormWeight != null)
+                {
+                    dHcFfnNorm = _ctx.CreateDeviceBuffer((ulong)(_hcDim * sizeof(float)));
+                    _ctx.CopyToDevice(dHcFfnNorm, (IntPtr)lw.HcFfnNormWeight, (ulong)(_hcDim * sizeof(float)));
+                }
+                dHcFfnDown = UploadHybridTensor(lw.HcFfnDownType, (IntPtr)lw.HcFfnDownWeight, _hcLowRank, _hcDim);
+                dHcFfnUp = UploadHybridTensor(lw.HcFfnUpType, (IntPtr)lw.HcFfnUpWeight, _hcDim, _hcLowRank);
+                if (lw.HcFfnInjectWeight != null)
+                {
+                    dHcFfnInject = UploadHybridTensor(lw.HcFfnInjectType, (IntPtr)lw.HcFfnInjectWeight, _hcCount, _hcDim);
+                }
+            }
+
             // FFN
-            var dFfnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
-            _ctx.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (ulong)(_dim * sizeof(float)));
+            ID3D12Resource? dFfnNorm = null;
+            if (lw.FfnNormWeight != null)
+            {
+                dFfnNorm = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+                _ctx.CopyToDevice(dFfnNorm, (IntPtr)lw.FfnNormWeight, (ulong)(_dim * sizeof(float)));
+            }
 
             ID3D12Resource? dFfnGate = null;
             ID3D12Resource? dFfnUp = null;
@@ -730,12 +869,16 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             ID3D12Resource? dFfnUpShexp = null;
             ID3D12Resource? dFfnDownShexp = null;
 
+            GgufType gateExpsGpuType = NormalizeHybridGpuType(lw.FfnGateExpsType, _dim);
+            GgufType upExpsGpuType = NormalizeHybridGpuType(lw.FfnUpExpsType, _dim);
+            GgufType downExpsGpuType = NormalizeHybridGpuType(lw.FfnDownExpsType, Math.Max(2, _weights.ExpertFeedForwardLength));
+
             if (lw.IsMoe)
             {
                 int expertFfnDim = _weights.ExpertFeedForwardLength;
                 int numExperts = _weights.ExpertCount;
 
-                dFfnGateInp = UploadTensor(GgufType.F32, (IntPtr)lw.FfnGateInpWeight, numExperts, _dim);
+                dFfnGateInp = UploadHybridTensor(GgufType.F32, (IntPtr)lw.FfnGateInpWeight, numExperts, _dim);
                 if (lw.FfnGateInpBias != null)
                 {
                     dFfnGateInpBias = _ctx.CreateDeviceBuffer((ulong)(numExperts * sizeof(float)));
@@ -744,97 +887,119 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
 
                 if (!_tieredMoe)
                 {
-                    dFfnGateExps = UploadTensor(lw.FfnGateExpsType, (IntPtr)lw.FfnGateExpsWeight, numExperts * expertFfnDim, _dim);
-                    dFfnUpExps = UploadTensor(lw.FfnUpExpsType, (IntPtr)lw.FfnUpExpsWeight, numExperts * expertFfnDim, _dim);
-                    dFfnDownExps = UploadTensor(lw.FfnDownExpsType, (IntPtr)lw.FfnDownExpsWeight, numExperts * _dim, expertFfnDim);
+                    if (lw.FfnGateExpsWeight == null && lw.FfnGateUpExpsWeight != null)
+                    {
+                        UploadSplitFusedExperts(lw, numExperts, expertFfnDim, out dFfnGateExps, out dFfnUpExps, out gateExpsGpuType, out upExpsGpuType);
+                    }
+                    else
+                    {
+                        dFfnGateExps = UploadHybridTensor(lw.FfnGateExpsType, (IntPtr)lw.FfnGateExpsWeight, numExperts * expertFfnDim, _dim);
+                        dFfnUpExps = UploadHybridTensor(lw.FfnUpExpsType, (IntPtr)lw.FfnUpExpsWeight, numExperts * expertFfnDim, _dim);
+                    }
+                    dFfnDownExps = UploadHybridTensor(lw.FfnDownExpsType, (IntPtr)lw.FfnDownExpsWeight, numExperts * _dim, expertFfnDim);
                 }
 
                 if (lw.FfnGateShexpWeight != null)
                 {
-                    int shexpFfnDim = expertFfnDim * 2;
-                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                        shexpFfnDim = (int)tShexp.Dimensions[1];
-
-                    dFfnGateShexp = UploadTensor(lw.FfnGateShexpType, (IntPtr)lw.FfnGateShexpWeight, shexpFfnDim, _dim);
-                    dFfnUpShexp = UploadTensor(lw.FfnUpShexpType, (IntPtr)lw.FfnUpShexpWeight, shexpFfnDim, _dim);
-                    dFfnDownShexp = UploadTensor(lw.FfnDownShexpType, (IntPtr)lw.FfnDownShexpWeight, _dim, shexpFfnDim);
+                    int shexpFfnDim = ResolveSharedExpertFfnDim(modelLayer, expertFfnDim);
+                    dFfnGateShexp = UploadHybridTensor(lw.FfnGateShexpType, (IntPtr)lw.FfnGateShexpWeight, shexpFfnDim, _dim);
+                    dFfnUpShexp = UploadHybridTensor(lw.FfnUpShexpType, (IntPtr)lw.FfnUpShexpWeight, shexpFfnDim, _dim);
+                    dFfnDownShexp = UploadHybridTensor(lw.FfnDownShexpType, (IntPtr)lw.FfnDownShexpWeight, _dim, shexpFfnDim);
+                    if (lw.FfnGateInpShexpWeight != null)
+                    {
+                        GetOrCreateShexpGateWeight(modelLayer, lw.FfnGateInpShexpWeight);
+                    }
                 }
             }
             else
             {
-                dFfnGate = UploadTensor(lw.FfnGateType, (IntPtr)lw.FfnGateWeight, _ffnDim, _dim);
-                dFfnUp = UploadTensor(lw.FfnUpType, (IntPtr)lw.FfnUpWeight, _ffnDim, _dim);
-                dFfnDown = UploadTensor(lw.FfnDownType, (IntPtr)lw.FfnDownWeight, _dim, _ffnDim);
+                dFfnGate = UploadHybridTensor(lw.FfnGateType, (IntPtr)lw.FfnGateWeight, _ffnDim, _dim);
+                dFfnUp = UploadHybridTensor(lw.FfnUpType, (IntPtr)lw.FfnUpWeight, _ffnDim, _dim);
+                dFfnDown = UploadHybridTensor(lw.FfnDownType, (IntPtr)lw.FfnDownWeight, _dim, _ffnDim);
             }
 
             _layerWeights.Add(new D3D12LayerWeights
             {
                 IsGdn = isGdn,
                 HasQGate = lw.HasQGate,
-                AttnNormWeight = dAttnNorm,
+                AttnNormWeight = dAttnNorm!,
                 QWeight = dQ ?? _ctx.DummyBuffer,
-                QType = NormalizeGpuType(lw.QType),
+                QType = NormalizeHybridGpuType(lw.QType, _dim),
                 KWeight = dK ?? _ctx.DummyBuffer,
-                KType = NormalizeGpuType(lw.KType),
+                KType = NormalizeHybridGpuType(lw.KType, _dim),
                 VWeight = dV ?? _ctx.DummyBuffer,
-                VType = NormalizeGpuType(lw.VType),
+                VType = NormalizeHybridGpuType(lw.VType, _dim),
                 AttnOutWeight = dAttnOut ?? _ctx.DummyBuffer,
-                AttnOutType = NormalizeGpuType(lw.AttnOutType),
+                AttnOutType = NormalizeHybridGpuType(lw.AttnOutType, _nHeads * _headDim),
                 AttnQNormWeight = dAttnQNorm,
                 AttnKNormWeight = dAttnKNorm,
                 QkvWeight = dQkv,
-                QkvType = NormalizeGpuType(lw.QkvType),
+                QkvType = NormalizeHybridGpuType(lw.QkvType, _dim),
                 AttnGateWeight = dAttnGate,
-                AttnGateType = NormalizeGpuType(lw.AttnGateType),
+                AttnGateType = NormalizeHybridGpuType(lw.AttnGateType, _dim),
                 SsmConv1dWeight = dSsmConv1d,
                 SsmAlphaWeight = dSsmAlpha,
-                SsmAlphaType = NormalizeGpuType(lw.SsmAlphaType),
+                SsmAlphaType = NormalizeHybridGpuType(lw.SsmAlphaType, _dim),
                 SsmBetaWeight = dSsmBeta,
-                SsmBetaType = NormalizeGpuType(lw.SsmBetaType),
+                SsmBetaType = NormalizeHybridGpuType(lw.SsmBetaType, _dim),
                 SsmDtBias = dSsmDtBias,
                 SsmAWeight = dSsmA,
                 SsmNormWeight = dSsmNorm,
                 SsmOutWeight = dSsmOut,
-                SsmOutType = NormalizeGpuType(lw.SsmOutType),
-                FfnNormWeight = dFfnNorm,
+                SsmOutType = NormalizeHybridGpuType(lw.SsmOutType, _ssmInnerSize),
+                FfnNormWeight = dFfnNorm!,
                 FfnGateWeight = dFfnGate,
-                FfnGateType = NormalizeGpuType(lw.FfnGateType),
+                FfnGateType = NormalizeHybridGpuType(lw.FfnGateType, _dim),
                 FfnUpWeight = dFfnUp,
-                FfnUpType = NormalizeGpuType(lw.FfnUpType),
+                FfnUpType = NormalizeHybridGpuType(lw.FfnUpType, _dim),
                 FfnDownWeight = dFfnDown,
-                FfnDownType = NormalizeGpuType(lw.FfnDownType),
+                FfnDownType = NormalizeHybridGpuType(lw.FfnDownType, Math.Max(2, _ffnDim)),
                 IsMoe = lw.IsMoe,
                 FfnGateInpWeight = dFfnGateInp,
                 FfnGateInpBias = dFfnGateInpBias,
                 FfnGateExpsWeight = dFfnGateExps,
                 FfnUpExpsWeight = dFfnUpExps,
                 FfnDownExpsWeight = dFfnDownExps,
-                FfnGateExpsType = NormalizeGpuType(lw.FfnGateExpsType),
-                FfnUpExpsType = NormalizeGpuType(lw.FfnUpExpsType),
-                FfnDownExpsType = NormalizeGpuType(lw.FfnDownExpsType),
+                FfnGateExpsType = gateExpsGpuType,
+                FfnUpExpsType = upExpsGpuType,
+                FfnDownExpsType = downExpsGpuType,
                 FfnGateShexpWeight = dFfnGateShexp,
                 FfnUpShexpWeight = dFfnUpShexp,
                 FfnDownShexpWeight = dFfnDownShexp,
-                FfnGateShexpType = NormalizeGpuType(lw.FfnGateShexpType),
-                FfnUpShexpType = NormalizeGpuType(lw.FfnUpShexpType),
-                FfnDownShexpType = NormalizeGpuType(lw.FfnDownShexpType)
+                FfnGateShexpType = NormalizeHybridGpuType(lw.FfnGateShexpType, _dim),
+                FfnUpShexpType = NormalizeHybridGpuType(lw.FfnUpShexpType, _dim),
+                FfnDownShexpType = NormalizeHybridGpuType(lw.FfnDownShexpType, Math.Max(2, ResolveSharedExpertFfnDim(modelLayer, Math.Max(2, _weights.ExpertFeedForwardLength)))),
+                HasHyperConnections = _hasHc && lw.HasHyperConnections,
+                HcAttnNormWeight = dHcAttnNorm,
+                HcAttnDownWeight = dHcAttnDown,
+                HcAttnDownType = NormalizeHybridGpuType(lw.HcAttnDownType, _hcDim),
+                HcAttnUpWeight = dHcAttnUp,
+                HcAttnUpType = NormalizeHybridGpuType(lw.HcAttnUpType, Math.Max(2, _hcLowRank)),
+                HcAttnInjectWeight = dHcAttnInject,
+                HcAttnInjectType = NormalizeHybridGpuType(lw.HcAttnInjectType, _hcDim),
+                HcFfnNormWeight = dHcFfnNorm,
+                HcFfnDownWeight = dHcFfnDown,
+                HcFfnDownType = NormalizeHybridGpuType(lw.HcFfnDownType, _hcDim),
+                HcFfnUpWeight = dHcFfnUp,
+                HcFfnUpType = NormalizeHybridGpuType(lw.HcFfnUpType, Math.Max(2, _hcLowRank)),
+                HcFfnInjectWeight = dHcFfnInject,
+                HcFfnInjectType = NormalizeHybridGpuType(lw.HcFfnInjectType, _hcDim)
             });
         }
 
         // LM Head (only needed on last stage)
         if (IsLastStage)
         {
-            _dOutNormWeight = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
-            _ctx.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (ulong)(_dim * sizeof(float)));
-            _dOutWeight = UploadTensor(_weights.OutType, (IntPtr)_weights.OutWeight, _vocabSize, _dim);
+            if (_weights.OutNormWeight != null)
+            {
+                _dOutNormWeight = _ctx.CreateDeviceBuffer((ulong)(_dim * sizeof(float)));
+                _ctx.CopyToDevice(_dOutNormWeight, (IntPtr)_weights.OutNormWeight, (ulong)(_dim * sizeof(float)));
+            }
+            _dOutWeight = UploadHybridTensor(_weights.OutType, (IntPtr)_weights.OutWeight, _vocabSize, _dim);
         }
-    }
 
-    private static GgufType NormalizeGpuType(GgufType t) => t == GgufType.BF16 ? GgufType.F32 : t;
-
-    private ID3D12Resource UploadTensor(GgufType type, IntPtr hostPtr, int rows, int cols)
-    {
-        return D3D12TensorAlign.UploadAlignedTensor(_ctx, type, hostPtr, rows, cols);
+        UploadOutputHcWeights();
+        InitHostedMoeSlotPool();
     }
 
     private void DispatchGemv(
@@ -864,16 +1029,24 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             GgufType.Q5_K => _psoGemvQ5K,
             GgufType.Q6_K => _psoGemvQ6K,
             GgufType.Q3_K => _psoGemvQ3K,
+            GgufType.Q4_0 => _psoGemvQ4_0,
+            GgufType.Q5_0 => _psoGemvQ5_0,
             GgufType.Q8_0 => _psoGemvQ8_0,
             GgufType.Q2_K => _psoGemvQ2_K,
             GgufType.Q2_0 => _psoGemvQ2_0,
+            GgufType.GgmlQ2_0 => _psoGemvGgmlQ2_0,
             GgufType.IQ2_XXS => _psoGemvIQ2_XXS,
+            GgufType.IQ2_XS => _psoGemvIQ2_XS,
+            GgufType.IQ2_S => _psoGemvIQ2_S,
+            GgufType.IQ3_XXS => _psoGemvIQ3_XXS,
             GgufType.IQ4_NL => _psoGemvIQ4_NL,
             GgufType.IQ4_XS => _psoGemvIQ4_XS,
             GgufType.MXFP4 => _psoGemvMXFP4,
             GgufType.IQ3_S => _psoGemvIQ3_S,
             GgufType.Ternary_1_58 or GgufType.PQ2_0 => _psoGemvTernary,
-            _ => _psoGemvFp32
+            GgufType.BF16 => _psoGemvBf16,
+            GgufType.F32 => _psoGemvFp32,
+            _ => throw new NotSupportedException($"Direct3D 12 hybrid GEMV does not support tensor quantization type {type}.")
         };
         cmdList.SetPipelineState(pso);
 
@@ -1037,441 +1210,599 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
         if ((uint)pos >= (uint)_maxSeqLen)
             throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Token position {pos} exceeds maximum sequence length {_maxSeqLen}.");
 
-        if (StartLayer == 0)
+        PleLookupTicket pleTicket = BeginPleTokenOverlap(token);
+        try
         {
-            QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
-        }
-        else
-        {
-            fixed (float* pInput = inputX)
+            if (StartLayer == 0)
             {
-                Buffer.MemoryCopy(pInput, _pUploadEmbedding, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
-            }
-        }
-
-        uint* ropeConsts = stackalloc uint[7];
-        uint* kvConsts = stackalloc uint[4];
-        uint* faConsts = stackalloc uint[6];
-        uint* convConsts = stackalloc uint[1];
-        uint* l2Consts = stackalloc uint[2];
-        uint* dnConsts = stackalloc uint[4];
-        uint* gsConsts = stackalloc uint[4];
-        uint* qgConsts = stackalloc uint[2];
-
-        int maxTopK = _weights.ExpertUsedCount > 0 ? _weights.ExpertUsedCount : 1;
-        int* selectedIndices = stackalloc int[maxTopK];
-        float* selectedWeights = stackalloc float[maxTopK];
-
-        _ctx.BeginCommands();
-        var cmd = _ctx.CommandList;
-
-        // Copy embedding / input activation into _dX
-        cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-        cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
-        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
-        cmd.ResourceBarrierUnorderedAccessView(null!);
-
-        int qDim = _nHeads * _headDim;
-        int kvDim = _headsKv * _headDim;
-
-        int layersToRun = maxLayers >= 0 ? Math.Min(maxLayers, LayerCount) : LayerCount;
-        for (int l = 0; l < layersToRun; l++)
-        {
-            var lw = _layerWeights[l];
-
-            // 1. Attention / GDN Pre-Norm
-            DispatchRmsNorm(cmd, _dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            if (lw.IsGdn)
-            {
-                // -------------------------------------------------------------
-                // Gated DeltaNet (SSM Linear Attention)
-                // -------------------------------------------------------------
-                DispatchGemv(cmd, lw.QkvType, _dGdnQkv, _dNormX, lw.QkvWeight!.GPUVirtualAddress, _dim, _gdnConvChannels);
-                DispatchGemv(cmd, lw.AttnGateType, _dGdnZ, _dNormX, lw.AttnGateWeight!.GPUVirtualAddress, _dim, _ssmInnerSize);
-                DispatchGemv(cmd, lw.SsmAlphaType, _dGdnA, _dNormX, lw.SsmAlphaWeight!.GPUVirtualAddress, _dim, _ssmHeads);
-                DispatchGemv(cmd, lw.SsmBetaType, _dGdnB, _dNormX, lw.SsmBetaWeight!.GPUVirtualAddress, _dim, _ssmHeads);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Causal 1D Depthwise Conv
-                cmd.SetComputeRootSignature(_sigSsmConv1d);
-                cmd.SetPipelineState(_psoSsmConv1d);
-                convConsts[0] = (uint)_gdnConvChannels;
-                cmd.SetComputeRoot32BitConstants(0, 1, (IntPtr)convConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dGdnQkv.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dConvState[l].GPUVirtualAddress);
-                cmd.SetComputeRootShaderResourceView(3, lw.SsmConv1dWeight!.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(4, _dGdnConvOut.GPUVirtualAddress);
-                cmd.Dispatch(((uint)_gdnConvChannels + 255) / 256, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // L2 Normalization of Q and K per group
-                cmd.SetComputeRootSignature(_sigL2NormQK);
-                cmd.SetPipelineState(_psoL2NormQK);
-                l2Consts[0] = (uint)_ssmGroupCount;
-                l2Consts[1] = (uint)_ssmStateDim;
-                cmd.SetComputeRoot32BitConstants(0, 2, (IntPtr)l2Consts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dGdnConvOut.GPUVirtualAddress);
-                ulong kByteOffset = (ulong)(_ssmGroupCount * _ssmStateDim * sizeof(float));
-                cmd.SetComputeRootUnorderedAccessView(2, _dGdnConvOut.GPUVirtualAddress + kByteOffset);
-                cmd.Dispatch((uint)_ssmGroupCount, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Recurrent Associative Memory State Update
-                cmd.SetComputeRootSignature(_sigDeltaNet);
-                cmd.SetPipelineState(_psoDeltaNet);
-                dnConsts[0] = (uint)_ssmHeads;
-                dnConsts[1] = (uint)_ssmStateDim;
-                dnConsts[2] = (uint)_ssmGroupCount;
-                dnConsts[3] = lw.SsmDtBias != null ? 1u : 0u;
-                cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)dnConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dGdnConvOut.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dGdnConvOut.GPUVirtualAddress + kByteOffset);
-                ulong vByteOffset = (ulong)(2 * _ssmGroupCount * _ssmStateDim * sizeof(float));
-                cmd.SetComputeRootUnorderedAccessView(3, _dGdnConvOut.GPUVirtualAddress + vByteOffset);
-                cmd.SetComputeRootUnorderedAccessView(4, _dGdnA.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(5, _dGdnB.GPUVirtualAddress);
-                cmd.SetComputeRootShaderResourceView(6, lw.SsmDtBias?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-                cmd.SetComputeRootShaderResourceView(7, lw.SsmAWeight?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(8, _dSsmState[l].GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(9, _dGdnY.GPUVirtualAddress);
-                cmd.Dispatch((uint)_ssmHeads, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Fused Head RMSNorm + SiLU gating on Z
-                cmd.SetComputeRootSignature(_sigSsmGateSilu);
-                cmd.SetPipelineState(_psoSsmGateSilu);
-                gsConsts[0] = (uint)_ssmHeads;
-                gsConsts[1] = (uint)_ssmStateDim;
-                *(float*)(&gsConsts[2]) = _weights.RmsNormEps;
-                gsConsts[3] = lw.SsmNormWeight != null ? 1u : 0u;
-                cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)gsConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dGdnY.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dGdnZ.GPUVirtualAddress);
-                cmd.SetComputeRootShaderResourceView(3, lw.SsmNormWeight?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
-                cmd.Dispatch((uint)_ssmHeads, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Output projection back to residual stream
-                DispatchGemv(cmd, lw.SsmOutType, _dAttnProjOut, _dGdnY, lw.SsmOutWeight!.GPUVirtualAddress, _ssmInnerSize, _dim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
+                QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, _pUploadEmbedding, _dim);
             }
             else
             {
-                // -------------------------------------------------------------
-                // Interleaved Full Attention Layer
-                // -------------------------------------------------------------
-                if (lw.HasQGate)
+                fixed (float* pInput = inputX)
                 {
-                    DispatchGemv(cmd, lw.QType, _dQFull, _dNormX, lw.QWeight.GPUVirtualAddress, _dim, 2 * qDim);
+                    Buffer.MemoryCopy(pInput, _pUploadEmbedding, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+                }
+            }
+
+            uint* ropeConsts = stackalloc uint[7];
+            uint* kvConsts = stackalloc uint[4];
+            uint* convConsts = stackalloc uint[1];
+            uint* l2Consts = stackalloc uint[2];
+            uint* dnConsts = stackalloc uint[4];
+            uint* gsConsts = stackalloc uint[4];
+            uint* qgConsts = stackalloc uint[2];
+
+            int layersToRun = maxLayers >= 0 ? Math.Min(maxLayers, LayerCount) : LayerCount;
+            bool layer0PleHandled = false;
+            bool xWrittenInCmd = false;
+            bool rWrittenInCmd = false;
+            bool qsaIdsInSrv = false;
+
+            if (StartLayer == 0 && layersToRun > 0 && _weights.Layers[0].HasPle && _pleProcessor != null && _pUploadHcR != null)
+            {
+                ulong vecBytes = (ulong)_dim * sizeof(float);
+                if (_hasHc)
+                {
+                    for (int c = 0; c < _hcCount; c++)
+                    {
+                        Buffer.MemoryCopy(_pUploadEmbedding, _pUploadHcR + (long)c * _dim, vecBytes, vecBytes);
+                    }
+                    ExecutePleLayerOnHostBuffer(0, ref pleTicket, _pUploadHcR, _pleEmbBuf);
+                }
+                else
+                {
+                    Buffer.MemoryCopy(_pUploadEmbedding, _pUploadHcR, vecBytes, vecBytes);
+                    ExecutePleLayerOnHostBuffer(0, ref pleTicket, _pUploadHcR, _pleEmbBuf);
+                }
+                layer0PleHandled = true;
+            }
+
+            _ctx.BeginCommands();
+            var cmd = _ctx.CommandList;
+
+            if (layer0PleHandled)
+            {
+                if (_hasHc)
+                {
+                    cmd.ResourceBarrierTransition(_dHcR!, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dHcR!, 0, _uploadHcR!, 0, (ulong)(_hcDim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dHcR!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    rWrittenInCmd = true;
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dX, 0, _uploadHcR!, 0, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    xWrittenInCmd = true;
+                }
+            }
+            else
+            {
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
+                cmd.CopyBufferRegion(_dX, 0, _uploadEmbedding, 0, (ulong)(_dim * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.Common);
+                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                if (_hasHc)
+                {
+                    DispatchHcBroadcastInit(cmd, 1, _dX, _dHcR!);
+                    rWrittenInCmd = true;
+                }
+            }
+
+            int qDim = _nHeads * _headDim;
+            int kvDim = _headsKv * _headDim;
+
+            for (int l = 0; l < layersToRun; l++)
+            {
+                int modelLayer = StartLayer + l;
+                var lw = _layerWeights[l];
+                var lwHost = _weights.Layers[modelLayer];
+
+                // Host PLE step for deeper layers (l > 0 or non-stage-0)
+                if (!(l == 0 && layer0PleHandled) && lwHost.HasPle && _pleProcessor != null && _readbackHcR != null && _uploadHcR != null)
+                {
+                    ID3D12Resource targetRes = _hasHc ? _dHcR! : _dX;
+                    bool targetIsUav = _hasHc ? rWrittenInCmd : xWrittenInCmd;
+                    ulong hcBytes = (ulong)((_hasHc ? _hcDim : _dim) * sizeof(float));
+
+                    cmd.ResourceBarrierTransition(targetRes, targetIsUav ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHcR, 0, targetRes, 0, hcBytes);
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.CopySource, ResourceStates.Common);
+                    _ctx.EndCommandsAndExecute();
+                    _ctx.Synchronize();
+
+                    ExecutePleLayerOnHostBuffer(modelLayer, ref pleTicket, _pReadbackHcR, _pleEmbBuf);
+                    Buffer.MemoryCopy(_pReadbackHcR, _pUploadHcR, hcBytes, hcBytes);
+
+                    _ctx.BeginCommands();
+                    cmd = _ctx.CommandList;
+                    qsaIdsInSrv = false;
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(targetRes, 0, _uploadHcR, 0, hcBytes);
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    if (_hasHc) { rWrittenInCmd = true; xWrittenInCmd = false; } else { xWrittenInCmd = true; rWrittenInCmd = false; }
+                }
+
+                // 1. Attention / GDN Pre-Norm (HC multi-stream read or standard RMSNorm)
+                if (_hasHc && lw.HasHyperConnections)
+                {
+                    DispatchHcRead(
+                        cmd,
+                        1,
+                        _dHcR!,
+                        _dHcXn!,
+                        _dHcLo!,
+                        _dHcUp!,
+                        _dHcInject!,
+                        lw.HcAttnNormWeight,
+                        lw.HcAttnDownType,
+                        lw.HcAttnDownWeight!,
+                        lw.HcAttnUpType,
+                        lw.HcAttnUpWeight!,
+                        lw.HcAttnInjectType,
+                        lw.HcAttnInjectWeight,
+                        _dNormX);
+                }
+                else if (lw.AttnNormWeight != null)
+                {
+                    DispatchRmsNorm(cmd, _dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dNormX);
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dX, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dNormX, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopyDest, ResourceStates.Common);
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
+
+                if (lw.IsGdn)
+                {
+                    DispatchGemv(cmd, lw.QkvType, _dGdnQkv, _dNormX, lw.QkvWeight!.GPUVirtualAddress, _dim, _gdnConvChannels);
+                    DispatchGemv(cmd, lw.AttnGateType, _dGdnZ, _dNormX, lw.AttnGateWeight!.GPUVirtualAddress, _dim, _ssmInnerSize);
+                    DispatchGemv(cmd, lw.SsmAlphaType, _dGdnA, _dNormX, lw.SsmAlphaWeight!.GPUVirtualAddress, _dim, _ssmHeads);
+                    DispatchGemv(cmd, lw.SsmBetaType, _dGdnB, _dNormX, lw.SsmBetaWeight!.GPUVirtualAddress, _dim, _ssmHeads);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                    // Split into Q and QGate
-                    cmd.SetComputeRootSignature(_sigQGateSplit);
-                    cmd.SetPipelineState(_psoQGateSplit);
-                    qgConsts[0] = (uint)_nHeads;
-                    qgConsts[1] = (uint)_headDim;
-                    cmd.SetComputeRoot32BitConstants(0, 2, (IntPtr)qgConsts, 0);
-                    cmd.SetComputeRootUnorderedAccessView(1, _dQFull.GPUVirtualAddress);
-                    cmd.SetComputeRootUnorderedAccessView(2, _dQ.GPUVirtualAddress);
-                    cmd.SetComputeRootUnorderedAccessView(3, _dQGate.GPUVirtualAddress);
-                    cmd.Dispatch(((uint)qDim + 255) / 256, 1, 1);
+                    cmd.SetComputeRootSignature(_sigSsmConv1d);
+                    cmd.SetPipelineState(_psoSsmConv1d);
+                    convConsts[0] = (uint)_gdnConvChannels;
+                    cmd.SetComputeRoot32BitConstants(0, 1, (IntPtr)convConsts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dGdnQkv.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(2, _dConvState[l].GPUVirtualAddress);
+                    cmd.SetComputeRootShaderResourceView(3, lw.SsmConv1dWeight!.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(4, _dGdnConvOut.GPUVirtualAddress);
+                    cmd.Dispatch(((uint)_gdnConvChannels + 255) / 256, 1, 1);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.SetComputeRootSignature(_sigL2NormQK);
+                    cmd.SetPipelineState(_psoL2NormQK);
+                    l2Consts[0] = (uint)_ssmGroupCount;
+                    l2Consts[1] = (uint)_ssmStateDim;
+                    cmd.SetComputeRoot32BitConstants(0, 2, (IntPtr)l2Consts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dGdnConvOut.GPUVirtualAddress);
+                    ulong kByteOffset = (ulong)(_ssmGroupCount * _ssmStateDim * sizeof(float));
+                    cmd.SetComputeRootUnorderedAccessView(2, _dGdnConvOut.GPUVirtualAddress + kByteOffset);
+                    cmd.Dispatch((uint)_ssmGroupCount, 1, 1);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.SetComputeRootSignature(_sigDeltaNet);
+                    cmd.SetPipelineState(_psoDeltaNet);
+                    dnConsts[0] = (uint)_ssmHeads;
+                    dnConsts[1] = (uint)_ssmStateDim;
+                    dnConsts[2] = (uint)_ssmGroupCount;
+                    dnConsts[3] = lw.SsmDtBias != null ? 1u : 0u;
+                    cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)dnConsts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dGdnConvOut.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(2, _dGdnConvOut.GPUVirtualAddress + kByteOffset);
+                    ulong vByteOffset = (ulong)(2 * _ssmGroupCount * _ssmStateDim * sizeof(float));
+                    cmd.SetComputeRootUnorderedAccessView(3, _dGdnConvOut.GPUVirtualAddress + vByteOffset);
+                    cmd.SetComputeRootUnorderedAccessView(4, _dGdnA.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(5, _dGdnB.GPUVirtualAddress);
+                    cmd.SetComputeRootShaderResourceView(6, lw.SsmDtBias?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
+                    cmd.SetComputeRootShaderResourceView(7, lw.SsmAWeight?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(8, _dSsmState[l].GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(9, _dGdnY.GPUVirtualAddress);
+                    cmd.Dispatch((uint)_ssmHeads, 1, 1);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.SetComputeRootSignature(_sigSsmGateSilu);
+                    cmd.SetPipelineState(_psoSsmGateSilu);
+                    gsConsts[0] = (uint)_ssmHeads;
+                    gsConsts[1] = (uint)_ssmStateDim;
+                    *(float*)(&gsConsts[2]) = _weights.RmsNormEps;
+                    gsConsts[3] = (lw.SsmNormWeight != null ? 1u : 0u) | (_useSigmoidGdnGate ? 2u : 0u);
+                    cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)gsConsts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dGdnY.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(2, _dGdnZ.GPUVirtualAddress);
+                    cmd.SetComputeRootShaderResourceView(3, lw.SsmNormWeight?.GPUVirtualAddress ?? _ctx.DummyBuffer.GPUVirtualAddress);
+                    cmd.Dispatch((uint)_ssmHeads, 1, 1);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    DispatchGemv(cmd, lw.SsmOutType, _dAttnProjOut, _dGdnY, lw.SsmOutWeight!.GPUVirtualAddress, _ssmInnerSize, _dim);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
                 }
                 else
                 {
-                    DispatchGemv(cmd, lw.QType, _dQ, _dNormX, lw.QWeight.GPUVirtualAddress, _dim, qDim);
-                }
-
-                DispatchGemv(cmd, lw.KType, _dK, _dNormX, lw.KWeight.GPUVirtualAddress, _dim, kvDim);
-                DispatchGemv(cmd, lw.VType, _dV, _dNormX, lw.VWeight.GPUVirtualAddress, _dim, kvDim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Optional QK-Norm
-                if (lw.AttnQNormWeight != null)
-                {
-                    DispatchRmsNormHeads(cmd, _dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-                }
-                if (lw.AttnKNormWeight != null)
-                {
-                    DispatchRmsNormHeads(cmd, _dK, lw.AttnKNormWeight, _headsKv, _headDim, _weights.RmsNormEps);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-                }
-
-                // Partial RoPE (using _ropeDim, e.g. 64 out of 256)
-                cmd.SetComputeRootSignature(_sigRope);
-                cmd.SetPipelineState(_psoRope);
-                ropeConsts[0] = (uint)_nHeads;
-                ropeConsts[1] = (uint)_headsKv;
-                ropeConsts[2] = (uint)_headDim;
-                ropeConsts[3] = (uint)_ropeDim;
-                ropeConsts[4] = (uint)pos;
-                *(float*)(&ropeConsts[5]) = _weights.RopeFreqBase;
-                *(float*)(&ropeConsts[6]) = 1.0f;
-                cmd.SetComputeRoot32BitConstants(0, 7, (IntPtr)ropeConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dK.GPUVirtualAddress);
-                uint totalPairs = (uint)((_nHeads + _headsKv) * (_ropeDim / 2));
-                cmd.Dispatch((totalPairs + 255) / 256, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // KV Store
-                cmd.SetComputeRootSignature(_sigKvStore);
-                cmd.SetPipelineState(_psoKvStore);
-                kvConsts[0] = (uint)_headsKv;
-                kvConsts[1] = (uint)_headDim;
-                kvConsts[2] = (uint)_maxSeqLen;
-                kvConsts[3] = (uint)pos;
-                cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)kvConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dK.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dV.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(3, _dKeyCache[l].GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(4, _dValCache[l].GPUVirtualAddress);
-                cmd.Dispatch(((uint)kvDim + 255) / 256, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // FlashAttention / AttentionGqa (256-wide)
-                cmd.SetComputeRootSignature(_sigFlashAttn);
-                cmd.SetPipelineState(_psoFlashAttn);
-                faConsts[0] = (uint)_nHeads;
-                faConsts[1] = (uint)_headsKv;
-                faConsts[2] = (uint)_headDim;
-                faConsts[3] = (uint)_maxSeqLen;
-                faConsts[4] = (uint)pos;
-                *(float*)(&faConsts[5]) = 1.0f / MathF.Sqrt(_headDim);
-                cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)faConsts, 0);
-                cmd.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(2, _dKeyCache[l].GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(3, _dValCache[l].GPUVirtualAddress);
-                cmd.SetComputeRootUnorderedAccessView(4, _dAttnOut.GPUVirtualAddress);
-                cmd.Dispatch((uint)_nHeads, 1, 1);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Post-Attention Q-Gate if present
-                if (lw.HasQGate)
-                {
-                    cmd.SetComputeRootSignature(_sigAttnOutGate);
-                    cmd.SetPipelineState(_psoAttnOutGate);
-                    uint totalQ = (uint)qDim;
-                    cmd.SetComputeRoot32BitConstants(0, 1, (IntPtr)(&totalQ), 0);
-                    cmd.SetComputeRootUnorderedAccessView(1, _dAttnOut.GPUVirtualAddress);
-                    cmd.SetComputeRootUnorderedAccessView(2, _dQGate.GPUVirtualAddress);
-                    cmd.Dispatch(((uint)qDim + 255) / 256, 1, 1);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-                }
-
-                // Output projection
-                DispatchGemv(cmd, lw.AttnOutType, _dAttnProjOut, _dAttnOut, lw.AttnOutWeight.GPUVirtualAddress, qDim, _dim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-            }
-
-            // Residual Add: _dX = _dX + _dAttnProjOut
-            DispatchVecAdd(cmd, _dAttnProjOut, _dX, _dim);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            // -------------------------------------------------------------
-            // Feed-Forward Network (Dense SwiGLU or GPU-First Sparse MoE)
-            // -------------------------------------------------------------
-            DispatchRmsNorm(cmd, _dX, lw.FfnNormWeight, _dMlpNorm, _dim, _weights.RmsNormEps);
-            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-            if (lw.IsMoe)
-            {
-                int expertFfnDim = _weights.ExpertFeedForwardLength;
-                int numExperts = _weights.ExpertCount;
-                int topK = _weights.ExpertUsedCount;
-                int modelLayer = StartLayer + l;
-                var layerHost = _weights.Layers[modelLayer];
-
-                // 1. Router GEMV: compute logits for all experts into _dRouterLogits
-                DispatchGemvBias(cmd, GgufType.F32, _dRouterLogits!, _dMlpNorm, lw.FfnGateInpWeight!.GPUVirtualAddress, _dim, numExperts, lw.FfnGateInpBias);
-                cmd.ResourceBarrierUnorderedAccessView(_dRouterLogits!);
-
-                _dTopKIndices ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(uint)));
-                _dTopKWeights ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(float)));
-
-                bool hasShexp = (lw.FfnGateShexpWeight != null);
-                bool hasShexpGate = hasShexp && layerHost.FfnGateInpShexpWeight != null;
-                if (hasShexpGate && _dShexpGateScalar == null)
-                    _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
-
-                // 2. GPU Softmax and Top-K directly in VRAM (zero host sync)
-                _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogits!, _dTopKIndices, _dTopKWeights, numExperts, topK, _weights.NormTopK);
-                cmd.ResourceBarrierUnorderedAccessView(_dTopKIndices);
-                cmd.ResourceBarrierUnorderedAccessView(_dTopKWeights);
-
-                // 3. Routed Experts Execution via Indirected GEMV (Zero-Stall)
-                ulong gateSliceBytes = lw.FfnGateExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnGateExpsType, expertFfnDim, _dim) : 0;
-                ulong upSliceBytes = lw.FfnUpExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnUpExpsType, expertFfnDim, _dim) : 0;
-                ulong downSliceBytes = lw.FfnDownExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnDownExpsType, _dim, expertFfnDim) : 0;
-
-                for (int k = 0; k < topK; k++)
-                {
-                    _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dMlpNorm, lw.FfnGateExpsWeight!, _dTopKIndices, k, gateSliceBytes, _dim, expertFfnDim);
-                    _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dMlpNorm, lw.FfnUpExpsWeight!, _dTopKIndices, k, upSliceBytes, _dim, expertFfnDim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    DispatchSwiGLU(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndices, k, downSliceBytes, expertFfnDim, _dim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeights, k, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-                }
-
-                // 4. Shared Expert if present
-                if (hasShexp)
-                {
-                    int shexpFfnDim = expertFfnDim * 2;
-                    if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                        shexpFfnDim = (int)tShexp.Dimensions[1];
-
-                    DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate!, _dMlpNorm, lw.FfnGateShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
-                    DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp!, _dMlpNorm, lw.FfnUpShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    DispatchSwiGLU(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut!, _dShexpAct!, lw.FfnDownShexpWeight!.GPUVirtualAddress, shexpFfnDim, _dim);
-                    cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                    if (hasShexpGate)
+                    if (lw.HasQGate)
                     {
-                        var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, layerHost.FfnGateInpShexpWeight);
-                        _ctx.DispatchMoeSharedExpertGate(cmd, _dMlpNorm, dShexpGateW, _dShexpGateScalar!, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar!);
+                        DispatchGemv(cmd, lw.QType, _dQFull, _dNormX, lw.QWeight.GPUVirtualAddress, _dim, 2 * qDim);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
 
-                        _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar!, 0, _dim, accumulate: 1);
+                        cmd.SetComputeRootSignature(_sigQGateSplit);
+                        cmd.SetPipelineState(_psoQGateSplit);
+                        qgConsts[0] = (uint)_nHeads;
+                        qgConsts[1] = (uint)_headDim;
+                        cmd.SetComputeRoot32BitConstants(0, 2, (IntPtr)qgConsts, 0);
+                        cmd.SetComputeRootUnorderedAccessView(1, _dQFull.GPUVirtualAddress);
+                        cmd.SetComputeRootUnorderedAccessView(2, _dQ.GPUVirtualAddress);
+                        cmd.SetComputeRootUnorderedAccessView(3, _dQGate.GPUVirtualAddress);
+                        cmd.Dispatch(((uint)qDim + 255) / 256, 1, 1);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
                     }
                     else
                     {
-                        DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                        DispatchGemv(cmd, lw.QType, _dQ, _dNormX, lw.QWeight.GPUVirtualAddress, _dim, qDim);
                     }
+
+                    DispatchGemv(cmd, lw.KType, _dK, _dNormX, lw.KWeight.GPUVirtualAddress, _dim, kvDim);
+                    DispatchGemv(cmd, lw.VType, _dV, _dNormX, lw.VWeight.GPUVirtualAddress, _dim, kvDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    if (lw.AttnQNormWeight != null)
+                    {
+                        DispatchRmsNormHeads(cmd, _dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
+                    }
+                    if (lw.AttnKNormWeight != null)
+                    {
+                        DispatchRmsNormHeads(cmd, _dK, lw.AttnKNormWeight, _headsKv, _headDim, _weights.RmsNormEps);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
+                    }
+
+                    cmd.SetComputeRootSignature(_sigRope);
+                    cmd.SetPipelineState(_psoRope);
+                    ropeConsts[0] = (uint)_nHeads;
+                    ropeConsts[1] = (uint)_headsKv;
+                    ropeConsts[2] = (uint)_headDim;
+                    ropeConsts[3] = (uint)_ropeDim;
+                    ropeConsts[4] = (uint)pos;
+                    *(float*)(&ropeConsts[5]) = _weights.RopeFreqBase;
+                    *(float*)(&ropeConsts[6]) = 1.0f;
+                    cmd.SetComputeRoot32BitConstants(0, 7, (IntPtr)ropeConsts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dQ.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(2, _dK.GPUVirtualAddress);
+                    uint totalPairs = (uint)((_nHeads + _headsKv) * (_ropeDim / 2));
+                    cmd.Dispatch((totalPairs + 255) / 256, 1, 1);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.SetComputeRootSignature(_sigKvStore);
+                    cmd.SetPipelineState(_psoKvStore);
+                    kvConsts[0] = (uint)_headsKv;
+                    kvConsts[1] = (uint)_headDim;
+                    kvConsts[2] = (uint)_maxSeqLen;
+                    kvConsts[3] = (uint)pos;
+                    cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)kvConsts, 0);
+                    cmd.SetComputeRootUnorderedAccessView(1, _dK.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(2, _dV.GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(3, _dKeyCache[l].GPUVirtualAddress);
+                    cmd.SetComputeRootUnorderedAccessView(4, _dValCache[l].GPUVirtualAddress);
+                    if (KvPrecision == KvCachePrecision.Q4_0)
+                    {
+                        uint nb = (uint)((_headDim + 31) / 32);
+                        uint numPairs = (nb + 1) / 2;
+                        cmd.Dispatch((uint)_headsKv * numPairs, 1, 1);
+                    }
+                    else if (KvPrecision == KvCachePrecision.Fp16)
+                    {
+                        uint totalHalf = (uint)(_headsKv * ((_headDim + 1) / 2));
+                        cmd.Dispatch((totalHalf + 127) / 128, 1, 1);
+                    }
+                    else
+                    {
+                        cmd.Dispatch(((uint)kvDim + 255) / 256, 1, 1);
+                    }
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    var qsa = lwHost.IsQsa && _qsaIndexers != null ? _qsaIndexers[modelLayer] : null;
+                    if (qsa != null && _readbackNormX != null)
+                    {
+                        cmd.ResourceBarrierTransition(_dNormX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.CopyBufferRegion(_readbackNormX, 0, _dNormX, 0, (ulong)(_dim * sizeof(float)));
+                        cmd.ResourceBarrierTransition(_dNormX, ResourceStates.CopySource, ResourceStates.Common);
+                        _ctx.EndCommandsAndExecute();
+                        _ctx.Synchronize();
+                        xWrittenInCmd = false;
+                        rWrittenInCmd = false;
+                        qsaIdsInSrv = false;
+
+                        _ctx.BeginCommands();
+                        cmd = _ctx.CommandList;
+
+                        var qsaWeights = new QsaIndexerWeights
+                        {
+                            QProjType = lwHost.IndexerQProjType,
+                            QProjWeight = lwHost.IndexerQProjWeight,
+                            KProjType = lwHost.IndexerKProjType,
+                            KProjWeight = lwHost.IndexerKProjWeight,
+                            QNormWeight = lwHost.IndexerQNormWeight,
+                            KNormWeight = lwHost.IndexerKNormWeight
+                        };
+                        DispatchSparseOrFlashAttention(cmd, l, pos, _dQ.GPUVirtualAddress, _dAttnOut.GPUVirtualAddress, qsa, _pReadbackNormX, in qsaWeights, syncSelectedIds: qsaIdsInSrv);
+                        qsaIdsInSrv = true;
+                    }
+                    else
+                    {
+                        DispatchFlashAttentionKernel(cmd, l, pos, _dQ.GPUVirtualAddress, _dAttnOut.GPUVirtualAddress);
+                    }
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    if (lw.HasQGate)
+                    {
+                        cmd.SetComputeRootSignature(_sigAttnOutGate);
+                        cmd.SetPipelineState(_psoAttnOutGate);
+                        uint totalQ = (uint)qDim;
+                        cmd.SetComputeRoot32BitConstants(0, 1, (IntPtr)(&totalQ), 0);
+                        cmd.SetComputeRootUnorderedAccessView(1, _dAttnOut.GPUVirtualAddress);
+                        cmd.SetComputeRootUnorderedAccessView(2, _dQGate.GPUVirtualAddress);
+                        cmd.Dispatch(((uint)qDim + 255) / 256, 1, 1);
+                        cmd.ResourceBarrierUnorderedAccessView(null!);
+                    }
+
+                    DispatchGemv(cmd, lw.AttnOutType, _dAttnProjOut, _dAttnOut, lw.AttnOutWeight.GPUVirtualAddress, qDim, _dim);
                     cmd.ResourceBarrierUnorderedAccessView(null!);
                 }
 
-                // 5. Residual connection: _dX += _dFfnOut
-                DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-            }
-            else
-            {
-                DispatchGemv(cmd, lw.FfnGateType, _dMlpGate, _dMlpNorm, lw.FfnGateWeight!.GPUVirtualAddress, _dim, _ffnDim);
-                DispatchGemv(cmd, lw.FfnUpType, _dMlpUp, _dMlpNorm, lw.FfnUpWeight!.GPUVirtualAddress, _dim, _ffnDim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                DispatchSwiGLU(cmd, _dMlpGate, _dMlpUp, _dMlpAct, _ffnDim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                DispatchGemv(cmd, lw.FfnDownType, _dMlpOut, _dMlpAct, lw.FfnDownWeight!.GPUVirtualAddress, _ffnDim, _dim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                // Residual Add: _dX = _dX + _dMlpOut
-                DispatchVecAdd(cmd, _dMlpOut, _dX, _dim);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-            }
-        }
-
-        // Output Head or Intermediate Stage Readback
-        if (IsLastStage)
-        {
-            if (computeLogits && logits.Length > 0)
-            {
-                DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dOutNorm, _dim, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                DispatchGemv(cmd, _weights.OutType, _dLogits, _dOutNorm, _dOutWeight!.GPUVirtualAddress, _dim, _vocabSize);
-                cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_vocabSize * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
-                _ctx.EndCommandsAndExecute();
-                _ctx.Synchronize();
-
-                fixed (float* pLogits = logits)
+                // Residual fold after Attention / GDN
+                if (_hasHc && lw.HasHyperConnections)
                 {
-                    Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_vocabSize * sizeof(float)), (ulong)(_vocabSize * sizeof(float)));
+                    DispatchHcWrite(cmd, 1, _dHcR!, _dAttnProjOut, _dHcInject!);
+                    rWrittenInCmd = true;
+                }
+                else
+                {
+                    DispatchVecAdd(cmd, _dAttnProjOut, _dX, _dim);
+                    cmd.ResourceBarrierUnorderedAccessView(_dX);
+                    xWrittenInCmd = true;
+                }
+
+                // 2. FFN / MoE Pre-Norm
+                if (_hasHc && lw.HasHyperConnections)
+                {
+                    DispatchHcRead(
+                        cmd,
+                        1,
+                        _dHcR!,
+                        _dHcXn!,
+                        _dHcLo!,
+                        _dHcUp!,
+                        _dHcInject!,
+                        lw.HcFfnNormWeight,
+                        lw.HcFfnDownType,
+                        lw.HcFfnDownWeight!,
+                        lw.HcFfnUpType,
+                        lw.HcFfnUpWeight!,
+                        lw.HcFfnInjectType,
+                        lw.HcFfnInjectWeight,
+                        _dMlpNorm);
+                }
+                else if (lw.FfnNormWeight != null)
+                {
+                    DispatchRmsNorm(cmd, _dX, lw.FfnNormWeight, _dMlpNorm, _dim, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dMlpNorm);
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dX, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dMlpNorm, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.CopyDest, ResourceStates.Common);
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
+
+                if (lw.IsMoe)
+                {
+                    int expertFfnDim = _weights.ExpertFeedForwardLength;
+                    int numExperts = _weights.ExpertCount;
+                    int topK = _weights.ExpertUsedCount;
+                    bool hasShexp = lw.FfnGateShexpWeight != null;
+                    bool hasShexpGate = hasShexp && lwHost.FfnGateInpShexpWeight != null;
+
+                    if (_tieredMoe)
+                    {
+                        ExecuteHostedMoeSingleToken(lw, modelLayer, expertFfnDim, numExperts, topK, hasShexp, hasShexpGate);
+                        cmd = _ctx.CommandList;
+                        xWrittenInCmd = false;
+                        rWrittenInCmd = false;
+                        qsaIdsInSrv = false;
+                    }
+                    else
+                    {
+                        DispatchGemvBias(cmd, GgufType.F32, _dRouterLogits!, _dMlpNorm, lw.FfnGateInpWeight!.GPUVirtualAddress, _dim, numExperts, lw.FfnGateInpBias);
+                        cmd.ResourceBarrierUnorderedAccessView(_dRouterLogits!);
+
+                        _dTopKIndices ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(uint)));
+                        _dTopKWeights ??= _ctx.CreateDeviceBuffer((ulong)(topK * sizeof(float)));
+                        _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogits!, _dTopKIndices, _dTopKWeights, numExperts, topK, _weights.NormTopK);
+                        cmd.ResourceBarrierUnorderedAccessView(_dTopKIndices);
+                        cmd.ResourceBarrierUnorderedAccessView(_dTopKWeights);
+
+                        ulong gateSliceBytes = GetHybridAlignedBytes(lw.FfnGateExpsType, expertFfnDim, _dim);
+                        ulong upSliceBytes = GetHybridAlignedBytes(lw.FfnUpExpsType, expertFfnDim, _dim);
+                        ulong downSliceBytes = GetHybridAlignedBytes(lw.FfnDownExpsType, _dim, expertFfnDim);
+
+                        for (int k = 0; k < topK; k++)
+                        {
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dMlpNorm, lw.FfnGateExpsWeight!, _dTopKIndices, k, gateSliceBytes, _dim, expertFfnDim);
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dMlpNorm, lw.FfnUpExpsWeight!, _dTopKIndices, k, upSliceBytes, _dim, expertFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchSwiGLU(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndices, k, downSliceBytes, expertFfnDim, _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeights, k, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+                        }
+
+                        if (hasShexp)
+                        {
+                            int shexpFfnDim = ResolveSharedExpertFfnDim(modelLayer, expertFfnDim);
+                            DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate!, _dMlpNorm, lw.FfnGateShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
+                            DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp!, _dMlpNorm, lw.FfnUpShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchSwiGLU(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut!, _dShexpAct!, lw.FfnDownShexpWeight!.GPUVirtualAddress, shexpFfnDim, _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                            if (hasShexpGate)
+                            {
+                                if (_dShexpGateScalar == null) _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
+                                var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, lwHost.FfnGateInpShexpWeight);
+                                _ctx.DispatchMoeSharedExpertGate(cmd, _dMlpNorm, dShexpGateW, _dShexpGateScalar, _dim);
+                                cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar);
+                                _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar, 0, _dim, accumulate: 1);
+                            }
+                            else
+                            {
+                                DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                            }
+                            cmd.ResourceBarrierUnorderedAccessView(null!);
+                        }
+                    }
+
+                    if (_hasHc && lw.HasHyperConnections)
+                    {
+                        DispatchHcWrite(cmd, 1, _dHcR!, _dFfnOut!, _dHcInject!);
+                        rWrittenInCmd = true;
+                    }
+                    else
+                    {
+                        DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
+                        cmd.ResourceBarrierUnorderedAccessView(_dX);
+                        xWrittenInCmd = true;
+                    }
+                }
+                else
+                {
+                    DispatchGemv(cmd, lw.FfnGateType, _dMlpGate, _dMlpNorm, lw.FfnGateWeight!.GPUVirtualAddress, _dim, _ffnDim);
+                    DispatchGemv(cmd, lw.FfnUpType, _dMlpUp, _dMlpNorm, lw.FfnUpWeight!.GPUVirtualAddress, _dim, _ffnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    DispatchSwiGLU(cmd, _dMlpGate, _dMlpUp, _dMlpAct, _ffnDim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    DispatchGemv(cmd, lw.FfnDownType, _dMlpOut, _dMlpAct, lw.FfnDownWeight!.GPUVirtualAddress, _ffnDim, _dim);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    if (_hasHc && lw.HasHyperConnections)
+                    {
+                        DispatchHcWrite(cmd, 1, _dHcR!, _dMlpOut, _dHcInject!);
+                        rWrittenInCmd = true;
+                    }
+                    else
+                    {
+                        DispatchVecAdd(cmd, _dMlpOut, _dX, _dim);
+                        cmd.ResourceBarrierUnorderedAccessView(_dX);
+                        xWrittenInCmd = true;
+                    }
+                }
+            }
+
+            if (StartLayer == 0 && _pleProcessor != null)
+            {
+                _pleProcessor.PushToken(token);
+            }
+
+            if (IsLastStage)
+            {
+                if (_hasHc && _readbackHcR != null)
+                {
+                    cmd.ResourceBarrierTransition(_dHcR!, rWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHcR, 0, _dHcR!, 0, (ulong)(_hcDim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dHcR!, ResourceStates.CopySource, rWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
+
+                if (_hasHc)
+                {
+                    ApplyOutputHcAndExtractHidden(cmd, 1, _dX);
+                    xWrittenInCmd = true;
+                }
+
+                if (_readbackHidden != null)
+                {
+                    cmd.ResourceBarrierTransition(_dX, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHidden, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
+                    xWrittenInCmd = false;
+                }
+
+                if (computeLogits && logits.Length > 0)
+                {
+                    ID3D12Resource lmHeadInput = _dX;
+                    if (_dOutNormWeight != null)
+                    {
+                        DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dOutNorm, _dim, _weights.RmsNormEps);
+                        cmd.ResourceBarrierUnorderedAccessView(_dOutNorm);
+                        lmHeadInput = _dOutNorm;
+                    }
+
+                    DispatchGemv(cmd, NormalizeHybridGpuType(_weights.OutType, _dim), _dLogits, lmHeadInput, _dOutWeight!.GPUVirtualAddress, _dim, _vocabSize);
+                    cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_vocabSize * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dLogits, ResourceStates.CopySource, ResourceStates.Common);
+                    _ctx.EndCommandsAndExecute();
+                    _ctx.Synchronize();
+
+                    RecordHiddenStatesAfterSingleStep(pos);
+                    fixed (float* pLogits = logits)
+                    {
+                        Buffer.MemoryCopy(_pReadbackLogits, pLogits, (ulong)(_vocabSize * sizeof(float)), (ulong)(_vocabSize * sizeof(float)));
+                    }
+                }
+                else
+                {
+                    _ctx.EndCommandsAndExecute();
+                    _ctx.Synchronize();
+                    RecordHiddenStatesAfterSingleStep(pos);
                 }
             }
             else
             {
+                if (!outputX.IsEmpty && _readbackActivation != null)
+                {
+                    cmd.ResourceBarrierTransition(_dX, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackActivation, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
+                }
                 _ctx.EndCommandsAndExecute();
                 _ctx.Synchronize();
-            }
-        }
-        else
-        {
-            if (!outputX.IsEmpty && _readbackActivation != null)
-            {
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopySource);
-                cmd.CopyBufferRegion(_readbackActivation, 0, _dX, 0, (ulong)(_dim * sizeof(float)));
-                cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
-            }
-            _ctx.EndCommandsAndExecute();
-            _ctx.Synchronize();
 
-            if (!outputX.IsEmpty && _pReadbackActivation != null)
-            {
-                fixed (float* pOut = outputX)
+                if (!outputX.IsEmpty && _pReadbackActivation != null)
                 {
-                    Buffer.MemoryCopy(_pReadbackActivation, pOut, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+                    fixed (float* pOut = outputX)
+                    {
+                        Buffer.MemoryCopy(_pReadbackActivation, pOut, (ulong)(_dim * sizeof(float)), (ulong)(_dim * sizeof(float)));
+                    }
                 }
             }
         }
-    }
-
-    private void ComputeTieredRoutedExpertsCpu(
-        int modelLayer,
-        int expertFfnDim,
-        int topK,
-        int* selectedIndices,
-        float* selectedWeights)
-    {
-        var lwHost = _weights.Layers[modelLayer];
-        long gateSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(lwHost.FfnGateExpsType, _dim);
-        long upSliceBytes = (long)expertFfnDim * GgufTypes.GetRowBytes(lwHost.FfnUpExpsType, _dim);
-        long downSliceBytes = (long)_dim * GgufTypes.GetRowBytes(lwHost.FfnDownExpsType, expertFfnDim);
-
-        fixed (float* pNormXSums = _normXSums)
+        finally
         {
-            QuantKernels.ComputeBlockSums32(_pReadbackNormX, pNormXSums, _dim);
-            new Span<float>(_pUploadExpertOut, _dim).Clear();
-
-            var ws = _expertWorkspaces![0];
-            fixed (float* pGate = ws.Gate, pUp = ws.Up, pAct = ws.Act, pActSums = ws.ActSums, pDownOut = ws.DownOut)
+            if (pleTicket.IsValid && _pleTable != null)
             {
-                for (int k = 0; k < topK; k++)
-                {
-                    int expertIdx = selectedIndices[k];
-                    float weight = selectedWeights[k];
-
-                    byte* expGateWeight = lwHost.FfnGateExpsWeight + (long)expertIdx * gateSliceBytes;
-                    byte* expUpWeight = lwHost.FfnUpExpsWeight + (long)expertIdx * upSliceBytes;
-                    byte* expDownWeight = lwHost.FfnDownExpsWeight + (long)expertIdx * downSliceBytes;
-
-                    QuantKernels.MatVecMul(lwHost.FfnGateExpsType, expGateWeight, _pReadbackNormX, pGate, _dim, expertFfnDim, pNormXSums);
-                    if (lwHost.FfnGateExpsBias != null)
-                        QuantKernels.VecAdd(lwHost.FfnGateExpsBias + (long)expertIdx * expertFfnDim, pGate, expertFfnDim);
-
-                    QuantKernels.MatVecMul(lwHost.FfnUpExpsType, expUpWeight, _pReadbackNormX, pUp, _dim, expertFfnDim, pNormXSums);
-                    if (lwHost.FfnUpExpsBias != null)
-                        QuantKernels.VecAdd(lwHost.FfnUpExpsBias + (long)expertIdx * expertFfnDim, pUp, expertFfnDim);
-
-                    QuantKernels.SwiGLU(pGate, pUp, pAct, expertFfnDim);
-                    QuantKernels.ComputeBlockSums32(pAct, pActSums, expertFfnDim);
-
-                    QuantKernels.MatVecMul(lwHost.FfnDownExpsType, expDownWeight, pAct, pDownOut, expertFfnDim, _dim, pActSums);
-                    if (lwHost.FfnDownExpsBias != null)
-                        QuantKernels.VecAdd(lwHost.FfnDownExpsBias + (long)expertIdx * _dim, pDownOut, _dim);
-
-                    QuantKernels.VecAddWeighted(pDownOut, _pUploadExpertOut, weight, _dim);
-                }
+                _pleTable.Collect(pleTicket, new Span<float>(_pleEmbBuf, _pleEmbDim));
             }
         }
     }
@@ -1567,6 +1898,7 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             _dTopKWeightsBatch = _ctx.CreateDeviceBuffer((ulong)(newCap * topK * sizeof(float)));
         }
 
+        EnsureQwen4ExpBatchBuffers(newCap);
         _allocatedBatchCapacity = newCap;
     }
 
@@ -1589,6 +1921,10 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             cmdList.SetPipelineState(_psoGemmQ6KBatch);
         else if (type == GgufType.Q8_0)
             cmdList.SetPipelineState(_psoGemmQ8_0Batch);
+        else if (type == GgufType.Q4_0)
+            cmdList.SetPipelineState(_psoGemmQ4_0Batch);
+        else if (type == GgufType.Q5_0)
+            cmdList.SetPipelineState(_psoGemmQ5_0Batch);
         else if (type == GgufType.F32)
             cmdList.SetPipelineState(_psoGemmFp32Batch);
         else if (type == GgufType.Q3_K)
@@ -1599,14 +1935,26 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             cmdList.SetPipelineState(_psoGemmQ2_KBatch);
         else if (type == GgufType.Q2_0)
             cmdList.SetPipelineState(_psoGemmQ2_0Batch);
+        else if (type == GgufType.GgmlQ2_0)
+            cmdList.SetPipelineState(_psoGemmGgmlQ2_0Batch);
         else if (type == GgufType.IQ2_XXS)
             cmdList.SetPipelineState(_psoGemmIQ2_XXSBatch);
+        else if (type == GgufType.IQ2_XS)
+            cmdList.SetPipelineState(_psoGemmIQ2_XSBatch);
+        else if (type == GgufType.IQ2_S)
+            cmdList.SetPipelineState(_psoGemmIQ2_SBatch);
+        else if (type == GgufType.IQ3_XXS)
+            cmdList.SetPipelineState(_psoGemmIQ3_XXSBatch);
         else if (type == GgufType.IQ4_NL)
             cmdList.SetPipelineState(_psoGemmIQ4_NLBatch);
+        else if (type == GgufType.IQ4_XS)
+            cmdList.SetPipelineState(_psoGemmIQ4_XSBatch);
         else if (type == GgufType.IQ3_S)
             cmdList.SetPipelineState(_psoGemmIQ3_SBatch);
         else if (type is GgufType.Ternary_1_58 or GgufType.PQ2_0)
             cmdList.SetPipelineState(_psoGemmTernaryBatch);
+        else if (type == GgufType.BF16)
+            cmdList.SetPipelineState(_psoGemmBf16Batch);
         else
             throw new NotSupportedException($"Direct3D 12 batch GEMM does not support tensor quantization type {type}.");
 
@@ -1685,19 +2033,8 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             return;
         }
 
-        int qDim = _nHeads * _headDim;
-        int kvDim = _headsKv * _headDim;
         int maxChunk = 32;
         EnsureBatchBuffers(maxChunk);
-
-        uint* convConsts = stackalloc uint[1];
-        uint* l2Consts = stackalloc uint[2];
-        uint* dnConsts = stackalloc uint[4];
-        uint* gsConsts = stackalloc uint[4];
-        uint* qgConsts = stackalloc uint[2];
-        uint* ropeConsts = stackalloc uint[7];
-        uint* kvConsts = stackalloc uint[4];
-        uint* faConsts = stackalloc uint[6];
 
         int offset = 0;
         while (offset < totalTokens)
@@ -1710,68 +2047,308 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             bool isLastChunk = (offset + chunkSize == totalTokens);
             int chunkStartPos = startPos + offset;
 
-            if (chunkSize == 1)
-            {
-                ForwardStage(
-                    !tokens.IsEmpty ? tokens[offset] : 0,
-                    chunkStartPos,
-                    !inputXBatch.IsEmpty ? inputXBatch.Slice(offset * _dim, _dim) : default,
-                    !outputXBatch.IsEmpty ? outputXBatch.Slice(offset * _dim, _dim) : default,
-                    logits,
-                    isLastChunk && computeLogits);
-                offset += 1;
-                continue;
-            }
+            ForwardBatchChunkCore(
+                !tokens.IsEmpty ? tokens.Slice(offset, chunkSize) : ReadOnlySpan<int>.Empty,
+                chunkStartPos,
+                !inputXBatch.IsEmpty ? inputXBatch.Slice(offset * _dim, chunkSize * _dim) : ReadOnlySpan<float>.Empty,
+                !outputXBatch.IsEmpty ? outputXBatch.Slice(offset * _dim, chunkSize * _dim) : Span<float>.Empty,
+                logits,
+                _vocabSize,
+                computeLastLogits: isLastChunk && computeLogits,
+                computeAllLogits: false);
 
-            // 1. Vectorized host embedding extraction or intermediate activation copy for the chunk
-            if (StartLayer == 0)
+            offset += chunkSize;
+        }
+    }
+
+    private void ForwardBatchChunkCore(
+        ReadOnlySpan<int> tokens,
+        int chunkStartPos,
+        ReadOnlySpan<float> inputXBatch,
+        Span<float> outputXBatch,
+        Span<float> logitsOut,
+        int logitsStride,
+        bool computeLastLogits,
+        bool computeAllLogits)
+    {
+        int chunkSize = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
+        if (chunkSize <= 0) return;
+
+        if (chunkSize == 1)
+        {
+            Span<float> singleLogits = (computeAllLogits || computeLastLogits) && logitsOut.Length >= _vocabSize
+                ? logitsOut.Slice(0, _vocabSize)
+                : Span<float>.Empty;
+
+            ForwardStage(
+                !tokens.IsEmpty ? tokens[0] : 0,
+                chunkStartPos,
+                inputXBatch,
+                outputXBatch,
+                singleLogits,
+                !singleLogits.IsEmpty);
+
+            if (_activePerStepSnapshots != null && (uint)_activeSnapshotOffset < (uint)_activeSnapshotLimit)
             {
-                fixed (int* pTokens = tokens)
+                SaveRecurrentState(_activePerStepSnapshots[_activeSnapshotOffset]);
+            }
+            return;
+        }
+
+        int qDim = _nHeads * _headDim;
+        int kvDim = _headsKv * _headDim;
+        uint* convConsts = stackalloc uint[1];
+        uint* l2Consts = stackalloc uint[2];
+        uint* dnConsts = stackalloc uint[4];
+        uint* gsConsts = stackalloc uint[4];
+        uint* qgConsts = stackalloc uint[2];
+        uint* ropeConsts = stackalloc uint[7];
+        uint* kvConsts = stackalloc uint[4];
+
+        // 1. Issue overlapped PLE N-gram lookups before embedding extraction
+        PleLookupTicket[]? pleTickets = null;
+        int prevCount = _pleProcessor?.NgramPrevCount ?? 0;
+        int pleLayerHistBytes = _pleProcessor != null ? checked((int)_pleProcessor.LayerHistoryBytes) : 0;
+        int pleHistBase = checked((int)_ssmSnapshotBytes) + prevCount * sizeof(int);
+
+        if (StartLayer == 0 && _pleProcessor != null && !tokens.IsEmpty)
+        {
+            ReadOnlySpan<int> initialPrev = _pleProcessor.PreviousTokens;
+            if (_activePerStepSnapshots != null)
+            {
+                int prevBytes = prevCount * sizeof(int);
+                for (int t = 0; t < chunkSize; t++)
                 {
-                    for (int t = 0; t < chunkSize; t++)
+                    int snapIdx = _activeSnapshotOffset + t;
+                    if ((uint)snapIdx < (uint)_activeSnapshotLimit)
                     {
-                        QuantKernels.ExtractEmbedding(
-                            _weights.EmbdType,
-                            _weights.EmbdWeight,
-                            pTokens[offset + t],
-                            _pUploadEmbeddingBatch + t * _dim,
-                            _dim);
+                        PleLayerProcessor.ComputePrevWindowAfterSteps(
+                            initialPrev,
+                            tokens,
+                            t + 1,
+                            MemoryMarshal.Cast<byte, int>(_activePerStepSnapshots[snapIdx].AsSpan(checked((int)_ssmSnapshotBytes), prevBytes)));
                     }
                 }
             }
-            else
+
+            if (_pleTable != null)
             {
-                fixed (float* pInput = inputXBatch)
+                Span<int> prevWindow = prevCount <= 32 ? stackalloc int[prevCount] : new int[prevCount];
+                pleTickets = new PleLookupTicket[chunkSize];
+                for (int t = 0; t < chunkSize; t++)
                 {
-                    Buffer.MemoryCopy(
-                        pInput + (long)offset * _dim,
-                        _pUploadEmbeddingBatch,
-                        (ulong)(chunkSize * _dim * sizeof(float)),
-                        (ulong)(chunkSize * _dim * sizeof(float)));
+                    if (t == 0)
+                    {
+                        pleTickets[t] = _pleTable.IssueToken(tokens[t], initialPrev);
+                    }
+                    else
+                    {
+                        PleLayerProcessor.ComputePrevWindowAfterSteps(initialPrev, tokens, t, prevWindow);
+                        pleTickets[t] = _pleTable.IssueToken(tokens[t], prevWindow);
+                    }
                 }
+            }
+        }
+
+        // 2. Host embedding extraction or activation copy
+        if (StartLayer == 0)
+        {
+            fixed (int* pTokens = tokens)
+            {
+                for (int t = 0; t < chunkSize; t++)
+                {
+                    QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, pTokens[t], _pUploadEmbeddingBatch + t * _dim, _dim);
+                }
+            }
+        }
+        else
+        {
+            fixed (float* pInput = inputXBatch)
+            {
+                Buffer.MemoryCopy(pInput, _pUploadEmbeddingBatch, (ulong)(chunkSize * _dim * sizeof(float)), (ulong)(chunkSize * _dim * sizeof(float)));
+            }
+        }
+
+        bool pleCollected = false;
+        void EnsurePleTicketsCollected()
+        {
+            if (pleCollected || _pleProcessor == null) return;
+            for (int t = 0; t < chunkSize; t++)
+            {
+                float* pleDst = _pleEmbBatch + (long)t * _pleEmbDim;
+                if (pleTickets != null && pleTickets[t].IsValid && _pleTable != null)
+                {
+                    _pleTable.Collect(pleTickets[t], new Span<float>(pleDst, _pleEmbDim));
+                    pleTickets[t] = default;
+                }
+                else
+                {
+                    new Span<float>(pleDst, _pleEmbDim).Clear();
+                }
+            }
+            pleCollected = true;
+        }
+
+        void RunHostPleBatchForLayer(int modelLayer, float* rHostBase)
+        {
+            EnsurePleTicketsCollected();
+            int pleSlot = _pleSlotMap![modelLayer];
+            var layerHost = _weights.Layers[modelLayer];
+            var pleWeights = new PleLayerWeights
+            {
+                PleKeyType = layerHost.PleKeyType,
+                PleKeyWeight = layerHost.PleKeyWeight,
+                PleValueType = layerHost.PleValueType,
+                PleValueWeight = layerHost.PleValueWeight,
+                PleNormKey = layerHost.PleNormKeyWeight,
+                PleNormQuery = layerHost.PleNormQueryWeight,
+                PleNormConv = layerHost.PleNormConvWeight,
+                PleConv1dWeight = layerHost.PleConv1dWeight
+            };
+            int stride = _hasHc ? _hcDim : _dim;
+            for (int t = 0; t < chunkSize; t++)
+            {
+                _pleProcessor!.ExecuteToken(pleSlot, rHostBase + (long)t * stride, _pleEmbBatch + (long)t * _pleEmbDim, pleWeights);
+                int snapIdx = _activeSnapshotOffset + t;
+                if (_activePerStepSnapshots != null && (uint)snapIdx < (uint)_activeSnapshotLimit)
+                {
+                    _pleProcessor.SaveLayerHistory(
+                        pleSlot,
+                        _activePerStepSnapshots[snapIdx].AsSpan(checked(pleHistBase + pleSlot * pleLayerHistBytes), pleLayerHistBytes));
+                }
+            }
+        }
+
+        try
+        {
+            bool layer0PleHandled = false;
+            bool xWrittenInCmd = false;
+            bool rWrittenInCmd = false;
+            bool qsaIdsInSrv = false;
+
+            if (StartLayer == 0 && LayerCount > 0 && _weights.Layers[0].HasPle && _pleProcessor != null && _pUploadHcRBatch != null)
+            {
+                ulong vecBytes = (ulong)_dim * sizeof(float);
+                if (_hasHc)
+                {
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        float* srcT = _pUploadEmbeddingBatch + (long)t * _dim;
+                        float* dstT = _pUploadHcRBatch + (long)t * _hcDim;
+                        for (int c = 0; c < _hcCount; c++)
+                        {
+                            Buffer.MemoryCopy(srcT, dstT + (long)c * _dim, vecBytes, vecBytes);
+                        }
+                    }
+                }
+                else
+                {
+                    Buffer.MemoryCopy(_pUploadEmbeddingBatch, _pUploadHcRBatch, (ulong)(chunkSize * _dim * sizeof(float)), (ulong)(chunkSize * _dim * sizeof(float)));
+                }
+                RunHostPleBatchForLayer(0, _pUploadHcRBatch);
+                layer0PleHandled = true;
             }
 
             _ctx.BeginCommands();
             var cmd = _ctx.CommandList;
 
-            // Copy entire chunk of embeddings/activations into _dXBatch
-            cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.Common, ResourceStates.CopyDest);
-            cmd.CopyBufferRegion(_dXBatch!, 0, _uploadEmbeddingBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
-            cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+            if (layer0PleHandled)
+            {
+                if (_hasHc)
+                {
+                    cmd.ResourceBarrierTransition(_dHcRBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dHcRBatch!, 0, _uploadHcRBatch!, 0, (ulong)(chunkSize * _hcDim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dHcRBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    rWrittenInCmd = true;
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dXBatch!, 0, _uploadHcRBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    xWrittenInCmd = true;
+                }
+            }
+            else
+            {
+                cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                cmd.CopyBufferRegion(_dXBatch!, 0, _uploadEmbeddingBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                xWrittenInCmd = true;
+
+                if (_hasHc)
+                {
+                    DispatchHcBroadcastInit(cmd, chunkSize, _dXBatch!, _dHcRBatch!);
+                    rWrittenInCmd = true;
+                }
+            }
 
             for (int l = 0; l < LayerCount; l++)
             {
+                int modelLayer = StartLayer + l;
                 var lw = _layerWeights[l];
+                var lwHost = _weights.Layers[modelLayer];
+
+                if (!(l == 0 && layer0PleHandled) && lwHost.HasPle && _pleProcessor != null && _readbackHcRBatch != null && _uploadHcRBatch != null)
+                {
+                    ID3D12Resource targetRes = _hasHc ? _dHcRBatch! : _dXBatch!;
+                    bool targetIsUav = _hasHc ? rWrittenInCmd : xWrittenInCmd;
+                    ulong hcBytes = (ulong)(chunkSize * (_hasHc ? _hcDim : _dim) * sizeof(float));
+
+                    cmd.ResourceBarrierTransition(targetRes, targetIsUav ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHcRBatch, 0, targetRes, 0, hcBytes);
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.CopySource, ResourceStates.Common);
+                    _ctx.EndCommandsAndExecute();
+                    _ctx.Synchronize();
+
+                    RunHostPleBatchForLayer(modelLayer, _pReadbackHcRBatch);
+                    Buffer.MemoryCopy(_pReadbackHcRBatch, _pUploadHcRBatch, hcBytes, hcBytes);
+
+                    _ctx.BeginCommands();
+                    cmd = _ctx.CommandList;
+                    qsaIdsInSrv = false;
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(targetRes, 0, _uploadHcRBatch, 0, hcBytes);
+                    cmd.ResourceBarrierTransition(targetRes, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    if (_hasHc) { rWrittenInCmd = true; xWrittenInCmd = false; } else { xWrittenInCmd = true; rWrittenInCmd = false; }
+                }
 
                 // Attention / GDN Pre-Norm
-                DispatchRmsNormBatch(cmd, _dXBatch!, lw.AttnNormWeight, _dNormXBatch!, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(_dNormXBatch!);
+                if (_hasHc && lw.HasHyperConnections)
+                {
+                    DispatchHcRead(
+                        cmd,
+                        chunkSize,
+                        _dHcRBatch!,
+                        _dHcXnBatch!,
+                        _dHcLoBatch!,
+                        _dHcUpBatch!,
+                        _dHcInjectBatch!,
+                        lw.HcAttnNormWeight,
+                        lw.HcAttnDownType,
+                        lw.HcAttnDownWeight!,
+                        lw.HcAttnUpType,
+                        lw.HcAttnUpWeight!,
+                        lw.HcAttnInjectType,
+                        lw.HcAttnInjectWeight,
+                        _dNormXBatch!);
+                }
+                else if (lw.AttnNormWeight != null)
+                {
+                    DispatchRmsNormBatch(cmd, _dXBatch!, lw.AttnNormWeight, _dNormXBatch!, _dim, chunkSize, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dNormXBatch!);
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch!, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dNormXBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dNormXBatch!, 0, _dXBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dNormXBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
 
                 if (lw.IsGdn)
                 {
-                    // -------------------------------------------------------------
-                    // Gated DeltaNet (SSM Linear Attention)
-                    // -------------------------------------------------------------
                     DispatchGemmBatch(cmd, lw.QkvType, _dGdnQkvBatch!, _dNormXBatch!, lw.QkvWeight!.GPUVirtualAddress, _dim, _gdnConvChannels, chunkSize);
                     DispatchGemmBatch(cmd, lw.AttnGateType, _dGdnZBatch!, _dNormXBatch!, lw.AttnGateWeight!.GPUVirtualAddress, _dim, _ssmInnerSize, chunkSize);
                     DispatchGemmBatch(cmd, lw.SsmAlphaType, _dGdnABatch!, _dNormXBatch!, lw.SsmAlphaWeight!.GPUVirtualAddress, _dim, _ssmHeads, chunkSize);
@@ -1781,18 +2358,20 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                     cmd.ResourceBarrierUnorderedAccessView(_dGdnABatch!);
                     cmd.ResourceBarrierUnorderedAccessView(_dGdnBBatch!);
 
+                    ulong kByteOffset = (ulong)(_ssmGroupCount * _ssmStateDim * sizeof(float));
+                    ulong vByteOffset = (ulong)(2 * _ssmGroupCount * _ssmStateDim * sizeof(float));
+                    ulong convSnapBytes = (ulong)_gdnConvChannels * 3UL * sizeof(float);
+                    ulong ssmSnapBytes = (ulong)_ssmHeads * (ulong)_ssmStateDim * (ulong)_ssmStateDim * sizeof(float);
+
                     for (int t = 0; t < chunkSize; t++)
                     {
                         ulong qkvOffset = (ulong)(t * _gdnConvChannels * sizeof(float));
                         ulong convOutOffset = (ulong)(t * _gdnConvChannels * sizeof(float));
-                        ulong kByteOffset = (ulong)(_ssmGroupCount * _ssmStateDim * sizeof(float));
-                        ulong vByteOffset = (ulong)(2 * _ssmGroupCount * _ssmStateDim * sizeof(float));
                         ulong aOffset = (ulong)(t * _ssmHeads * sizeof(float));
                         ulong bOffset = (ulong)(t * _ssmHeads * sizeof(float));
                         ulong yOffset = (ulong)(t * _ssmInnerSize * sizeof(float));
                         ulong zOffset = (ulong)(t * _ssmInnerSize * sizeof(float));
 
-                        // Causal 1D Depthwise Conv
                         cmd.SetComputeRootSignature(_sigSsmConv1d);
                         cmd.SetPipelineState(_psoSsmConv1d);
                         convConsts[0] = (uint)_gdnConvChannels;
@@ -1804,7 +2383,6 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.Dispatch(((uint)_gdnConvChannels + 255) / 256, 1, 1);
                         cmd.ResourceBarrierUnorderedAccessView(_dGdnConvOutBatch!);
 
-                        // L2 Normalization of Q and K per group
                         cmd.SetComputeRootSignature(_sigL2NormQK);
                         cmd.SetPipelineState(_psoL2NormQK);
                         l2Consts[0] = (uint)_ssmGroupCount;
@@ -1815,7 +2393,6 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.Dispatch((uint)_ssmGroupCount, 1, 1);
                         cmd.ResourceBarrierUnorderedAccessView(_dGdnConvOutBatch!);
 
-                        // Recurrent Associative Memory State Update
                         cmd.SetComputeRootSignature(_sigDeltaNet);
                         cmd.SetPipelineState(_psoDeltaNet);
                         dnConsts[0] = (uint)_ssmHeads;
@@ -1835,13 +2412,27 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.Dispatch((uint)_ssmHeads, 1, 1);
                         cmd.ResourceBarrierUnorderedAccessView(_dGdnYBatch!);
 
-                        // Fused Head RMSNorm + SiLU gating on Z
+                        if (_activePerStepSnapshots != null && _readbackStepSsmSnapshot != null && _ssmSnapshotBytes > 0)
+                        {
+                            long layerSnapOff = _ssmLayerSnapshotOffsets![l];
+                            if (layerSnapOff >= 0 && _activeSnapshotOffset + t < _activeSnapshotLimit)
+                            {
+                                ulong dstBase = (ulong)t * (ulong)_ssmSnapshotBytes + (ulong)layerSnapOff;
+                                cmd.ResourceBarrierTransition(_dConvState[l], ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                                cmd.ResourceBarrierTransition(_dSsmState[l], ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                                cmd.CopyBufferRegion(_readbackStepSsmSnapshot, dstBase, _dConvState[l], 0, convSnapBytes);
+                                cmd.CopyBufferRegion(_readbackStepSsmSnapshot, dstBase + convSnapBytes, _dSsmState[l], 0, ssmSnapBytes);
+                                cmd.ResourceBarrierTransition(_dConvState[l], ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                                cmd.ResourceBarrierTransition(_dSsmState[l], ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                            }
+                        }
+
                         cmd.SetComputeRootSignature(_sigSsmGateSilu);
                         cmd.SetPipelineState(_psoSsmGateSilu);
                         gsConsts[0] = (uint)_ssmHeads;
                         gsConsts[1] = (uint)_ssmStateDim;
                         *(float*)(&gsConsts[2]) = _weights.RmsNormEps;
-                        gsConsts[3] = lw.SsmNormWeight != null ? 1u : 0u;
+                        gsConsts[3] = (lw.SsmNormWeight != null ? 1u : 0u) | (_useSigmoidGdnGate ? 2u : 0u);
                         cmd.SetComputeRoot32BitConstants(0, 4, (IntPtr)gsConsts, 0);
                         cmd.SetComputeRootUnorderedAccessView(1, _dGdnYBatch!.GPUVirtualAddress + yOffset);
                         cmd.SetComputeRootUnorderedAccessView(2, _dGdnZBatch!.GPUVirtualAddress + zOffset);
@@ -1850,15 +2441,22 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.ResourceBarrierUnorderedAccessView(_dGdnYBatch!);
                     }
 
-                    // Output projection with fused residual addition
-                    DispatchGemmBatch(cmd, lw.SsmOutType, null, _dGdnYBatch!, lw.SsmOutWeight!.GPUVirtualAddress, _ssmInnerSize, _dim, chunkSize, residual: _dXBatch!);
-                    cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                    if (_hasHc && lw.HasHyperConnections)
+                    {
+                        DispatchGemmBatch(cmd, lw.SsmOutType, _dAttnProjOutBatch!, _dGdnYBatch!, lw.SsmOutWeight!.GPUVirtualAddress, _ssmInnerSize, _dim, chunkSize);
+                        cmd.ResourceBarrierUnorderedAccessView(_dAttnProjOutBatch!);
+                        DispatchHcWrite(cmd, chunkSize, _dHcRBatch!, _dAttnProjOutBatch!, _dHcInjectBatch!);
+                        rWrittenInCmd = true;
+                    }
+                    else
+                    {
+                        DispatchGemmBatch(cmd, lw.SsmOutType, null, _dGdnYBatch!, lw.SsmOutWeight!.GPUVirtualAddress, _ssmInnerSize, _dim, chunkSize, residual: _dXBatch!);
+                        cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                        xWrittenInCmd = true;
+                    }
                 }
                 else
                 {
-                    // -------------------------------------------------------------
-                    // Interleaved Full Attention Layer
-                    // -------------------------------------------------------------
                     if (lw.HasQGate)
                     {
                         DispatchGemmBatch(cmd, lw.QType, _dQFullBatch!, _dNormXBatch!, lw.QWeight.GPUVirtualAddress, _dim, 2 * qDim, chunkSize);
@@ -1901,13 +2499,39 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.ResourceBarrierUnorderedAccessView(_dKBatch!);
                     }
 
+                    var qsa = lwHost.IsQsa && _qsaIndexers != null ? _qsaIndexers[modelLayer] : null;
+                    QsaIndexerWeights qsaWeights = default;
+                    if (qsa != null && _readbackNormXBatch != null)
+                    {
+                        cmd.ResourceBarrierTransition(_dNormXBatch!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                        cmd.CopyBufferRegion(_readbackNormXBatch, 0, _dNormXBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                        cmd.ResourceBarrierTransition(_dNormXBatch!, ResourceStates.CopySource, ResourceStates.Common);
+                        _ctx.EndCommandsAndExecute();
+                        _ctx.Synchronize();
+                        xWrittenInCmd = false;
+                        rWrittenInCmd = false;
+                        qsaIdsInSrv = false;
+
+                        _ctx.BeginCommands();
+                        cmd = _ctx.CommandList;
+
+                        qsaWeights = new QsaIndexerWeights
+                        {
+                            QProjType = lwHost.IndexerQProjType,
+                            QProjWeight = lwHost.IndexerQProjWeight,
+                            KProjType = lwHost.IndexerKProjType,
+                            KProjWeight = lwHost.IndexerKProjWeight,
+                            QNormWeight = lwHost.IndexerQNormWeight,
+                            KNormWeight = lwHost.IndexerKNormWeight
+                        };
+                    }
+
                     for (int t = 0; t < chunkSize; t++)
                     {
                         int pos = chunkStartPos + t;
                         ulong qOffset = (ulong)(t * qDim * sizeof(float));
                         ulong kvOffset = (ulong)(t * kvDim * sizeof(float));
 
-                        // Partial RoPE
                         cmd.SetComputeRootSignature(_sigRope);
                         cmd.SetPipelineState(_psoRope);
                         ropeConsts[0] = (uint)_nHeads;
@@ -1924,7 +2548,6 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.Dispatch((totalPairs + 255) / 256, 1, 1);
                         cmd.ResourceBarrierUnorderedAccessView(_dKBatch!);
 
-                        // KV Store
                         cmd.SetComputeRootSignature(_sigKvStore);
                         cmd.SetPipelineState(_psoKvStore);
                         kvConsts[0] = (uint)_headsKv;
@@ -1936,25 +2559,48 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         cmd.SetComputeRootUnorderedAccessView(2, _dVBatch!.GPUVirtualAddress + kvOffset);
                         cmd.SetComputeRootUnorderedAccessView(3, _dKeyCache[l].GPUVirtualAddress);
                         cmd.SetComputeRootUnorderedAccessView(4, _dValCache[l].GPUVirtualAddress);
-                        cmd.Dispatch(((uint)kvDim + 255) / 256, 1, 1);
+                        if (KvPrecision == KvCachePrecision.Q4_0)
+                        {
+                            uint nb = (uint)((_headDim + 31) / 32);
+                            uint numPairs = (nb + 1) / 2;
+                            cmd.Dispatch((uint)_headsKv * numPairs, 1, 1);
+                        }
+                        else if (KvPrecision == KvCachePrecision.Fp16)
+                        {
+                            uint totalHalf = (uint)(_headsKv * ((_headDim + 1) / 2));
+                            cmd.Dispatch((totalHalf + 127) / 128, 1, 1);
+                        }
+                        else
+                        {
+                            cmd.Dispatch(((uint)kvDim + 255) / 256, 1, 1);
+                        }
                         cmd.ResourceBarrierUnorderedAccessView(_dKeyCache[l]);
                         cmd.ResourceBarrierUnorderedAccessView(_dValCache[l]);
 
-                        // FlashAttention
-                        cmd.SetComputeRootSignature(_sigFlashAttn);
-                        cmd.SetPipelineState(_psoFlashAttn);
-                        faConsts[0] = (uint)_nHeads;
-                        faConsts[1] = (uint)_headsKv;
-                        faConsts[2] = (uint)_headDim;
-                        faConsts[3] = (uint)_maxSeqLen;
-                        faConsts[4] = (uint)pos;
-                        *(float*)(&faConsts[5]) = 1.0f / MathF.Sqrt(_headDim);
-                        cmd.SetComputeRoot32BitConstants(0, 6, (IntPtr)faConsts, 0);
-                        cmd.SetComputeRootUnorderedAccessView(1, _dQBatch!.GPUVirtualAddress + qOffset);
-                        cmd.SetComputeRootUnorderedAccessView(2, _dKeyCache[l].GPUVirtualAddress);
-                        cmd.SetComputeRootUnorderedAccessView(3, _dValCache[l].GPUVirtualAddress);
-                        cmd.SetComputeRootUnorderedAccessView(4, _dAttnOutBatch!.GPUVirtualAddress + qOffset);
-                        cmd.Dispatch((uint)_nHeads, 1, 1);
+                        if (qsa != null && _pReadbackNormXBatch != null)
+                        {
+                            DispatchSparseOrFlashAttention(
+                                cmd,
+                                l,
+                                pos,
+                                _dQBatch!.GPUVirtualAddress + qOffset,
+                                _dAttnOutBatch!.GPUVirtualAddress + qOffset,
+                                qsa,
+                                _pReadbackNormXBatch + (long)t * _dim,
+                                in qsaWeights,
+                                syncSelectedIds: qsaIdsInSrv);
+                            qsaIdsInSrv = true;
+
+                            int snapIdx = _activeSnapshotOffset + t;
+                            if (_activePerStepSnapshots != null && _qsaSnapshotOffsets != null && (uint)snapIdx < (uint)_activeSnapshotLimit)
+                            {
+                                qsa.SaveState(_activePerStepSnapshots[snapIdx].AsSpan(_qsaSnapshotOffsets[modelLayer], checked((int)qsa.StateSnapshotBytes)));
+                            }
+                        }
+                        else
+                        {
+                            DispatchFlashAttentionKernel(cmd, l, pos, _dQBatch!.GPUVirtualAddress + qOffset, _dAttnOutBatch!.GPUVirtualAddress + qOffset);
+                        }
                         cmd.ResourceBarrierUnorderedAccessView(_dAttnOutBatch!);
 
                         if (lw.HasQGate)
@@ -1970,16 +2616,54 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                         }
                     }
 
-                    // AttnOut projection with fused residual addition
-                    DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch!, lw.AttnOutWeight.GPUVirtualAddress, qDim, _dim, chunkSize, residual: _dXBatch!);
-                    cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                    if (_hasHc && lw.HasHyperConnections)
+                    {
+                        DispatchGemmBatch(cmd, lw.AttnOutType, _dAttnProjOutBatch!, _dAttnOutBatch!, lw.AttnOutWeight.GPUVirtualAddress, qDim, _dim, chunkSize);
+                        cmd.ResourceBarrierUnorderedAccessView(_dAttnProjOutBatch!);
+                        DispatchHcWrite(cmd, chunkSize, _dHcRBatch!, _dAttnProjOutBatch!, _dHcInjectBatch!);
+                        rWrittenInCmd = true;
+                    }
+                    else
+                    {
+                        DispatchGemmBatch(cmd, lw.AttnOutType, null, _dAttnOutBatch!, lw.AttnOutWeight.GPUVirtualAddress, qDim, _dim, chunkSize, residual: _dXBatch!);
+                        cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                        xWrittenInCmd = true;
+                    }
                 }
 
-                // -------------------------------------------------------------
-                // Feed-Forward Network (Dense SwiGLU or Sparse MoE)
-                // -------------------------------------------------------------
-                DispatchRmsNormBatch(cmd, _dXBatch!, lw.FfnNormWeight, _dMlpNormBatch!, _dim, chunkSize, _weights.RmsNormEps);
-                cmd.ResourceBarrierUnorderedAccessView(_dMlpNormBatch!);
+                // FFN / MoE Pre-Norm
+                if (_hasHc && lw.HasHyperConnections)
+                {
+                    DispatchHcRead(
+                        cmd,
+                        chunkSize,
+                        _dHcRBatch!,
+                        _dHcXnBatch!,
+                        _dHcLoBatch!,
+                        _dHcUpBatch!,
+                        _dHcInjectBatch!,
+                        lw.HcFfnNormWeight,
+                        lw.HcFfnDownType,
+                        lw.HcFfnDownWeight!,
+                        lw.HcFfnUpType,
+                        lw.HcFfnUpWeight!,
+                        lw.HcFfnInjectType,
+                        lw.HcFfnInjectWeight,
+                        _dMlpNormBatch!);
+                }
+                else if (lw.FfnNormWeight != null)
+                {
+                    DispatchRmsNormBatch(cmd, _dXBatch!, lw.FfnNormWeight, _dMlpNormBatch!, _dim, chunkSize, _weights.RmsNormEps);
+                    cmd.ResourceBarrierUnorderedAccessView(_dMlpNormBatch!);
+                }
+                else
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch!, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.ResourceBarrierTransition(_dMlpNormBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.CopyBufferRegion(_dMlpNormBatch!, 0, _dXBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dMlpNormBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
 
                 if (!lw.IsMoe)
                 {
@@ -1991,122 +2675,209 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                     DispatchSwiGLU(cmd, _dMlpGateBatch!, _dMlpUpBatch!, _dMlpActBatch!, chunkSize * _ffnDim);
                     cmd.ResourceBarrierUnorderedAccessView(_dMlpActBatch!);
 
-                    DispatchGemmBatch(cmd, lw.FfnDownType, null, _dMlpActBatch!, lw.FfnDownWeight!.GPUVirtualAddress, _ffnDim, _dim, chunkSize, residual: _dXBatch!);
-                    cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                    if (_hasHc && lw.HasHyperConnections)
+                    {
+                        DispatchGemmBatch(cmd, lw.FfnDownType, _dMlpOutBatch!, _dMlpActBatch!, lw.FfnDownWeight!.GPUVirtualAddress, _ffnDim, _dim, chunkSize);
+                        cmd.ResourceBarrierUnorderedAccessView(_dMlpOutBatch!);
+                        DispatchHcWrite(cmd, chunkSize, _dHcRBatch!, _dMlpOutBatch!, _dHcInjectBatch!);
+                        rWrittenInCmd = true;
+                    }
+                    else
+                    {
+                        DispatchGemmBatch(cmd, lw.FfnDownType, null, _dMlpActBatch!, lw.FfnDownWeight!.GPUVirtualAddress, _ffnDim, _dim, chunkSize, residual: _dXBatch!);
+                        cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                        xWrittenInCmd = true;
+                    }
                 }
                 else
                 {
                     int expertFfnDim = _weights.ExpertFeedForwardLength;
                     int numExperts = _weights.ExpertCount;
                     int topK = _weights.ExpertUsedCount;
-                    int modelLayer = StartLayer + l;
-                    var layerHost = _weights.Layers[modelLayer];
+                    bool hasShexp = lw.FfnGateShexpWeight != null;
+                    bool hasShexpGate = hasShexp && lwHost.FfnGateInpShexpWeight != null;
 
-                    DispatchGemmBatch(cmd, GgufType.F32, _dRouterLogitsBatch!, _dMlpNormBatch!, lw.FfnGateInpWeight!.GPUVirtualAddress, _dim, numExperts, chunkSize, lw.FfnGateInpBias);
-                    cmd.ResourceBarrierUnorderedAccessView(_dRouterLogitsBatch!);
-
-                    _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogitsBatch!, _dTopKIndicesBatch!, _dTopKWeightsBatch!, numExperts, topK, _weights.NormTopK, chunkSize);
-                    cmd.ResourceBarrierUnorderedAccessView(_dTopKIndicesBatch!);
-                    cmd.ResourceBarrierUnorderedAccessView(_dTopKWeightsBatch!);
-
-                    ulong gateSliceBytes = lw.FfnGateExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnGateExpsType, expertFfnDim, _dim) : 0;
-                    ulong upSliceBytes = lw.FfnUpExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnUpExpsType, expertFfnDim, _dim) : 0;
-                    ulong downSliceBytes = lw.FfnDownExpsWeight != null ? D3D12TensorAlign.GetAlignedTensorBytes(lw.FfnDownExpsType, _dim, expertFfnDim) : 0;
-
-                    bool hasShexp = (lw.FfnGateShexpWeight != null);
-                    bool hasShexpGate = hasShexp && layerHost.FfnGateInpShexpWeight != null;
-                    if (hasShexpGate && _dShexpGateScalar == null)
-                        _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
-
-                    for (int t = 0; t < chunkSize; t++)
+                    if (_tieredMoe)
                     {
-                        ulong normOffset = (ulong)(t * _dim * sizeof(float));
-                        ulong xOffset = (ulong)(t * _dim * sizeof(float));
+                        ExecuteHostedMoeBatchChunk(lw, modelLayer, expertFfnDim, numExperts, topK, chunkSize, hasShexp, hasShexpGate);
+                        cmd = _ctx.CommandList;
+                        xWrittenInCmd = false;
+                        rWrittenInCmd = false;
+                        qsaIdsInSrv = false;
 
-                        cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
-                        cmd.CopyBufferRegion(_dMlpNorm, 0, _dMlpNormBatch!, normOffset, (ulong)(_dim * sizeof(float)));
-                        cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-
-                        for (int k = 0; k < topK; k++)
+                        if (_hasHc && lw.HasHyperConnections)
                         {
-                            int tokenKIndex = t * topK + k;
-                            _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dMlpNorm, lw.FfnGateExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, gateSliceBytes, _dim, expertFfnDim);
-                            _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dMlpNorm, lw.FfnUpExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, upSliceBytes, _dim, expertFfnDim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            DispatchSwiGLU(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, downSliceBytes, expertFfnDim, _dim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeightsBatch!, tokenKIndex, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
+                            DispatchHcWrite(cmd, chunkSize, _dHcRBatch!, _dMlpOutBatch!, _dHcInjectBatch!);
+                            rWrittenInCmd = true;
                         }
-
-                        if (hasShexp)
+                        else
                         {
-                            int shexpFfnDim = expertFfnDim * 2;
-                            if (_weights.Gguf.TryGetTensor($"blk.{modelLayer}.ffn_gate_shexp.weight", out var tShexp) && tShexp != null)
-                                shexpFfnDim = (int)tShexp.Dimensions[1];
-
-                            DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate!, _dMlpNorm, lw.FfnGateShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
-                            DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp!, _dMlpNorm, lw.FfnUpShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            DispatchSwiGLU(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut!, _dShexpAct!, lw.FfnDownShexpWeight!.GPUVirtualAddress, shexpFfnDim, _dim);
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
-
-                            if (hasShexpGate)
-                            {
-                                var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, layerHost.FfnGateInpShexpWeight);
-                                _ctx.DispatchMoeSharedExpertGate(cmd, _dMlpNorm, dShexpGateW, _dShexpGateScalar!, _dim);
-                                cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar!);
-
-                                _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar!, 0, _dim, accumulate: 1);
-                            }
-                            else
-                            {
-                                DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
-                            }
-                            cmd.ResourceBarrierUnorderedAccessView(null!);
+                            DispatchVecAdd(cmd, _dMlpOutBatch!, _dXBatch!, chunkSize * _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                            xWrittenInCmd = true;
                         }
-
-                        cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
-                        cmd.CopyBufferRegion(_dX, 0, _dXBatch!, xOffset, (ulong)(_dim * sizeof(float)));
-                        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-
-                        DispatchVecAdd(cmd, _dFfnOut!, _dX, _dim);
-                        cmd.ResourceBarrierUnorderedAccessView(_dX);
-
-                        cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                        cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
-                        cmd.CopyBufferRegion(_dXBatch!, xOffset, _dX, 0, (ulong)(_dim * sizeof(float)));
-                        cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
-                        cmd.ResourceBarrierTransition(_dX, ResourceStates.CopySource, ResourceStates.Common);
                     }
+                    else
+                    {
+                        DispatchGemmBatch(cmd, GgufType.F32, _dRouterLogitsBatch!, _dMlpNormBatch!, lw.FfnGateInpWeight!.GPUVirtualAddress, _dim, numExperts, chunkSize, lw.FfnGateInpBias);
+                        cmd.ResourceBarrierUnorderedAccessView(_dRouterLogitsBatch!);
+
+                        _ctx.DispatchMoeRouterSoftmaxTopK(cmd, _dRouterLogitsBatch!, _dTopKIndicesBatch!, _dTopKWeightsBatch!, numExperts, topK, _weights.NormTopK, chunkSize);
+                        cmd.ResourceBarrierUnorderedAccessView(_dTopKIndicesBatch!);
+                        cmd.ResourceBarrierUnorderedAccessView(_dTopKWeightsBatch!);
+
+                        ulong gateSliceBytes = GetHybridAlignedBytes(lw.FfnGateExpsType, expertFfnDim, _dim);
+                        ulong upSliceBytes = GetHybridAlignedBytes(lw.FfnUpExpsType, expertFfnDim, _dim);
+                        ulong downSliceBytes = GetHybridAlignedBytes(lw.FfnDownExpsType, _dim, expertFfnDim);
+
+                        if (hasShexpGate && _dShexpGateScalar == null)
+                            _dShexpGateScalar = _ctx.CreateDeviceBuffer(sizeof(float));
+
+                        ulong vecBytes = (ulong)_dim * sizeof(float);
+                        cmd.ResourceBarrierTransition(_dMlpOutBatch!, ResourceStates.Common, ResourceStates.CopyDest);
+                        for (int t = 0; t < chunkSize; t++)
+                        {
+                            ulong normOffset = (ulong)t * vecBytes;
+
+                            cmd.ResourceBarrierTransition(_dMlpNorm, t == 0 ? ResourceStates.Common : ResourceStates.UnorderedAccess, ResourceStates.CopyDest);
+                            cmd.CopyBufferRegion(_dMlpNorm, 0, _dMlpNormBatch!, normOffset, vecBytes);
+                            cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+
+                            for (int k = 0; k < topK; k++)
+                            {
+                                int tokenKIndex = t * topK + k;
+                                _ctx.DispatchExpertGemv(cmd, lw.FfnGateExpsType, _dExpertGate!, _dMlpNorm, lw.FfnGateExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, gateSliceBytes, _dim, expertFfnDim);
+                                _ctx.DispatchExpertGemv(cmd, lw.FfnUpExpsType, _dExpertUp!, _dMlpNorm, lw.FfnUpExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, upSliceBytes, _dim, expertFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchSwiGLU(cmd, _dExpertGate!, _dExpertUp!, _dExpertAct!, expertFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                _ctx.DispatchExpertGemv(cmd, lw.FfnDownExpsType, _dExpertDownOut!, _dExpertAct!, lw.FfnDownExpsWeight!, _dTopKIndicesBatch!, tokenKIndex, downSliceBytes, expertFfnDim, _dim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dTopKWeightsBatch!, tokenKIndex, _dim, accumulate: (uint)(k == 0 ? 0 : 1));
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+                            }
+
+                            if (hasShexp)
+                            {
+                                int shexpFfnDim = ResolveSharedExpertFfnDim(modelLayer, expertFfnDim);
+                                DispatchGemv(cmd, lw.FfnGateShexpType, _dShexpGate!, _dMlpNorm, lw.FfnGateShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
+                                DispatchGemv(cmd, lw.FfnUpShexpType, _dShexpUp!, _dMlpNorm, lw.FfnUpShexpWeight!.GPUVirtualAddress, _dim, shexpFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchSwiGLU(cmd, _dShexpGate!, _dShexpUp!, _dShexpAct!, shexpFfnDim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                DispatchGemv(cmd, lw.FfnDownShexpType, _dExpertDownOut!, _dShexpAct!, lw.FfnDownShexpWeight!.GPUVirtualAddress, shexpFfnDim, _dim);
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+
+                                if (hasShexpGate)
+                                {
+                                    var dShexpGateW = GetOrCreateShexpGateWeight(modelLayer, lwHost.FfnGateInpShexpWeight);
+                                    _ctx.DispatchMoeSharedExpertGate(cmd, _dMlpNorm, dShexpGateW, _dShexpGateScalar!, _dim);
+                                    cmd.ResourceBarrierUnorderedAccessView(_dShexpGateScalar!);
+                                    _ctx.DispatchVecAddWeightedFromBuffer(cmd, _dFfnOut!, _dExpertDownOut!, _dShexpGateScalar!, 0, _dim, accumulate: 1);
+                                }
+                                else
+                                {
+                                    DispatchVecAdd(cmd, _dExpertDownOut!, _dFfnOut!, _dim);
+                                }
+                                cmd.ResourceBarrierUnorderedAccessView(null!);
+                            }
+
+                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                            cmd.CopyBufferRegion(_dMlpOutBatch!, normOffset, _dFfnOut!, 0, vecBytes);
+                            cmd.ResourceBarrierTransition(_dFfnOut!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                        }
+                        cmd.ResourceBarrierTransition(_dMlpNorm, ResourceStates.UnorderedAccess, ResourceStates.Common);
+                        cmd.ResourceBarrierTransition(_dMlpOutBatch!, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
+
+                        if (_hasHc && lw.HasHyperConnections)
+                        {
+                            DispatchHcWrite(cmd, chunkSize, _dHcRBatch!, _dMlpOutBatch!, _dHcInjectBatch!);
+                            rWrittenInCmd = true;
+                        }
+                        else
+                        {
+                            DispatchVecAdd(cmd, _dMlpOutBatch!, _dXBatch!, chunkSize * _dim);
+                            cmd.ResourceBarrierUnorderedAccessView(_dXBatch!);
+                            xWrittenInCmd = true;
+                        }
+                    }
+                }
+            }
+
+            if (StartLayer == 0 && _pleProcessor != null && !tokens.IsEmpty)
+            {
+                for (int t = 0; t < chunkSize; t++)
+                {
+                    _pleProcessor.PushToken(tokens[t]);
                 }
             }
 
             if (IsLastStage)
             {
-                if (computeLogits && isLastChunk)
+                if (_hasHc && _readbackHcRBatch != null)
+                {
+                    cmd.ResourceBarrierTransition(_dHcRBatch!, rWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHcRBatch, 0, _dHcRBatch!, 0, (ulong)(chunkSize * _hcDim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dHcRBatch!, ResourceStates.CopySource, rWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common);
+                }
+
+                if (_hasHc)
+                {
+                    ApplyOutputHcAndExtractHidden(cmd, chunkSize, _dXBatch!);
+                    xWrittenInCmd = true;
+                }
+
+                if (_readbackHiddenBatch != null)
+                {
+                    cmd.ResourceBarrierTransition(_dXBatch!, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackHiddenBatch, 0, _dXBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
+                    xWrittenInCmd = true;
+                }
+
+                if (computeAllLogits && _dLogitsBatch != null && _readbackLogitsBatch != null)
+                {
+                    ID3D12Resource lmBatchIn = _dXBatch!;
+                    if (_dOutNormWeight != null)
+                    {
+                        DispatchRmsNormBatch(cmd, _dXBatch!, _dOutNormWeight, _dNormXBatch!, _dim, chunkSize, _weights.RmsNormEps);
+                        cmd.ResourceBarrierUnorderedAccessView(_dNormXBatch!);
+                        lmBatchIn = _dNormXBatch!;
+                    }
+                    DispatchGemmBatch(cmd, NormalizeHybridGpuType(_weights.OutType, _dim), _dLogitsBatch, lmBatchIn, _dOutWeight!.GPUVirtualAddress, _dim, _vocabSize, chunkSize);
+                    cmd.ResourceBarrierUnorderedAccessView(_dLogitsBatch);
+
+                    ulong allLogitsBytes = (ulong)chunkSize * (ulong)_vocabSize * sizeof(float);
+                    cmd.ResourceBarrierTransition(_dLogitsBatch, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
+                    cmd.CopyBufferRegion(_readbackLogitsBatch, 0, _dLogitsBatch, 0, allLogitsBytes);
+                    cmd.ResourceBarrierTransition(_dLogitsBatch, ResourceStates.CopySource, ResourceStates.Common);
+                }
+                else if (computeLastLogits)
                 {
                     ulong lastTokenOffset = (ulong)((chunkSize - 1) * _dim * sizeof(float));
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.Common, ResourceStates.CopyDest);
+                    cmd.ResourceBarrierTransition(_dXBatch!, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
                     cmd.CopyBufferRegion(_dX, 0, _dXBatch!, lastTokenOffset, (ulong)(_dim * sizeof(float)));
+                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, ResourceStates.Common);
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.CopyDest, ResourceStates.UnorderedAccess);
 
-                    DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dOutNorm, _dim, _weights.RmsNormEps);
-                    cmd.ResourceBarrierUnorderedAccessView(_dOutNorm);
+                    ID3D12Resource lmHeadIn = _dX;
+                    if (_dOutNormWeight != null)
+                    {
+                        DispatchRmsNorm(cmd, _dX, _dOutNormWeight, _dOutNorm, _dim, _weights.RmsNormEps);
+                        cmd.ResourceBarrierUnorderedAccessView(_dOutNorm);
+                        lmHeadIn = _dOutNorm;
+                    }
 
-                    DispatchGemv(cmd, _weights.OutType, _dLogits, _dOutNorm, _dOutWeight!.GPUVirtualAddress, _dim, _vocabSize);
+                    DispatchGemv(cmd, NormalizeHybridGpuType(_weights.OutType, _dim), _dLogits, lmHeadIn, _dOutWeight!.GPUVirtualAddress, _dim, _vocabSize);
                     cmd.ResourceBarrierUnorderedAccessView(_dLogits);
 
-                    if (!logits.IsEmpty)
+                    if (!logitsOut.IsEmpty)
                     {
                         cmd.ResourceBarrierTransition(_dLogits, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
                         cmd.CopyBufferRegion(_readbackLogits, 0, _dLogits, 0, (ulong)(_vocabSize * sizeof(float)));
@@ -2119,40 +2890,72 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
                     cmd.ResourceBarrierTransition(_dX, ResourceStates.UnorderedAccess, ResourceStates.Common);
                 }
             }
-            else
+            else if (!outputXBatch.IsEmpty && _readbackActivation != null)
             {
-                if (!outputXBatch.IsEmpty && _readbackActivation != null)
-                {
-                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.UnorderedAccess, ResourceStates.CopySource);
-                    ulong totalBytes = (ulong)(chunkSize * _dim * sizeof(float));
-                    cmd.CopyBufferRegion(_readbackActivation, 0, _dXBatch!, 0, totalBytes);
-                    cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
-                }
+                cmd.ResourceBarrierTransition(_dXBatch!, xWrittenInCmd ? ResourceStates.UnorderedAccess : ResourceStates.Common, ResourceStates.CopySource);
+                cmd.CopyBufferRegion(_readbackActivation, 0, _dXBatch!, 0, (ulong)(chunkSize * _dim * sizeof(float)));
+                cmd.ResourceBarrierTransition(_dXBatch!, ResourceStates.CopySource, ResourceStates.UnorderedAccess);
             }
 
             _ctx.EndCommandsAndExecute();
             _ctx.Synchronize();
 
-            if (IsLastStage && computeLogits && isLastChunk && !logits.IsEmpty)
+            if (IsLastStage)
             {
-                fixed (float* pDst = logits)
+                RecordHiddenStatesAfterBatchChunk(chunkStartPos, chunkSize);
+
+                if (_activePerStepSnapshots != null && _pReadbackStepSsmSnapshot != null && _ssmSnapshotBytes > 0)
                 {
-                    Buffer.MemoryCopy(_pReadbackLogits, pDst, (ulong)(_vocabSize * sizeof(float)), (ulong)(_vocabSize * sizeof(float)));
+                    int ssmLen = checked((int)_ssmSnapshotBytes);
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        int snapIdx = _activeSnapshotOffset + t;
+                        if ((uint)snapIdx < (uint)_activeSnapshotLimit)
+                        {
+                            new ReadOnlySpan<byte>(_pReadbackStepSsmSnapshot + (long)t * ssmLen, ssmLen).CopyTo(_activePerStepSnapshots[snapIdx].AsSpan(0, ssmLen));
+                        }
+                    }
+                }
+
+                if (computeAllLogits && _pReadbackLogitsBatch != null)
+                {
+                    for (int t = 0; t < chunkSize; t++)
+                    {
+                        new ReadOnlySpan<float>(_pReadbackLogitsBatch + (long)t * _vocabSize, _vocabSize).CopyTo(logitsOut.Slice(t * logitsStride, _vocabSize));
+                    }
+                }
+                else if (computeLastLogits && !logitsOut.IsEmpty)
+                {
+                    fixed (float* pDst = logitsOut)
+                    {
+                        Buffer.MemoryCopy(_pReadbackLogits, pDst, (ulong)(_vocabSize * sizeof(float)), (ulong)(_vocabSize * sizeof(float)));
+                    }
                 }
             }
-            else if (!IsLastStage && !outputXBatch.IsEmpty && _pReadbackActivation != null)
+            else if (!outputXBatch.IsEmpty && _pReadbackActivation != null)
             {
                 fixed (float* pOutput = outputXBatch)
                 {
                     Buffer.MemoryCopy(
                         _pReadbackActivation,
-                        pOutput + (long)offset * _dim,
+                        pOutput,
                         (ulong)(chunkSize * _dim * sizeof(float)),
                         (ulong)(chunkSize * _dim * sizeof(float)));
                 }
             }
-
-            offset += chunkSize;
+        }
+        finally
+        {
+            if (pleTickets != null && _pleTable != null)
+            {
+                for (int t = 0; t < pleTickets.Length; t++)
+                {
+                    if (pleTickets[t].IsValid)
+                    {
+                        _pleTable.Collect(pleTickets[t], new Span<float>(_pleEmbBatch + (long)t * _pleEmbDim, _pleEmbDim));
+                    }
+                }
+            }
         }
     }
 
@@ -2165,6 +2968,14 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             if (_dSsmState[l] != null) _ctx.ZeroDeviceBuffer(_dSsmState[l]);
             if (_dKeyCache[l] != null) _ctx.ZeroDeviceBuffer(_dKeyCache[l]);
             if (_dValCache[l] != null) _ctx.ZeroDeviceBuffer(_dValCache[l]);
+        }
+        _pleProcessor?.Reset();
+        if (_qsaIndexers != null)
+        {
+            for (int i = 0; i < _qsaIndexers.Length; i++)
+            {
+                _qsaIndexers[i]?.Reset();
+            }
         }
     }
 
@@ -2292,12 +3103,19 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             _psoGemvQ8_0?.Dispose();
             _psoGemvQ2_K?.Dispose();
             _psoGemvQ2_0?.Dispose();
+            _psoGemvGgmlQ2_0?.Dispose();
             _psoGemvIQ2_XXS?.Dispose();
+            _psoGemvIQ2_XS?.Dispose();
+            _psoGemvIQ2_S?.Dispose();
+            _psoGemvIQ3_XXS?.Dispose();
             _psoGemvIQ4_NL?.Dispose();
+            _psoGemvQ4_0?.Dispose();
+            _psoGemvQ5_0?.Dispose();
             _psoGemvIQ4_XS?.Dispose();
             _psoGemvMXFP4?.Dispose();
             _psoGemvIQ3_S?.Dispose();
             _psoGemvTernary?.Dispose();
+            _psoGemvBf16?.Dispose();
             _psoGemvFp32?.Dispose();
             _sigGemv?.Dispose();
 
@@ -2340,20 +3158,29 @@ public sealed unsafe class Qwen3HybridD3D12Model : ID3D12Model
             _psoGemmQ4KBatch?.Dispose();
             _psoGemmQ6KBatch?.Dispose();
             _psoGemmQ8_0Batch?.Dispose();
+            _psoGemmQ4_0Batch?.Dispose();
+            _psoGemmQ5_0Batch?.Dispose();
             _psoGemmFp32Batch?.Dispose();
             _psoGemmQ3KBatch?.Dispose();
             _psoGemmQ5KBatch?.Dispose();
             _psoGemmQ2_KBatch?.Dispose();
             _psoGemmQ2_0Batch?.Dispose();
+            _psoGemmGgmlQ2_0Batch?.Dispose();
             _psoGemmIQ2_XXSBatch?.Dispose();
+            _psoGemmIQ2_XSBatch?.Dispose();
+            _psoGemmIQ2_SBatch?.Dispose();
+            _psoGemmIQ3_XXSBatch?.Dispose();
             _psoGemmIQ4_NLBatch?.Dispose();
+            _psoGemmIQ4_XSBatch?.Dispose();
             _psoGemmIQ3_SBatch?.Dispose();
             _psoGemmTernaryBatch?.Dispose();
+            _psoGemmBf16Batch?.Dispose();
             _sigGemmBatch?.Dispose();
 
             _psoRmsNormBatch?.Dispose();
             _sigRmsNormBatch?.Dispose();
 
+            DisposeQwen4Exp();
             _ctx.Dispose();
         }
     }

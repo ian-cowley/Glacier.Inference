@@ -2,6 +2,7 @@ namespace Glacier.Inference.Gpu;
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu.D3D12;
@@ -13,9 +14,9 @@ using Glacier.Inference.Model;
 /// for a token is recorded into one command buffer and only the logits are read back.
 /// Supported quant types for weight matrices: Q4_K, Q5_K, Q6_K, Q8_0 (alpha/beta/router/norms are F32).
 /// </summary>
-public sealed unsafe class Qwen35VulkanModel : ID3D12Model
+public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
 {
-    private const int HeadDim = 256, StateDim = 128, ConvKernel = 4;
+    private const int HeadDim = 256, StateDim = 128, ConvKernel = 4, BatchMax = 32;
 
     private enum Patch { None, Pos, KvLen, Token }
 
@@ -31,18 +32,47 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
 
     private sealed record Mat(VulkanCompute.GBuf Buf, GgufType Type, int K, int N);
 
+    private sealed class BatchLayerMeta
+    {
+        public VulkanCompute.GBuf AttnNorm = null!, FfnNorm = null!;
+        public bool IsGdn, IsMoe;
+        public Mat? Qkv, Gate, OutW, QW, KW, VW, OW, GW, UW, DW;
+        public VulkanCompute.GBuf? QkvBias, AlphaW, BetaW, ConvW, ConvState, AW, DtBias, SsmNorm, RecState;
+        public VulkanCompute.GBuf? QNorm, KNorm, KCache, VCache, QBias, KBias, VBias, OBias, GBias, UBias;
+        public int FfnDim, MoeOpsStart, MoeOpsCount;
+
+        // Lazily initialized batched descriptor sets
+        public IntPtr BAttnNormSet, BFfnNormSet;
+        public IntPtr BQkvSet, BQkvBiasSet, BGateSet, BAlphaSet, BBetaSet, BConvSet, BL2Set, BRecSet, BSsmNormSet, BSwiGdnSet, BOutSet;
+        public IntPtr BQSet, BKSet, BVSet, BQBiasSet, BKBiasSet, BVBiasSet, BPrepSet, BDecSet, BOSet, BOBiasSet;
+        public IntPtr BGSet, BUSet, BGBiasSet, BUBiasSet, BSwiFfnSet, BDSet;
+    }
+
     private readonly ModelWeights _w;
     private readonly VulkanContext _ctx;
     private readonly VulkanCompute _vk;
     private readonly int _maxSeq, _dim, _vocab;
     private readonly List<Op> _embedOps = new(), _layerOps = new(), _finalOps = new();
+    private readonly List<BatchLayerMeta> _batchMeta = new();
     private readonly List<(VulkanCompute.GBuf Conv, VulkanCompute.GBuf Rec)> _states = new();
     private readonly VulkanCompute.GBuf _gLogits;
+    private VulkanCompute.GBuf _gX = null!, _gNorm = null!, _embdBuf = null!;
+    private int _maxFfn;
+    private readonly float[] _lastHidden;
+    private float[]? _hiddenHistory;
+    private bool[]? _historyValid;
+    private bool _historyEnabled;
     private bool _disposed;
 
     // Kernels
     private readonly VulkanCompute.Kernel[] _kMv = new VulkanCompute.Kernel[12], _kMoe = new VulkanCompute.Kernel[12], _kEmbed = new VulkanCompute.Kernel[12];
     private readonly VulkanCompute.Kernel _kF32, _kRms, _kSwi, _kAdd, _kConv, _kL2, _kRec, _kTopk, _kComb, _kPrep, _kDec;
+    private readonly VulkanCompute.Kernel[] _kMm = new VulkanCompute.Kernel[12], _kEmbedB = new VulkanCompute.Kernel[12];
+    private readonly VulkanCompute.Kernel _kF32Mm, _kBiasBatch, _kCopy, _kConvB, _kL2B, _kRecB;
+    private bool _batchReady;
+    private VulkanCompute.GBuf? _bTokens, _bX, _bNorm, _bProj, _bQkv, _bZ, _bAlpha, _bBeta, _bConvOut, _bY, _bGated;
+    private VulkanCompute.GBuf? _bQFull, _bK, _bV, _bQ, _bGate, _bAttnOut, _bScores, _bGateOut, _bUpOut, _bAct;
+    private IntPtr _bEmbedSet, _bAddProjSet, _bCopyBXToGX, _bCopyBNormToGNorm, _bCopyGXToBX;
 
     public string DeviceName => _ctx.DeviceName;
 
@@ -109,8 +139,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         return true;
     }
 
-    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
-    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16;
+    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.BF16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
+    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16 or GgufType.BF16;
 
     private static int QIdx(GgufType t) => t switch
     {
@@ -125,6 +155,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         GgufType.Q2_K => 8,
         GgufType.Q4_0 => 9,
         GgufType.F16 => 10,
+        GgufType.BF16 => 11,
         _ => throw new NotSupportedException($"Vulkan runner does not support weight type {t}.")
     };
 
@@ -143,6 +174,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         _maxSeq = maxSeqLen;
         _dim = weights.EmbeddingLength;
         _vocab = weights.VocabSize;
+        _lastHidden = new float[_dim];
         _ctx = new VulkanContext(deviceOrdinal);
         _vk = new VulkanCompute(_ctx);
 
@@ -151,21 +183,29 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
             // ---- kernels ----
             for (int t = 0; t < 12; t++)
             {
-                if (HasEmbeddedShader($"qmatvec_q{t}")) _kMv[t] = _vk.LoadEmbedded($"qmatvec_q{t}", 3, 8);
-                if (HasEmbeddedShader($"qmatvec_moe_q{t}")) _kMoe[t] = _vk.LoadEmbedded($"qmatvec_moe_q{t}", 4, 16);
-                if (HasEmbeddedShader($"embed_q{t}")) _kEmbed[t] = _vk.LoadEmbedded($"embed_q{t}", 2, 8);
+                if (HasEmbeddedShader($"qmatvec_q{t}")) _kMv[t] = _vk.LoadEmbedded($"qmatvec_q{t}", 3, 8, 1u << 2);
+                if (HasEmbeddedShader($"qmatvec_moe_q{t}")) _kMoe[t] = _vk.LoadEmbedded($"qmatvec_moe_q{t}", 4, 16, 1u << 2);
+                if (HasEmbeddedShader($"embed_q{t}")) _kEmbed[t] = _vk.LoadEmbedded($"embed_q{t}", 2, 8, 1u << 1);
+                if (HasEmbeddedShader($"qmatmat_q{t}")) _kMm[t] = _vk.LoadEmbedded($"qmatmat_q{t}", 3, 12, 1u << 2);
+                if (HasEmbeddedShader($"embed_batch_q{t}")) _kEmbedB[t] = _vk.LoadEmbedded($"embed_batch_q{t}", 3, 8, 1u << 1);
             }
-            _kF32 = _vk.LoadEmbedded("f32_matvec", 3, 8);
-            _kRms = _vk.LoadEmbedded("rmsnorm", 3, 12);
-            _kSwi = _vk.LoadEmbedded("elementwise_swiglu", 3, 4);
-            _kAdd = _vk.LoadEmbedded("elementwise_add", 3, 4);
-            _kConv = _vk.LoadEmbedded("gdn_conv", 4, 4);
-            _kL2 = _vk.LoadEmbedded("gdn_l2", 1, 4);
-            _kRec = _vk.LoadEmbedded("gdn_rec", 7, 8);
-            _kTopk = _vk.LoadEmbedded("moe_topk", 3, 12);
-            _kComb = _vk.LoadEmbedded("moe_combine", 6, 12);
-            _kPrep = _vk.LoadEmbedded("attn_prep", 9, 28);
-            _kDec = _vk.LoadEmbedded("attn_decode", 6, 20);
+            _kF32 = _vk.LoadEmbedded("f32_matvec", 3, 8, 1u << 2);
+            _kRms = _vk.LoadEmbedded("rmsnorm", 3, 12, 1u << 2);
+            _kSwi = _vk.LoadEmbedded("elementwise_swiglu", 3, 4, 1u << 2);
+            _kAdd = _vk.LoadEmbedded("elementwise_add", 3, 4, 1u << 0);
+            _kConv = _vk.LoadEmbedded("gdn_conv", 4, 4, (1u << 2) | (1u << 3));
+            _kL2 = _vk.LoadEmbedded("gdn_l2", 1, 4, 1u << 0);
+            _kRec = _vk.LoadEmbedded("gdn_rec", 7, 8, (1u << 5) | (1u << 6));
+            _kTopk = _vk.LoadEmbedded("moe_topk", 3, 12, (1u << 1) | (1u << 2));
+            _kComb = _vk.LoadEmbedded("moe_combine", 6, 12, 1u << 0);
+            _kPrep = _vk.LoadEmbedded("attn_prep", 9, 28, (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8));
+            _kDec = _vk.LoadEmbedded("attn_decode", 6, 20, (1u << 4) | (1u << 5));
+            _kF32Mm = _vk.LoadEmbedded("f32_matmat", 3, 12, 1u << 2);
+            _kBiasBatch = _vk.LoadEmbedded("bias_add_batch", 2, 8, 1u << 0);
+            _kCopy = _vk.LoadEmbedded("copy_f32", 2, 12, 1u << 1);
+            _kConvB = _vk.LoadEmbedded("gdn_conv_b", 4, 8, (1u << 2) | (1u << 3));
+            _kL2B = _vk.LoadEmbedded("gdn_l2_b", 1, 8, 1u << 0);
+            _kRecB = _vk.LoadEmbedded("gdn_rec_b", 7, 16, (1u << 5) | (1u << 6));
 
             _gLogits = _vk.Alloc((long)_vocab * 4);
             Build();
@@ -214,17 +254,18 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
     private Op Mv(Mat m, VulkanCompute.GBuf x, VulkanCompute.GBuf y)
     {
         var k = _kMv[QIdx(m.Type)];
+        int groups = (m.N + 3) / 4;
         return new Op
         {
             Name = $"mv_{m.Type} K{m.K} N{m.N}", K = k, Set = _vk.MakeSet(k, m.Buf, x, y),
             Push = new uint[] { (uint)m.K, (uint)m.N },
-            Gx = (uint)Math.Min(m.N, 32768), Gy = (uint)((m.N + 32767) / 32768)
+            Gx = (uint)Math.Min(groups, 32768), Gy = (uint)((groups + 32767) / 32768)
         };
     }
 
     private Op MvF32(VulkanCompute.GBuf w, int k, int n, VulkanCompute.GBuf x, VulkanCompute.GBuf y) => new()
     {
-        Name = "mv_F32", K = _kF32, Set = _vk.MakeSet(_kF32, w, x, y), Push = new uint[] { (uint)k, (uint)n }, Gx = (uint)n
+        Name = "mv_F32", K = _kF32, Set = _vk.MakeSet(_kF32, w, x, y), Push = new uint[] { (uint)k, (uint)n }, Gx = (uint)((n + 3) / 4)
     };
 
     private Op MvMoe(Mat expsAsOne, int k, int n, long sliceBytes, int xStride, VulkanCompute.GBuf x, VulkanCompute.GBuf y, VulkanCompute.GBuf idx, int topK)
@@ -234,7 +275,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         {
             Name = $"moe_mv_{expsAsOne.Type} K{k} N{n}", K = kern, Set = _vk.MakeSet(kern, expsAsOne.Buf, x, y, idx),
             Push = new uint[] { (uint)k, (uint)n, (uint)sliceBytes, (uint)xStride },
-            Gx = (uint)n, Gy = (uint)topK
+            Gx = (uint)((n + 3) / 4), Gy = (uint)topK
         };
     }
 
@@ -266,9 +307,10 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
             if (w.Layers[l].IsMoe && w.Gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var tt) && tt != null)
                 sFmax = Math.Max(sFmax, (int)tt.Dimensions[1]);
         int maxF = Math.Max(Math.Max(F * topK, sFmax), ffn);
+        _maxFfn = maxF;
 
         // ---- shared activations / scratch ----
-        var gX = _vk.Alloc(dim * 4L); var gNorm = _vk.Alloc(dim * 4L); var gProj = _vk.Alloc(dim * 4L);
+        var gX = _vk.Alloc(dim * 4L); _gX = gX; var gNorm = _vk.Alloc(dim * 4L); _gNorm = gNorm; var gProj = _vk.Alloc(dim * 4L);
         var gQkv = _vk.Alloc(ch * 4L); var gZ = _vk.Alloc(inner * 4L); var gAlpha = _vk.Alloc(nV * 4L); var gBeta = _vk.Alloc(nV * 4L);
         var gConvOut = _vk.Alloc(ch * 4L); var gY = _vk.Alloc(inner * 4L); var gGated = _vk.Alloc(inner * 4L);
         var gQFull = _vk.Alloc(2L * qDim * 4); var gK = _vk.Alloc(kvDim * 4L); var gV = _vk.Alloc(kvDim * 4L);
@@ -299,10 +341,16 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
 
             var attnNorm = UploadF32(L.AttnNormWeight, dim);
             var ffnNorm = UploadF32(L.FfnNormWeight, dim);
+            var meta = new BatchLayerMeta { AttnNorm = attnNorm, FfnNorm = ffnNorm, IsGdn = L.IsGdn, IsMoe = L.IsMoe, FfnDim = ffn };
             _layerOps.Add(Rms(gX, attnNorm, gNorm, dim, 1));
 
             if (L.IsGdn)
             {
+                if (L.SsmConv1dWeight == null)
+                {
+                    throw new InvalidDataException($"Missing SsmConv1dWeight for GDN layer {l}.");
+                }
+
                 var qkv = UploadMat(L.QkvWeight, L.QkvType, dim, ch);
                 var gate = UploadMat(L.AttnGateWeight, L.AttnGateType, dim, inner);
                 var alphaW = UploadSmallMatrixAsF32(L.SsmAlphaWeight, L.SsmAlphaType, dim, nV);
@@ -317,10 +365,15 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 var recState = _vk.Alloc((long)nV * StateDim * StateDim * 4); recState.Zero();
                 _states.Add((convState, recState));
 
+                meta.Qkv = qkv; meta.Gate = gate; meta.AlphaW = alphaW; meta.BetaW = betaW;
+                meta.ConvW = convW; meta.ConvState = convState; meta.AW = aW; meta.DtBias = dtBias;
+                meta.SsmNorm = ssmNorm; meta.RecState = recState; meta.OutW = outW;
+
                 _layerOps.Add(Mv(qkv, gNorm, gQkv));
                 if (L.QkvBias != null)
                 {
                     var qkvBias = UploadF32(L.QkvBias, ch);
+                    meta.QkvBias = qkvBias;
                     _layerOps.Add(Add(gQkv, qkvBias, ch));
                 }
                 _layerOps.Add(Mv(gate, gNorm, gZ));
@@ -345,22 +398,28 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 var kCache = _vk.Alloc((long)nKv * _maxSeq * HeadDim * 4);
                 var vCache = _vk.Alloc((long)nKv * _maxSeq * HeadDim * 4);
 
+                meta.QW = qW; meta.KW = kW; meta.VW = vW; meta.OW = oW;
+                meta.QNorm = qNorm; meta.KNorm = kNorm; meta.KCache = kCache; meta.VCache = vCache;
+
                 _layerOps.Add(Mv(qW, gNorm, gQFull));
                 _layerOps.Add(Mv(kW, gNorm, gK));
                 _layerOps.Add(Mv(vW, gNorm, gV));
                 if (L.QBias != null)
                 {
                     var qBias = UploadF32(L.QBias, 2 * qDim);
+                    meta.QBias = qBias;
                     _layerOps.Add(Add(gQFull, qBias, 2 * qDim));
                 }
                 if (L.KBias != null)
                 {
                     var kBias = UploadF32(L.KBias, kvDim);
+                    meta.KBias = kBias;
                     _layerOps.Add(Add(gK, kBias, kvDim));
                 }
                 if (L.VBias != null)
                 {
                     var vBias = UploadF32(L.VBias, kvDim);
+                    meta.VBias = vBias;
                     _layerOps.Add(Add(gV, vBias, kvDim));
                 }
                 _layerOps.Add(new Op
@@ -379,6 +438,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                 if (L.AttnOutBias != null)
                 {
                     var oBias = UploadF32(L.AttnOutBias, dim);
+                    meta.OBias = oBias;
                     _layerOps.Add(Add(gProj, oBias, dim));
                 }
                 _layerOps.Add(Add(gX, gProj, dim));
@@ -388,6 +448,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
             _layerOps.Add(Rms(gX, ffnNorm, gNorm, dim, 1));
             if (L.IsMoe)
             {
+                meta.MoeOpsStart = _layerOps.Count;
                 var router = UploadF32(L.FfnGateInpWeight, (long)E * dim);
                 long gateSlice = (long)F * GgufTypes.GetRowBytes(L.FfnGateExpsType, dim);
                 long upSlice = (long)F * GgufTypes.GetRowBytes(L.FfnUpExpsType, dim);
@@ -425,6 +486,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                     Name = "moe_combine", K = _kComb, Set = _vk.MakeSet(_kComb, gX, gNorm, shGate, gDownOut, gTw, gSd),
                     Push = new uint[] { (uint)dim, (uint)topK, hasShGate ? 1u : 0u }, Gx = 1
                 });
+                meta.MoeOpsCount = _layerOps.Count - meta.MoeOpsStart;
             }
             else
             {
@@ -434,6 +496,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                     var gW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
                     var uW = UploadMat(L.FfnUpWeight + (long)ffn * rowBytes, L.FfnUpType, dim, ffn);
                     var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
+                    meta.GW = gW; meta.UW = uW; meta.DW = dW;
                     _layerOps.Add(Mv(gW, gNorm, gGateOut));
                     _layerOps.Add(Mv(uW, gNorm, gUpOut));
                     if (L.FfnUpBias != null)
@@ -442,6 +505,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                         _layerOps.Add(Add(gGateOut, gBias, ffn));
                         var uBias = UploadF32(L.FfnUpBias + ffn, ffn);
                         _layerOps.Add(Add(gUpOut, uBias, ffn));
+                        meta.GBias = gBias; meta.UBias = uBias;
                     }
                     _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
                     _layerOps.Add(Mv(dW, gAct, gProj));
@@ -452,6 +516,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                     var gW = UploadMat(L.FfnGateWeight, L.FfnGateType, dim, ffn);
                     var uW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
                     var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
+                    meta.GW = gW; meta.UW = uW; meta.DW = dW;
                     _layerOps.Add(Mv(gW, gNorm, gGateOut));
                     _layerOps.Add(Mv(uW, gNorm, gUpOut));
                     if (L.FfnUpBias != null)
@@ -460,12 +525,14 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
                         _layerOps.Add(Add(gGateOut, gBias, ffn));
                         var uBias = UploadF32(L.FfnUpBias + ffn, ffn);
                         _layerOps.Add(Add(gUpOut, uBias, ffn));
+                        meta.GBias = gBias; meta.UBias = uBias;
                     }
                     _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
                     _layerOps.Add(Mv(dW, gAct, gProj));
                     _layerOps.Add(Add(gX, gProj, dim));
                 }
             }
+            _batchMeta.Add(meta);
         }
 
         // ---- output head ----
@@ -474,6 +541,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
 
         // ---- embedding (allocated last: only one row is read per token; see the allocation-order note above) ----
         var embdBuf = _vk.AllocFrom(w.EmbdWeight, (long)_vocab * GgufTypes.GetRowBytes(w.EmbdType, dim));
+        _embdBuf = embdBuf;
         _embedOps.Add(new Op
         {
             Name = "embed", K = _kEmbed[QIdx(w.EmbdType)], Set = _vk.MakeSet(_kEmbed[QIdx(w.EmbdType)], embdBuf, gX),
@@ -500,6 +568,56 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
     }
 
 
+    public int HiddenDim => _dim;
+    public int VocabSize => _vocab;
+    public bool SupportsPerStepVerificationSnapshots => _states.Count > 0;
+    public long StateSnapshotBytes
+    {
+        get
+        {
+            long total = 0;
+            foreach (var (conv, rec) in _states)
+            {
+                total += (long)conv.Size + (long)rec.Size;
+            }
+            return total;
+        }
+    }
+
+    public ReadOnlySpan<float> GetLastHiddenState() => _lastHidden;
+
+    public void CopyTokenEmbedding(int tokenId, Span<float> destination)
+    {
+        if ((uint)tokenId >= (uint)_vocab)
+            throw new ArgumentOutOfRangeException(nameof(tokenId), tokenId, "Token id outside vocabulary.");
+        if (destination.Length < _dim)
+            throw new ArgumentException($"Destination span length {destination.Length} < HiddenDim ({_dim}).", nameof(destination));
+
+        fixed (float* dst = destination)
+        {
+            Glacier.Inference.Quant.QuantKernels.ExtractEmbedding(_w.EmbdType, _w.EmbdWeight, tokenId, dst, _dim);
+        }
+    }
+
+    public void EnablePositionHistory()
+    {
+        _hiddenHistory ??= new float[(long)_maxSeq * _dim];
+        _historyValid ??= new bool[_maxSeq];
+        _historyEnabled = true;
+    }
+
+    public bool TryGetHiddenStateAt(int position, Span<float> destination)
+    {
+        if (!_historyEnabled || _hiddenHistory == null || _historyValid == null ||
+            (uint)position >= (uint)_maxSeq || !_historyValid[position] || destination.Length < _dim)
+        {
+            return false;
+        }
+
+        _hiddenHistory.AsSpan(position * _dim, _dim).CopyTo(destination.Slice(0, _dim));
+        return true;
+    }
+
     /// <summary>
     /// Runs one token through the model on the GPU. When <paramref name="computeLogits"/> is true and <paramref name="logits"/>
     /// has at least <c>VocabSize</c> elements, the output logits are copied into it; otherwise the output head is skipped.
@@ -522,15 +640,378 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
         {
             fixed (float* p = logits) _gLogits.DownloadTo(p, (long)_vocab * 4);
         }
+        if (wantLogits || _historyEnabled)
+        {
+            fixed (float* pHid = _lastHidden) _gX.DownloadTo(pHid, (long)_dim * 4);
+            if (_historyEnabled && _hiddenHistory != null && _historyValid != null)
+            {
+                _lastHidden.AsSpan().CopyTo(_hiddenHistory.AsSpan(pos * _dim, _dim));
+                _historyValid[pos] = true;
+            }
+        }
     }
 
-    /// <summary>Processes prompt tokens one at a time (no batched GPU prefill yet); logits are produced for the last token only.</summary>
+    private void DispatchQmm(Mat m, IntPtr set, int b)
+    {
+        var kern = _kMm[QIdx(m.Type)];
+        int groups = (m.N + 3) / 4;
+        uint gx = (uint)Math.Min(groups, 32768);
+        uint gy = (uint)((b + 7) / 8);
+        uint gz = (uint)((groups + 32767) / 32768);
+        _vk.Dispatch(kern, set, new uint[] { (uint)m.K, (uint)m.N, (uint)b }, gx, gy, gz);
+    }
+
+    private void DispatchBiasBatch(IntPtr set, int len, int b)
+    {
+        uint gx = (uint)((len * b + 255) / 256);
+        _vk.Dispatch(_kBiasBatch, set, new uint[] { (uint)len, (uint)b }, gx);
+    }
+
+    private void EnsureBatchState()
+    {
+        if (_batchReady) return;
+        _batchReady = true;
+
+        var w = _w;
+        int dim = _dim, nH = w.HeadCount, nKv = w.HeadCountKv;
+        int qDim = nH * HeadDim, kvDim = nKv * HeadDim;
+        int nK = w.SsmGroupCount, nV = w.SsmTimeStepRank, ch = (2 * nK + nV) * StateDim, inner = w.SsmInnerSize;
+
+        _bTokens = _vk.Alloc(BatchMax * 4L);
+        _bX = _vk.Alloc((long)BatchMax * dim * 4L);
+        _bNorm = _vk.Alloc((long)BatchMax * dim * 4L);
+        _bProj = _vk.Alloc((long)BatchMax * dim * 4L);
+        _bQkv = _vk.Alloc((long)BatchMax * ch * 4L);
+        _bConvOut = _vk.Alloc((long)BatchMax * ch * 4L);
+        _bZ = _vk.Alloc((long)BatchMax * inner * 4L);
+        _bAlpha = _vk.Alloc((long)BatchMax * nV * 4L);
+        _bBeta = _vk.Alloc((long)BatchMax * nV * 4L);
+        _bY = _vk.Alloc((long)BatchMax * inner * 4L);
+        _bGated = _vk.Alloc((long)BatchMax * inner * 4L);
+        _bQFull = _vk.Alloc((long)BatchMax * 2L * qDim * 4L);
+        _bK = _vk.Alloc((long)BatchMax * kvDim * 4L);
+        _bV = _vk.Alloc((long)BatchMax * kvDim * 4L);
+        _bQ = _vk.Alloc((long)BatchMax * qDim * 4L);
+        _bGate = _vk.Alloc((long)BatchMax * qDim * 4L);
+        _bAttnOut = _vk.Alloc((long)BatchMax * qDim * 4L);
+        _bScores = _vk.Alloc((long)BatchMax * nH * _maxSeq * 4L);
+        _bGateOut = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
+        _bUpOut = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
+        _bAct = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
+
+        _bEmbedSet = _vk.MakeSet(_kEmbedB[QIdx(w.EmbdType)], _embdBuf, _bX, _bTokens);
+        _bAddProjSet = _vk.MakeSet(_kAdd, _bX, _bProj, _bProj);
+        _bCopyBXToGX = _vk.MakeSet(_kCopy, _bX, _gX);
+        _bCopyBNormToGNorm = _vk.MakeSet(_kCopy, _bNorm, _gNorm);
+        _bCopyGXToBX = _vk.MakeSet(_kCopy, _gX, _bX);
+
+        foreach (var m in _batchMeta)
+        {
+            m.BAttnNormSet = _vk.MakeSet(_kRms, _bX, m.AttnNorm, _bNorm);
+            m.BFfnNormSet = _vk.MakeSet(_kRms, _bX, m.FfnNorm, _bNorm);
+
+            if (m.IsGdn)
+            {
+                var kQkv = _kMm[QIdx(m.Qkv!.Type)];
+                var kGate = _kMm[QIdx(m.Gate!.Type)];
+                var kOut = _kMm[QIdx(m.OutW!.Type)];
+                m.BQkvSet = _vk.MakeSet(kQkv, m.Qkv.Buf, _bNorm, _bQkv);
+                if (m.QkvBias != null) m.BQkvBiasSet = _vk.MakeSet(_kBiasBatch, _bQkv, m.QkvBias);
+                m.BGateSet = _vk.MakeSet(kGate, m.Gate.Buf, _bNorm, _bZ);
+                m.BAlphaSet = _vk.MakeSet(_kF32Mm, m.AlphaW!, _bNorm, _bAlpha);
+                m.BBetaSet = _vk.MakeSet(_kF32Mm, m.BetaW!, _bNorm, _bBeta);
+                m.BConvSet = _vk.MakeSet(_kConvB, _bQkv, m.ConvW!, m.ConvState!, _bConvOut);
+                m.BL2Set = _vk.MakeSet(_kL2B, _bConvOut);
+                m.BRecSet = _vk.MakeSet(_kRecB, _bConvOut, _bAlpha, _bBeta, m.DtBias!, m.AW!, m.RecState!, _bY);
+                m.BSsmNormSet = _vk.MakeSet(_kRms, _bY, m.SsmNorm!, _bY);
+                m.BSwiGdnSet = _vk.MakeSet(_kSwi, _bZ, _bY, _bGated);
+                m.BOutSet = _vk.MakeSet(kOut, m.OutW.Buf, _bGated, _bProj);
+            }
+            else
+            {
+                m.BQSet = _vk.MakeSet(_kMm[QIdx(m.QW!.Type)], m.QW.Buf, _bNorm, _bQFull);
+                m.BKSet = _vk.MakeSet(_kMm[QIdx(m.KW!.Type)], m.KW.Buf, _bNorm, _bK);
+                m.BVSet = _vk.MakeSet(_kMm[QIdx(m.VW!.Type)], m.VW.Buf, _bNorm, _bV);
+                if (m.QBias != null) m.BQBiasSet = _vk.MakeSet(_kBiasBatch, _bQFull, m.QBias);
+                if (m.KBias != null) m.BKBiasSet = _vk.MakeSet(_kBiasBatch, _bK, m.KBias);
+                if (m.VBias != null) m.BVBiasSet = _vk.MakeSet(_kBiasBatch, _bV, m.VBias);
+                m.BPrepSet = _vk.MakeSet(_kPrep, _bQFull, _bK, _bV, m.QNorm!, m.KNorm!, _bQ, _bGate, m.KCache!, m.VCache!);
+                m.BDecSet = _vk.MakeSet(_kDec, _bQ, _bGate, m.KCache!, m.VCache!, _bScores, _bAttnOut);
+                m.BOSet = _vk.MakeSet(_kMm[QIdx(m.OW!.Type)], m.OW.Buf, _bAttnOut, _bProj);
+                if (m.OBias != null) m.BOBiasSet = _vk.MakeSet(_kBiasBatch, _bProj, m.OBias);
+            }
+
+            if (!m.IsMoe)
+            {
+                m.BGSet = _vk.MakeSet(_kMm[QIdx(m.GW!.Type)], m.GW.Buf, _bNorm, _bGateOut);
+                m.BUSet = _vk.MakeSet(_kMm[QIdx(m.UW!.Type)], m.UW.Buf, _bNorm, _bUpOut);
+                if (m.GBias != null) m.BGBiasSet = _vk.MakeSet(_kBiasBatch, _bGateOut, m.GBias);
+                if (m.UBias != null) m.BUBiasSet = _vk.MakeSet(_kBiasBatch, _bUpOut, m.UBias);
+                m.BSwiFfnSet = _vk.MakeSet(_kSwi, _bGateOut, _bUpOut, _bAct);
+                m.BDSet = _vk.MakeSet(_kMm[QIdx(m.DW!.Type)], m.DW.Buf, _bAct, _bProj);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Processes prompt tokens in batched chunks of up to 32 tokens with batched prefill projections,
+    /// full-attention prep/decode, and chunked GDN state stepping. Logits are computed for the final token only.
+    /// </summary>
     public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (tokens.IsEmpty) return;
+        if ((uint)startPos >= (uint)_maxSeq || tokens.Length > _maxSeq - startPos)
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos, $"Sequence range [{startPos}, {startPos + tokens.Length}) exceeds MaxSeqLen ({_maxSeq}).");
         for (int i = 0; i < tokens.Length; i++)
         {
-            bool last = i == tokens.Length - 1;
-            Forward(tokens[i], startPos + i, last && computeLogits ? logits : Span<float>.Empty, last && computeLogits);
+            if ((uint)tokens[i] >= (uint)_vocab)
+                throw new ArgumentOutOfRangeException(nameof(tokens), tokens[i], "Token id outside vocabulary.");
+        }
+
+        if (tokens.Length == 1 || _historyEnabled || _kEmbedB[QIdx(_w.EmbdType)] == null)
+        {
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                bool last = i == tokens.Length - 1;
+                Forward(tokens[i], startPos + i, last && computeLogits ? logits : Span<float>.Empty, last && computeLogits);
+            }
+            return;
+        }
+
+        EnsureBatchState();
+        bool wantLogits = computeLogits && logits.Length >= _vocab;
+
+        var w = _w;
+        int dim = _dim, nH = w.HeadCount, nKv = w.HeadCountKv;
+        int kvDim = nKv * HeadDim, qDim = nH * HeadDim;
+        int nK = w.SsmGroupCount, nV = w.SsmTimeStepRank, ch = (2 * nK + nV) * StateDim, inner = w.SsmInnerSize;
+        uint epsBits = VulkanCompute.F(w.RmsNormEps);
+        uint freqBits = VulkanCompute.F(w.RopeFreqBase);
+        uint scaleBits = VulkanCompute.F(1f / MathF.Sqrt(HeadDim));
+        uint gxDim = (uint)((dim + 255) / 256);
+
+        uint* tokUpload = stackalloc uint[BatchMax];
+        int offset = 0;
+        while (offset < tokens.Length)
+        {
+            int b = Math.Min(BatchMax, tokens.Length - offset);
+            int chunkPos = startPos + offset;
+            bool isLastChunk = offset + b == tokens.Length;
+
+            for (int i = 0; i < b; i++) tokUpload[i] = (uint)tokens[offset + i];
+            _bTokens!.UploadFrom(tokUpload, b * 4L);
+
+            _vk.Begin();
+            _vk.Dispatch(_kEmbedB[QIdx(w.EmbdType)], _bEmbedSet, new uint[] { (uint)dim, (uint)b }, (uint)b);
+
+            uint gxBDim = (uint)((b * dim + 255) / 256);
+            uint gxCh = (uint)((ch + 255) / 256);
+            uint gyB8 = (uint)((b + 7) / 8);
+
+            for (int l = 0; l < _batchMeta.Count; l++)
+            {
+                var m = _batchMeta[l];
+                _vk.Dispatch(_kRms, m.BAttnNormSet, new uint[] { (uint)dim, (uint)b, epsBits }, (uint)b);
+
+                if (m.IsGdn)
+                {
+                    DispatchQmm(m.Qkv!, m.BQkvSet, b);
+                    if (m.QkvBias != null) DispatchBiasBatch(m.BQkvBiasSet, ch, b);
+                    DispatchQmm(m.Gate!, m.BGateSet, b);
+                    _vk.Dispatch(_kF32Mm, m.BAlphaSet, new uint[] { (uint)dim, (uint)nV, (uint)b }, (uint)((nV + 3) / 4), gyB8);
+                    _vk.Dispatch(_kF32Mm, m.BBetaSet, new uint[] { (uint)dim, (uint)nV, (uint)b }, (uint)((nV + 3) / 4), gyB8);
+
+                    for (int t = 0; t < b; t++)
+                    {
+                        _vk.Dispatch(_kConvB, m.BConvSet, new uint[] { (uint)ch, (uint)t }, gxCh);
+                    }
+                    _vk.Dispatch(_kL2B, m.BL2Set, new uint[] { (uint)nK, (uint)ch }, (uint)nK, (uint)b);
+                    for (int t = 0; t < b; t++)
+                    {
+                        _vk.Dispatch(_kRecB, m.BRecSet, new uint[] { (uint)nK, (uint)nV, (uint)ch, (uint)t }, (uint)nV);
+                    }
+
+                    _vk.Dispatch(_kRms, m.BSsmNormSet, new uint[] { (uint)StateDim, (uint)(b * nV), epsBits }, (uint)(b * nV));
+                    _vk.Dispatch(_kSwi, m.BSwiGdnSet, new uint[] { (uint)(b * inner) }, (uint)((b * inner + 255) / 256));
+                    DispatchQmm(m.OutW!, m.BOutSet, b);
+                    _vk.Dispatch(_kAdd, _bAddProjSet, new uint[] { (uint)(b * dim) }, gxBDim);
+                }
+                else
+                {
+                    DispatchQmm(m.QW!, m.BQSet, b);
+                    DispatchQmm(m.KW!, m.BKSet, b);
+                    DispatchQmm(m.VW!, m.BVSet, b);
+                    if (m.QBias != null) DispatchBiasBatch(m.BQBiasSet, 2 * qDim, b);
+                    if (m.KBias != null) DispatchBiasBatch(m.BKBiasSet, kvDim, b);
+                    if (m.VBias != null) DispatchBiasBatch(m.BVBiasSet, kvDim, b);
+
+                    _vk.Dispatch(
+                        _kPrep,
+                        m.BPrepSet,
+                        new uint[] { (uint)chunkPos, (uint)nH, (uint)nKv, (uint)_maxSeq, (uint)w.RopeDimensionCount, epsBits, freqBits },
+                        (uint)(nH + 2 * nKv),
+                        (uint)b);
+                    _vk.Dispatch(
+                        _kDec,
+                        m.BDecSet,
+                        new uint[] { (uint)(chunkPos + 1), (uint)nH, (uint)nKv, (uint)_maxSeq, scaleBits },
+                        (uint)nH,
+                        (uint)b);
+                    DispatchQmm(m.OW!, m.BOSet, b);
+                    if (m.OBias != null) DispatchBiasBatch(m.BOBiasSet, dim, b);
+                    _vk.Dispatch(_kAdd, _bAddProjSet, new uint[] { (uint)(b * dim) }, gxBDim);
+                }
+
+                // FFN
+                _vk.Dispatch(_kRms, m.BFfnNormSet, new uint[] { (uint)dim, (uint)b, epsBits }, (uint)b);
+                if (m.IsMoe)
+                {
+                    for (int t = 0; t < b; t++)
+                    {
+                        _vk.Dispatch(_kCopy, _bCopyBXToGX, new uint[] { (uint)dim, (uint)(t * dim), 0u }, gxDim);
+                        _vk.Dispatch(_kCopy, _bCopyBNormToGNorm, new uint[] { (uint)dim, (uint)(t * dim), 0u }, gxDim);
+                        for (int oi = 0; oi < m.MoeOpsCount; oi++)
+                        {
+                            var op = _layerOps[m.MoeOpsStart + oi];
+                            _vk.Dispatch(op.K, op.Set, op.Push, op.Gx, op.Gy);
+                        }
+                        _vk.Dispatch(_kCopy, _bCopyGXToBX, new uint[] { (uint)dim, 0u, (uint)(t * dim) }, gxDim);
+                    }
+                }
+                else
+                {
+                    DispatchQmm(m.GW!, m.BGSet, b);
+                    DispatchQmm(m.UW!, m.BUSet, b);
+                    if (m.GBias != null) DispatchBiasBatch(m.BGBiasSet, m.FfnDim, b);
+                    if (m.UBias != null) DispatchBiasBatch(m.BUBiasSet, m.FfnDim, b);
+                    _vk.Dispatch(_kSwi, m.BSwiFfnSet, new uint[] { (uint)(b * m.FfnDim) }, (uint)((b * m.FfnDim + 255) / 256));
+                    DispatchQmm(m.DW!, m.BDSet, b);
+                    _vk.Dispatch(_kAdd, _bAddProjSet, new uint[] { (uint)(b * dim) }, gxBDim);
+                }
+
+                // Flush periodically on deep models (e.g. 64-layer 27B) so a single vkQueueSubmit never trips AMDGPU's ~2s CS watchdog.
+                if ((l & 7) == 7 && l + 1 < _batchMeta.Count)
+                {
+                    _vk.SubmitAndWait();
+                    _vk.Begin();
+                }
+            }
+
+            if (isLastChunk)
+            {
+                _vk.Dispatch(_kCopy, _bCopyBXToGX, new uint[] { (uint)dim, (uint)((b - 1) * dim), 0u }, gxDim);
+                if (wantLogits)
+                {
+                    Run(_finalOps, tokens[^1], startPos + tokens.Length - 1);
+                }
+            }
+
+            _vk.SubmitAndWait();
+            offset += b;
+        }
+
+        if (wantLogits)
+        {
+            fixed (float* p = logits) _gLogits.DownloadTo(p, (long)_vocab * 4);
+            fixed (float* pHid = _lastHidden) _gX.DownloadTo(pHid, (long)_dim * 4);
+        }
+    }
+
+    public void SaveRecurrentState(Span<byte> destination)
+    {
+        long required = StateSnapshotBytes;
+        if (destination.Length < required)
+            throw new ArgumentException($"Destination span length {destination.Length} < required {required} bytes.", nameof(destination));
+        if (required == 0) return;
+
+        long offset = 0;
+        fixed (byte* p = destination)
+        {
+            foreach (var (conv, rec) in _states)
+            {
+                conv.DownloadTo(p + offset, (long)conv.Size);
+                offset += (long)conv.Size;
+                rec.DownloadTo(p + offset, (long)rec.Size);
+                offset += (long)rec.Size;
+            }
+        }
+    }
+
+    public void RestoreRecurrentState(ReadOnlySpan<byte> snapshot)
+    {
+        long required = StateSnapshotBytes;
+        if (snapshot.Length < required)
+            throw new ArgumentException($"Snapshot span length {snapshot.Length} < required {required} bytes.", nameof(snapshot));
+        if (required == 0) return;
+
+        long offset = 0;
+        fixed (byte* p = snapshot)
+        {
+            foreach (var (conv, rec) in _states)
+            {
+                conv.UploadFrom(p + offset, (long)conv.Size);
+                offset += (long)conv.Size;
+                rec.UploadFrom(p + offset, (long)rec.Size);
+                offset += (long)rec.Size;
+            }
+        }
+    }
+
+    public void VerifyBatch(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<int> predictedTokens,
+        byte[][]? perStepSnapshots = null)
+    {
+        if (tokens.IsEmpty) return;
+        if (predictedTokens.Length < tokens.Length)
+            throw new ArgumentException($"predictedTokens length {predictedTokens.Length} < tokens length {tokens.Length}.", nameof(predictedTokens));
+
+        float[] row = new float[_vocab];
+        long snapBytes = perStepSnapshots != null ? StateSnapshotBytes : 0L;
+        for (int t = 0; t < tokens.Length; t++)
+        {
+            Forward(tokens[t], startPos + t, row, computeLogits: true);
+            int bestId = 0;
+            float bestVal = row[0];
+            for (int v = 1; v < _vocab; v++)
+            {
+                if (row[v] > bestVal)
+                {
+                    bestVal = row[v];
+                    bestId = v;
+                }
+            }
+            predictedTokens[t] = bestId;
+            if (perStepSnapshots != null && t < perStepSnapshots.Length && perStepSnapshots[t] != null && snapBytes > 0)
+            {
+                SaveRecurrentState(perStepSnapshots[t]);
+            }
+        }
+    }
+
+    public void VerifyBatchLogits(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<float> flatLogits,
+        int vocabStride,
+        byte[][]? perStepSnapshots = null)
+    {
+        if (tokens.IsEmpty) return;
+        if (vocabStride < _vocab)
+            throw new ArgumentException($"vocabStride ({vocabStride}) must be >= VocabSize ({_vocab}).", nameof(vocabStride));
+        if (flatLogits.Length < (tokens.Length - 1) * vocabStride + _vocab)
+            throw new ArgumentException("flatLogits buffer is too small.", nameof(flatLogits));
+
+        long snapBytes = perStepSnapshots != null ? StateSnapshotBytes : 0L;
+        for (int t = 0; t < tokens.Length; t++)
+        {
+            Forward(tokens[t], startPos + t, flatLogits.Slice(t * vocabStride, _vocab), computeLogits: true);
+            if (perStepSnapshots != null && t < perStepSnapshots.Length && perStepSnapshots[t] != null && snapBytes > 0)
+            {
+                SaveRecurrentState(perStepSnapshots[t]);
+            }
         }
     }
 
@@ -543,6 +1024,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model
             conv.Zero();
             rec.Zero();
         }
+        Array.Clear(_lastHidden);
+        if (_historyValid != null) Array.Clear(_historyValid);
     }
 
     /// <summary>

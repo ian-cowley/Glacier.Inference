@@ -268,23 +268,142 @@ RWStructuredBuffer<uint> v_cache : register(u3);
 void main(uint3 id : SV_DispatchThreadID)
 {
     if (pos >= max_seq_len) return;
-    uint half_elements = n_heads_kv * (head_dim / 2);
+    uint pairs = (head_dim + 1u) / 2u;
+    uint half_elements = n_heads_kv * pairs;
     uint idx = id.x;
     if (idx >= half_elements) return;
 
-    uint h = idx / (head_dim / 2);
-    uint d_pair = idx % (head_dim / 2);
+    uint h = idx / pairs;
+    uint d_pair = idx % pairs;
 
     uint in_idx0 = (h * head_dim) + (d_pair * 2);
     uint in_idx1 = in_idx0 + 1;
+    bool has1 = (d_pair * 2 + 1) < head_dim;
 
-    uint k_packed = f32tof16(k[in_idx0]) | (f32tof16(k[in_idx1]) << 16);
-    uint v_packed = f32tof16(v[in_idx0]) | (f32tof16(v[in_idx1]) << 16);
+    uint k_packed = f32tof16(k[in_idx0]) | (has1 ? (f32tof16(k[in_idx1]) << 16) : 0u);
+    uint v_packed = f32tof16(v[in_idx0]) | (has1 ? (f32tof16(v[in_idx1]) << 16) : 0u);
 
-    uint cache_idx = (h * max_seq_len + pos) * (head_dim / 2) + d_pair;
+    uint cache_idx = (h * max_seq_len + pos) * pairs + d_pair;
 
     k_cache[cache_idx] = k_packed;
     v_cache[cache_idx] = v_packed;
+}
+";
+
+    /// <summary>
+    /// Packed 4-bit (Q4_0) KV Cache Store kernel using a race-free per-(h, pos)-row split layout:
+    /// <c>nb = (head_dim + 31) / 32</c>, <c>num_pairs = (nb + 1) / 2</c>, <c>row_uints = nb * 4 + num_pairs</c>.
+    /// First <c>nb * 4</c> uints store 4-bit nibbles; last <c>num_pairs</c> uints store packed FP16 scale pairs.
+    /// Dispatches <c>(n_heads_kv * num_pairs, 1, 1)</c> threadgroups of 64 threads.
+    /// </summary>
+    public const string KvCacheStoreQ4_0 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+};
+
+RWStructuredBuffer<float> k : register(u0);
+RWStructuredBuffer<float> v : register(u1);
+RWStructuredBuffer<uint> k_cache : register(u2);
+RWStructuredBuffer<uint> v_cache : register(u3);
+
+groupshared float s_kmax[64];
+groupshared float s_vmax[64];
+groupshared uint s_kq[64];
+groupshared uint s_vq[64];
+groupshared uint s_sk[2];
+groupshared uint s_sv[2];
+
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    if (pos >= max_seq_len) return;
+
+    uint nb = (head_dim + 31u) >> 5;
+    uint num_pairs = (nb + 1u) >> 1;
+    uint h = gid.x / num_pairs;
+    uint pair_idx = gid.x % num_pairs;
+    if (h >= n_heads_kv) return;
+
+    uint tid = gtid.x;
+    uint sub = tid >> 5;
+    uint lane = tid & 31u;
+    uint blk = pair_idx * 2u + sub;
+    bool valid_blk = (blk < nb);
+    uint d = blk * 32u + lane;
+
+    float kv = (valid_blk && d < head_dim) ? k[h * head_dim + d] : 0.0f;
+    float vv = (valid_blk && d < head_dim) ? v[h * head_dim + d] : 0.0f;
+
+    s_kmax[tid] = isfinite(kv) ? abs(kv) : (isinf(kv) ? 458528.0f : 0.0f);
+    s_vmax[tid] = isfinite(vv) ? abs(vv) : (isinf(vv) ? 458528.0f : 0.0f);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < 16u) { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 16u]); s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 16u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 8u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 8u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 8u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 4u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 4u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 4u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 2u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 2u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 2u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 1u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 1u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 1u]); }
+    GroupMemoryBarrierWithGroupSync();
+
+    float amax_k = min(s_kmax[sub * 32u], 458528.0f);
+    float amax_v = min(s_vmax[sub * 32u], 458528.0f);
+
+    float dk_raw = clamp(amax_k / 7.0f, 0.0f, 65504.0f);
+    float dv_raw = clamp(amax_v / 7.0f, 0.0f, 65504.0f);
+    if (!isfinite(dk_raw)) dk_raw = 65504.0f;
+    if (!isfinite(dv_raw)) dv_raw = 65504.0f;
+    uint hk = f32tof16(dk_raw);
+    uint hv = f32tof16(dv_raw);
+    float dk = f16tof32(hk);
+    float dv = f16tof32(hv);
+
+    float inv_dk = (dk > 0.0f) ? (1.0f / dk) : 0.0f;
+    float inv_dv = (dv > 0.0f) ? (1.0f / dv) : 0.0f;
+
+    int qk = isnan(kv) ? 8 : (isinf(kv) ? (kv > 0.0f ? 15 : 0) : ((dk > 0.0f) ? clamp((int)round(kv * inv_dk) + 8, 0, 15) : 8));
+    int qv = isnan(vv) ? 8 : (isinf(vv) ? (vv > 0.0f ? 15 : 0) : ((dv > 0.0f) ? clamp((int)round(vv * inv_dv) + 8, 0, 15) : 8));
+
+    s_kq[tid] = (uint)qk;
+    s_vq[tid] = (uint)qv;
+    if (lane == 0u)
+    {
+        s_sk[sub] = valid_blk ? (hk & 0xFFFFu) : 0u;
+        s_sv[sub] = valid_blk ? (hv & 0xFFFFu) : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint row_uints = nb * 4u + num_pairs;
+    uint row_base = (h * max_seq_len + pos) * row_uints;
+
+    if (valid_blk && lane < 4u)
+    {
+        uint b_base = sub * 32u + lane * 4u;
+        uint kb0 = s_kq[b_base + 0u] | (s_kq[b_base + 16u] << 4);
+        uint kb1 = s_kq[b_base + 1u] | (s_kq[b_base + 17u] << 4);
+        uint kb2 = s_kq[b_base + 2u] | (s_kq[b_base + 18u] << 4);
+        uint kb3 = s_kq[b_base + 3u] | (s_kq[b_base + 19u] << 4);
+        k_cache[row_base + blk * 4u + lane] = kb0 | (kb1 << 8) | (kb2 << 16) | (kb3 << 24);
+
+        uint vb0 = s_vq[b_base + 0u] | (s_vq[b_base + 16u] << 4);
+        uint vb1 = s_vq[b_base + 1u] | (s_vq[b_base + 17u] << 4);
+        uint vb2 = s_vq[b_base + 2u] | (s_vq[b_base + 18u] << 4);
+        uint vb3 = s_vq[b_base + 3u] | (s_vq[b_base + 19u] << 4);
+        v_cache[row_base + blk * 4u + lane] = vb0 | (vb1 << 8) | (vb2 << 16) | (vb3 << 24);
+    }
+
+    if (tid == 0u)
+    {
+        k_cache[row_base + nb * 4u + pair_idx] = (s_sk[0] & 0xFFFFu) | ((s_sk[1] & 0xFFFFu) << 16);
+        v_cache[row_base + nb * 4u + pair_idx] = (s_sv[0] & 0xFFFFu) | ((s_sv[1] & 0xFFFFu) << 16);
+    }
 }
 ";
 
@@ -425,7 +544,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     uint group_size = n_heads_q / n_heads_kv;
     uint h_kv = h / group_size;
     uint q_base = h * head_dim;
-    uint half_dim = head_dim / 2;
+    uint half_dim = (head_dim + 1u) / 2u;
 
     float q_reg[4];
     float acc[4];
@@ -490,6 +609,132 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                 uint v_packed = v_cache[kv_base + (d >> 1)];
                 float v_d = ((d & 1) == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
                 acc[c] = acc[c] * alpha + w_t * v_d;
+            }
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
+}
+";
+
+    public const string AttentionGqaQ4_0 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+    float attn_scale;
+};
+
+RWByteAddressBuffer q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWByteAddressBuffer attn_out : register(u3);
+
+groupshared float s_red[128];
+
+[numthreads(128, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    if (h >= n_heads_q || pos >= max_seq_len) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+    uint q_base = h * head_dim;
+    uint nb = (head_dim + 31u) >> 5;
+    uint row_uints = nb * 4u + ((nb + 1u) >> 1);
+
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (uint t = 0; t <= pos; t++)
+    {
+        uint row_base = (h_kv * max_seq_len + t) * row_uints;
+        float dot_part = 0.0f;
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                uint blk = d >> 5;
+                uint elem = d & 31u;
+                uint l_idx = elem & 15u;
+                uint k_word = k_cache[row_base + blk * 4u + (l_idx >> 2)];
+                uint k_sword = k_cache[row_base + nb * 4u + (blk >> 1)];
+                float k_scale = ((blk & 1u) == 0u) ? f16tof32(k_sword & 0xFFFFu) : f16tof32(k_sword >> 16);
+                uint k_shift = ((l_idx & 3u) * 8u) + ((elem >= 16u) ? 4u : 0u);
+                int k_nib = (int)((k_word >> k_shift) & 0xFu) - 8;
+                dot_part += q_reg[c] * (k_scale * (float)k_nib);
+            }
+        }
+
+        s_red[tid] = dot_part;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 64) s_red[tid] += s_red[tid + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 32) s_red[tid] += s_red[tid + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 16) s_red[tid] += s_red[tid + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 8)  s_red[tid] += s_red[tid + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 4)  s_red[tid] += s_red[tid + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 2)  s_red[tid] += s_red[tid + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        GroupMemoryBarrierWithGroupSync();
+
+        float s_t = s_red[0] * attn_scale;
+
+        float m_new = max(m, s_t);
+        float alpha = exp(m - m_new);
+        float w_t = exp(s_t - m_new);
+
+        [unroll]
+        for (uint c = 0; c < 4; c++)
+        {
+            uint d = tid + c * 128;
+            if (d < head_dim)
+            {
+                uint blk = d >> 5;
+                uint elem = d & 31u;
+                uint l_idx = elem & 15u;
+                uint v_word = v_cache[row_base + blk * 4u + (l_idx >> 2)];
+                uint v_sword = v_cache[row_base + nb * 4u + (blk >> 1)];
+                float v_scale = ((blk & 1u) == 0u) ? f16tof32(v_sword & 0xFFFFu) : f16tof32(v_sword >> 16);
+                uint v_shift = ((l_idx & 3u) * 8u) + ((elem >= 16u) ? 4u : 0u);
+                int v_nib = (int)((v_word >> v_shift) & 0xFu) - 8;
+                acc[c] = acc[c] * alpha + w_t * (v_scale * (float)v_nib);
             }
         }
         l = l * alpha + w_t;
@@ -762,7 +1007,7 @@ RWStructuredBuffer<uint> v_cache : register(u3);
 [numthreads(256, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    uint half_dim = head_dim / 2;
+    uint half_dim = (head_dim + 1u) / 2u;
     uint total_per_token = n_heads_kv * half_dim;
     uint total = batch_size * total_per_token;
     if (id.x >= total) return;
@@ -777,14 +1022,135 @@ void main(uint3 id : SV_DispatchThreadID)
 
     uint in_idx0 = t * (n_heads_kv * head_dim) + (h * head_dim) + (d_pair * 2);
     uint in_idx1 = in_idx0 + 1;
+    bool has1 = (d_pair * 2 + 1) < head_dim;
 
-    uint k_packed = f32tof16(k[in_idx0]) | (f32tof16(k[in_idx1]) << 16);
-    uint v_packed = f32tof16(v[in_idx0]) | (f32tof16(v[in_idx1]) << 16);
+    uint k_packed = f32tof16(k[in_idx0]) | (has1 ? (f32tof16(k[in_idx1]) << 16) : 0u);
+    uint v_packed = f32tof16(v[in_idx0]) | (has1 ? (f32tof16(v[in_idx1]) << 16) : 0u);
 
     uint cache_idx = (h * max_seq_len + pos) * half_dim + d_pair;
 
     k_cache[cache_idx] = k_packed;
     v_cache[cache_idx] = v_packed;
+}
+";
+
+    /// <summary>
+    /// Batched packed 4-bit (Q4_0) KV Cache Store kernel using per-(h, pos)-row split layout.
+    /// Dispatches <c>(n_heads_kv * num_pairs, batch_size, 1)</c> threadgroups of 64 threads.
+    /// </summary>
+    public const string KvCacheStoreBatchQ4_0 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint start_pos;
+    uint batch_size;
+};
+
+RWStructuredBuffer<float> k : register(u0);
+RWStructuredBuffer<float> v : register(u1);
+RWStructuredBuffer<uint> k_cache : register(u2);
+RWStructuredBuffer<uint> v_cache : register(u3);
+
+groupshared float s_kmax[64];
+groupshared float s_vmax[64];
+groupshared uint s_kq[64];
+groupshared uint s_vq[64];
+groupshared uint s_sk[2];
+groupshared uint s_sv[2];
+
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint t = gid.y;
+    if (t >= batch_size) return;
+    uint pos = start_pos + t;
+    if (pos >= max_seq_len) return;
+
+    uint nb = (head_dim + 31u) >> 5;
+    uint num_pairs = (nb + 1u) >> 1;
+    uint h = gid.x / num_pairs;
+    uint pair_idx = gid.x % num_pairs;
+    if (h >= n_heads_kv) return;
+
+    uint tid = gtid.x;
+    uint sub = tid >> 5;
+    uint lane = tid & 31u;
+    uint blk = pair_idx * 2u + sub;
+    bool valid_blk = (blk < nb);
+    uint d = blk * 32u + lane;
+
+    uint src_idx = t * (n_heads_kv * head_dim) + h * head_dim + d;
+    float kv = (valid_blk && d < head_dim) ? k[src_idx] : 0.0f;
+    float vv = (valid_blk && d < head_dim) ? v[src_idx] : 0.0f;
+
+    s_kmax[tid] = isfinite(kv) ? abs(kv) : (isinf(kv) ? 458528.0f : 0.0f);
+    s_vmax[tid] = isfinite(vv) ? abs(vv) : (isinf(vv) ? 458528.0f : 0.0f);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lane < 16u) { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 16u]); s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 16u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 8u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 8u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 8u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 4u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 4u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 4u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 2u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 2u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 2u]); }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane < 1u)  { s_kmax[tid] = max(s_kmax[tid], s_kmax[tid + 1u]);  s_vmax[tid] = max(s_vmax[tid], s_vmax[tid + 1u]); }
+    GroupMemoryBarrierWithGroupSync();
+
+    float amax_k = min(s_kmax[sub * 32u], 458528.0f);
+    float amax_v = min(s_vmax[sub * 32u], 458528.0f);
+
+    float dk_raw = clamp(amax_k / 7.0f, 0.0f, 65504.0f);
+    float dv_raw = clamp(amax_v / 7.0f, 0.0f, 65504.0f);
+    if (!isfinite(dk_raw)) dk_raw = 65504.0f;
+    if (!isfinite(dv_raw)) dv_raw = 65504.0f;
+    uint hk = f32tof16(dk_raw);
+    uint hv = f32tof16(dv_raw);
+    float dk = f16tof32(hk);
+    float dv = f16tof32(hv);
+
+    float inv_dk = (dk > 0.0f) ? (1.0f / dk) : 0.0f;
+    float inv_dv = (dv > 0.0f) ? (1.0f / dv) : 0.0f;
+
+    int qk = isnan(kv) ? 8 : (isinf(kv) ? (kv > 0.0f ? 15 : 0) : ((dk > 0.0f) ? clamp((int)round(kv * inv_dk) + 8, 0, 15) : 8));
+    int qv = isnan(vv) ? 8 : (isinf(vv) ? (vv > 0.0f ? 15 : 0) : ((dv > 0.0f) ? clamp((int)round(vv * inv_dv) + 8, 0, 15) : 8));
+
+    s_kq[tid] = (uint)qk;
+    s_vq[tid] = (uint)qv;
+    if (lane == 0u)
+    {
+        s_sk[sub] = valid_blk ? (hk & 0xFFFFu) : 0u;
+        s_sv[sub] = valid_blk ? (hv & 0xFFFFu) : 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint row_uints = nb * 4u + num_pairs;
+    uint row_base = (h * max_seq_len + pos) * row_uints;
+
+    if (valid_blk && lane < 4u)
+    {
+        uint b_base = sub * 32u + lane * 4u;
+        uint kb0 = s_kq[b_base + 0u] | (s_kq[b_base + 16u] << 4);
+        uint kb1 = s_kq[b_base + 1u] | (s_kq[b_base + 17u] << 4);
+        uint kb2 = s_kq[b_base + 2u] | (s_kq[b_base + 18u] << 4);
+        uint kb3 = s_kq[b_base + 3u] | (s_kq[b_base + 19u] << 4);
+        k_cache[row_base + blk * 4u + lane] = kb0 | (kb1 << 8) | (kb2 << 16) | (kb3 << 24);
+
+        uint vb0 = s_vq[b_base + 0u] | (s_vq[b_base + 16u] << 4);
+        uint vb1 = s_vq[b_base + 1u] | (s_vq[b_base + 17u] << 4);
+        uint vb2 = s_vq[b_base + 2u] | (s_vq[b_base + 18u] << 4);
+        uint vb3 = s_vq[b_base + 3u] | (s_vq[b_base + 19u] << 4);
+        v_cache[row_base + blk * 4u + lane] = vb0 | (vb1 << 8) | (vb2 << 16) | (vb3 << 24);
+    }
+
+    if (tid == 0u)
+    {
+        k_cache[row_base + nb * 4u + pair_idx] = (s_sk[0] & 0xFFFFu) | ((s_sk[1] & 0xFFFFu) << 16);
+        v_cache[row_base + nb * 4u + pair_idx] = (s_sv[0] & 0xFFFFu) | ((s_sv[1] & 0xFFFFu) << 16);
+    }
 }
 ";
 
@@ -975,7 +1341,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (pos_t >= max_seq_len) return;
 
     uint q_base = (t * n_heads_q + h) * head_dim;
-    uint half_dim = head_dim / 2;
+    uint half_dim = (head_dim + 1u) / 2u;
     float q_reg[4];
     float acc[4];
     [unroll]
@@ -1066,6 +1432,168 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
                         uint pair_idx = d >> 1; uint v_packed = v_cache[kv_base + pair_idx];
                         float v_d = ((d & 1) == 0) ? f16tof32(v_packed & 0xFFFF) : f16tof32(v_packed >> 16);
                         acc[c] = acc[c] * alpha + w_k * v_d;
+                    }
+                }
+                l = l * alpha + w_k;
+                m = m_new;
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        if (d < head_dim)
+        {
+            attn_out.Store((q_base + d) * 4, asuint(acc[c] * inv_l));
+        }
+    }
+}
+";
+
+    /// <summary>
+    /// Batched multi-head attention GQA kernel for packed 4-bit (Q4_0) KV cache buffers.
+    /// </summary>
+    public const string AttentionBatchQ4_0 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint start_pos;
+    float attn_scale;
+    uint batch_size;
+};
+
+RWByteAddressBuffer q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWByteAddressBuffer attn_out : register(u3);
+
+groupshared float s_red[4][128];
+
+[numthreads(128, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    uint t = gid.y;
+    if (h >= n_heads_q || t >= batch_size) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+    uint pos_t = start_pos + t;
+    if (pos_t >= max_seq_len) return;
+
+    uint q_base = (t * n_heads_q + h) * head_dim;
+    uint nb = (head_dim + 31u) >> 5;
+    uint row_uints = nb * 4u + ((nb + 1u) >> 1);
+    float q_reg[4];
+    float acc[4];
+    [unroll]
+    for (uint c = 0; c < 4; c++)
+    {
+        uint d = tid + c * 128;
+        q_reg[c] = (d < head_dim) ? asfloat(q.Load((q_base + d) * 4)) : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    uint warp_id = tid / 32;
+    uint lane_id = tid % 32;
+
+    for (uint p = 0; p <= pos_t; p += 4)
+    {
+        [unroll]
+        for (uint i = 0; i < 4; i++)
+        {
+            uint curr_p = p + i;
+            float dot_part = 0.0f;
+            if (curr_p <= pos_t)
+            {
+                uint row_base = (h_kv * max_seq_len + curr_p) * row_uints;
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        uint blk = d >> 5;
+                        uint elem = d & 31u;
+                        uint l_idx = elem & 15u;
+                        uint k_word = k_cache[row_base + blk * 4u + (l_idx >> 2)];
+                        uint k_sword = k_cache[row_base + nb * 4u + (blk >> 1)];
+                        float k_scale = ((blk & 1u) == 0u) ? f16tof32(k_sword & 0xFFFFu) : f16tof32(k_sword >> 16);
+                        uint k_shift = ((l_idx & 3u) * 8u) + ((elem >= 16u) ? 4u : 0u);
+                        int k_nib = (int)((k_word >> k_shift) & 0xFu) - 8;
+                        dot_part += q_reg[c] * (k_scale * (float)k_nib);
+                    }
+                }
+            }
+            s_red[i][tid] = dot_part;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (lane_id < 8)
+        {
+            float chunk_sum = 0.0f;
+            [unroll]
+            for (uint j = 0; j < 16; j++)
+            {
+                chunk_sum += s_red[warp_id][lane_id * 16 + j];
+            }
+            s_red[warp_id][lane_id] = chunk_sum;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (lane_id == 0)
+        {
+            s_red[warp_id][0] = s_red[warp_id][0] + s_red[warp_id][1] +
+                                s_red[warp_id][2] + s_red[warp_id][3] +
+                                s_red[warp_id][4] + s_red[warp_id][5] +
+                                s_red[warp_id][6] + s_red[warp_id][7];
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        [unroll]
+        for (uint k = 0; k < 4; k++)
+        {
+            uint curr_p = p + k;
+            if (curr_p <= pos_t)
+            {
+                float total_dot = s_red[k][0];
+                float s_k = total_dot * attn_scale;
+
+                float m_new = max(m, s_k);
+                float alpha = exp(m - m_new);
+                float w_k = exp(s_k - m_new);
+                uint row_base = (h_kv * max_seq_len + curr_p) * row_uints;
+
+                [unroll]
+                for (uint c = 0; c < 4; c++)
+                {
+                    uint d = tid + c * 128;
+                    if (d < head_dim)
+                    {
+                        uint blk = d >> 5;
+                        uint elem = d & 31u;
+                        uint l_idx = elem & 15u;
+                        uint v_word = v_cache[row_base + blk * 4u + (l_idx >> 2)];
+                        uint v_sword = v_cache[row_base + nb * 4u + (blk >> 1)];
+                        float v_scale = ((blk & 1u) == 0u) ? f16tof32(v_sword & 0xFFFFu) : f16tof32(v_sword >> 16);
+                        uint v_shift = ((l_idx & 3u) * 8u) + ((elem >= 16u) ? 4u : 0u);
+                        int v_nib = (int)((v_word >> v_shift) & 0xFu) - 8;
+                        acc[c] = acc[c] * alpha + w_k * (v_scale * (float)v_nib);
                     }
                 }
                 l = l * alpha + w_k;

@@ -126,7 +126,7 @@ public unsafe class VulkanKernelTests
             var gW = Up(vk, w); var gX = Up(vk, x); var gY = vk.Alloc(N * 4L);
             var set = vk.MakeSet(kern, gW, gX, gY);
             vk.Begin();
-            vk.Dispatch(kern, set, new uint[] { K, N }, N);
+            vk.Dispatch(kern, set, new uint[] { K, N }, (N + 3u) / 4u);
             vk.SubmitAndWait();
             AssertClose(yCpu, Down(gY, N), 1e-3, 1e-3, $"mat-vec {c.Type}");
         }
@@ -202,16 +202,16 @@ public unsafe class VulkanKernelTests
         var gSg = vk.Alloc(F * 4L); var gSu = vk.Alloc(F * 4L); var gSAct = vk.Alloc(F * 4L); var gSd = vk.Alloc(DIM * 4L);
 
         vk.Begin();
-        vk.Dispatch(kRouter, vk.MakeSet(kRouter, gRouter, gNorm, gLogits), new uint[] { DIM, E }, E);
+        vk.Dispatch(kRouter, vk.MakeSet(kRouter, gRouter, gNorm, gLogits), new uint[] { DIM, E }, (uint)((E + 3) / 4));
         vk.Dispatch(kTopk, vk.MakeSet(kTopk, gLogits, gIdx, gTw), new uint[] { E, TOPK, 1 }, 1);
-        vk.Dispatch(kMoe4, vk.MakeSet(kMoe4, gGateW, gNorm, gGateOut, gIdx), new uint[] { DIM, F, (uint)gateSlice, 0 }, F, TOPK);
-        vk.Dispatch(kMoe4, vk.MakeSet(kMoe4, gUpW, gNorm, gUpOut, gIdx), new uint[] { DIM, F, (uint)gateSlice, 0 }, F, TOPK);
+        vk.Dispatch(kMoe4, vk.MakeSet(kMoe4, gGateW, gNorm, gGateOut, gIdx), new uint[] { DIM, F, (uint)gateSlice, 0 }, (uint)((F + 3) / 4), TOPK);
+        vk.Dispatch(kMoe4, vk.MakeSet(kMoe4, gUpW, gNorm, gUpOut, gIdx), new uint[] { DIM, F, (uint)gateSlice, 0 }, (uint)((F + 3) / 4), TOPK);
         vk.Dispatch(kSwi, vk.MakeSet(kSwi, gGateOut, gUpOut, gAct), new uint[] { TOPK * F }, (TOPK * F + 255) / 256);
-        vk.Dispatch(kMoe5, vk.MakeSet(kMoe5, gDownW, gAct, gDownOut, gIdx), new uint[] { F, DIM, (uint)downSlice, F }, DIM, TOPK);
-        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSgW, gNorm, gSg), new uint[] { DIM, F }, F);
-        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSuW, gNorm, gSu), new uint[] { DIM, F }, F);
+        vk.Dispatch(kMoe5, vk.MakeSet(kMoe5, gDownW, gAct, gDownOut, gIdx), new uint[] { F, DIM, (uint)downSlice, F }, (uint)((DIM + 3) / 4), TOPK);
+        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSgW, gNorm, gSg), new uint[] { DIM, F }, (uint)((F + 3) / 4));
+        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSuW, gNorm, gSu), new uint[] { DIM, F }, (uint)((F + 3) / 4));
         vk.Dispatch(kSwi, vk.MakeSet(kSwi, gSg, gSu, gSAct), new uint[] { F }, (F + 255) / 256);
-        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSdW, gSAct, gSd), new uint[] { F, DIM }, DIM);
+        vk.Dispatch(kQ8, vk.MakeSet(kQ8, gSdW, gSAct, gSd), new uint[] { F, DIM }, (uint)((DIM + 3) / 4));
         vk.Dispatch(kComb, vk.MakeSet(kComb, gX, gNorm, gShGate, gDownOut, gTw, gSd), new uint[] { DIM, TOPK, 1 }, 1);
         vk.SubmitAndWait();
 
@@ -469,7 +469,7 @@ public unsafe class VulkanKernelTests
         var kQ4 = vk.LoadEmbedded("qmatvec_q4", 3, 8);
         var gWIq = Up(vk, wIq); var gXIq = Up(vk, xIq); var gYIq = vk.Alloc(mIq * 4L);
         vk.Begin();
-        vk.Dispatch(kQ4, vk.MakeSet(kQ4, gWIq, gXIq, gYIq), new uint[] { (uint)kIq, (uint)mIq }, (uint)mIq);
+        vk.Dispatch(kQ4, vk.MakeSet(kQ4, gWIq, gXIq, gYIq), new uint[] { (uint)kIq, (uint)mIq }, (uint)((mIq + 3) / 4));
         vk.SubmitAndWait();
         AssertClose(refIq, Down(gYIq, mIq), 1e-3, 1e-4, "IQ4_XS matvec");
 
@@ -502,7 +502,7 @@ public unsafe class VulkanKernelTests
         var kQ5 = vk.LoadEmbedded("qmatvec_q5", 3, 8);
         var gWMx = Up(vk, wMx); var gXMx = Up(vk, xMx); var gYMx = vk.Alloc(mMx * 4L);
         vk.Begin();
-        vk.Dispatch(kQ5, vk.MakeSet(kQ5, gWMx, gXMx, gYMx), new uint[] { (uint)kMx, (uint)mMx }, (uint)mMx);
+        vk.Dispatch(kQ5, vk.MakeSet(kQ5, gWMx, gXMx, gYMx), new uint[] { (uint)kMx, (uint)mMx }, (uint)((mMx + 3) / 4));
         vk.SubmitAndWait();
         AssertClose(refMx, Down(gYMx, mMx), 1e-3, 1e-4, "MXFP4 matvec");
     }
@@ -851,7 +851,7 @@ public unsafe class VulkanKernelTests
             var gY3 = vk.Alloc(N * 4L);
             var k3 = vk.LoadEmbedded("qmatvec_q6", 3, 8);
             vk.Begin();
-            vk.Dispatch(k3, vk.MakeSet(k3, gW3, gX, gY3), new uint[] { (uint)K, (uint)N }, (uint)N);
+            vk.Dispatch(k3, vk.MakeSet(k3, gW3, gX, gY3), new uint[] { (uint)K, (uint)N }, (uint)((N + 3) / 4));
             vk.SubmitAndWait();
             AssertClose(y3Ref, Down(gY3, N), 1e-3, 1e-4, "Q3_K qmatvec");
         }
@@ -875,9 +875,167 @@ public unsafe class VulkanKernelTests
             var gY4 = vk.Alloc(N * 4L);
             var k4 = vk.LoadEmbedded("qmatvec_q7", 3, 8);
             vk.Begin();
-            vk.Dispatch(k4, vk.MakeSet(k4, gW4, gX, gY4), new uint[] { (uint)K, (uint)N }, (uint)N);
+            vk.Dispatch(k4, vk.MakeSet(k4, gW4, gX, gY4), new uint[] { (uint)K, (uint)N }, (uint)((N + 3) / 4));
             vk.SubmitAndWait();
             AssertClose(y4Ref, Down(gY4, N), 1e-3, 1e-4, "IQ4_NL qmatvec");
         }
+    }
+
+    [VulkanFact]
+    public unsafe void BatchedPrefillKernels_MatchReference_AndHazardCoalescingSkipsIndependentBarriers()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(99);
+
+        const int K = 256, N = 67, B = 11; // non-multiple of 4 rows AND spans TILE_B=8 boundary (8 + 3)
+        float[] xBatch = RandF(rng, B * K, 0.5f);
+        var gXBatch = Up(vk, xBatch);
+
+        var cases = new (string Kernel, GgufType Type, int BlockElems, int BlockBytes, int[] Halves)[]
+        {
+            ("qmatmat_q0", GgufType.Q4_K, 256, 144, new[] { 0, 2 }),
+            ("qmatmat_q1", GgufType.Q5_K, 256, 176, new[] { 0, 2 }),
+            ("qmatmat_q2", GgufType.Q6_K, 256, 210, new[] { 208 }),
+            ("qmatmat_q3", GgufType.Q8_0, 32, 34, new[] { 0 }),
+        };
+
+        foreach (var c in cases)
+        {
+            byte[] w = RandQuant(rng, (long)N * (K / c.BlockElems), c.BlockBytes, c.Halves, 0.002f, 0.006f);
+            float[] yCpu = new float[B * N];
+            fixed (byte* pw = w) fixed (float* px = xBatch) fixed (float* py = yCpu)
+            {
+                for (int b = 0; b < B; b++)
+                    QuantKernels.MatVecMul(c.Type, pw, px + b * K, py + b * N, K, N);
+            }
+
+            var kern = vk.LoadEmbedded(c.Kernel, 3, 12, 1u << 2);
+            var gW = Up(vk, w);
+            var gY = vk.Alloc((long)B * N * 4L);
+            vk.Begin();
+            vk.Dispatch(kern, vk.MakeSet(kern, gW, gXBatch, gY), new uint[] { K, N, B }, (uint)((N + 3) / 4), (uint)((B + 7) / 8), 1);
+            vk.SubmitAndWait();
+            AssertClose(yCpu, Down(gY, B * N), 2e-3, 2e-3, $"batched matmul {c.Type}");
+        }
+
+        // f32_matmat + bias_add_batch + hazard coalescing check
+        float[] fW = RandF(rng, N * K, 0.25f);
+        float[] bias = RandF(rng, N, 0.5f);
+        float[] yF32Ref = new float[B * N];
+        for (int b = 0; b < B; b++)
+            for (int r = 0; r < N; r++)
+            {
+                float s = bias[r];
+                for (int i = 0; i < K; i++) s += fW[r * K + i] * xBatch[b * K + i];
+                yF32Ref[b * N + r] = s;
+            }
+
+        var kF32Mm = vk.LoadEmbedded("f32_matmat", 3, 12, 1u << 2);
+        var kBias = vk.LoadEmbedded("bias_add_batch", 2, 8, 1u << 0);
+        var gFW = Up(vk, fW); var gBias = Up(vk, bias);
+        var gOut1 = vk.Alloc((long)B * N * 4L);
+        var gOut2 = vk.Alloc((long)B * N * 4L);
+        var gOut3 = vk.Alloc((long)B * N * 4L);
+
+        // 3 independent projections reading shared gXBatch (0 barriers between them) + 1 bias_add on gOut1 (1 barrier) + 1 final host barrier
+        vk.Begin();
+        vk.Dispatch(kF32Mm, vk.MakeSet(kF32Mm, gFW, gXBatch, gOut1), new uint[] { K, N, B }, (uint)((N + 3) / 4), (uint)((B + 7) / 8));
+        vk.Dispatch(kF32Mm, vk.MakeSet(kF32Mm, gFW, gXBatch, gOut2), new uint[] { K, N, B }, (uint)((N + 3) / 4), (uint)((B + 7) / 8));
+        vk.Dispatch(kF32Mm, vk.MakeSet(kF32Mm, gFW, gXBatch, gOut3), new uint[] { K, N, B }, (uint)((N + 3) / 4), (uint)((B + 7) / 8));
+        vk.Dispatch(kBias, vk.MakeSet(kBias, gOut1, gBias), new uint[] { N, B }, (uint)((B * N + 255) / 256));
+        vk.SubmitAndWait();
+        Assert.Equal(4, vk.LastDispatchCount);
+        Assert.Equal(2, vk.LastBarrierCount);
+        AssertClose(yF32Ref, Down(gOut1, B * N), 2e-3, 1e-3, "f32_matmat + bias_add_batch");
+    }
+
+    [VulkanFact]
+    public void BatchedPrefill_GdnAndFullAttention_MatchSequentialReference()
+    {
+        using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
+        using var vk = new VulkanCompute(ctx);
+        var rng = new Random(123);
+
+        // 1. Batched GDN
+        const int NK = 2, NV = 4, CH = (NK * 2 + NV) * GdnD, INNER = NV * GdnD, B = 6;
+        const float eps = 1e-6f;
+        float[] convW = Rand(rng, CH * GdnConvKernel, 0.4f), dtBias = Rand(rng, NV, 0.3f, 0.5f), normW = Rand(rng, GdnD, 0.1f, 1f);
+        float[] aW = new float[NV]; for (int h = 0; h < NV; h++) aW[h] = -(0.02f + (float)rng.NextDouble() * 1.5f);
+
+        float[] qkvB = Rand(rng, B * CH), zB = Rand(rng, B * INNER), aB = Rand(rng, B * NV), bB = Rand(rng, B * NV);
+        var refConv = new float[CH * 3];
+        var refS = new float[NV][]; for (int h = 0; h < NV; h++) refS[h] = new float[GdnD * GdnD];
+        float[] gdnExpected = new float[B * INNER];
+        for (int t = 0; t < B; t++)
+        {
+            float[] stepOut = GdnReference(NK, NV,
+                qkvB.AsSpan(t * CH, CH).ToArray(),
+                zB.AsSpan(t * INNER, INNER).ToArray(),
+                aB.AsSpan(t * NV, NV).ToArray(),
+                bB.AsSpan(t * NV, NV).ToArray(),
+                convW, dtBias, aW, normW, eps, refConv, refS);
+            stepOut.CopyTo(gdnExpected, t * INNER);
+        }
+
+        var kConvB = vk.LoadEmbedded("gdn_conv_b", 4, 8, (1u << 2) | (1u << 3));
+        var kL2B = vk.LoadEmbedded("gdn_l2_b", 1, 8, 1u << 0);
+        var kRecB = vk.LoadEmbedded("gdn_rec_b", 7, 16, (1u << 5) | (1u << 6));
+        var kNorm = vk.LoadEmbedded("rmsnorm", 3, 12, 1u << 2);
+        var kSwi = vk.LoadEmbedded("elementwise_swiglu", 3, 4, 1u << 2);
+
+        var gQkv = Up(vk, qkvB); var gZ = Up(vk, zB); var gA = Up(vk, aB); var gB = Up(vk, bB);
+        var gConvW = Up(vk, convW); var gConvS = vk.Alloc(CH * 3L * 4); gConvS.Zero(); var gConvOut = vk.Alloc(B * CH * 4L);
+        var gDt = Up(vk, dtBias); var gAW = Up(vk, aW); var gState = vk.Alloc((long)NV * GdnD * GdnD * 4); gState.Zero();
+        var gY = vk.Alloc(B * INNER * 4L); var gNormW = Up(vk, normW); var gOut = vk.Alloc(B * INNER * 4L);
+
+        var sConv = vk.MakeSet(kConvB, gQkv, gConvW, gConvS, gConvOut);
+        var sL2 = vk.MakeSet(kL2B, gConvOut);
+        var sRec = vk.MakeSet(kRecB, gConvOut, gA, gB, gDt, gAW, gState, gY);
+        var sNorm = vk.MakeSet(kNorm, gY, gNormW, gY);
+        var sSwi = vk.MakeSet(kSwi, gZ, gY, gOut);
+
+        vk.Begin();
+        for (int t = 0; t < B; t++) vk.Dispatch(kConvB, sConv, new uint[] { CH, (uint)t }, (CH + 255) / 256);
+        vk.Dispatch(kL2B, sL2, new uint[] { NK, CH }, NK, B);
+        for (int t = 0; t < B; t++) vk.Dispatch(kRecB, sRec, new uint[] { NK, NV, CH, (uint)t }, NV);
+        vk.Dispatch(kNorm, sNorm, new uint[] { GdnD, B * NV, VulkanCompute.F(eps) }, B * NV);
+        vk.Dispatch(kSwi, sSwi, new uint[] { B * INNER }, (B * INNER + 255) / 256);
+        vk.SubmitAndWait();
+        AssertClose(gdnExpected, Down(gOut, B * INNER), 1e-3, 1e-3, "batched GDN");
+
+        // 2. Batched Full Attention prep + decode (Gy = B causal self-attention)
+        const int NQ = 4, NKV = 2, MAXSEQ = 16;
+        const float freqBase = 10000000f;
+        float[] qNormW = Rand(rng, AttD, 0.1f, 1f), kNormW = Rand(rng, AttD, 0.1f, 1f);
+        float[] qfB = Rand(rng, B * NQ * 512), krB = Rand(rng, B * NKV * AttD), vrB = Rand(rng, B * NKV * AttD);
+        var refK = new float[NKV][]; var refV = new float[NKV][];
+        for (int i = 0; i < NKV; i++) { refK[i] = new float[MAXSEQ * AttD]; refV[i] = new float[MAXSEQ * AttD]; }
+        float[] attnExpected = new float[B * NQ * AttD];
+        for (int p = 0; p < B; p++)
+        {
+            float[] exp = AttentionReference(NQ, NKV,
+                qfB.AsSpan(p * NQ * 512, NQ * 512).ToArray(),
+                krB.AsSpan(p * NKV * AttD, NKV * AttD).ToArray(),
+                vrB.AsSpan(p * NKV * AttD, NKV * AttD).ToArray(),
+                qNormW, kNormW, p, eps, freqBase, refK, refV);
+            exp.CopyTo(attnExpected, p * NQ * AttD);
+        }
+
+        var kPrep = vk.LoadEmbedded("attn_prep", 9, 28, (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8));
+        var kDec = vk.LoadEmbedded("attn_decode", 6, 20, (1u << 4) | (1u << 5));
+        var gQF = Up(vk, qfB); var gKR = Up(vk, krB); var gVR = Up(vk, vrB);
+        var gQN = Up(vk, qNormW); var gKN = Up(vk, kNormW);
+        var gQ = vk.Alloc(B * NQ * AttD * 4L); var gGate = vk.Alloc(B * NQ * AttD * 4L);
+        var gKC = vk.Alloc((long)NKV * MAXSEQ * AttD * 4); var gVC = vk.Alloc((long)NKV * MAXSEQ * AttD * 4); gKC.Zero(); gVC.Zero();
+        var gSc = vk.Alloc((long)B * NQ * MAXSEQ * 4); var gAOut = vk.Alloc(B * NQ * AttD * 4L);
+
+        vk.Begin();
+        vk.Dispatch(kPrep, vk.MakeSet(kPrep, gQF, gKR, gVR, gQN, gKN, gQ, gGate, gKC, gVC),
+            new uint[] { 0, NQ, NKV, MAXSEQ, AttRope, VulkanCompute.F(eps), VulkanCompute.F(freqBase) }, NQ + 2 * NKV, B);
+        vk.Dispatch(kDec, vk.MakeSet(kDec, gQ, gGate, gKC, gVC, gSc, gAOut),
+            new uint[] { 1, NQ, NKV, MAXSEQ, VulkanCompute.F(1f / MathF.Sqrt(AttD)) }, NQ, B);
+        vk.SubmitAndWait();
+        AssertClose(attnExpected, Down(gAOut, B * NQ * AttD), 2e-3, 2e-3, "batched FullAttention");
     }
 }

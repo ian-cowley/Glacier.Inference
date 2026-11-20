@@ -15,6 +15,7 @@ public interface ISpeculativeTarget : IDisposable
 
     int VocabSize => Tokenizer.VocabSize;
     bool SupportsLogitVerification => false;
+    bool SupportsPerStepVerificationSnapshots => false;
     bool IsRingBufferEnabled => false;
     long StateSnapshotBytes => 0;
 
@@ -33,6 +34,9 @@ public interface ISpeculativeTarget : IDisposable
     void Prefill(ReadOnlySpan<int> promptTokens);
     int SampleNextToken(SamplingOptions options, ReadOnlySpan<int> recentTokens = default);
     void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens);
+    void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens, byte[][]? perStepSnapshots)
+        => VerifyBatch(tokens, startPos, predictedTokens);
+
     void ForwardToken(int token, int pos, bool computeLogits);
 
     void CopyCurrentLogits(Span<float> destination) => throw new NotSupportedException("Target does not expose raw logits.");
@@ -46,6 +50,9 @@ public interface ISpeculativeTarget : IDisposable
             CopyCurrentLogits(batchLogitsOut.Slice(i * vocabSize, vocabSize));
         }
     }
+
+    void VerifyBatchLogits(ReadOnlySpan<int> tokens, int startPos, Span<float> batchLogitsOut, byte[][]? perStepSnapshots)
+        => VerifyBatchLogits(tokens, startPos, batchLogitsOut);
 
     void SaveRecurrentState(Span<byte> destination) { }
     void RestoreRecurrentState(ReadOnlySpan<byte> snapshot) { }

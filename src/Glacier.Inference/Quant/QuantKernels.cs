@@ -38,11 +38,23 @@ public static unsafe partial class QuantKernels
             case GgufType.Q2_0:
                 DequantizeQ2_0((BlockQ2_0*)rowPtr, dst, embeddingDim);
                 break;
+            case GgufType.GgmlQ2_0:
+                DequantizeGgmlQ2_0((BlockGgmlQ2_0*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q3_K:
                 DequantizeQ3_K((BlockQ3_K*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.IQ2_XXS:
                 DequantizeIQ2_XXS((BlockIQ2_XXS*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ2_XS:
+                DequantizeIQ2_XS((BlockIQ2_XS*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ2_S:
+                DequantizeIQ2_S((BlockIQ2_S*)rowPtr, dst, embeddingDim);
+                break;
+            case GgufType.IQ3_XXS:
+                DequantizeIQ3_XXS((BlockIQ3_XXS*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.IQ3_S:
                 DequantizeIQ3_S((BlockIQ3_S*)rowPtr, dst, embeddingDim);
@@ -99,6 +111,9 @@ public static unsafe partial class QuantKernels
             case GgufType.F16:
                 Half* h = (Half*)rowPtr;
                 for (int i = 0; i < embeddingDim; i++) dst[i] = (float)h[i];
+                break;
+            case GgufType.BF16:
+                DequantizeBF16((ushort*)rowPtr, dst, embeddingDim);
                 break;
             case GgufType.F32:
                 Buffer.MemoryCopy(rowPtr, dst, embeddingDim * 4, embeddingDim * 4);

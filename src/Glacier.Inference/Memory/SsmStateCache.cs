@@ -26,6 +26,7 @@ public sealed unsafe class SsmStateCache : IDisposable
     public int ConvChannels => _convChannels;
     public int Heads => _heads;
     public int StateDim => _stateDim;
+    public long PerLayerBytes => _layerConvBytes + _layerRecurrentBytes;
     public long TotalBytes => _totalBytes;
 
     public SsmStateCache(int layerCount, int convKernel, int convChannels, int heads, int stateDim)
@@ -122,6 +123,27 @@ public sealed unsafe class SsmStateCache : IDisposable
         fixed (byte* srcPtr = source)
         {
             Buffer.MemoryCopy(srcPtr, _buffer, _totalBytes, _totalBytes);
+        }
+    }
+
+    /// <summary>
+    /// Copies the single-layer conv and recurrent state slice for <paramref name="layerIndex"/>
+    /// into <paramref name="destination"/> (sized at least <see cref="PerLayerBytes"/>).
+    /// </summary>
+    public void SaveLayerState(int layerIndex, Span<byte> destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)layerIndex >= (uint)_layerCount)
+            throw new ArgumentOutOfRangeException(nameof(layerIndex), layerIndex, $"Layer index must be between 0 and {_layerCount - 1}.");
+
+        long perLayer = PerLayerBytes;
+        if (destination.Length < perLayer)
+            throw new ArgumentException($"Destination slice ({destination.Length}) is smaller than PerLayerBytes ({perLayer}).", nameof(destination));
+
+        byte* layerPtr = _buffer + (layerIndex * perLayer);
+        fixed (byte* dstPtr = destination)
+        {
+            Buffer.MemoryCopy(layerPtr, dstPtr, destination.Length, perLayer);
         }
     }
 

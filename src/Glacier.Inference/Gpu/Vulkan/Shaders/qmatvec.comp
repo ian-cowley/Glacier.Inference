@@ -1,17 +1,18 @@
 #version 450
-// Quantised mat-vec: y[row] = dot(W[row,:], x). One workgroup (64 threads) per output row.
-// Compile with -DQTYPE=0 (Q4_K) | 1 (Q5_K) | 2 (Q6_K) | 3 (Q8_0); add -DMOE for the indexed-expert variant.
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Quantised mat-vec: y[row] = dot(W[row,:], x). Four output rows per workgroup (64x4 threads).
+// Compile with -DQTYPE=0 (Q4_K) .. 11 (BF16); add -DMOE for the indexed-expert variant.
 //
 // Tuned layout: every thread owns 4 consecutive weights per block (one 32-bit load of quants), scales are decoded
 // once per block per thread, and x is read as vec4. Block/weight alignment: Q4_K/Q5_K blocks are 4-byte aligned;
 // Q6_K (210 B) and Q8_0 (34 B) are only 2-byte aligned and use funnel-shifted 32-bit loads.
-layout(local_size_x = 64) in;
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 #ifdef MOE
-// MoE variant: workgroup (row, slot). Expert = idx[slot]; weights for that expert start at idx[slot]*sliceBytes.
+// MoE variant: workgroup (rowBlock, slot). Expert = idx[slot]; weights for that expert start at idx[slot]*sliceBytes.
 // x offset = slot*xStride floats (0 => shared input; must be a multiple of 4), y index = slot*N + row.
 layout(std430, binding = 3) readonly buffer IDX { uint idx[]; };
 layout(push_constant) uniform PC { uint K; uint N; uint sliceBytes; uint xStride; } pc;
@@ -19,7 +20,7 @@ layout(push_constant) uniform PC { uint K; uint N; uint sliceBytes; uint xStride
 layout(push_constant) uniform PC { uint K; uint N; } pc;
 #endif
 
-shared float partial[64];
+shared float partial[4][64];
 
 // 32-bit load at an arbitrary byte offset (little endian).
 uint u32at(uint o) {
@@ -47,19 +48,20 @@ void scaleMin(uint j, uint s0, uint s1, uint s2, out float sc, out float mn) {
 #endif
 
 void main() {
+    uint ly = gl_LocalInvocationID.y;
+    uint t = gl_LocalInvocationID.x;
 #ifdef MOE
-    uint row = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.x * 4u + ly;
     uint slot = gl_WorkGroupID.y;
     uint wbase = idx[slot] * pc.sliceBytes;
     uint xo4 = (slot * pc.xStride) >> 2;
     uint yo = slot * pc.N;
 #else
-    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * 32768u;
+    uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 32768u) * 4u + ly;
     uint wbase = 0u, xo4 = 0u, yo = 0u;
 #endif
-    if (row >= pc.N) return;
-    uint t = gl_LocalInvocationID.x;
     float acc = 0.0;
+    if (row < pc.N) {
 
 #if QTYPE == 0 || QTYPE == 1
     // 2 blocks per pass: threads 0..31 -> block A, 32..63 -> block B. Thread (g, lb) owns weights
@@ -288,13 +290,33 @@ void main() {
         vec2 f23 = unpackHalf2x16(u32at(bo + 4u));
         acc += dot(vec4(f01, f23), x4[xo4 + i]);
     }
-#endif
-
-    partial[t] = acc;
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1) {
-        if (t < s) partial[t] += partial[t + s];
-        barrier();
+#elif QTYPE == 11
+    // BF16: 16-bit bfloat16 (2 bytes per element). 64 threads per row; 4 weights (2 uints) per thread.
+    uint k4 = pc.K >> 2;
+    uint rowOff = wbase + row * pc.K * 2u;
+    for (uint i = t; i < k4; i += 64u) {
+        uint bo = rowOff + i * 8u;
+        uint u01 = u32at(bo);
+        uint u23 = u32at(bo + 4u);
+        vec4 bf = vec4(uintBitsToFloat(u01 << 16),
+                       uintBitsToFloat(u01 & 0xFFFF0000u),
+                       uintBitsToFloat(u23 << 16),
+                       uintBitsToFloat(u23 & 0xFFFF0000u));
+        acc += dot(bf, x4[xo4 + i]);
     }
-    if (t == 0u) y[yo + row] = partial[0];
+#endif
+    }
+
+    if (gl_SubgroupSize == 64u) {
+        acc = subgroupAdd(acc);
+        if (t == 0u && row < pc.N) y[yo + row] = acc;
+    } else {
+        partial[ly][t] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (t < s) partial[ly][t] += partial[ly][t + s];
+            barrier();
+        }
+        if (t == 0u && row < pc.N) y[yo + row] = partial[ly][0];
+    }
 }

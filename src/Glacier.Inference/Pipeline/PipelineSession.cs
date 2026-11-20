@@ -63,7 +63,8 @@ public sealed class PipelineSession : IDisposable
         ModelWeights weights,
         List<PipelineStageSpec> specs,
         int maxSeqLen = 4096,
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        ulong? explicitVramReserveBytes = null)
     {
         if (specs == null || specs.Count == 0)
             throw new ArgumentException("Pipeline stage specifications cannot be null or empty.", nameof(specs));
@@ -102,7 +103,8 @@ public sealed class PipelineSession : IDisposable
                         isFirstStage: isFirst,
                         isLastStage: isLast,
                         maxSeqLen: maxSeqLen,
-                        kvPrecision: kvPrecision);
+                        kvPrecision: kvPrecision,
+                        explicitVramReserveBytes: explicitVramReserveBytes);
                 }
 #endif
                 else
@@ -114,7 +116,8 @@ public sealed class PipelineSession : IDisposable
                         layerCount: spec.LayerCount,
                         isFirstStage: isFirst,
                         isLastStage: isLast,
-                        maxSeqLen: maxSeqLen);
+                        maxSeqLen: maxSeqLen,
+                        kvPrecision: kvPrecision);
                 }
             }
             catch

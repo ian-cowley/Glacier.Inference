@@ -74,10 +74,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (g >= num_groups) return;
 
     uint tid = gtid.x;
+    bool active = (tid < state_dim);
     uint idx = g * state_dim + tid;
 
-    float q_val = q[idx];
-    float k_val = k[idx];
+    float q_val = active ? q[idx] : 0.0f;
+    float k_val = active ? k[idx] : 0.0f;
 
     s_sq_q[tid] = q_val * q_val;
     s_sq_k[tid] = k_val * k_val;
@@ -95,15 +96,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    float sum_q = s_sq_q[0];
-    float sum_k = s_sq_k[0];
+    if (active)
+    {
+        float sum_q = s_sq_q[0];
+        float sum_k = s_sq_k[0];
 
-    float qk_scale = 1.0f / sqrt((float)state_dim);
-    float inv_norm_q = sum_q > 1e-12f ? (1.0f / sqrt(sum_q + 1e-6f)) * qk_scale : 0.0f;
-    float inv_norm_k = sum_k > 1e-12f ? (1.0f / sqrt(sum_k + 1e-6f)) : 0.0f;
+        float qk_scale = 1.0f / sqrt((float)state_dim);
+        float inv_norm_q = sum_q > 1e-12f ? (1.0f / sqrt(sum_q + 1e-6f)) * qk_scale : 0.0f;
+        float inv_norm_k = sum_k > 1e-12f ? (1.0f / sqrt(sum_k + 1e-6f)) : 0.0f;
 
-    q[idx] = q_val * inv_norm_q;
-    k[idx] = k_val * inv_norm_k;
+        q[idx] = q_val * inv_norm_q;
+        k[idx] = k_val * inv_norm_k;
+    }
 }
 ";
 
@@ -142,13 +146,16 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (h >= num_heads) return;
 
     uint tid = gtid.x;
+    bool active = (tid < state_dim);
     // llama.cpp maps V-head -> Q/K-head by tiling (h % num_groups), not grouping (h / ratio).
     uint g = h % num_groups;
 
     // Load Q and K vectors for this group into shared memory
-    s_q[tid] = q[g * state_dim + tid];
-    s_k[tid] = k[g * state_dim + tid];
+    s_q[tid] = active ? q[g * state_dim + tid] : 0.0f;
+    s_k[tid] = active ? k[g * state_dim + tid] : 0.0f;
     GroupMemoryBarrierWithGroupSync();
+
+    if (!active) return;
 
     // Compute decay rate and learning rate beta
     float a_val = dt_a[h] + (has_dt_bias != 0 ? dt_bias[h] : 0.0f);
@@ -159,13 +166,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     float b_val = beta_b[h];
     float beta = 1.0f / (1.0f + exp(-b_val));
 
-    // Recurrent state matrix offset for head h: [num_heads, 128, 128]
+    // Recurrent state matrix offset for head h: [num_heads, state_dim, state_dim]
     uint head_state_base = (h * state_dim + tid) * state_dim;
 
     // 1. Decay row tid and retrieve memory: kv_mem = (decay * S_{t-1}) * k
     float kv_mem = 0.0f;
-    [unroll]
-    for (uint j = 0; j < 128; j++)
+    for (uint j = 0; j < state_dim; j++)
     {
         uint idx = head_state_base + j;
         float s_val = ssm_state[idx] * decay;
@@ -173,16 +179,12 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         kv_mem += s_val * s_k[j];
     }
 
-    // 2. Compute delta for element tid
+    // 2. Compute delta for element tid, update row, and project output: y = S_t * q
     float v_val = v[h * state_dim + tid];
-    s_delta[tid] = (v_val - kv_mem) * beta;
-    GroupMemoryBarrierWithGroupSync();
+    float d_val = (v_val - kv_mem) * beta;
 
-    // 3. Update state with rank-1 update: S_t = S' + delta * k^T, then project output: y = S_t * q
     float y_dot = 0.0f;
-    float d_val = s_delta[tid];
-    [unroll]
-    for (uint col = 0; col < 128; col++)
+    for (uint col = 0; col < state_dim; col++)
     {
         uint idx = head_state_base + col;
         float updated = ssm_state[idx] + d_val * s_k[col];
@@ -195,8 +197,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 ";
 
     /// <summary>
-    /// Fused Head RMSNorm + SiLU gating on Z for Qwen 3.5 / 3.6 GDN:
-    /// y = RMSNorm(y, norm_weight) * (z * sigmoid(z))
+    /// Fused Head RMSNorm + SiLU (or Sigmoid when bit 1 is set) gating on Z for Qwen 3.5 / 3.8 GDN.
     /// Dispatches 1 threadgroup per head (128 threads per group).
     /// </summary>
     public const string Qwen3SsmGateSilu = @"
@@ -205,7 +206,7 @@ cbuffer Params : register(b0)
     uint num_heads;
     uint state_dim;
     float rms_eps;
-    uint has_norm;
+    uint has_norm_flags;
 };
 
 RWStructuredBuffer<float> y : register(u0);
@@ -221,9 +222,10 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (h >= num_heads) return;
 
     uint tid = gtid.x;
+    bool active = (tid < state_dim);
     uint idx = h * state_dim + tid;
 
-    float y_val = y[idx];
+    float y_val = active ? y[idx] : 0.0f;
     s_sq[tid] = y_val * y_val;
     GroupMemoryBarrierWithGroupSync();
 
@@ -237,20 +239,25 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
     }
 
-    float normed_y = y_val;
-    if (has_norm != 0)
+    if (active)
     {
-        float mean_sq = s_sq[0] / (float)state_dim;
-        float inv_rms = rsqrt(mean_sq + rms_eps);
-        normed_y = y_val * inv_rms * norm_weight[tid];
+        uint has_norm = has_norm_flags & 1u;
+        uint sigmoid_only = (has_norm_flags >> 1) & 1u;
+
+        float normed_y = y_val;
+        if (has_norm != 0u)
+        {
+            float mean_sq = s_sq[0] / (float)state_dim;
+            float inv_rms = rsqrt(mean_sq + rms_eps);
+            normed_y = y_val * inv_rms * norm_weight[tid];
+        }
+
+        float z_val = z[idx];
+        float sig_z = 1.0f / (1.0f + exp(-z_val));
+        float gated_z = (sigmoid_only != 0u) ? sig_z : (z_val * sig_z);
+
+        y[idx] = normed_y * gated_z;
     }
-
-    // Gating with SiLU on z: z * sigmoid(z)
-    float z_val = z[idx];
-    float sig_z = 1.0f / (1.0f + exp(-z_val));
-    float gated_z = z_val * sig_z;
-
-    y[idx] = normed_y * gated_z;
 }
 ";
 
@@ -464,6 +471,194 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 
         float total_dot = s_red[0];
         float s_t = total_dot * attn_scale;
+
+        float m_new = max(m, s_t);
+        float alpha = exp(m - m_new);
+        float w_t = exp(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid < head_dim)
+    {
+        attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+    }
+}
+";
+
+    public const string Qwen3AttentionF16 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+    float attn_scale;
+};
+
+RWStructuredBuffer<float> q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWStructuredBuffer<float> attn_out : register(u3);
+
+groupshared float s_red[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    if (h >= n_heads_q) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+    uint half_dim = (head_dim + 1u) / 2u;
+
+    float q_d = (tid < head_dim) ? q[h * head_dim + tid] : 0.0f;
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (uint t = 0; t <= pos; t++)
+    {
+        uint kv_base = (h_kv * max_seq_len + t) * half_dim;
+        float k_d = 0.0f;
+        float v_d = 0.0f;
+        if (tid < head_dim)
+        {
+            uint pair_idx = tid >> 1;
+            uint kp = k_cache[kv_base + pair_idx];
+            uint vp = v_cache[kv_base + pair_idx];
+            k_d = ((tid & 1u) == 0u) ? f16tof32(kp & 0xFFFFu) : f16tof32(kp >> 16);
+            v_d = ((tid & 1u) == 0u) ? f16tof32(vp & 0xFFFFu) : f16tof32(vp >> 16);
+        }
+
+        s_red[tid] = q_d * k_d;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 128) s_red[tid] += s_red[tid + 128];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 64) s_red[tid] += s_red[tid + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 32) s_red[tid] += s_red[tid + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 16) s_red[tid] += s_red[tid + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 8)  s_red[tid] += s_red[tid + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 4)  s_red[tid] += s_red[tid + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 2)  s_red[tid] += s_red[tid + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        GroupMemoryBarrierWithGroupSync();
+
+        float s_t = s_red[0] * attn_scale;
+
+        float m_new = max(m, s_t);
+        float alpha = exp(m - m_new);
+        float w_t = exp(s_t - m_new);
+
+        acc = acc * alpha + w_t * v_d;
+        l = l * alpha + w_t;
+        m = m_new;
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid < head_dim)
+    {
+        attn_out[h * head_dim + tid] = (l > 0.0f) ? (acc / l) : 0.0f;
+    }
+}
+";
+
+    public const string Qwen3AttentionQ4_0 = @"
+cbuffer Params : register(b0)
+{
+    uint n_heads_q;
+    uint n_heads_kv;
+    uint head_dim;
+    uint max_seq_len;
+    uint pos;
+    float attn_scale;
+};
+
+RWStructuredBuffer<float> q : register(u0);
+RWStructuredBuffer<uint> k_cache : register(u1);
+RWStructuredBuffer<uint> v_cache : register(u2);
+RWStructuredBuffer<float> attn_out : register(u3);
+
+groupshared float s_red[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint h = gid.x;
+    if (h >= n_heads_q) return;
+
+    uint tid = gtid.x;
+    uint group_size = n_heads_q / n_heads_kv;
+    uint h_kv = h / group_size;
+    uint nb = (head_dim + 31u) >> 5;
+    uint row_uints = nb * 4u + ((nb + 1u) >> 1);
+
+    float q_d = (tid < head_dim) ? q[h * head_dim + tid] : 0.0f;
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;
+
+    for (uint t = 0; t <= pos; t++)
+    {
+        uint row_base = (h_kv * max_seq_len + t) * row_uints;
+        float k_d = 0.0f;
+        float v_d = 0.0f;
+        if (tid < head_dim)
+        {
+            uint blk = tid >> 5;
+            uint elem = tid & 31u;
+            uint l_idx = elem & 15u;
+            uint shift = ((l_idx & 3u) * 8u) + ((elem >= 16u) ? 4u : 0u);
+
+            uint kw = k_cache[row_base + blk * 4u + (l_idx >> 2)];
+            uint ksw = k_cache[row_base + nb * 4u + (blk >> 1)];
+            float ks = ((blk & 1u) == 0u) ? f16tof32(ksw & 0xFFFFu) : f16tof32(ksw >> 16);
+            k_d = ks * (float)((int)((kw >> shift) & 0xFu) - 8);
+
+            uint vw = v_cache[row_base + blk * 4u + (l_idx >> 2)];
+            uint vsw = v_cache[row_base + nb * 4u + (blk >> 1)];
+            float vs = ((blk & 1u) == 0u) ? f16tof32(vsw & 0xFFFFu) : f16tof32(vsw >> 16);
+            v_d = vs * (float)((int)((vw >> shift) & 0xFu) - 8);
+        }
+
+        s_red[tid] = q_d * k_d;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < 128) s_red[tid] += s_red[tid + 128];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 64) s_red[tid] += s_red[tid + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 32) s_red[tid] += s_red[tid + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 16) s_red[tid] += s_red[tid + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 8)  s_red[tid] += s_red[tid + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 4)  s_red[tid] += s_red[tid + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 2)  s_red[tid] += s_red[tid + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if (tid < 1)  s_red[tid] += s_red[tid + 1];
+        GroupMemoryBarrierWithGroupSync();
+
+        float s_t = s_red[0] * attn_scale;
 
         float m_new = max(m, s_t);
         float alpha = exp(m - m_new);

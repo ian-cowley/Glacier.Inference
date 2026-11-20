@@ -6,6 +6,19 @@ layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
 layout(std430, binding = 1) readonly buffer CW { float cw[]; };      // [channels][4]
 layout(std430, binding = 2) buffer CS { float cs[]; };              // [channels][3]
 layout(std430, binding = 3) writeonly buffer OUT { float o[]; };
+#ifdef BATCH
+layout(push_constant) uniform PC { uint channels; uint tokIdx; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) return;
+    uint tokOff = pc.tokIdx * pc.channels;
+    float h0 = cs[c * 3u], h1 = cs[c * 3u + 1u], h2 = cs[c * 3u + 2u];
+    float x = qkv[tokOff + c];
+    float acc = h0 * cw[c * 4u] + h1 * cw[c * 4u + 1u] + h2 * cw[c * 4u + 2u] + x * cw[c * 4u + 3u];
+    cs[c * 3u] = h1; cs[c * 3u + 1u] = h2; cs[c * 3u + 2u] = x;
+    o[tokOff + c] = acc / (1.0 + exp(-acc));
+}
+#else
 layout(push_constant) uniform PC { uint channels; } pc;
 void main() {
     uint c = gl_GlobalInvocationID.x;
@@ -16,3 +29,4 @@ void main() {
     cs[c * 3u] = h1; cs[c * 3u + 1u] = h2; cs[c * 3u + 2u] = x;
     o[c] = acc / (1.0 + exp(-acc));
 }
+#endif

@@ -46,6 +46,14 @@ struct __align__(2) BlockQ8_0 {
     int8_t qs[32];
 };
 
+#define QK4_0 32
+
+struct __align__(2) BlockQ4_0 {
+    half d;
+    uint8_t qs[16];
+};
+static_assert(sizeof(BlockQ4_0) == 18, "BlockQ4_0 must be 18 bytes");
+
 // Unpack scales & mins for Q4_K and Q5_K
 __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     if (j < 4) {

@@ -134,7 +134,7 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     {
         Assert.Throws<NotSupportedException>(() => TestableVulkanRunner.QIdx((GgufType)9999));
         Assert.Throws<NotSupportedException>(() => TestableVulkanRunner.QIdx(GgufType.F32));
-        Assert.Throws<NotSupportedException>(() => TestableVulkanRunner.QIdx(GgufType.BF16));
+        Assert.Equal(11, TestableVulkanRunner.QIdx(GgufType.BF16));
     }
 
     #endregion

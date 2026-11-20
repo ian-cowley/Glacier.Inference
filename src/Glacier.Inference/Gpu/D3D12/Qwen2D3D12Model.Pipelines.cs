@@ -29,10 +29,16 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemvQ5K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ5K));
         _psoGemvQ6K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ6K));
         _psoGemvQ3K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ3K));
+        _psoGemvQ4_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ4_0));
+        _psoGemvQ5_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ5_0));
         _psoGemvQ8_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ8_0));
         _psoGemvQ2_K = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_K));
         _psoGemvQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvQ2_0));
+        _psoGemvGgmlQ2_0 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvGgmlQ2_0));
         _psoGemvIQ2_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XXS));
+        _psoGemvIQ2_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_XS));
+        _psoGemvIQ2_S = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ2_S));
+        _psoGemvIQ3_XXS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ3_XXS));
         _psoGemvIQ4_NL = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_NL));
         _psoGemvIQ4_XS = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvIQ4_XS));
         _psoGemvMXFP4 = _ctx.CreatePipelineState(_sigGemv, _ctx.CompileShader(D3D12Shaders.GemvMXFP4));
@@ -111,7 +117,12 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
-        string kvShader = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.KvCacheStoreF16 : D3D12Shaders.KvCacheStore;
+        string kvShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.KvCacheStoreQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.KvCacheStoreF16,
+            _ => D3D12Shaders.KvCacheStore
+        };
         _sigKvStore = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreParams));
         _psoKvStore = _ctx.CreatePipelineState(_sigKvStore, _ctx.CompileShader(kvShader));
 
@@ -124,7 +135,12 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
-        string attnShader = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.AttentionGqaF16 : D3D12Shaders.AttentionGqa;
+        string attnShader = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.AttentionGqaQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.AttentionGqaF16,
+            _ => D3D12Shaders.AttentionGqa
+        };
         _sigAttention = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnParams));
         _psoAttention = _ctx.CreatePipelineState(_sigAttention, _ctx.CompileShader(attnShader));
 
@@ -159,9 +175,16 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoGemmQ5KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5KBatch));
         _psoGemmQ2_KBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_KBatch));
         _psoGemmQ2_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ2_0Batch));
+        _psoGemmGgmlQ2_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmGgmlQ2_0Batch));
         _psoGemmIQ2_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XXSBatch));
+        _psoGemmIQ2_XSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_XSBatch));
+        _psoGemmIQ2_SBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ2_SBatch));
+        _psoGemmIQ3_XXSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ3_XXSBatch));
         _psoGemmIQ4_NLBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ4_NLBatch));
+        _psoGemmIQ4_XSBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ4_XSBatch));
         _psoGemmIQ3_SBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmIQ3_SBatch));
+        _psoGemmQ4_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ4_0Batch));
+        _psoGemmQ5_0Batch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmQ5_0Batch));
         _psoGemmTernaryBatch = _ctx.CreatePipelineState(_sigGemmBatch, _ctx.CompileShader(D3D12Shaders.GemmTernaryBatch));
 
         // 10. Batched RMSNorm Root Signature: (Params b0, weight t0, x u0, dst u1)
@@ -194,7 +217,12 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
-        string kvShaderBatch = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.KvCacheStoreBatchF16 : D3D12Shaders.KvCacheStoreBatch;
+        string kvShaderBatch = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.KvCacheStoreBatchQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.KvCacheStoreBatchF16,
+            _ => D3D12Shaders.KvCacheStoreBatch
+        };
         _sigKvStoreBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, kvStoreBatchParams));
         _psoKvStoreBatch = _ctx.CreatePipelineState(_sigKvStoreBatch, _ctx.CompileShader(kvShaderBatch));
 
@@ -207,7 +235,12 @@ public sealed unsafe partial class Qwen2D3D12Model
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(2, 0), ShaderVisibility.All),
             new RootParameter(RootParameterType.UnorderedAccessView, new RootDescriptor(3, 0), ShaderVisibility.All)
         };
-        string attnShaderBatch = KvPrecision == KvCachePrecision.Fp16 ? D3D12Shaders.AttentionBatchF16 : D3D12Shaders.AttentionBatch;
+        string attnShaderBatch = KvPrecision switch
+        {
+            KvCachePrecision.Q4_0 => D3D12Shaders.AttentionBatchQ4_0,
+            KvCachePrecision.Fp16 => D3D12Shaders.AttentionBatchF16,
+            _ => D3D12Shaders.AttentionBatch
+        };
         _sigAttentionBatch = _ctx.CreateRootSignature(new RootSignatureDescription(RootSignatureFlags.None, attnBatchParams));
         _psoAttentionBatch = _ctx.CreatePipelineState(_sigAttentionBatch, _ctx.CompileShader(attnShaderBatch));
     }

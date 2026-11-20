@@ -745,4 +745,519 @@ __global__ void gemv_mxfp4(
     }
 }
 
+// =========================================================================
+// Unsloth Dynamic 3.1 Mixed-Tensor GEMV Kernels (Alignment-Safe Byte Loads)
+// =========================================================================
+
+__device__ uint64_t g_iq2xxs_grid[256];
+__device__ uint64_t g_iq2xs_grid[512];
+__device__ uint64_t g_iq2s_grid[1024];
+
+__device__ __forceinline__ float load_f16_bytes(const uint8_t* p) {
+    uint16_t raw = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    __half h;
+    memcpy(&h, &raw, sizeof(uint16_t));
+    return __half2float(h);
+}
+
+__device__ __forceinline__ uint8_t ksign_iq2xs(uint32_t idx) {
+    return (uint8_t)((idx & 127u) | ((__popc(idx & 127u) & 1u) << 7));
+}
+
+__device__ __forceinline__ uint32_t decode_iq3s_grid_cu(uint32_t idx) {
+    uint32_t b0 = 1u + 2u * ((idx >> 0) & 3u);
+    uint32_t b1 = 1u + 2u * ((idx >> 2) & 3u);
+    uint32_t b2 = 1u + 2u * ((idx >> 4) & 3u);
+    uint32_t b3 = 1u + 2u * ((idx >> 6) & 3u);
+    if ((idx & 256u) != 0u) {
+        b0 += 8u;
+        b1 += ((idx >> 1) & 1u) * 8u;
+        b2 += ((idx >> 3) & 1u) * 8u;
+        b3 += ((idx >> 5) & 1u) * 8u;
+    }
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+__global__ void gemv_iq2_xxs(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 66;
+    float row_sum = 0.0f;
+
+    int ib32 = lane_id >> 2;
+    int l = lane_id & 3;
+    int x_offset = lane_id * 8;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 66;
+        float d = load_f16_bytes(bo);
+        const uint8_t* q_base = bo + 2 + ib32 * 8;
+        uint32_t aux0 = (uint32_t)q_base[0] | ((uint32_t)q_base[1] << 8) | ((uint32_t)q_base[2] << 16) | ((uint32_t)q_base[3] << 24);
+        uint32_t aux1 = (uint32_t)q_base[4] | ((uint32_t)q_base[5] << 8) | ((uint32_t)q_base[6] << 16) | ((uint32_t)q_base[7] << 24);
+
+        float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+        uint32_t grid_idx = (aux0 >> (l * 8)) & 0xFFu;
+        uint8_t signs = ksign_iq2xs((aux1 >> (7 * l)) & 127u);
+        uint64_t grid = g_iq2xxs_grid[grid_idx];
+
+        const float* xb = x + blk * 256 + x_offset;
+        float sub = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float g = (float)((uint8_t)((grid >> (j * 8)) & 0xFFu));
+            float s = ((signs >> j) & 1) ? -1.0f : 1.0f;
+            sub += xb[j] * (g * s);
+        }
+        row_sum += db * sub;
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_iq2_xs(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 74;
+    float row_sum = 0.0f;
+
+    int ib32 = lane_id >> 2;
+    int l = lane_id & 3;
+    int q_off = 2 + (ib32 * 4 + l) * 2;
+    int x_offset = lane_id * 8;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 74;
+        float d = load_f16_bytes(bo);
+        uint16_t q = (uint16_t)bo[q_off] | ((uint16_t)bo[q_off + 1] << 8);
+        uint8_t sc = bo[66 + ib32];
+        uint32_t ls = (l < 2) ? (sc & 0x0Fu) : (sc >> 4);
+        float db = d * (0.5f + (float)ls) * 0.25f;
+
+        uint64_t grid = g_iq2xs_grid[q & 511u];
+        uint8_t signs = ksign_iq2xs(q >> 9);
+
+        const float* xb = x + blk * 256 + x_offset;
+        float sub = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float g = (float)((uint8_t)((grid >> (j * 8)) & 0xFFu));
+            float s = ((signs >> j) & 1) ? -1.0f : 1.0f;
+            sub += xb[j] * (g * s);
+        }
+        row_sum += db * sub;
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_iq2_s(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 82;
+    float row_sum = 0.0f;
+
+    int ib32 = lane_id >> 2;
+    int l = lane_id & 3;
+    int x_offset = lane_id * 8;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 82;
+        float d = load_f16_bytes(bo);
+        uint8_t q_lo = bo[2 + 4 * ib32 + l];
+        uint8_t signs = bo[34 + 4 * ib32 + l];
+        uint8_t qh = bo[66 + ib32];
+        uint32_t grid_idx = (uint32_t)q_lo | (((uint32_t)((qh >> (2 * l)) & 3u)) << 8);
+        uint8_t sc = bo[74 + ib32];
+        uint32_t ls = (l < 2) ? (sc & 0x0Fu) : (sc >> 4);
+        float db = d * (0.5f + (float)ls) * 0.25f;
+
+        uint64_t grid = g_iq2s_grid[grid_idx];
+        const float* xb = x + blk * 256 + x_offset;
+        float sub = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float g = (float)((uint8_t)((grid >> (j * 8)) & 0xFFu));
+            float s = ((signs >> j) & 1) ? -1.0f : 1.0f;
+            sub += xb[j] * (g * s);
+        }
+        row_sum += db * sub;
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_iq3_xxs(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 98;
+    float row_sum = 0.0f;
+
+    int ib32 = lane_id >> 2;
+    int l = lane_id & 3;
+    int x_offset = lane_id * 8;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 98;
+        float d = load_f16_bytes(bo);
+        const uint8_t* ap = bo + 66 + 4 * ib32;
+        uint32_t aux32 = (uint32_t)ap[0] | ((uint32_t)ap[1] << 8) | ((uint32_t)ap[2] << 16) | ((uint32_t)ap[3] << 24);
+        float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+
+        uint8_t signs = ksign_iq2xs((aux32 >> (7 * l)) & 127u);
+        uint32_t g0 = decode_iq3s_grid_cu(bo[2 + 8 * ib32 + 2 * l]);
+        uint32_t g1 = decode_iq3s_grid_cu(bo[2 + 8 * ib32 + 2 * l + 1]);
+
+        const float* xb = x + blk * 256 + x_offset;
+        float sub = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float v0 = (float)((g0 >> (j * 8)) & 0xFFu);
+            float v1 = (float)((g1 >> (j * 8)) & 0xFFu);
+            sub += xb[j] * (v0 * (((signs >> j) & 1) ? -1.0f : 1.0f));
+            sub += xb[4 + j] * (v1 * (((signs >> (4 + j)) & 1) ? -1.0f : 1.0f));
+        }
+        row_sum += db * sub;
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_iq3_s(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 110;
+    float row_sum = 0.0f;
+
+    int ib = lane_id >> 2;
+    int gp = lane_id & 3;
+    int g0_idx = gp * 2;
+    int g1_idx = g0_idx + 1;
+    int x_offset = lane_id * 8;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 110;
+        float d = load_f16_bytes(bo);
+        uint8_t sc_byte = bo[106 + (ib >> 1)];
+        uint32_t ls = ((ib & 1) == 0) ? (sc_byte & 0x0Fu) : (sc_byte >> 4);
+        float db = d * (float)(1u + 2u * ls);
+
+        uint8_t qh = bo[66 + ib];
+        uint32_t idx0 = bo[2 + ib * 8 + g0_idx] | (((uint32_t)((qh >> g0_idx) & 1u)) << 8);
+        uint32_t idx1 = bo[2 + ib * 8 + g1_idx] | (((uint32_t)((qh >> g1_idx) & 1u)) << 8);
+        uint32_t grid0 = decode_iq3s_grid_cu(idx0);
+        uint32_t grid1 = decode_iq3s_grid_cu(idx1);
+
+        uint8_t sign_byte = bo[74 + ib * 4 + gp];
+        const float* xb = x + blk * 256 + x_offset;
+        float sub = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float v0 = (float)((grid0 >> (j * 8)) & 0xFFu);
+            float v1 = (float)((grid1 >> (j * 8)) & 0xFFu);
+            sub += xb[j] * (v0 * (((sign_byte >> j) & 1) ? -1.0f : 1.0f));
+            sub += xb[4 + j] * (v1 * (((sign_byte >> (4 + j)) & 1) ? -1.0f : 1.0f));
+        }
+        row_sum += db * sub;
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_iq4_nl(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    static constexpr int kvalues_iq4nl[16] = { -127,-104,-83,-65,-49,-35,-22,-10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 5;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 18;
+    float row_sum = 0.0f;
+    int l = lane_id & 15;
+    int is_high = lane_id >> 4;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 18;
+        float d = load_f16_bytes(bo);
+        uint8_t q = bo[2 + l];
+        int nib = is_high ? (q >> 4) : (q & 0x0F);
+        row_sum += d * (float)kvalues_iq4nl[nib] * x[blk * 32 + lane_id];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_q2_k(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 8;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 84;
+    float row_sum = 0.0f;
+
+    int n_half = lane_id >> 4;
+    int l = lane_id & 15;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 84;
+        float d = load_f16_bytes(bo + 80);
+        float dmin = load_f16_bytes(bo + 82);
+        const uint8_t* qs = bo + 16 + n_half * 32;
+        const float* xb = x + blk * 256 + n_half * 128;
+
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int shift = j * 2;
+            int is_idx = n_half * 8 + j * 2;
+            uint8_t sb0 = bo[is_idx];
+            uint8_t sb1 = bo[is_idx + 1];
+            float dl0 = d * (float)(sb0 & 0x0F);
+            float ml0 = dmin * (float)(sb0 >> 4);
+            float dl1 = d * (float)(sb1 & 0x0F);
+            float ml1 = dmin * (float)(sb1 >> 4);
+
+            int q0 = (qs[l] >> shift) & 3;
+            int q1 = (qs[16 + l] >> shift) & 3;
+            row_sum += (dl0 * q0 - ml0) * xb[j * 32 + l]
+                     + (dl1 * q1 - ml1) * xb[j * 32 + 16 + l];
+        }
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_q4_0(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 5;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 18;
+    float row_sum = 0.0f;
+    int l = lane_id & 15;
+    int is_high = lane_id >> 4;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 18;
+        float d = load_f16_bytes(bo);
+        uint8_t q = bo[2 + l];
+        int qv = (is_high ? (q >> 4) : (q & 0x0F)) - 8;
+        row_sum += d * (float)qv * x[blk * 32 + lane_id];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_q5_0(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    int nb = k_cols >> 5;
+    const uint8_t* row_w = W + (size_t)warp_id * nb * 22;
+    float row_sum = 0.0f;
+    int l = lane_id & 15;
+    int is_high = lane_id >> 4;
+
+    for (int blk = 0; blk < nb; blk++) {
+        const uint8_t* bo = row_w + (size_t)blk * 22;
+        float d = load_f16_bytes(bo);
+        uint32_t qh = (uint32_t)bo[2] | ((uint32_t)bo[3] << 8) | ((uint32_t)bo[4] << 16) | ((uint32_t)bo[5] << 24);
+        uint8_t q = bo[6 + l];
+        int nib = is_high ? (q >> 4) : (q & 0x0F);
+        int hb = ((qh >> lane_id) & 1u) << 4;
+        int qv = (nib | hb) - 16;
+        row_sum += d * (float)qv * x[blk * 32 + lane_id];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_f16(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    const __half* row_w = (const __half*)W + (size_t)warp_id * k_cols;
+    float row_sum = 0.0f;
+    for (int col = lane_id; col < k_cols; col += WARP_SIZE) {
+        row_sum += __half2float(row_w[col]) * x[col];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
+__global__ void gemv_bf16(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ W,
+    int k_cols,
+    int m_rows,
+    const float* __restrict__ bias,
+    float* __restrict__ residual
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    if (warp_id >= m_rows) return;
+
+    const uint16_t* row_w = (const uint16_t*)W + (size_t)warp_id * k_cols;
+    float row_sum = 0.0f;
+    for (int col = lane_id; col < k_cols; col += WARP_SIZE) {
+        uint32_t bits = ((uint32_t)row_w[col]) << 16;
+        row_sum += __uint_as_float(bits) * x[col];
+    }
+
+    row_sum = warp_reduce_sum(row_sum);
+    if (lane_id == 0) {
+        if (bias != nullptr) row_sum += bias[warp_id];
+        if (residual != nullptr) residual[warp_id] += row_sum;
+        if (y != nullptr) y[warp_id] = row_sum;
+    }
+}
+
 } // extern "C"

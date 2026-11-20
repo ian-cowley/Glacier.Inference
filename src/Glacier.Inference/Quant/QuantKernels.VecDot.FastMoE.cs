@@ -228,6 +228,192 @@ public static unsafe partial class QuantKernels
     }
 
     // =========================================================================
+    // 1b. Upstream GGML_TYPE_Q2_0 (Type 42): 64-Element 18-Byte 2-Bit Kernels
+    // =========================================================================
+
+    /// <summary>
+    /// Computes dot product between an upstream GGML_TYPE_Q2_0 (Type 42) quantized row
+    /// (64 elements in 18 bytes: FP16 Delta + 16 packed bytes) and float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotGgmlQ2_0(BlockGgmlQ2_0* row, float* x, int k)
+    {
+        int nb = k / QK2_0;
+        float totalSum = 0f;
+
+        if (Vector512.IsHardwareAccelerated && Avx512F.IsSupported && Avx2.IsSupported)
+        {
+            var vDup03 = Vector128.Create((byte)0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+            var vShifts = Vector512.Create(0u, 2u, 4u, 6u, 0u, 2u, 4u, 6u, 0u, 2u, 4u, 6u, 0u, 2u, 4u, 6u);
+            var vMask3 = Vector512.Create(3);
+            var vOne = Vector512.Create(1);
+
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                var vRaw = Vector128.Load(row[i].Qs);
+                var vAcc = Vector512<float>.Zero;
+
+                for (int g = 0; g < 4; g++)
+                {
+                    var vBytes = Ssse3.Shuffle(vRaw, vDup03);
+                    var vU32 = Avx512F.ConvertToVector512Int32(vBytes).AsUInt32();
+                    var vQ = Avx512F.ShiftRightLogicalVariable(vU32, vShifts).AsInt32();
+                    var vSigned = (vQ & vMask3) - vOne;
+                    var vq = Vector512.ConvertToSingle(vSigned);
+                    var vx = Vector512.Load(x + (g * 16));
+                    vAcc = Vector512.FusedMultiplyAdd(vx, vq, vAcc);
+                    if (g < 3) vRaw = Sse2.ShiftRightLogical128BitLane(vRaw, 4);
+                }
+
+                totalSum += d * Vector512.Sum(vAcc);
+                x += QK2_0;
+            }
+            return totalSum;
+        }
+
+        if (Avx2.IsSupported)
+        {
+            var vDup01 = Vector128.Create((byte)0, 0, 0, 0, 1, 1, 1, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+            var vShifts = Vector256.Create(0u, 2u, 4u, 6u, 0u, 2u, 4u, 6u);
+            var vMask3 = Vector256.Create(3);
+            var vOne = Vector256.Create(1);
+
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                var vRaw = Vector128.Load(row[i].Qs);
+                var vAcc = Vector256<float>.Zero;
+
+                for (int g = 0; g < 8; g++)
+                {
+                    var vBytes = Ssse3.Shuffle(vRaw, vDup01);
+                    var vU32 = Avx2.ConvertToVector256Int32(vBytes).AsUInt32();
+                    var vQ = Avx2.ShiftRightLogicalVariable(vU32, vShifts).AsInt32();
+                    var vSigned = Avx2.Subtract(Avx2.And(vQ, vMask3), vOne);
+                    var vq = Vector256.ConvertToSingle(vSigned);
+                    var vx = Vector256.Load(x + (g * 8));
+                    vAcc = Fma.IsSupported ? Fma.MultiplyAdd(vx, vq, vAcc) : (vAcc + (vx * vq));
+                    if (g < 7) vRaw = Sse2.ShiftRightLogical128BitLane(vRaw, 2);
+                }
+
+                totalSum += d * Vector256.Sum(vAcc);
+                x += QK2_0;
+            }
+            return totalSum;
+        }
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d = (float)row[i].Delta;
+            byte* q = row[i].Qs;
+            float blockSum = 0f;
+
+            for (int b = 0; b < 16; b++)
+            {
+                byte qb = q[b];
+                float* xb = x + (b * 4);
+                blockSum += (((qb >> 0) & 3) - 1) * xb[0]
+                          + (((qb >> 2) & 3) - 1) * xb[1]
+                          + (((qb >> 4) & 3) - 1) * xb[2]
+                          + (((qb >> 6) & 3) - 1) * xb[3];
+            }
+
+            totalSum += d * blockSum;
+            x += QK2_0;
+        }
+
+        return totalSum;
+    }
+
+    /// <summary>
+    /// Dequantizes a row of upstream GGML_TYPE_Q2_0 (Type 42) blocks (64 elements in 18 bytes) into floats.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeGgmlQ2_0(BlockGgmlQ2_0* src, float* dst, int k)
+    {
+        int nb = k / QK2_0;
+        for (int i = 0; i < nb; i++)
+        {
+            float d = (float)src[i].Delta;
+            byte* q = src[i].Qs;
+
+            for (int b = 0; b < 16; b++)
+            {
+                byte qb = q[b];
+                float* outB = dst + (b * 4);
+                outB[0] = (((qb >> 0) & 3) - 1) * d;
+                outB[1] = (((qb >> 2) & 3) - 1) * d;
+                outB[2] = (((qb >> 4) & 3) - 1) * d;
+                outB[3] = (((qb >> 6) & 3) - 1) * d;
+            }
+            dst += QK2_0;
+        }
+    }
+
+    /// <summary>
+    /// Quantizes a float row of length k into upstream GGML_TYPE_Q2_0 (Type 42) blocks
+    /// (64 elements in 18 bytes: 2-byte FP16 Delta + 16 packed bytes encoding {-1, 0, +1, +2} * d).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeGgmlQ2_0(float* src, BlockGgmlQ2_0* dst, int k)
+    {
+        int nb = k / QK2_0;
+        for (int i = 0; i < nb; i++)
+        {
+            float* x = src + i * QK2_0;
+            float maxPos = 0f;
+            float maxNeg = 0f;
+            for (int j = 0; j < QK2_0; j++)
+            {
+                float v = x[j];
+                if (v > maxPos) maxPos = v;
+                else if (v < 0f && -v > maxNeg) maxNeg = -v;
+            }
+
+            float d0 = MathF.Max(maxPos * 0.5f, maxNeg);
+            if (d0 <= 1e-12f)
+            {
+                dst[i].Delta = (Half)0f;
+                byte* qZero = dst[i].Qs;
+                for (int b = 0; b < 16; b++)
+                {
+                    qZero[b] = 0x55; // all four 2-bit codes = 1 (represents 1 - 1 = 0)
+                }
+                continue;
+            }
+
+            // Refine scale via 1 least-squares pass over clamped ternary/quaternary grid {-1, 0, 1, 2}
+            float inv0 = 1.0f / d0;
+            double sumXq = 0.0;
+            double sumQq = 0.0;
+            for (int j = 0; j < QK2_0; j++)
+            {
+                int qSigned = Math.Clamp((int)MathF.Round(x[j] * inv0), -1, 2);
+                sumXq += x[j] * qSigned;
+                sumQq += qSigned * qSigned;
+            }
+
+            float d = sumQq > 0.0 ? (float)(sumXq / sumQq) : d0;
+            if (d <= 1e-12f) d = d0;
+            dst[i].Delta = (Half)d;
+            float dActual = (float)dst[i].Delta;
+            float invD = dActual > 1e-12f ? 1.0f / dActual : 0f;
+
+            byte* q = dst[i].Qs;
+            for (int b = 0; b < 16; b++)
+            {
+                int baseJ = b * 4;
+                int q0 = Math.Clamp((int)MathF.Round(x[baseJ + 0] * invD), -1, 2) + 1;
+                int q1 = Math.Clamp((int)MathF.Round(x[baseJ + 1] * invD), -1, 2) + 1;
+                int q2 = Math.Clamp((int)MathF.Round(x[baseJ + 2] * invD), -1, 2) + 1;
+                int q3 = Math.Clamp((int)MathF.Round(x[baseJ + 3] * invD), -1, 2) + 1;
+                q[b] = (byte)(q0 | (q1 << 2) | (q2 << 4) | (q3 << 6));
+            }
+        }
+    }
+
+    // =========================================================================
     // 2. IQ4_NL: Non-Linear 32-Element 4-Bit Block Kernels (640-col ffn_down)
     // =========================================================================
 
@@ -559,6 +745,180 @@ public static unsafe partial class QuantKernels
                 }
 
                 qh[ib] = qhByte;
+            }
+        }
+    }
+
+    // =========================================================================
+    // 4. IQ3_XXS: Non-Linear 256-Element 3.0625-Bit Super-Block Kernels
+    // =========================================================================
+
+    /// <summary>
+    /// Computes dot product between an IQ3_XXS quantized row (256 elements in 98 bytes) and float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotIQ3_XXS(BlockIQ3_XXS* row, float* x, int k)
+    {
+        int nb = k / QK_K;
+        float totalSum = 0f;
+
+        fixed (uint* pGrid = Iq3sGrid)
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                byte* qs = row[i].Qs;
+
+                for (int ib32 = 0; ib32 < 8; ib32++)
+                {
+                    uint aux32 = *(uint*)(qs + 64 + 4 * ib32);
+                    float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                    float subSum = 0f;
+
+                    for (int l = 0; l < 4; l++)
+                    {
+                        byte signs = pSigns[(aux32 >> (7 * l)) & 127];
+                        uint g0 = pGrid[qs[8 * ib32 + 2 * l]];
+                        uint g1 = pGrid[qs[8 * ib32 + 2 * l + 1]];
+
+                        subSum += x[0] * ((g0 & 0xFF) * ((signs & 1) != 0 ? -1f : 1f))
+                                + x[1] * (((g0 >> 8) & 0xFF) * ((signs & 2) != 0 ? -1f : 1f))
+                                + x[2] * (((g0 >> 16) & 0xFF) * ((signs & 4) != 0 ? -1f : 1f))
+                                + x[3] * ((g0 >> 24) * ((signs & 8) != 0 ? -1f : 1f))
+                                + x[4] * ((g1 & 0xFF) * ((signs & 16) != 0 ? -1f : 1f))
+                                + x[5] * (((g1 >> 8) & 0xFF) * ((signs & 32) != 0 ? -1f : 1f))
+                                + x[6] * (((g1 >> 16) & 0xFF) * ((signs & 64) != 0 ? -1f : 1f))
+                                + x[7] * ((g1 >> 24) * ((signs & 128) != 0 ? -1f : 1f));
+                        x += 8;
+                    }
+
+                    totalSum += db * subSum;
+                }
+            }
+        }
+
+        return totalSum;
+    }
+
+    /// <summary>
+    /// Dequantizes a row of IQ3_XXS super-blocks (256 elements in 98 bytes) into a float destination buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeIQ3_XXS(BlockIQ3_XXS* src, float* dst, int k)
+    {
+        int nb = k / QK_K;
+
+        fixed (uint* pGrid = Iq3sGrid)
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)src[i].Delta;
+                byte* qs = src[i].Qs;
+
+                for (int ib32 = 0; ib32 < 8; ib32++)
+                {
+                    uint aux32 = *(uint*)(qs + 64 + 4 * ib32);
+                    float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+
+                    for (int l = 0; l < 4; l++)
+                    {
+                        byte signs = pSigns[(aux32 >> (7 * l)) & 127];
+                        uint g0 = pGrid[qs[8 * ib32 + 2 * l]];
+                        uint g1 = pGrid[qs[8 * ib32 + 2 * l + 1]];
+
+                        dst[0] = db * (g0 & 0xFF) * ((signs & 1) != 0 ? -1f : 1f);
+                        dst[1] = db * ((g0 >> 8) & 0xFF) * ((signs & 2) != 0 ? -1f : 1f);
+                        dst[2] = db * ((g0 >> 16) & 0xFF) * ((signs & 4) != 0 ? -1f : 1f);
+                        dst[3] = db * (g0 >> 24) * ((signs & 8) != 0 ? -1f : 1f);
+                        dst[4] = db * (g1 & 0xFF) * ((signs & 16) != 0 ? -1f : 1f);
+                        dst[5] = db * ((g1 >> 8) & 0xFF) * ((signs & 32) != 0 ? -1f : 1f);
+                        dst[6] = db * ((g1 >> 16) & 0xFF) * ((signs & 64) != 0 ? -1f : 1f);
+                        dst[7] = db * (g1 >> 24) * ((signs & 128) != 0 ? -1f : 1f);
+                        dst += 8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Quantizes a float row of length k into IQ3_XXS super-blocks (256 elements in 98 bytes).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeIQ3_XXS(float* src, BlockIQ3_XXS* dst, int k)
+    {
+        int nb = k / QK_K;
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float* x = src + i * QK_K;
+                float maxAbs = 0f;
+                for (int j = 0; j < QK_K; j++)
+                {
+                    float a = MathF.Abs(x[j]);
+                    if (a > maxAbs) maxAbs = a;
+                }
+
+                float d = maxAbs / (7.0f * 15.5f * 0.5f);
+                dst[i].Delta = (Half)d;
+                float dActual = (float)dst[i].Delta;
+                byte* qs = dst[i].Qs;
+
+                for (int ib32 = 0; ib32 < 8; ib32++)
+                {
+                    float subMax = 0f;
+                    for (int j = 0; j < 32; j++)
+                    {
+                        float a = MathF.Abs(x[ib32 * 32 + j]);
+                        if (a > subMax) subMax = a;
+                    }
+
+                    int ls = dActual > 1e-12f
+                        ? Math.Clamp((int)MathF.Round((subMax / (7.0f * dActual * 0.5f)) - 0.5f), 0, 15)
+                        : 0;
+                    float db = dActual * (0.5f + ls) * 0.5f;
+                    float invDb = db > 1e-12f ? 1.0f / db : 0f;
+
+                    uint aux32 = (uint)ls << 28;
+                    for (int l = 0; l < 4; l++)
+                    {
+                        float* xg = x + ib32 * 32 + l * 8;
+                        int rawSigns = 0;
+                        float minMag = float.MaxValue;
+                        int minIdx = 0;
+                        for (int j = 0; j < 8; j++)
+                        {
+                            float v = xg[j];
+                            if (v < 0f) rawSigns |= (1 << j);
+                            float a = MathF.Abs(v);
+                            if (a < minMag) { minMag = a; minIdx = j; }
+                        }
+
+                        int signIdx = rawSigns & 127;
+                        if (pSigns[signIdx] != rawSigns && minIdx < 7)
+                        {
+                            signIdx = (rawSigns ^ (1 << minIdx)) & 127;
+                        }
+                        aux32 |= ((uint)signIdx & 127u) << (7 * l);
+
+                        int idx0 = 0;
+                        int idx1 = 0;
+                        for (int e = 0; e < 4; e++)
+                        {
+                            int m0 = Math.Clamp((int)MathF.Round((MathF.Abs(xg[e]) * invDb - 1.0f) * 0.5f), 0, 3);
+                            int m1 = Math.Clamp((int)MathF.Round((MathF.Abs(xg[4 + e]) * invDb - 1.0f) * 0.5f), 0, 3);
+                            idx0 |= m0 << (2 * e);
+                            idx1 |= m1 << (2 * e);
+                        }
+                        qs[8 * ib32 + 2 * l] = (byte)idx0;
+                        qs[8 * ib32 + 2 * l + 1] = (byte)idx1;
+                    }
+
+                    *(uint*)(qs + 64 + 4 * ib32) = aux32;
+                }
             }
         }
     }

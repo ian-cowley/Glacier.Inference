@@ -104,6 +104,9 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuModuleGetFunction")]
     public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
 
+    [DllImport(CudaLib, EntryPoint = "cuModuleGetGlobal_v2")]
+    public static extern int ModuleGetGlobal(out IntPtr dptr, out nuint bytes, IntPtr hmod, string name);
+
     [DllImport(CudaLib, EntryPoint = "cuMemAlloc_v2")]
     public static extern int MemAlloc(out IntPtr dptr, nuint bytesize);
 

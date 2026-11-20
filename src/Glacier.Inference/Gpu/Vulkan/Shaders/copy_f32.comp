@@ -1,0 +1,12 @@
+#version 450
+// Slice copy: Dst[dstOff + i] = Src[srcOff + i] for i in [0, count).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(push_constant) uniform PC { uint count; uint srcOff; uint dstOff; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.count) {
+        dst[pc.dstOff + i] = src[pc.srcOff + i];
+    }
+}

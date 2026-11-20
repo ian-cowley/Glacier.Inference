@@ -1,6 +1,7 @@
 namespace Glacier.Inference.Quant;
 
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -8,7 +9,7 @@ using System.Runtime.Intrinsics.X86;
 
 public static unsafe partial class QuantKernels
 {
-    private static readonly ulong[] Iq2xxsGrid = new ulong[256]
+    internal static readonly ulong[] Iq2xxsGrid = new ulong[256]
     {
         0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
         0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
@@ -76,7 +77,7 @@ public static unsafe partial class QuantKernels
         0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
     };
 
-    private static readonly byte[] KSignsIq2Xs = new byte[128]
+    internal static readonly byte[] KSignsIq2Xs = new byte[128]
     {
         0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
         144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
@@ -87,6 +88,82 @@ public static unsafe partial class QuantKernels
         96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
         240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
     };
+
+    /// <summary>
+    /// 512-entry E8 sphere lattice codebook for IQ2_XS (extends <see cref="Iq2xxsGrid"/>).
+    /// </summary>
+    internal static readonly ulong[] Iq2xsGrid = BuildIq2Grid(512);
+
+    /// <summary>
+    /// 1024-entry E8 sphere lattice codebook for IQ2_S (extends <see cref="Iq2xsGrid"/>).
+    /// </summary>
+    internal static readonly ulong[] Iq2sGrid = BuildIq2Grid(1024);
+
+    private static ulong[] BuildIq2Grid(int targetCount)
+    {
+        // E8 shifted-lattice magnitudes in the positive orthant (levels 0..3 -> {8, 25, 43, 61})
+        // obeying the even coordinate-sum parity rule: (sum_j level[j]) % 2 == 0.
+        ReadOnlySpan<byte> levels = [8, 25, 43, 61];
+        var seen = new HashSet<ulong>(targetCount);
+        var grid = new ulong[targetCount];
+
+        int count = Math.Min(Iq2xxsGrid.Length, targetCount);
+        for (int i = 0; i < count; i++)
+        {
+            grid[i] = Iq2xxsGrid[i];
+            seen.Add(Iq2xxsGrid[i]);
+        }
+
+        if (targetCount <= Iq2xxsGrid.Length)
+            return grid;
+
+        var candidates = new List<(ulong Packed, uint NormSq)>(32768);
+        for (int idx = 0; idx < 65536; idx++)
+        {
+            int l0 = (idx >> 0) & 3;
+            int l1 = (idx >> 2) & 3;
+            int l2 = (idx >> 4) & 3;
+            int l3 = (idx >> 6) & 3;
+            int l4 = (idx >> 8) & 3;
+            int l5 = (idx >> 10) & 3;
+            int l6 = (idx >> 12) & 3;
+            int l7 = (idx >> 14) & 3;
+
+            if (((l0 + l1 + l2 + l3 + l4 + l5 + l6 + l7) & 1) != 0)
+                continue;
+
+            byte m0 = levels[l0], m1 = levels[l1], m2 = levels[l2], m3 = levels[l3];
+            byte m4 = levels[l4], m5 = levels[l5], m6 = levels[l6], m7 = levels[l7];
+
+            ulong packed = (ulong)m0
+                | ((ulong)m1 << 8)
+                | ((ulong)m2 << 16)
+                | ((ulong)m3 << 24)
+                | ((ulong)m4 << 32)
+                | ((ulong)m5 << 40)
+                | ((ulong)m6 << 48)
+                | ((ulong)m7 << 56);
+
+            if (seen.Contains(packed))
+                continue;
+
+            uint normSq = (uint)(m0 * m0 + m1 * m1 + m2 * m2 + m3 * m3 + m4 * m4 + m5 * m5 + m6 * m6 + m7 * m7);
+            candidates.Add((packed, normSq));
+        }
+
+        candidates.Sort(static (a, b) =>
+        {
+            int c = a.NormSq.CompareTo(b.NormSq);
+            return c != 0 ? c : a.Packed.CompareTo(b.Packed);
+        });
+
+        for (int i = 0; i < candidates.Count && count < targetCount; i++)
+        {
+            grid[count++] = candidates[i].Packed;
+        }
+
+        return grid;
+    }
 
     /// <summary>
     /// Computes dot product between an IQ2_XXS quantized row and a float vector x of length k.
@@ -179,5 +256,346 @@ public static unsafe partial class QuantKernels
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Computes dot product between an IQ2_XS quantized row (256 elements in 74 bytes) and float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotIQ2_XS(BlockIQ2_XS* row, float* x, int k)
+    {
+        int nb = k / QK_K;
+        float totalSum = 0f;
+
+        fixed (ulong* pGrid = Iq2xsGrid)
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                ushort* qs = row[i].Qs;
+                byte* scales = row[i].Scales;
+
+                for (int ib32 = 0; ib32 < 8; ++ib32)
+                {
+                    byte sc = scales[ib32];
+                    for (int l = 0; l < 4; ++l)
+                    {
+                        ushort q = qs[4 * ib32 + l];
+                        int ls = (l < 2) ? (sc & 0x0F) : (sc >> 4);
+                        float db = d * (0.5f + ls) * 0.25f;
+                        byte* grid = (byte*)(pGrid + (q & 511));
+                        byte signs = pSigns[q >> 9];
+
+                        float subSum = 0f;
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            float sign = ((signs >> j) & 1) != 0 ? -1f : 1f;
+                            subSum += x[j] * (grid[j] * sign);
+                        }
+
+                        totalSum += db * subSum;
+                        x += 8;
+                    }
+                }
+            }
+        }
+
+        return totalSum;
+    }
+
+    /// <summary>
+    /// Dequantizes an IQ2_XS quantized row (256 elements in 74 bytes) to float destination buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeIQ2_XS(BlockIQ2_XS* src, float* dst, int k)
+    {
+        int nb = k / QK_K;
+
+        fixed (ulong* pGrid = Iq2xsGrid)
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)src[i].Delta;
+                ushort* qs = src[i].Qs;
+                byte* scales = src[i].Scales;
+
+                for (int ib32 = 0; ib32 < 8; ++ib32)
+                {
+                    byte sc = scales[ib32];
+                    for (int l = 0; l < 4; ++l)
+                    {
+                        ushort q = qs[4 * ib32 + l];
+                        int ls = (l < 2) ? (sc & 0x0F) : (sc >> 4);
+                        float db = d * (0.5f + ls) * 0.25f;
+                        byte* grid = (byte*)(pGrid + (q & 511));
+                        byte signs = pSigns[q >> 9];
+
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            float sign = ((signs >> j) & 1) != 0 ? -1f : 1f;
+                            dst[j] = db * grid[j] * sign;
+                        }
+                        dst += 8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Computes dot product between an IQ2_S quantized row (256 elements in 82 bytes) and float vector x of length k.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotIQ2_S(BlockIQ2_S* row, float* x, int k)
+    {
+        int nb = k / QK_K;
+        float totalSum = 0f;
+
+        fixed (ulong* pGrid = Iq2sGrid)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)row[i].Delta;
+                byte* qs = row[i].Qs;
+                byte* qh = row[i].Qh;
+                byte* scales = row[i].Scales;
+
+                for (int ib32 = 0; ib32 < 8; ++ib32)
+                {
+                    byte sc = scales[ib32];
+                    byte qhByte = qh[ib32];
+                    for (int l = 0; l < 4; ++l)
+                    {
+                        int gridIdx = qs[4 * ib32 + l] | (((qhByte >> (2 * l)) & 3) << 8);
+                        byte signs = qs[32 + 4 * ib32 + l];
+                        int ls = (l < 2) ? (sc & 0x0F) : (sc >> 4);
+                        float db = d * (0.5f + ls) * 0.25f;
+                        byte* grid = (byte*)(pGrid + gridIdx);
+
+                        float subSum = 0f;
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            float sign = ((signs >> j) & 1) != 0 ? -1f : 1f;
+                            subSum += x[j] * (grid[j] * sign);
+                        }
+
+                        totalSum += db * subSum;
+                        x += 8;
+                    }
+                }
+            }
+        }
+
+        return totalSum;
+    }
+
+    /// <summary>
+    /// Dequantizes an IQ2_S quantized row (256 elements in 82 bytes) to float destination buffer.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeIQ2_S(BlockIQ2_S* src, float* dst, int k)
+    {
+        int nb = k / QK_K;
+
+        fixed (ulong* pGrid = Iq2sGrid)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float d = (float)src[i].Delta;
+                byte* qs = src[i].Qs;
+                byte* qh = src[i].Qh;
+                byte* scales = src[i].Scales;
+
+                for (int ib32 = 0; ib32 < 8; ++ib32)
+                {
+                    byte sc = scales[ib32];
+                    byte qhByte = qh[ib32];
+                    for (int l = 0; l < 4; ++l)
+                    {
+                        int gridIdx = qs[4 * ib32 + l] | (((qhByte >> (2 * l)) & 3) << 8);
+                        byte signs = qs[32 + 4 * ib32 + l];
+                        int ls = (l < 2) ? (sc & 0x0F) : (sc >> 4);
+                        float db = d * (0.5f + ls) * 0.25f;
+                        byte* grid = (byte*)(pGrid + gridIdx);
+
+                        for (int j = 0; j < 8; ++j)
+                        {
+                            float sign = ((signs >> j) & 1) != 0 ? -1f : 1f;
+                            dst[j] = db * grid[j] * sign;
+                        }
+                        dst += 8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Quantizes a float row of length k into IQ2_XS super-blocks (256 elements in 74 bytes).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeIQ2_XS(float* src, BlockIQ2_XS* dst, int k)
+    {
+        int nb = k / QK_K;
+        fixed (ulong* pGrid = Iq2xsGrid)
+        fixed (byte* pSigns = KSignsIq2Xs)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float* x = src + i * QK_K;
+                float maxAbs = 0f;
+                for (int j = 0; j < QK_K; j++)
+                {
+                    float a = MathF.Abs(x[j]);
+                    if (a > maxAbs) maxAbs = a;
+                }
+
+                float d = maxAbs / (43.0f * 15.5f * 0.25f);
+                dst[i].Delta = (Half)d;
+                float dActual = (float)dst[i].Delta;
+
+                for (int ib32 = 0; ib32 < 8; ib32++)
+                {
+                    int ls0 = ComputeIq2SubScale(x + ib32 * 32, 16, dActual, maxGridMag: 43.0f);
+                    int ls1 = ComputeIq2SubScale(x + ib32 * 32 + 16, 16, dActual, maxGridMag: 43.0f);
+                    dst[i].Scales[ib32] = (byte)((ls0 & 0xF) | ((ls1 & 0xF) << 4));
+
+                    for (int l = 0; l < 4; l++)
+                    {
+                        float* xg = x + ib32 * 32 + l * 8;
+                        int ls = (l < 2) ? ls0 : ls1;
+                        float db = dActual * (0.5f + ls) * 0.25f;
+                        float invDb = db > 1e-12f ? 1.0f / db : 0f;
+
+                        int rawSigns = 0;
+                        float minMag = float.MaxValue;
+                        int minIdx = 0;
+                        for (int j = 0; j < 8; j++)
+                        {
+                            float v = xg[j];
+                            if (v < 0f) rawSigns |= (1 << j);
+                            float a = MathF.Abs(v);
+                            if (a < minMag) { minMag = a; minIdx = j; }
+                        }
+
+                        int signIdx = rawSigns & 127;
+                        if (pSigns[signIdx] != rawSigns && minIdx < 7)
+                        {
+                            // Match parity by flipping the smallest-magnitude coordinate when beneficial
+                            signIdx = (rawSigns ^ (1 << minIdx)) & 127;
+                        }
+                        byte usedSigns = pSigns[signIdx];
+
+                        int bestGrid = 0;
+                        float bestErr = float.MaxValue;
+                        for (int g = 0; g < Iq2xsGrid.Length; g++)
+                        {
+                            byte* pg = (byte*)(pGrid + g);
+                            float err = 0f;
+                            for (int j = 0; j < 8; j++)
+                            {
+                                float qv = pg[j] * (((usedSigns >> j) & 1) != 0 ? -1f : 1f);
+                                float diff = qv - (xg[j] * invDb);
+                                err += diff * diff;
+                            }
+                            if (err < bestErr)
+                            {
+                                bestErr = err;
+                                bestGrid = g;
+                            }
+                        }
+
+                        dst[i].Qs[4 * ib32 + l] = (ushort)((bestGrid & 511) | ((signIdx & 127) << 9));
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Quantizes a float row of length k into IQ2_S super-blocks (256 elements in 82 bytes).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeIQ2_S(float* src, BlockIQ2_S* dst, int k)
+    {
+        int nb = k / QK_K;
+        fixed (ulong* pGrid = Iq2sGrid)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                float* x = src + i * QK_K;
+                float maxAbs = 0f;
+                for (int j = 0; j < QK_K; j++)
+                {
+                    float a = MathF.Abs(x[j]);
+                    if (a > maxAbs) maxAbs = a;
+                }
+
+                float d = maxAbs / (43.0f * 15.5f * 0.25f);
+                dst[i].Delta = (Half)d;
+                float dActual = (float)dst[i].Delta;
+
+                for (int ib32 = 0; ib32 < 8; ib32++)
+                {
+                    int ls0 = ComputeIq2SubScale(x + ib32 * 32, 16, dActual, maxGridMag: 43.0f);
+                    int ls1 = ComputeIq2SubScale(x + ib32 * 32 + 16, 16, dActual, maxGridMag: 43.0f);
+                    dst[i].Scales[ib32] = (byte)((ls0 & 0xF) | ((ls1 & 0xF) << 4));
+                    byte qhByte = 0;
+
+                    for (int l = 0; l < 4; l++)
+                    {
+                        float* xg = x + ib32 * 32 + l * 8;
+                        int ls = (l < 2) ? ls0 : ls1;
+                        float db = dActual * (0.5f + ls) * 0.25f;
+                        float invDb = db > 1e-12f ? 1.0f / db : 0f;
+
+                        byte signs = 0;
+                        for (int j = 0; j < 8; j++)
+                        {
+                            if (xg[j] < 0f) signs |= (byte)(1 << j);
+                        }
+
+                        int bestGrid = 0;
+                        float bestErr = float.MaxValue;
+                        for (int g = 0; g < Iq2sGrid.Length; g++)
+                        {
+                            byte* pg = (byte*)(pGrid + g);
+                            float err = 0f;
+                            for (int j = 0; j < 8; j++)
+                            {
+                                float qv = pg[j];
+                                float diff = qv - (MathF.Abs(xg[j]) * invDb);
+                                err += diff * diff;
+                            }
+                            if (err < bestErr)
+                            {
+                                bestErr = err;
+                                bestGrid = g;
+                            }
+                        }
+
+                        dst[i].Qs[4 * ib32 + l] = (byte)(bestGrid & 0xFF);
+                        dst[i].Qs[32 + 4 * ib32 + l] = signs;
+                        qhByte |= (byte)(((bestGrid >> 8) & 3) << (2 * l));
+                    }
+
+                    dst[i].Qh[ib32] = qhByte;
+                }
+            }
+        }
+    }
+
+    private static int ComputeIq2SubScale(float* x, int count, float d, float maxGridMag = 43.0f)
+    {
+        if (d <= 1e-12f) return 0;
+        float subMax = 0f;
+        for (int j = 0; j < count; j++)
+        {
+            float a = MathF.Abs(x[j]);
+            if (a > subMax) subMax = a;
+        }
+        return Math.Clamp((int)MathF.Round((subMax / (maxGridMag * d * 0.25f)) - 0.5f), 0, 15);
     }
 }

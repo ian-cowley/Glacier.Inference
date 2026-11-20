@@ -49,12 +49,14 @@ public enum GgufType : uint
     IQ3_S = 21,
     IQ2_S = 22,
     IQ4_XS = 23,
+    IQ1_M = 29,
     BF16 = 30,
     Q4_0_4_4 = 31,
     Q4_0_4_8 = 32,
     Q4_0_8_8 = 33,
     Q2_0 = 36,
     MXFP4 = 39,
+    GgmlQ2_0 = 42,
     Ternary_1_58 = 100,
     PQ2_0 = 142
 }
@@ -64,32 +66,77 @@ public enum GgufType : uint
 /// </summary>
 public static class GgufTypes
 {
-    public static long GetRowBytes(GgufType type, int count) => type switch
+    public static bool TryGetBlockInfo(GgufType type, out int blockSize, out int blockBytes)
     {
-        GgufType.F32 => (long)count * 4,
-        GgufType.F16 or GgufType.BF16 => (long)count * 2,
-        GgufType.Q8_0 => ((long)count / 32) * 34,
-        GgufType.Q4_0 => ((long)count / 32) * 18,
-        GgufType.Q5_0 => ((long)count / 32) * 22,
-        GgufType.Q5_1 => ((long)count / 32) * 24,
-        GgufType.Q4_K => ((long)count / 256) * 144,
-        GgufType.Q6_K => ((long)count / 256) * 210,
-        GgufType.Q3_K => ((long)count / 256) * 110,
-        GgufType.Q5_K => ((long)count / 256) * 176,
-        GgufType.Q2_K => ((long)count / 256) * 84,
-        GgufType.IQ1_S => ((long)count / 256) * 48,
-        GgufType.IQ2_XXS => ((long)count / 256) * 66,
-        GgufType.IQ2_XS => ((long)count / 256) * 74,
-        GgufType.IQ2_S => ((long)count / 256) * 82,
-        GgufType.IQ3_XXS => ((long)count / 256) * 98,
-        GgufType.IQ3_S => ((long)count / 256) * 110,
-        GgufType.IQ4_XS => ((long)count / 256) * 136,
-        GgufType.IQ4_NL => ((long)count / 32) * 18,
-        GgufType.Q2_0 => ((long)count / 64) * 20,
-        GgufType.MXFP4 => ((long)count / 32) * 17,
-        GgufType.Ternary_1_58 or GgufType.PQ2_0 => ((long)count / 256) * 68,
-        _ => (long)count * 2
-    };
+        switch (type)
+        {
+            case GgufType.F32:
+                blockSize = 1; blockBytes = 4; return true;
+            case GgufType.F16:
+            case GgufType.BF16:
+                blockSize = 1; blockBytes = 2; return true;
+            case GgufType.Q8_0:
+                blockSize = 32; blockBytes = 34; return true;
+            case GgufType.Q4_0:
+            case GgufType.IQ4_NL:
+                blockSize = 32; blockBytes = 18; return true;
+            case GgufType.Q5_0:
+                blockSize = 32; blockBytes = 22; return true;
+            case GgufType.Q5_1:
+                blockSize = 32; blockBytes = 24; return true;
+            case GgufType.MXFP4:
+                blockSize = 32; blockBytes = 17; return true;
+            case GgufType.Q2_0:
+                blockSize = 64; blockBytes = 20; return true;
+            case GgufType.GgmlQ2_0:
+                blockSize = 64; blockBytes = 18; return true;
+            case GgufType.Q4_K:
+                blockSize = 256; blockBytes = 144; return true;
+            case GgufType.Q6_K:
+                blockSize = 256; blockBytes = 210; return true;
+            case GgufType.Q3_K:
+                blockSize = 256; blockBytes = 110; return true;
+            case GgufType.Q5_K:
+                blockSize = 256; blockBytes = 176; return true;
+            case GgufType.Q2_K:
+                blockSize = 256; blockBytes = 84; return true;
+            case GgufType.IQ1_S:
+                blockSize = 256; blockBytes = 50; return true;
+            case GgufType.IQ1_M:
+                blockSize = 256; blockBytes = 56; return true;
+            case GgufType.IQ2_XXS:
+                blockSize = 256; blockBytes = 66; return true;
+            case GgufType.IQ2_XS:
+                blockSize = 256; blockBytes = 74; return true;
+            case GgufType.IQ2_S:
+                blockSize = 256; blockBytes = 82; return true;
+            case GgufType.IQ3_XXS:
+                blockSize = 256; blockBytes = 98; return true;
+            case GgufType.IQ3_S:
+                blockSize = 256; blockBytes = 110; return true;
+            case GgufType.IQ4_XS:
+                blockSize = 256; blockBytes = 136; return true;
+            case GgufType.Ternary_1_58:
+            case GgufType.PQ2_0:
+                blockSize = 256; blockBytes = 68; return true;
+            default:
+                blockSize = 1; blockBytes = 2; return false;
+        }
+    }
+
+    public static long GetRowBytes(GgufType type, int count)
+    {
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count), count, "Element count must be non-negative.");
+
+        if (!TryGetBlockInfo(type, out int blockSize, out int blockBytes))
+            return (long)count * 2;
+
+        if (blockSize > 1 && (count % blockSize) != 0)
+            throw new ArgumentException($"Element count ({count}) must be a multiple of block size ({blockSize}) for {type}.", nameof(count));
+
+        return ((long)count / blockSize) * blockBytes;
+    }
 }
 
 /// <summary>
@@ -123,12 +170,15 @@ public sealed class GgufTensorInfo
             GgufType.F16 or GgufType.BF16 => count * 2,
             GgufType.Q8_0 => (count / 32) * 34,
             GgufType.Q4_0 => (count / 32) * 18,
+            GgufType.Q5_0 => (count / 32) * 22,
+            GgufType.Q5_1 => (count / 32) * 24,
             GgufType.Q4_K => (count / 256) * 144, // 256 elements in 144 bytes
             GgufType.Q6_K => (count / 256) * 210, // 256 elements in 210 bytes
             GgufType.Q3_K => (count / 256) * 110, // 256 elements in 110 bytes
             GgufType.Q5_K => (count / 256) * 176, // 256 elements in 176 bytes
             GgufType.Q2_K => (count / 256) * 84,  // 256 elements in 84 bytes
-            GgufType.IQ1_S => (count / 256) * 48, // 256 elements in 48 bytes
+            GgufType.IQ1_S => (count / 256) * 50, // 256 elements in 50 bytes
+            GgufType.IQ1_M => (count / 256) * 56, // 256 elements in 56 bytes
             GgufType.IQ2_XXS => (count / 256) * 66, // 256 elements in 66 bytes (2.0625 b/w)
             GgufType.IQ2_XS => (count / 256) * 74, // 256 elements in 74 bytes (2.3125 b/w)
             GgufType.IQ2_S => (count / 256) * 82,  // 256 elements in 82 bytes (2.5625 b/w)
@@ -138,6 +188,7 @@ public sealed class GgufTensorInfo
             GgufType.IQ4_NL => (count / 32) * 18,  // 32 elements in 18 bytes
             GgufType.Q2_0 => (count / 64) * 20,    // 64 elements in 20 bytes (2.50 b/w fast MoE block)
             GgufType.MXFP4 => (count / 32) * 17,  // 32 elements in 17 bytes (E8M0 + 32x E2M1 FP4)
+            GgufType.GgmlQ2_0 => (count / 64) * 18, // 64 elements in 18 bytes (upstream GGML_TYPE_Q2_0 = 42, 2.25 b/w)
             GgufType.Ternary_1_58 or GgufType.PQ2_0 => (count / 256) * 68, // 256 elements in 68 bytes (2.125 b/w multiplication-free ternary / Prism PQ2_0)
             _ => count * 2 // conservative fallback
         };

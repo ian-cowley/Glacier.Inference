@@ -240,8 +240,7 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         for (int idx = 0; idx < kvCount; idx++)
         {
             int t = startT + idx;
-            float* kPast = kvCache.GetKeyPtr(stageLayer, hKv, t);
-            float dot = QuantKernels.VecDotF32(qHead, kPast, _headDim);
+            float dot = kvCache.DotKey(stageLayer, hKv, t, qHead);
             scores[idx] = dot * _attnScale;
         }
 
@@ -257,42 +256,7 @@ public sealed unsafe partial class Qwen2Model : CpuModelBase
         for (int idx = 0; idx < kvCount; idx++)
         {
             int t = startT + idx;
-            float* vPast = kvCache.GetValuePtr(stageLayer, hKv, t);
-            float w = scores[idx];
-
-            if (Vector512.IsHardwareAccelerated && _vHeadDim >= 16)
-            {
-                var vw = Vector512.Create(w);
-                int d = 0;
-                for (; d <= _vHeadDim - 16; d += 16)
-                {
-                    var vo = Vector512.Load(outHead + d);
-                    var vv = Vector512.Load(vPast + d);
-                    vo = Vector512.FusedMultiplyAdd(vw, vv, vo);
-                    vo.Store(outHead + d);
-                }
-                for (; d < _vHeadDim; d++) outHead[d] += w * vPast[d];
-            }
-            else if (Vector256.IsHardwareAccelerated)
-            {
-                var vw = Vector256.Create(w);
-                int d = 0;
-                for (; d <= _vHeadDim - 8; d += 8)
-                {
-                    var vo = Vector256.Load(outHead + d);
-                    var vv = Vector256.Load(vPast + d);
-                    vo += vw * vv;
-                    vo.Store(outHead + d);
-                }
-                for (; d < _vHeadDim; d++) outHead[d] += w * vPast[d];
-            }
-            else
-            {
-                for (int d = 0; d < _vHeadDim; d++)
-                {
-                    outHead[d] += w * vPast[d];
-                }
-            }
+            kvCache.AccumulateValue(stageLayer, hKv, t, scores[idx], outHead);
         }
     }
 

@@ -163,11 +163,221 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             for (uint i = 0; i < 32; i++)
             {
                 uint t = t_base + i;
+                uint safe_t = (t < batch_size) ? t : 0;
+                uint row_base = safe_t * k_cols;
+                float xv0 = asfloat(x.Load((row_base + col0) * 4));
+                float xv1 = asfloat(x.Load((row_base + col1) * 4));
                 if (t < batch_size)
                 {
-                    uint row_base = t * k_cols;
-                    acc[i] += w0 * asfloat(x.Load((row_base + col0) * 4))
-                            + w1 * asfloat(x.Load((row_base + col1) * 4));
+                    acc[i] += w0 * xv0 + w1 * xv1;
+                }
+            }
+        }
+    }
+
+    [unroll]
+    for (uint i = 0; i < 32; i++)
+    {
+        uint t = t_base + i;
+        s_mem[i * 128 + s_idx] = (t < batch_size && warp_id < m_rows) ? acc[i] : 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 16) { [unroll] for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 16]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8)  { [unroll] for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 8]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4)  { [unroll] for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 4]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2)  { [unroll] for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 2]; }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1)  { [unroll] for (uint i = 0; i < 32; i++) s_mem[i * 128 + s_idx] += s_mem[i * 128 + s_idx + 1]; }
+
+    if (lane_id == 0 && warp_id < m_rows)
+    {
+        float b_val = 0.0f;
+        if (has_bias != 0) b_val = asfloat(bias.Load(warp_id * 4));
+        [unroll]
+        for (uint i = 0; i < 32; i++)
+        {
+            uint t = t_base + i;
+            if (t < batch_size)
+            {
+                float final_sum = s_mem[i * 128 + row_in_grp * 32] + b_val;
+                uint out_byte_addr = (t * m_rows + warp_id) * 4;
+                if (has_residual != 0)
+                {
+                    float prev = asfloat(residual.Load(out_byte_addr));
+                    residual.Store(out_byte_addr, asuint(prev + final_sum));
+                }
+                if (has_y != 0)
+                {
+                    y.Store(out_byte_addr, asuint(final_sum));
+                }
+            }
+        }
+    }
+}
+";
+
+    // =========================================================================
+    // 1b. GGML_TYPE_Q2_0 (Type 42) GEMV & Batched GEMM (64 elements in 20 aligned bytes)
+    // =========================================================================
+
+    public const string GemvGgmlQ2_0 = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint has_bias;
+    uint has_residual;
+    uint has_y;
+    uint row_offset;
+};
+
+ByteAddressBuffer W : register(t0);
+StructuredBuffer<float> bias : register(t1);
+RWStructuredBuffer<float> x : register(u0);
+RWStructuredBuffer<float> residual : register(u1);
+RWStructuredBuffer<float> y : register(u2);
+
+groupshared float s_mem[128];
+
+[numthreads(32, 4, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = row_offset + gid.x * 4 + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 32 + lane_id;
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 64;
+        uint row_byte_offset = warp_id * nb * 20;
+        float row_sum = 0.0f;
+
+        uint q_byte_idx = lane_id >> 1;
+        uint elem_pair = lane_id & 1;
+        uint q_word_off = 4 + (q_byte_idx & ~3);
+        uint q_byte_shift = (q_byte_idx & 3) * 8;
+        uint shift0 = elem_pair * 4;
+        uint shift1 = shift0 + 2;
+        uint x_sub_off = lane_id * 2;
+
+        for (uint b = 0; b < nb; b++)
+        {
+            uint blk_addr = row_byte_offset + b * 20;
+            float d = f16tof32(W.Load(blk_addr) & 0xFFFF);
+
+            uint q_word = W.Load(blk_addr + q_word_off);
+            uint q_byte = (q_word >> q_byte_shift) & 0xFF;
+
+            float q0 = (float)((int)((q_byte >> shift0) & 3) - 1);
+            float q1 = (float)((int)((q_byte >> shift1) & 3) - 1);
+
+            uint col0 = b * 64 + x_sub_off;
+            row_sum += d * (q0 * x[col0] + q1 * x[col0 + 1]);
+        }
+
+        s_mem[s_idx] = row_sum;
+    }
+    else
+    {
+        s_mem[s_idx] = 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 16) s_mem[s_idx] += s_mem[s_idx + 16];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8)  s_mem[s_idx] += s_mem[s_idx + 8];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4)  s_mem[s_idx] += s_mem[s_idx + 4];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2)  s_mem[s_idx] += s_mem[s_idx + 2];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1)  s_mem[s_idx] += s_mem[s_idx + 1];
+
+    if (lane_id == 0 && warp_id < m_rows)
+    {
+        float final_sum = s_mem[row_in_grp * 32];
+        if (has_bias != 0) final_sum += bias[warp_id];
+        if (has_residual != 0) residual[warp_id] += final_sum;
+        if (has_y != 0) y[warp_id] = final_sum;
+    }
+}
+";
+
+    public const string GemmGgmlQ2_0Batch = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint batch_size;
+    uint has_bias;
+    uint has_residual;
+    uint has_y;
+};
+
+ByteAddressBuffer W : register(t0);
+ByteAddressBuffer bias : register(t1);
+RWByteAddressBuffer x : register(u2);
+RWByteAddressBuffer residual : register(u0);
+RWByteAddressBuffer y : register(u1);
+
+groupshared float s_mem[4096];
+
+[numthreads(32, 4, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = gid.x * 4 + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 32 + lane_id;
+    uint t_base = gid.y * 32;
+
+    float acc[32];
+    [unroll]
+    for (uint i = 0; i < 32; i++) acc[i] = 0.0f;
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 64;
+        uint row_byte_offset = warp_id * nb * 20;
+
+        uint q_byte_idx = lane_id >> 1;
+        uint elem_pair = lane_id & 1;
+        uint q_word_off = 4 + (q_byte_idx & ~3);
+        uint q_byte_shift = (q_byte_idx & 3) * 8;
+        uint shift0 = elem_pair * 4;
+        uint shift1 = shift0 + 2;
+        uint x_sub_off = lane_id * 2;
+
+        for (uint b = 0; b < nb; b++)
+        {
+            uint blk_addr = row_byte_offset + b * 20;
+            float d = f16tof32(W.Load(blk_addr) & 0xFFFF);
+
+            uint q_word = W.Load(blk_addr + q_word_off);
+            uint q_byte = (q_word >> q_byte_shift) & 0xFF;
+
+            float w0 = d * (float)((int)((q_byte >> shift0) & 3) - 1);
+            float w1 = d * (float)((int)((q_byte >> shift1) & 3) - 1);
+
+            uint col0 = b * 64 + x_sub_off;
+            uint col1 = col0 + 1;
+
+            [unroll]
+            for (uint i = 0; i < 32; i++)
+            {
+                uint t = t_base + i;
+                uint safe_t = (t < batch_size) ? t : 0;
+                uint row_base = safe_t * k_cols;
+                float xv0 = asfloat(x.Load((row_base + col0) * 4));
+                float xv1 = asfloat(x.Load((row_base + col1) * 4));
+                if (t < batch_size)
+                {
+                    acc[i] += w0 * xv0 + w1 * xv1;
                 }
             }
         }
@@ -366,9 +576,11 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             for (uint i = 0; i < 32; i++)
             {
                 uint t = t_base + i;
+                uint safe_t = (t < batch_size) ? t : 0;
+                float xv = asfloat(x.Load((safe_t * k_cols + col_idx) * 4));
                 if (t < batch_size)
                 {
-                    acc[i] += w * asfloat(x.Load((t * k_cols + col_idx) * 4));
+                    acc[i] += w * xv;
                 }
             }
         }
@@ -642,17 +854,14 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             for (uint i = 0; i < 32; i++)
             {
                 uint t = t_base + i;
+                uint safe_t = (t < batch_size) ? t : 0;
+                uint t_x_byte = (safe_t * k_cols + col_base) * 4;
+                float4 xv0 = asfloat(x.Load4(t_x_byte));
+                float4 xv1 = asfloat(x.Load4(t_x_byte + 16));
                 if (t < batch_size)
                 {
-                    uint t_x_byte = (t * k_cols + col_base) * 4;
-                    acc[i] += w0 * asfloat(x.Load(t_x_byte + 0))
-                            + w1 * asfloat(x.Load(t_x_byte + 4))
-                            + w2 * asfloat(x.Load(t_x_byte + 8))
-                            + w3 * asfloat(x.Load(t_x_byte + 12))
-                            + w4 * asfloat(x.Load(t_x_byte + 16))
-                            + w5 * asfloat(x.Load(t_x_byte + 20))
-                            + w6 * asfloat(x.Load(t_x_byte + 24))
-                            + w7 * asfloat(x.Load(t_x_byte + 28));
+                    acc[i] += w0 * xv0.x + w1 * xv0.y + w2 * xv0.z + w3 * xv0.w
+                            + w4 * xv1.x + w5 * xv1.y + w6 * xv1.z + w7 * xv1.w;
                 }
             }
         }

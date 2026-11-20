@@ -195,6 +195,78 @@ __global__ void attention_gqa_fp8(
 }
 
 // =========================================================================
+// 9f-q4. Packed 4-Bit (Q4_0) GQA Attention Kernel
+// =========================================================================
+__global__ void attention_gqa_q4_0(
+    const float* __restrict__ q,
+    const BlockQ4_0* __restrict__ k_cache,
+    const BlockQ4_0* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads_q || pos < 0 || pos >= max_seq_len) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int blocks_per_head = (head_dim + 31) >> 5;
+
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q[(size_t)h * head_dim + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_blk_base = ((size_t)h_kv * max_seq_len + t) * blocks_per_head;
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* k_blk = &k_cache[kv_blk_base + blk];
+            float k_d = __half2float(k_blk->d);
+            int q_nib = (k_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            dot_part += q_reg[c] * (k_d * (float)(q_nib - 8));
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* v_blk = &v_cache[kv_blk_base + blk];
+            float v_d = __half2float(v_blk->d);
+            int q_nib = (v_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            acc[c] = acc[c] * alpha + w_t * (v_d * (float)(q_nib - 8));
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out[(size_t)h * head_dim + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
 // 9b. Batched GQA Attention Kernel
 // 2D grid: blockIdx.x = h (0..n_heads_q - 1), blockIdx.y = b (0..batch_size - 1)
 // =========================================================================
@@ -385,6 +457,84 @@ __global__ void attention_gqa_batch_fp8(
 
         for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
             acc[c] = acc[c] * alpha + w_t * float(v_cache[kv_base + d]);
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out_batch[q_base + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
+// 9h-q4. Batched Packed 4-Bit (Q4_0) GQA Attention Kernel
+// =========================================================================
+__global__ void attention_gqa_batch_q4_0(
+    const float* __restrict__ q_batch,
+    const BlockQ4_0* __restrict__ k_cache,
+    const BlockQ4_0* __restrict__ v_cache,
+    float* __restrict__ attn_out_batch,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int chunk_start_pos,
+    int batch_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads_q || b >= batch_size) return;
+
+    int pos = chunk_start_pos + b;
+    if (pos < 0 || pos >= max_seq_len) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int blocks_per_head = (head_dim + 31) >> 5;
+
+    size_t q_base = ((size_t)b * n_heads_q + h) * head_dim;
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q_batch[q_base + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        size_t kv_blk_base = ((size_t)h_kv * max_seq_len + t) * blocks_per_head;
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* k_blk = &k_cache[kv_blk_base + blk];
+            float k_d = __half2float(k_blk->d);
+            int q_nib = (k_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            dot_part += q_reg[c] * (k_d * (float)(q_nib - 8));
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* v_blk = &v_cache[kv_blk_base + blk];
+            float v_d = __half2float(v_blk->d);
+            int q_nib = (v_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            acc[c] = acc[c] * alpha + w_t * (v_d * (float)(q_nib - 8));
         }
         l = l * alpha + w_t;
         m = m_new;

@@ -263,4 +263,28 @@ public static unsafe partial class QuantKernels
             }
         }
     }
+
+    /// <summary>
+    /// Dequantizes a row of IEEE BF16 values into 32-bit floating point array.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeBF16(ushort* src, float* dst, int k)
+    {
+        int i = 0;
+        if (Avx2.IsSupported && k >= 8)
+        {
+            int limit8 = k - 8;
+            for (; i <= limit8; i += 8)
+            {
+                var v16 = Vector128.Load(src + i);
+                var v32 = Avx2.ConvertToVector256Int32(v16);
+                var vf = Avx2.ShiftLeftLogical(v32, 16).AsSingle();
+                vf.Store(dst + i);
+            }
+        }
+        for (; i < k; i++)
+        {
+            dst[i] = BitConverter.UInt32BitsToSingle((uint)src[i] << 16);
+        }
+    }
 }

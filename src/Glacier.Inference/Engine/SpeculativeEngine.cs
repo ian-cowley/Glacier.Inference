@@ -158,7 +158,17 @@ public sealed class SpeculativeEngine : IDisposable
         float[]? residualProbs = useLeviathanRejection ? new float[vocabSize] : null;
 
         long ssmStateBytes = _targetSession.StateSnapshotBytes;
-        byte[]? ssmSnapshot = ssmStateBytes > 0 ? new byte[ssmStateBytes] : null;
+        bool usePerStepSnapshots = ssmStateBytes > 0 && _targetSession.SupportsPerStepVerificationSnapshots;
+        byte[]? ssmSnapshot = ssmStateBytes > 0 && !usePerStepSnapshots ? new byte[ssmStateBytes] : null;
+        byte[][]? stepSnapshots = null;
+        if (usePerStepSnapshots && maxDraftCfg > 0)
+        {
+            stepSnapshots = new byte[maxDraftCfg][];
+            for (int s = 0; s < maxDraftCfg; s++)
+            {
+                stepSnapshots[s] = new byte[ssmStateBytes];
+            }
+        }
 
         // 4. Main Speculative Decoding Loop
         while (generatedTokens.Count < options.MaxTokens && (_targetSession.IsRingBufferEnabled || currentPos < maxSeq))
@@ -217,6 +227,7 @@ public sealed class SpeculativeEngine : IDisposable
             {
                 speculativeSteps++;
                 draftTokensProposed += draftedCount;
+                long roundStartTs = Stopwatch.GetTimestamp();
 
                 verifyBatch[0] = pendingToken;
                 for (int i = 0; i < draftedCount; i++)
@@ -238,7 +249,8 @@ public sealed class SpeculativeEngine : IDisposable
                     _targetSession.VerifyBatchLogits(
                         verifyBatch.AsSpan(0, batchLen),
                         currentPos,
-                        targetBatchLogits.AsSpan(0, batchLen * vocabSize));
+                        targetBatchLogits.AsSpan(0, batchLen * vocabSize),
+                        stepSnapshots);
 
                     for (int i = 0; i < draftedCount; i++)
                     {
@@ -295,7 +307,11 @@ public sealed class SpeculativeEngine : IDisposable
                             allTokens.Add(correctionToken);
                             generatedTokens.Add(correctionToken);
 
-                            if (ssmSnapshot != null)
+                            if (stepSnapshots != null)
+                            {
+                                _targetSession.RestoreRecurrentState(stepSnapshots[i]);
+                            }
+                            else if (ssmSnapshot != null)
                             {
                                 RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
                             }
@@ -337,10 +353,11 @@ public sealed class SpeculativeEngine : IDisposable
                         if (IsEos(bonusToken))
                         {
                             finishReason = "stop";
-                            break;
                         }
-
-                        EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
+                        else
+                        {
+                            EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
+                        }
                     }
                 }
                 else
@@ -348,7 +365,8 @@ public sealed class SpeculativeEngine : IDisposable
                     _targetSession.VerifyBatch(
                         verifyBatch.AsSpan(0, batchLen),
                         currentPos,
-                        predictions.AsSpan(0, batchLen));
+                        predictions.AsSpan(0, batchLen),
+                        stepSnapshots);
 
                     for (int i = 0; i < draftedCount; i++)
                     {
@@ -381,7 +399,11 @@ public sealed class SpeculativeEngine : IDisposable
                             allTokens.Add(targetPrediction);
                             generatedTokens.Add(targetPrediction);
 
-                            if (ssmSnapshot != null)
+                            if (stepSnapshots != null)
+                            {
+                                _targetSession.RestoreRecurrentState(stepSnapshots[i]);
+                            }
+                            else if (ssmSnapshot != null)
                             {
                                 RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
                             }
@@ -416,12 +438,16 @@ public sealed class SpeculativeEngine : IDisposable
                         if (IsEos(bonusToken))
                         {
                             finishReason = "stop";
-                            break;
                         }
-
-                        EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
+                        else
+                        {
+                            EmitTokenUtf8(_targetSession.Tokenizer, utf8Decoder, ref charBuf, bonusToken, responseSb, onToken);
+                        }
                     }
                 }
+
+                double roundElapsedMs = Stopwatch.GetElapsedTime(roundStartTs).TotalMilliseconds;
+                _draftProvider.OnVerificationResult(draftedCount, acceptedInStep, roundElapsedMs);
 
                 if (finishReason == "stop")
                 {

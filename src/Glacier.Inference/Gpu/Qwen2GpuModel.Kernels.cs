@@ -46,9 +46,19 @@ public sealed unsafe partial class Qwen2GpuModel
 
     private void LaunchKvStore(int layer, int pos)
     {
-        int total = _nHeadsKv * _headDim;
         uint blockSize = 256;
-        uint gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+        uint gridSize;
+        if (KvPrecision == KvCachePrecision.Q4_0)
+        {
+            int blocksPerHead = (_headDim + 31) / 32;
+            int totalBlocks = _nHeadsKv * blocksPerHead;
+            gridSize = (uint)((totalBlocks + 7) / 8); // 8 warps per 256-thread block
+        }
+        else
+        {
+            int total = _nHeadsKv * _headDim;
+            gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+        }
 
         IntPtr dKCache = _dKeyCache[layer];
         IntPtr dVCache = _dValCache[layer];
@@ -72,6 +82,7 @@ public sealed unsafe partial class Qwen2GpuModel
         {
             KvCachePrecision.Fp16 => _fnKvCacheStoreF16,
             KvCachePrecision.Fp8 => _fnKvCacheStoreFp8,
+            KvCachePrecision.Q4_0 => _fnKvCacheStoreQ4_0,
             _ => _fnKvCacheStore
         };
 
@@ -120,6 +131,7 @@ public sealed unsafe partial class Qwen2GpuModel
         {
             KvCachePrecision.Fp16 => _fnAttentionGqaF16,
             KvCachePrecision.Fp8 => _fnAttentionGqaFp8,
+            KvCachePrecision.Q4_0 => _fnAttentionGqaQ4_0,
             _ => _fnAttentionGqa
         };
 
@@ -167,6 +179,7 @@ public sealed unsafe partial class Qwen2GpuModel
         {
             KvCachePrecision.Fp16 => _fnAttentionGqaBatchF16,
             KvCachePrecision.Fp8 => _fnAttentionGqaBatchFp8,
+            KvCachePrecision.Q4_0 => _fnAttentionGqaBatchQ4_0,
             _ => _fnAttentionGqaBatch
         };
 
@@ -177,6 +190,19 @@ public sealed unsafe partial class Qwen2GpuModel
             0, IntPtr.Zero,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(attention_gqa_batch)");
+    }
+
+    private static void UploadModuleGlobalUlongArray(IntPtr module, string symbolName, ulong[] values)
+    {
+        CuDriver.Check(CuDriver.ModuleGetGlobal(out IntPtr dPtr, out nuint bytes, module, symbolName), $"ModuleGetGlobal({symbolName})");
+        nuint expectedBytes = (nuint)values.Length * sizeof(ulong);
+        if (bytes < expectedBytes)
+            throw new InvalidOperationException($"CUDA device global '{symbolName}' size ({bytes}) is smaller than required ({expectedBytes}).");
+
+        fixed (ulong* pValues = values)
+        {
+            CuDriver.Check(CuDriver.MemcpyHtoD(dPtr, (IntPtr)pValues, expectedBytes), $"MemcpyHtoD({symbolName})");
+        }
     }
 
     private void LaunchGemv(
@@ -197,8 +223,19 @@ public sealed unsafe partial class Qwen2GpuModel
             GgufType.Q3_K => _fnGemvQ3K,
             GgufType.Q6_K => _fnGemvQ6K,
             GgufType.Q8_0 => _fnGemvQ8_0,
+            GgufType.Q2_K => _fnGemvQ2_K,
+            GgufType.Q4_0 => _fnGemvQ4_0,
+            GgufType.Q5_0 => _fnGemvQ5_0,
+            GgufType.IQ2_XXS => _fnGemvIQ2_XXS,
+            GgufType.IQ2_XS => _fnGemvIQ2_XS,
+            GgufType.IQ2_S => _fnGemvIQ2_S,
+            GgufType.IQ3_XXS => _fnGemvIQ3_XXS,
+            GgufType.IQ3_S => _fnGemvIQ3_S,
+            GgufType.IQ4_NL => _fnGemvIQ4_NL,
             GgufType.IQ4_XS => _fnGemvIQ4_XS,
             GgufType.MXFP4 => _fnGemvMXFP4,
+            GgufType.F16 => _fnGemvF16,
+            GgufType.BF16 => _fnGemvBf16,
             GgufType.F32 => _fnGemvFp32,
             _ => throw new NotSupportedException($"GPU GEMV does not support type {type}")
         };
@@ -339,24 +376,49 @@ public sealed unsafe partial class Qwen2GpuModel
         IntPtr dResidual = default,
         IntPtr hStream = default)
     {
+        if (type is not (GgufType.Q4_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F32))
+        {
+            for (int t = 0; t < batchSize; t++)
+            {
+                IntPtr dYT = dY != IntPtr.Zero ? dY + (nint)t * mRows * sizeof(float) : IntPtr.Zero;
+                IntPtr dXT = dX + (nint)t * kCols * sizeof(float);
+                IntPtr dResT = dResidual != IntPtr.Zero ? dResidual + (nint)t * mRows * sizeof(float) : IntPtr.Zero;
+                LaunchGemv(type, dYT, dXT, dW, kCols, mRows, dBias, dResT, hStream);
+            }
+            return;
+        }
+
         IntPtr fn = type switch
         {
             GgufType.Q4_K => _fnGemmQ4KBatch,
             GgufType.Q6_K => _fnGemmQ6KBatch,
             GgufType.Q8_0 => _fnGemmQ8_0Batch,
+            GgufType.F32 => _fnGemmFp32Batch,
             _ => throw new NotSupportedException($"GPU batch GEMM does not support type {type}")
         };
 
         uint blockSize = 128;
         uint numWarps = 4;
-        uint gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
-        int tileSize = type switch
+        uint gridX;
+        uint gridY;
+        if (type == GgufType.F32)
         {
-            GgufType.Q6_K => 8,
-            GgufType.Q8_0 => 8,
-            _ => 16
-        };
-        uint gridY = (uint)((batchSize + tileSize - 1) / tileSize);
+            int tilesPerRow = (batchSize + 7) / 8;
+            long totalWarps = (long)mRows * tilesPerRow;
+            gridX = (uint)((totalWarps + (int)numWarps - 1) / (int)numWarps);
+            gridY = 1;
+        }
+        else
+        {
+            gridX = (uint)((mRows + (int)numWarps - 1) / (int)numWarps);
+            int tileSize = type switch
+            {
+                GgufType.Q6_K => 8,
+                GgufType.Q8_0 => 8,
+                _ => 16
+            };
+            gridY = (uint)((batchSize + tileSize - 1) / tileSize);
+        }
 
         void** pArgs = stackalloc void*[8];
         pArgs[0] = &dY;
@@ -499,9 +561,19 @@ public sealed unsafe partial class Qwen2GpuModel
 
     private void LaunchKvCacheStoreBatch(int layer, int startPos, int batchSize)
     {
-        int total = _nHeadsKv * _headDim * batchSize;
         uint blockSize = 256;
-        uint gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+        uint gridSize;
+        if (KvPrecision == KvCachePrecision.Q4_0)
+        {
+            int blocksPerHead = (_headDim + 31) / 32;
+            int totalBlocks = batchSize * _nHeadsKv * blocksPerHead;
+            gridSize = (uint)((totalBlocks + 7) / 8); // 8 warps per 256-thread block
+        }
+        else
+        {
+            int total = _nHeadsKv * _headDim * batchSize;
+            gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+        }
 
         IntPtr dKCache = _dKeyCache[layer];
         IntPtr dVCache = _dValCache[layer];
@@ -526,6 +598,7 @@ public sealed unsafe partial class Qwen2GpuModel
         {
             KvCachePrecision.Fp16 => _fnKvCacheStoreBatchF16,
             KvCachePrecision.Fp8 => _fnKvCacheStoreBatchFp8,
+            KvCachePrecision.Q4_0 => _fnKvCacheStoreBatchQ4_0,
             _ => _fnKvCacheStoreBatch
         };
 

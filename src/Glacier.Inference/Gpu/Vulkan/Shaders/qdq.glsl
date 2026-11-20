@@ -35,6 +35,9 @@
 #elif QTYPE == 10
   #define BLK 1u
   #define BYTES 2u
+#elif QTYPE == 11
+  #define BLK 1u
+  #define BYTES 2u
 #else
   #define BLK 32u
   #define BYTES 34u
@@ -43,6 +46,7 @@
 uint byteAt(uint o) { return (w[o >> 2] >> ((o & 3u) * 8u)) & 0xFFu; }
 int  sbyteAt(uint o) { int b = int(byteAt(o)); return b - ((b & 0x80) << 1); }
 float halfAt(uint o) { return unpackHalf2x16(byteAt(o) | (byteAt(o + 1u) << 8)).x; }
+float bf16At(uint o) { return uintBitsToFloat((byteAt(o) | (byteAt(o + 1u) << 8)) << 16); }
 
 void scaleMin(uint j, uint scBase, out uint sc, out uint mn) {
     if (j < 4u) {
@@ -165,6 +169,9 @@ float dq(uint b, uint e) {
 #elif QTYPE == 10
     // F16: 16-bit half float
     return halfAt(b + e * 2u);
+#elif QTYPE == 11
+    // BF16: 16-bit brain float
+    return bf16At(b + e * 2u);
 #else
     return halfAt(b) * float(sbyteAt(b + 2u + e));
 #endif

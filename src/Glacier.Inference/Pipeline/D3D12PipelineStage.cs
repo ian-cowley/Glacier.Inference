@@ -36,7 +36,8 @@ public sealed class D3D12PipelineStage : IPipelineStage
         bool isFirstStage,
         bool isLastStage,
         int maxSeqLen = 4096,
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto)
+        KvCachePrecision kvPrecision = KvCachePrecision.Auto,
+        ulong? explicitVramReserveBytes = null)
     {
         _device = device;
         _engine = InferenceEngineType.DirectML;
@@ -50,7 +51,8 @@ public sealed class D3D12PipelineStage : IPipelineStage
             kvPrecision: kvPrecision,
             startLayer: startLayer,
             layerCount: layerCount,
-            isLastStage: isLastStage);
+            isLastStage: isLastStage,
+            explicitVramReserveBytes: explicitVramReserveBytes);
     }
 
     public void ForwardStage(

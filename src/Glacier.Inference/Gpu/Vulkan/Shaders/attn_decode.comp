@@ -13,14 +13,17 @@ shared float sq[256];
 shared float red[256];
 void main() {
     uint h = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint kvLen = pc.kvLen + b;
     uint t = gl_LocalInvocationID.x;
     uint kvh = h / (pc.nHeads / pc.nKv);
-    sq[t] = q[h * 256u + t];
+    uint qBase = (b * pc.nHeads + h) * 256u;
+    sq[t] = q[qBase + t];
     barrier();
-    uint sb = h * pc.maxSeq;
+    uint sb = (b * pc.nHeads + h) * pc.maxSeq;
     uint kb = kvh * pc.maxSeq * 256u;
     float mx = -3.4e38;
-    for (uint p = t; p < pc.kvLen; p += 256u) {
+    for (uint p = t; p < kvLen; p += 256u) {
         float dot = 0.0;
         uint ko = kb + p * 256u;
         for (uint d = 0u; d < 256u; d++) dot += sq[d] * kCache[ko + d];
@@ -34,7 +37,7 @@ void main() {
     float m = red[0];
     barrier();
     float sum = 0.0;
-    for (uint p = t; p < pc.kvLen; p += 256u) {
+    for (uint p = t; p < kvLen; p += 256u) {
         float e = exp(scores[sb + p] - m);
         scores[sb + p] = e;
         sum += e;
@@ -46,7 +49,7 @@ void main() {
     memoryBarrierBuffer();
     barrier();
     float acc = 0.0;
-    for (uint p = 0u; p < pc.kvLen; p++) acc += scores[sb + p] * vCache[kb + p * 256u + t];
-    float g = gate[h * 256u + t];
-    o[h * 256u + t] = acc * inv * (1.0 / (1.0 + exp(-g)));
+    for (uint p = 0u; p < kvLen; p++) acc += scores[sb + p] * vCache[kb + p * 256u + t];
+    float g = gate[qBase + t];
+    o[qBase + t] = acc * inv * (1.0 / (1.0 + exp(-g)));
 }

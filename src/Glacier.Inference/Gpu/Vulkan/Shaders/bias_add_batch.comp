@@ -1,0 +1,13 @@
+#version 450
+// Batched 1D bias addition: X[row * len + j] += Bias[j] for row in [0, rows).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer Bias { float bias[]; };
+layout(push_constant) uniform PC { uint len; uint rows; } pc;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.len * pc.rows;
+    if (idx < total) {
+        x[idx] += bias[idx % pc.len];
+    }
+}

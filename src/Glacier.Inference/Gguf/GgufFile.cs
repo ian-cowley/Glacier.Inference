@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Text;
+using Glacier.Inference.Memory;
 
 /// <summary>
 /// High-performance zero-copy memory-mapped GGUF model reader.
@@ -19,12 +20,24 @@ public sealed unsafe class GgufFile : IDisposable
     private const ulong MaxArrayElements = 1_000_000;
 
     private readonly MemoryMappedFile _mmf;
-    private readonly List<(MemoryMappedFile Mmf, MemoryMappedViewAccessor Acc, IntPtr BasePtr)> _extraShards = new();
+    private readonly List<ExtraShardMapping> _extraShards = new();
     private readonly Dictionary<string, IntPtr> _shardTensorPtrs = new();
+    private readonly Dictionary<string, (string Path, long FileOffset)> _shardTensorLocations = new(StringComparer.Ordinal);
     private readonly MemoryMappedViewAccessor _accessor;
     private byte* _basePointer;
     private readonly long _fileLength;
     private bool _disposed;
+
+    private sealed class ExtraShardMapping
+    {
+        public required string Path { get; init; }
+        public required ulong TensorDataOffset { get; init; }
+        public required int TensorCount { get; init; }
+        public required string? SingleTensorName { get; init; }
+        public required MemoryMappedFile Mmf { get; init; }
+        public required MemoryMappedViewAccessor Acc { get; init; }
+        public required IntPtr BasePtr { get; set; }
+    }
 
     public string FilePath { get; }
     public uint Version { get; }
@@ -44,8 +57,8 @@ public sealed unsafe class GgufFile : IDisposable
     public int ContextLength => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.context_length", 32768), 1, 1_048_576);
     public int EmbeddingLength => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.embedding_length", 3584), 1, 131_072);
     public int FeedForwardLength => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.feed_forward_length", 18944), 1, 524_288);
-    public int HeadCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.attention.head_count", 28), 1, 1024);
-    public int HeadCountKv => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.attention.head_count_kv", 4), 1, 1024);
+    public int HeadCount => Math.Clamp(GetMaxMetadataInt($"{Architecture}.attention.head_count", 28), 1, 1024);
+    public int HeadCountKv => Math.Clamp(GetMaxMetadataInt($"{Architecture}.attention.head_count_kv", 4), 1, 1024);
     public int HeadDim
     {
         get
@@ -88,13 +101,34 @@ public sealed unsafe class GgufFile : IDisposable
     public bool NormTopK => Architecture != "deepseek2" && Architecture != "qwen2moe" && GetMetadataBool($"{Architecture}.expert_weights_norm", Architecture != "deepseek2" && Architecture != "qwen2moe");
     public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
 
-    public bool IsHybridSsm => Architecture == "qwen35" || Tensors.ContainsKey("blk.0.ssm_out.weight") || Tensors.ContainsKey("blk.0.ssm_conv1d.weight");
+    public bool IsHybridSsm => Architecture == "qwen35" || Architecture == "qwen4exp" || Architecture == "qwen38" || Tensors.ContainsKey("blk.0.ssm_out.weight") || Tensors.ContainsKey("blk.0.ssm_conv1d.weight");
     public int FullAttentionInterval => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.full_attention_interval", 4), 1, 256);
     public int SsmConvKernel => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.conv_kernel", 4), 1, 256);
     public int SsmStateSize => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.state_size", 128), 1, 4096);
     public int SsmGroupCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.group_count", 16), 1, 1024);
     public int SsmTimeStepRank => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.time_step_rank", 48), 1, 1024);
     public int SsmInnerSize => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.inner_size", 6144), 1, 131_072);
+
+    // Qwen3.8-Flash-Next (qwen4exp): Hyper-Connections, QSA Indexer, and PLE
+    public int HyperConnectionCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.hyper_connection.count", 0), 0, 64);
+    public int HyperConnectionLowRank => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.hyper_connection.low_rank", 0), 0, 8192);
+    public int IndexerHeadCount => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.attention.indexer.head_count", 4), 1, 256);
+    public int IndexerKeyLength => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.attention.indexer.key_length", 128), 1, 4096);
+    public int IndexerTopK => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.attention.indexer.top_k", 2048), 1, 1_048_576);
+    public int[]? AttentionCompressRatios => GetMetadataInt32Array($"{Architecture}.attention.compress_ratios");
+    public int[]? PleLayers => GetMetadataInt32Array($"{Architecture}.ple.layers");
+    public int PleNgramSize => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ple.ngram_size", 3), 1, 32);
+    public int PleHeadsPerNgram => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ple.heads_per_ngram", 8), 1, 64);
+    public int PleConvKernel => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ple.conv_kernel", 4), 1, 64);
+    public int PleEosTokenId => (int)GetMetadataUInt32($"{Architecture}.ple.eos_token_id", (uint)GetMetadataUInt32("tokenizer.ggml.eos_token_id", 248044));
+    public int PleImageTokenId => Metadata.ContainsKey($"{Architecture}.ple.image_token_id") ? (int)GetMetadataUInt32($"{Architecture}.ple.image_token_id", 0) : -1;
+    public int PleRowDim => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.embedding_length_per_layer_input", 160), 1, 8192);
+    public ulong[]? PleLayerMultipliers => GetMetadataUInt64Array($"{Architecture}.ple.layer_multipliers");
+    public long[]? PleHeadOffsets => GetMetadataInt64Array($"{Architecture}.ple.head_offsets");
+    public long[]? PleHeadVocabSizes => GetMetadataInt64Array($"{Architecture}.ple.head_vocab_sizes");
+
+    public string? PleTableFilePath { get; private set; }
+    public long PleTableByteOffset { get; private set; }
 
     public float FinalLogitSoftcapping => GetMetadataSingle($"{Architecture}.final_logit_softcapping", 0f);
     public float AttnLogitSoftcapping => GetMetadataSingle($"{Architecture}.attention.logit_softcapping",
@@ -170,7 +204,8 @@ public sealed unsafe class GgufFile : IDisposable
         if (_fileLength < MinGgufHeaderSize)
             throw new InvalidDataException($"File is too short to be a valid GGUF file ({_fileLength} bytes).");
 
-        _mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+        var primaryStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        _mmf = MemoryMappedFile.CreateFromFile(primaryStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
         try
         {
             _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
@@ -267,19 +302,19 @@ public sealed unsafe class GgufFile : IDisposable
             if (TensorCount > 0 && TensorDataOffset > (ulong)_fileLength)
                 throw new InvalidDataException($"Tensor data offset ({TensorDataOffset}) exceeds file size ({_fileLength}).");
 
-            // 5. Validate All Tensor Offsets and Bounds
+            // 5. Validate All Tensor Offsets, Bounds, and Quantized Block Alignment
             foreach (var tensor in TensorList)
             {
-                ulong byteSize = tensor.GetByteSize();
-                ulong endOffset = TensorDataOffset + tensor.Offset + byteSize;
-
-                if (tensor.Offset > (ulong)_fileLength || endOffset < TensorDataOffset || endOffset > (ulong)_fileLength)
-                {
-                    throw new InvalidDataException($"Tensor '{tensor.Name}' bounds [{TensorDataOffset + tensor.Offset}..{endOffset}] exceed file size ({_fileLength}).");
-                }
+                ValidateTensorBoundsAndAlignment(tensor, TensorDataOffset, (ulong)_fileLength, "primary file");
             }
 
-            // 6. Load additional split-GGUF shards if present (-00001-of-0000N.gguf)
+            // 6. Record PLE table location in primary file if present, and load additional split shards
+            if (Tensors.TryGetValue("per_layer_token_embd.weight", out var primaryPle))
+            {
+                PleTableFilePath = filePath;
+                PleTableByteOffset = (long)(TensorDataOffset + primaryPle.Offset);
+            }
+
             LoadExtraShards(filePath);
         }
         catch
@@ -314,6 +349,30 @@ public sealed unsafe class GgufFile : IDisposable
     public bool TryGetTensor(string tensorName, out GgufTensorInfo? tensor) =>
         Tensors.TryGetValue(tensorName, out tensor);
 
+    public bool TryGetTensorFileLocation(string tensorName, out string filePath, out long fileByteOffset, out ulong byteSize)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!Tensors.TryGetValue(tensorName, out var info) || info == null)
+        {
+            filePath = string.Empty;
+            fileByteOffset = 0;
+            byteSize = 0;
+            return false;
+        }
+
+        byteSize = info.GetByteSize();
+        if (_shardTensorLocations.TryGetValue(tensorName, out var shardLoc))
+        {
+            filePath = shardLoc.Path;
+            fileByteOffset = shardLoc.FileOffset;
+            return true;
+        }
+
+        filePath = FilePath;
+        fileByteOffset = checked((long)(TensorDataOffset + info.Offset));
+        return true;
+    }
+
     public string GetMetadataString(string key, string fallback = "") =>
         Metadata.TryGetValue(key, out var val) && val is string s ? s : fallback;
 
@@ -325,6 +384,28 @@ public sealed unsafe class GgufFile : IDisposable
             if (val is int i32 && i32 >= 0) return (uint)i32;
             if (val is ulong u64 && u64 <= uint.MaxValue) return (uint)u64;
         }
+        return fallback;
+    }
+
+    private int GetMaxMetadataInt(string key, int fallback)
+    {
+        if (!Metadata.TryGetValue(key, out var val) || val == null)
+            return fallback;
+
+        if (val is uint u32) return u32 <= int.MaxValue ? (int)u32 : int.MaxValue;
+        if (val is int i32 && i32 >= 0) return i32;
+        if (val is ulong u64 && u64 <= int.MaxValue) return (int)u64;
+        if (val is List<object> list)
+        {
+            int max = 0;
+            for (int i = 0; i < list.Count; i++)
+            {
+                int item = Convert.ToInt32(list[i]);
+                if (item > max) max = item;
+            }
+            if (max > 0) return max;
+        }
+
         return fallback;
     }
 
@@ -354,6 +435,61 @@ public sealed unsafe class GgufFile : IDisposable
         if (Metadata.TryGetValue(key, out var val) && val is List<object> list)
             return list;
         return null;
+    }
+
+    public int[]? GetMetadataInt32Array(string key)
+    {
+        var list = GetMetadataList(key);
+        if (list == null) return null;
+        var arr = new int[list.Count];
+        for (int i = 0; i < list.Count; i++) arr[i] = Convert.ToInt32(list[i]);
+        return arr;
+    }
+
+    public long[]? GetMetadataInt64Array(string key)
+    {
+        var list = GetMetadataList(key);
+        if (list == null) return null;
+        var arr = new long[list.Count];
+        for (int i = 0; i < list.Count; i++) arr[i] = Convert.ToInt64(list[i]);
+        return arr;
+    }
+
+    public ulong[]? GetMetadataUInt64Array(string key)
+    {
+        var list = GetMetadataList(key);
+        if (list == null) return null;
+        var arr = new ulong[list.Count];
+        for (int i = 0; i < list.Count; i++) arr[i] = Convert.ToUInt64(list[i]);
+        return arr;
+    }
+
+    /// <summary>
+    /// If <c>per_layer_token_embd.weight</c> resides in its own exclusive split-GGUF shard, closes that shard's
+    /// memory mapping so Windows/Linux unbuffered Direct I/O does not contend with an active mmap section.
+    /// </summary>
+    public bool DetachExclusivePleShardMapping()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        for (int i = _extraShards.Count - 1; i >= 0; i--)
+        {
+            var shard = _extraShards[i];
+            if (shard.TensorCount == 1 && shard.SingleTensorName == "per_layer_token_embd.weight")
+            {
+                if (shard.BasePtr != IntPtr.Zero)
+                {
+                    try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                    shard.BasePtr = IntPtr.Zero;
+                }
+                shard.Acc.Dispose();
+                shard.Mmf.Dispose();
+                _shardTensorPtrs.Remove("per_layer_token_embd.weight");
+                _shardTensorLocations.Remove("per_layer_token_embd.weight");
+                _extraShards.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void EnsureReadable(byte* ptr, byte* endPtr, ulong bytes)
@@ -468,11 +604,11 @@ public sealed unsafe class GgufFile : IDisposable
             }
             _accessor?.Dispose();
             _mmf?.Dispose();
-            foreach (var (mmf, acc, ptr) in _extraShards)
+            foreach (var shard in _extraShards)
             {
-                if (ptr != IntPtr.Zero) { try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { } }
-                acc.Dispose();
-                mmf.Dispose();
+                if (shard.BasePtr != IntPtr.Zero) { try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { } }
+                shard.Acc.Dispose();
+                shard.Mmf.Dispose();
             }
             _extraShards.Clear();
             _disposed = true;
@@ -495,11 +631,11 @@ public sealed unsafe class GgufFile : IDisposable
                 throw new FileNotFoundException($"Missing split-GGUF shard {s}/{splitCount}: {shardPath}", shardPath);
 
             long shardLen = new FileInfo(shardPath).Length;
-            var mmf = MemoryMappedFile.CreateFromFile(shardPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            var shardStream = new FileStream(shardPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var mmf = MemoryMappedFile.CreateFromFile(shardStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
             var acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
             byte* basePtr = null;
             acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
-            _extraShards.Add((mmf, acc, (IntPtr)basePtr));
 
             byte* ptr = basePtr;
             byte* endPtr = basePtr + shardLen;
@@ -537,13 +673,89 @@ public sealed unsafe class GgufFile : IDisposable
             ulong headerBytes = (ulong)(ptr - basePtr);
             ulong rem = headerBytes % shardAlign;
             ulong dataOff = rem == 0 ? headerBytes : headerBytes + (shardAlign - rem);
+
+            _extraShards.Add(new ExtraShardMapping
+            {
+                Path = shardPath,
+                TensorDataOffset = dataOff,
+                TensorCount = shardTensors.Count,
+                SingleTensorName = shardTensors.Count == 1 ? shardTensors[0].Name : null,
+                Mmf = mmf,
+                Acc = acc,
+                BasePtr = (IntPtr)basePtr
+            });
+
             foreach (var t in shardTensors)
             {
-                ulong endOff = dataOff + t.Offset + t.GetByteSize();
-                if (t.Offset > (ulong)shardLen || endOff < dataOff || endOff > (ulong)shardLen)
-                    throw new InvalidDataException($"Tensor '{t.Name}' bounds exceed shard {shardPath} size.");
+                ValidateTensorBoundsAndAlignment(t, dataOff, (ulong)shardLen, $"shard '{Path.GetFileName(shardPath)}'");
                 _shardTensorPtrs[t.Name] = (IntPtr)(basePtr + dataOff + t.Offset);
+                _shardTensorLocations[t.Name] = (shardPath, checked((long)(dataOff + t.Offset)));
+                if (t.Name == "per_layer_token_embd.weight")
+                {
+                    PleTableFilePath = shardPath;
+                    PleTableByteOffset = (long)(dataOff + t.Offset);
+                }
             }
+        }
+    }
+
+    private static void ValidateTensorBoundsAndAlignment(
+        GgufTensorInfo tensor,
+        ulong dataOffset,
+        ulong fileLength,
+        string contextLabel)
+    {
+        ulong elemCount = tensor.Dimensions.Length == 0 ? 0UL : 1UL;
+        try
+        {
+            checked
+            {
+                for (int d = 0; d < tensor.Dimensions.Length; d++)
+                    elemCount *= tensor.Dimensions[d];
+            }
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException($"Tensor '{tensor.Name}' dimensions overflow element count in {contextLabel}.", ex);
+        }
+
+        if (GgufTypes.TryGetBlockInfo(tensor.Type, out int blockSize, out _) && blockSize > 1)
+        {
+            if (tensor.Dimensions.Length == 0 || tensor.Dimensions[0] == 0 || (tensor.Dimensions[0] % (ulong)blockSize) != 0)
+            {
+                ulong innerDim = tensor.Dimensions.Length > 0 ? tensor.Dimensions[0] : 0UL;
+                throw new InvalidDataException(
+                    $"Tensor '{tensor.Name}' ({tensor.Type}) innermost dimension ({innerDim}) must be a positive multiple of block size {blockSize} in {contextLabel}.");
+            }
+        }
+
+        ulong byteSize;
+        try
+        {
+            checked
+            {
+                if (GgufTypes.TryGetBlockInfo(tensor.Type, out int bs, out int bb))
+                {
+                    byteSize = (elemCount / (ulong)bs) * (ulong)bb;
+                }
+                else
+                {
+                    byteSize = elemCount * 2UL;
+                }
+            }
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException($"Tensor '{tensor.Name}' byte size overflows in {contextLabel}.", ex);
+        }
+
+        if (tensor.Offset > fileLength ||
+            dataOffset > fileLength ||
+            tensor.Offset > fileLength - dataOffset ||
+            byteSize > fileLength - dataOffset - tensor.Offset)
+        {
+            throw new InvalidDataException(
+                $"Tensor '{tensor.Name}' bounds exceed {contextLabel} size ({fileLength}).");
         }
     }
 }

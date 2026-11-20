@@ -92,6 +92,23 @@ public sealed class D3D12LayerWeights : IDisposable
     public GgufType SsmOutType { get; init; }
     public ID3D12Resource? SsmNormWeight { get; init; }
 
+    // Qwen3.8-Flash-Next (qwen4exp) Hyper-Connections
+    public bool HasHyperConnections { get; init; }
+    public ID3D12Resource? HcAttnNormWeight { get; init; }
+    public ID3D12Resource? HcAttnDownWeight { get; init; }
+    public GgufType HcAttnDownType { get; init; }
+    public ID3D12Resource? HcAttnUpWeight { get; init; }
+    public GgufType HcAttnUpType { get; init; }
+    public ID3D12Resource? HcAttnInjectWeight { get; init; }
+    public GgufType HcAttnInjectType { get; init; }
+    public ID3D12Resource? HcFfnNormWeight { get; init; }
+    public ID3D12Resource? HcFfnDownWeight { get; init; }
+    public GgufType HcFfnDownType { get; init; }
+    public ID3D12Resource? HcFfnUpWeight { get; init; }
+    public GgufType HcFfnUpType { get; init; }
+    public ID3D12Resource? HcFfnInjectWeight { get; init; }
+    public GgufType HcFfnInjectType { get; init; }
+
     public void Dispose()
     {
         AttnNormWeight?.Dispose();
@@ -139,5 +156,14 @@ public sealed class D3D12LayerWeights : IDisposable
         SsmAWeight?.Dispose();
         SsmOutWeight?.Dispose();
         SsmNormWeight?.Dispose();
+
+        HcAttnNormWeight?.Dispose();
+        HcAttnDownWeight?.Dispose();
+        HcAttnUpWeight?.Dispose();
+        HcAttnInjectWeight?.Dispose();
+        HcFfnNormWeight?.Dispose();
+        HcFfnDownWeight?.Dispose();
+        HcFfnUpWeight?.Dispose();
+        HcFfnInjectWeight?.Dispose();
     }
 }

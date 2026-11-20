@@ -31,4 +31,9 @@ public sealed record SpeculativeOptions
     /// Sampling parameters applied to model verification (default: Greedy).
     /// </summary>
     public SamplingOptions Sampling { get; init; } = SamplingOptions.Greedy;
+
+    /// <summary>
+    /// Number of iterative parallel mask-refinement steps for DFlash block-diffusion drafting (default: 3).
+    /// </summary>
+    public int DFlashDiffusionSteps { get; init; } = 3;
 }

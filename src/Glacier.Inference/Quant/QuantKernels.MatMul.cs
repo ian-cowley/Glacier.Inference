@@ -24,7 +24,7 @@ public static unsafe partial class QuantKernels
     /// </summary>
     public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows, float* xSums)
     {
-        Debug.Assert(nCols > 0 && (nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
+        Debug.Assert(nCols > 0 && (type is GgufType.F32 or GgufType.F16 or GgufType.BF16 || nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (type == GgufType.Q4_K && xSums == null && nCols >= 32)
         {
             int nChunks = nCols / 32;
@@ -74,7 +74,7 @@ public static unsafe partial class QuantKernels
         int batchSize,
         float* xSumsBatch = null)
     {
-        Debug.Assert(nCols > 0 && (nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
+        Debug.Assert(nCols > 0 && (type is GgufType.F32 or GgufType.F16 or GgufType.BF16 || nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (batchSize == 1)
         {
             MatVecMul(type, weightData, xBatch, yBatch, nCols, nRows, xSumsBatch);
@@ -154,10 +154,15 @@ public static unsafe partial class QuantKernels
             GgufType.Q2_K => VecDotQ2_K((BlockQ2_K*)rowPtr, x, nCols),
             GgufType.Q2_0 => VecDotQ2_0((BlockQ2_0*)rowPtr, x, nCols),
             GgufType.MXFP4 => VecDotMXFP4((BlockMXFP4*)rowPtr, x, nCols),
+            GgufType.GgmlQ2_0 => VecDotGgmlQ2_0((BlockGgmlQ2_0*)rowPtr, x, nCols),
             GgufType.IQ4_XS => VecDotIQ4_XS((BlockIQ4_XS*)rowPtr, x, nCols),
             GgufType.IQ4_NL => VecDotIQ4_NL((BlockIQ4_NL*)rowPtr, x, nCols),
             GgufType.IQ3_S => VecDotIQ3_S((BlockIQ3_S*)rowPtr, x, nCols),
+            GgufType.IQ3_XXS => VecDotIQ3_XXS((BlockIQ3_XXS*)rowPtr, x, nCols),
             GgufType.IQ2_XXS => VecDotIQ2_XXS((BlockIQ2_XXS*)rowPtr, x, nCols),
+            GgufType.IQ2_XS => VecDotIQ2_XS((BlockIQ2_XS*)rowPtr, x, nCols),
+            GgufType.IQ2_S => VecDotIQ2_S((BlockIQ2_S*)rowPtr, x, nCols),
+            GgufType.BF16 => VecDotBF16((ushort*)rowPtr, x, nCols),
             GgufType.F16 => VecDotF16((Half*)rowPtr, x, nCols),
             GgufType.F32 => VecDotF32((float*)rowPtr, x, nCols),
             _ => throw new NotSupportedException($"Quantization type {type} is not supported in hardware GEMV kernels.")

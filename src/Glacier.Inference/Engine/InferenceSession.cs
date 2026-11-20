@@ -99,23 +99,62 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null || _pipelineSession != null;
     public bool IsPipelineAccelerated => _pipelineSession != null;
     public PipelineSession? PipelineSession => _pipelineSession;
-    public KvCachePrecision KvPrecision => _gpuModel?.KvPrecision ?? KvCachePrecision.Fp32;
+    public KvCachePrecision KvPrecision =>
+        _gpuModel?.KvPrecision
+        ?? _d3d12Model?.KvPrecision
+        ?? _kvCache?.Precision
+        ?? (_cpuModel as Gemma4Model)?.GemmaCache.Precision
+        ?? KvCachePrecision.Fp32;
     public Qwen2GpuModel? GpuModel => _gpuModel;
     public ID3D12Model? D3D12Model => _d3d12Model;
     public ICpuModel? CpuModel => _cpuModel;
+    public HostRamExpertArena? ExpertArena => _weights.ExpertArena;
+    public IHiddenStateSource? HiddenStateSource =>
+        (_cpuModel as IHiddenStateSource)
+#if !ANDROID
+        ?? (_d3d12Model as IHiddenStateSource)
+#endif
+        ;
+    public DirectIoNgramTable? PleTable =>
+        (_cpuModel as Qwen3HybridModel)?.PleTable
+#if !ANDROID
+        ?? (_d3d12Model as Qwen3HybridD3D12Model)?.PleTable
+#endif
+        ;
     public UniversalArchitecture Architecture => _weights.ArchitectureFamily;
     public int MaxSeqLen => _maxSeqLen;
     public int VocabSize => _weights.VocabSize;
     public bool SupportsLogitVerification => true;
+    public bool SupportsPerStepVerificationSnapshots =>
+        (_cpuModel?.SupportsPerStepVerificationSnapshots ?? false)
+#if !ANDROID
+        || (_d3d12Model is Qwen3HybridD3D12Model qhSnap && qhSnap.SupportsPerStepVerificationSnapshots)
+        || (_d3d12Model is Qwen35VulkanModel vk35Snap && vk35Snap.SupportsPerStepVerificationSnapshots)
+#endif
+        ;
+    public int MoeTailSkipMinRank
+    {
+        get => _cpuModel?.MoeTailSkipMinRank ?? 0;
+        set
+        {
+            if (_cpuModel != null)
+            {
+                _cpuModel.MoeTailSkipMinRank = value;
+            }
+        }
+    }
     public bool IsRingBufferEnabled => _kvCache?.IsRingBuffer == true && _cpuModel is not Gemma4Model;
-    public long StateSnapshotBytes => _cpuModel?.StateSnapshotBytes ?? 0;
+    public long StateSnapshotBytes =>
+        _cpuModel?.StateSnapshotBytes
+#if !ANDROID
+        ?? (_d3d12Model as Qwen3HybridD3D12Model)?.StateSnapshotBytes
+        ?? (_d3d12Model as Qwen35VulkanModel)?.StateSnapshotBytes
+#endif
+        ?? 0;
     public bool HasUnsnapshottableRecurrentState =>
         StateSnapshotBytes == 0 &&
         (_weights.IsHybridSsm ||
          _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm ||
-#if !ANDROID
-         _d3d12Model is Qwen3HybridD3D12Model ||
-#endif
          (_pipelineSession != null && _weights.IsHybridSsm));
     public bool CanOverwriteKvFromPrefix =>
         !IsRingBufferEnabled && StateSnapshotBytes == 0 && !HasUnsnapshottableRecurrentState;
@@ -134,8 +173,13 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         string? device = null,
         InferenceEngineType engine = InferenceEngineType.Auto,
         KvCachePrecision kvPrecision = KvCachePrecision.Auto,
-        string? split = null)
+        string? split = null,
+        PleIoMode pleIoMode = PleIoMode.Auto,
+        ulong? hostArenaBudgetBytes = null,
+        bool? tieredMoe = null,
+        int? vramReserveMb = null)
     {
+        ulong? explicitVramReserveBytes = WddmVramGuard.ResolveExplicitReserveBytes(vramReserveMb);
         _gguf = GgufFile.Open(modelPath);
         if (Embedding.EmbeddingGemma2Model.IsSupported(_gguf))
         {
@@ -149,6 +193,18 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         _sampler = new Sampler();
         _logits = new float[_weights.VocabSize];
 
+        var hwSnapshot = HardwareRuntimeProfiler.CaptureSnapshot();
+        var hwPolicy = HardwareRuntimeProfiler.RecommendPolicy(hwSnapshot, _weights);
+        PleIoMode resolvedPleIo = pleIoMode == PleIoMode.Auto ? hwPolicy.RecommendedPleIoMode : pleIoMode;
+
+        ulong defaultArenaBudget = hwPolicy.RecommendedHostArenaBytes;
+        if (resolvedPleIo == PleIoMode.MemoryMapped && _gguf.TryGetTensor("per_layer_token_embd.weight", out var pleTensorInfo) && pleTensorInfo != null)
+        {
+            ulong pleBytes = pleTensorInfo.GetByteSize();
+            defaultArenaBudget = defaultArenaBudget > pleBytes ? defaultArenaBudget - pleBytes : 0UL;
+        }
+        ulong effectiveArenaBudget = hostArenaBudgetBytes ?? defaultArenaBudget;
+
         string? effectiveSplit = split;
         if (effectiveSplit == null && device != null && (device.Contains(',') || device.Contains(':') || device.Equals("auto", StringComparison.OrdinalIgnoreCase)))
         {
@@ -161,7 +217,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
         if (stageSpecs != null && stageSpecs.Count > 1)
         {
-            _pipelineSession = PipelineSession.Create(_weights, stageSpecs, maxSeqLen, kvPrecision);
+            _pipelineSession = PipelineSession.Create(_weights, stageSpecs, maxSeqLen, kvPrecision, explicitVramReserveBytes);
             _kvCache = null;
             ActiveDevice = _pipelineSession.TopologyDescription;
             Device = stageSpecs[0].Device;
@@ -198,6 +254,14 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             }
 #endif
 
+            void EnsureHostExpertArenaIfNeeded()
+            {
+                if (_weights.IsMoe && _weights.ExpertArena == null && effectiveArenaBudget > 0)
+                {
+                    _weights.AttachExpertArena(effectiveArenaBudget, preferUnbufferedIo: true);
+                }
+            }
+
             if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
@@ -205,7 +269,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpu = new GpuContext(targetDevice.Index);
                     _gpuModel = new Qwen2GpuModel(_gpu, _weights, maxSeqLen, kvPrecision);
                     _kvCache = null; // GPU maintains all KV states in device VRAM
-                    ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision} | Arch: {_weights.ArchitectureFamily}]";
+                    ActiveDevice = $"{targetDevice.Name} [Engine: Pure C# Bare-Metal SASS | KV: {_gpuModel.KvPrecision.ToDisplayName()} | Arch: {_weights.ArchitectureFamily}]";
                 }
                 catch (Exception ex)
                 {
@@ -218,15 +282,16 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _gpu?.Dispose();
                     _gpu = null;
                     _gpuModel = null;
-                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                    EnsureHostExpertArenaIfNeeded();
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim, precision: kvPrecision);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen, pleIoMode: resolvedPleIo, kvPrecision: kvPrecision);
                     Device = DeviceManager.ResolveDevice("cpu");
                     Engine = InferenceEngineType.Cpu;
                     ActiveDevice = $"{Device.Name} [Fallback from Bare-Metal | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
 #if !ANDROID
-            else if (!_weights.IsMla && (_weights.IsHybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+            else if (!_weights.IsMla && (_weights.IsHybridSsm || _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      (targetDevice.Vendor == GpuVendor.Amd || targetDevice.Vendor == GpuVendor.Nvidia || targetDevice.Vendor == GpuVendor.Intel) && OperatingSystem.IsWindows())
             {
                 try
@@ -234,20 +299,62 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     var d3dCtx = new D3D12Context(targetDevice.Index);
                     if (_weights.ArchitectureFamily == UniversalArchitecture.Gemma4)
                     {
-                        _d3d12Model = new Gemma4D3D12Model(d3dCtx, _weights, maxSeqLen);
-                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (Google Gemma 4 ISWA + Dual MoE) | KV: FP32 | Arch: Gemma 4]";
+                        var gemmaD3d = new Gemma4D3D12Model(d3dCtx, _weights, maxSeqLen, kvPrecision, explicitVramReserveBytes);
+                        _d3d12Model = gemmaD3d;
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (Google Gemma 4 ISWA + Dual MoE) | KV: {gemmaD3d.KvPrecision.ToDisplayName()} | Arch: Gemma 4]";
                     }
                     else if (_weights.IsHybridSsm || _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm)
                     {
-                        _d3d12Model = new Qwen3HybridD3D12Model(d3dCtx, _weights, maxSeqLen);
-                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (Qwen 3.5/3.6 Gated DeltaNet SSM) | KV: FP32 | Arch: HybridSsm]";
+                        bool willTieredMoe = tieredMoe ?? false;
+                        if (!tieredMoe.HasValue && _weights.IsMoe)
+                        {
+                            ulong expertBytes = EstimateHybridExpertBytes(_weights);
+                            var vramSnap = d3dCtx.QueryVramHeadroom(explicitVramReserveBytes);
+                            ulong safeVram = vramSnap.SafeAvailableBytes > 0 ? vramSnap.SafeAvailableBytes : d3dCtx.TotalAccessibleMemory;
+                            ulong trunkMargin = 512UL * 1024 * 1024;
+                            willTieredMoe = safeVram > 0 && expertBytes + trunkMargin > safeVram;
+                        }
+
+                        if (willTieredMoe)
+                        {
+                            // Pre-populate DDR4 HostRamExpertArena so Hosted MoE slot pre-warming & overflow avoid NVMe page faults
+                            EnsureHostExpertArenaIfNeeded();
+                        }
+
+                        var qhD3d = new Qwen3HybridD3D12Model(
+                            d3dCtx,
+                            _weights,
+                            maxSeqLen,
+                            tieredMoe: tieredMoe,
+                            pleIoMode: resolvedPleIo,
+                            kvPrecision: kvPrecision,
+                            explicitVramReserveBytes: explicitVramReserveBytes);
+                        _d3d12Model = qhD3d;
+
+                        if (qhD3d.TieredMoe && _weights.ExpertArena == null)
+                        {
+                            EnsureHostExpertArenaIfNeeded();
+                        }
+
+                        string qhArch = (_weights.HyperConnectionCount > 0 || _weights.PleHashConfig != null)
+                            ? "Qwen 3.8 GDN/QSA+PLE"
+                            : "Qwen 3.5/3.6 Gated DeltaNet SSM";
+                        string qhMoe = _weights.IsMoe
+                            ? (qhD3d.TieredMoe ? $" + Hosted MoE ({qhD3d.ActiveHostedMoeSlots}/{qhD3d.HostedMoeSlotCapacity} VRAM slots)" : " + VRAM MoE")
+                            : "";
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute ({qhArch}{qhMoe}) | KV: {qhD3d.KvPrecision.ToDisplayName()} | Arch: {_weights.ArchitectureFamily}]";
                     }
                     else
                     {
-                        var qwenD3d = new Qwen2D3D12Model(d3dCtx, _weights, maxSeqLen);
+                        var qwenD3d = new Qwen2D3D12Model(
+                            d3dCtx,
+                            _weights,
+                            maxSeqLen,
+                            kvPrecision: kvPrecision,
+                            explicitVramReserveBytes: explicitVramReserveBytes);
                         _d3d12Model = qwenD3d;
                         string moeSuffix = _weights.IsMoe ? (qwenD3d.TieredMoe ? " Tiered MoE (GPU+CPU)" : " MoE") : "";
-                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{moeSuffix}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                        ActiveDevice = $"{targetDevice.Name} [Engine: Bare-Metal DirectX 12 Compute (HLSL Wave32{moeSuffix}) | KV: {qwenD3d.KvPrecision.ToDisplayName()} | Arch: {_weights.ArchitectureFamily}]";
                     }
                     _kvCache = null; // GPU maintains all KV states in device VRAM
                 }
@@ -261,14 +368,16 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
                     _d3d12Model?.Dispose();
                     _d3d12Model = null;
-                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                    EnsureHostExpertArenaIfNeeded();
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim, precision: kvPrecision);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen, pleIoMode: resolvedPleIo, kvPrecision: kvPrecision);
                     Device = DeviceManager.ResolveDevice("cpu");
                     Engine = InferenceEngineType.Cpu;
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
             else if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
+                     _weights.HyperConnectionCount == 0 && _weights.PleHashConfig == null &&
                      VulkanContext.IsSupported &&
                      (Mamba2VulkanModel.IsSupported(_weights, out _) || Qwen35VulkanModel.IsSupported(_weights, out _) || Gemma4VulkanModel.IsSupported(_weights, out _) || Qwen2VulkanModel.IsSupported(_weights, out _)) &&
                      Qwen35VulkanModel.FindVulkanDevice(targetDevice.Name) >= 0)
@@ -306,8 +415,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
 
                     _d3d12Model?.Dispose();
                     _d3d12Model = null;
-                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                    EnsureHostExpertArenaIfNeeded();
+                    _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim, precision: kvPrecision);
+                    _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen, pleIoMode: resolvedPleIo, kvPrecision: kvPrecision);
                     Device = DeviceManager.ResolveDevice("cpu");
                     Engine = InferenceEngineType.Cpu;
                     ActiveDevice = $"{Device.Name} [Fallback from Vulkan | Arch: {_weights.ArchitectureFamily}]";
@@ -337,8 +447,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     throw new InvalidOperationException($"Cannot run on {targetDevice.Name} with engine '{targetEngine}': {reason}");
                 }
 
-                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim);
-                _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen);
+                EnsureHostExpertArenaIfNeeded();
+                _kvCache = new KVCache(_weights.BlockCount, _weights.HeadCountKv, _weights.HeadDim, maxSeqLen, _weights.ValueDim, precision: kvPrecision);
+                _cpuModel = CpuModelFactory.Create(_weights, maxSeqLen, pleIoMode: resolvedPleIo, kvPrecision: kvPrecision);
                 var cpuDevice = DeviceManager.ResolveDevice("cpu");
                 if (targetDevice.Vendor != GpuVendor.Cpu || targetEngine != InferenceEngineType.Cpu)
                 {
@@ -366,7 +477,31 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
     }
 
-    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device, KvCachePrecision kvPrecision = KvCachePrecision.Auto, string? split = null)
+    private static unsafe ulong EstimateHybridExpertBytes(ModelWeights weights)
+    {
+        int expertFfnDim = weights.ExpertFeedForwardLength;
+        int numExperts = weights.ExpertCount;
+        int dim = weights.EmbeddingLength;
+        if (!weights.IsMoe || expertFfnDim <= 0 || numExperts <= 0) return 0UL;
+
+        ulong total = 0;
+        for (int l = 0; l < weights.BlockCount; l++)
+        {
+            var lw = weights.Layers[l];
+            if (lw == null || !lw.IsMoe) continue;
+
+            ulong perExpert = lw.FfnGateUpExpsWeight != null && lw.FfnGateExpsWeight == null
+                ? (ulong)(2L * expertFfnDim * GgufTypes.GetRowBytes(lw.FfnGateUpExpsType, dim) +
+                          (long)dim * GgufTypes.GetRowBytes(lw.FfnDownExpsType, expertFfnDim))
+                : (ulong)((long)expertFfnDim * GgufTypes.GetRowBytes(lw.FfnGateExpsType, dim) +
+                          (long)expertFfnDim * GgufTypes.GetRowBytes(lw.FfnUpExpsType, dim) +
+                          (long)dim * GgufTypes.GetRowBytes(lw.FfnDownExpsType, expertFfnDim));
+            total += (ulong)numExperts * perExpert;
+        }
+        return total;
+    }
+
+    public InferenceSession(string modelPath, int maxSeqLen, InferenceDevice device, KvCachePrecision kvPrecision = KvCachePrecision.Auto, string? split = null, PleIoMode pleIoMode = PleIoMode.Auto)
         : this(modelPath, maxSeqLen, device switch
         {
             InferenceDevice.Gpu => "gpu",
@@ -377,7 +512,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             InferenceDevice.Gpu => InferenceEngineType.BareMetal,
             InferenceDevice.Cpu => InferenceEngineType.Cpu,
             _ => InferenceEngineType.Auto
-        }, kvPrecision: kvPrecision, split: split)
+        }, kvPrecision: kvPrecision, split: split, pleIoMode: pleIoMode)
     {
     }
 
@@ -482,6 +617,16 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         var utf8Decoder = Encoding.UTF8.GetDecoder();
         char[] charBuf = new char[128];
 
+        int maxReasoningTokens = ReasoningBudgetPolicy.ResolveBudget(options.MaxReasoningTokens, options.MaxTokens);
+        int thinkId = options.ThinkTokenId >= 0
+            ? options.ThinkTokenId
+            : (_tokenizer.TryGetTokenId("<think>", out int resolvedThinkId) ? resolvedThinkId : -1);
+        int endThinkId = options.EndThinkTokenId >= 0
+            ? options.EndThinkTokenId
+            : (_tokenizer.TryGetTokenId("</think>", out int resolvedEndThinkId) ? resolvedEndThinkId : -1);
+        bool useSingleTokenThinkDelimiters = thinkId >= 0 && endThinkId >= 0;
+        var thinkTracker = new ReasoningBudgetTracker(thinkId, endThinkId, maxReasoningTokens, promptTokens, formattedPrompt);
+
         int currentPos = promptTokens.Length;
         for (int step = 0; step < options.MaxTokens && (IsRingBufferEnabled || currentPos < maxSeq); step++)
         {
@@ -524,9 +669,60 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
             }
 
-            // Forward next token
-            ForwardToken(nextToken, currentPos, computeLogits: true);
-            currentPos++;
+            bool shouldForceCloseThink = useSingleTokenThinkDelimiters
+                ? thinkTracker.ObserveTokenAndShouldForceClose(nextToken)
+                : thinkTracker.ObserveDecodedTextAndShouldForceClose(responseSb);
+            if (!shouldForceCloseThink &&
+                options.EnableReasoningLoopGuard &&
+                thinkTracker.InThink &&
+                !thinkTracker.ForcedThinkClose &&
+                thinkTracker.ReasoningTokens >= 24 &&
+                Sampler.DetectPeriodicReasoningLoop(CollectionsMarshal.AsSpan(recentTokens), minPeriod: 2, maxPeriod: 64, minRepeats: 4) > 0)
+            {
+                thinkTracker.MarkForcedClose();
+                shouldForceCloseThink = true;
+            }
+
+            if (shouldForceCloseThink)
+            {
+                int[] closeTokens = ReasoningBudgetPolicy.BuildEndThinkTokens(_tokenizer, endThinkId);
+                ForwardToken(nextToken, currentPos, computeLogits: closeTokens.Length == 0);
+                currentPos++;
+
+                for (int c = 0; c < closeTokens.Length; c++)
+                {
+                    if (!IsRingBufferEnabled && currentPos >= maxSeq)
+                    {
+                        break;
+                    }
+
+                    int closeTok = closeTokens[c];
+                    recentTokens.Add(closeTok);
+
+                    byte[] closeBytes = _tokenizer.GetTokenBytes(closeTok);
+                    int closeChars = utf8Decoder.GetChars(closeBytes, 0, closeBytes.Length, charBuf, 0, flush: false);
+                    if (closeChars > 0)
+                    {
+                        string closePiece = new string(charBuf, 0, closeChars);
+                        responseSb.Append(closePiece);
+                        onToken?.Invoke(closePiece);
+                        if (onTokenAsync != null)
+                        {
+                            await onTokenAsync(closePiece).ConfigureAwait(false);
+                        }
+                    }
+
+                    bool isLastClose = c == closeTokens.Length - 1;
+                    ForwardToken(closeTok, currentPos, computeLogits: isLastClose);
+                    currentPos++;
+                }
+            }
+            else
+            {
+                // Forward next token
+                ForwardToken(nextToken, currentPos, computeLogits: true);
+                currentPos++;
+            }
 
             // Yield control briefly
             if ((step & 15) == 0)
@@ -631,6 +827,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     /// In CPU mode, verifies candidates with cached attention.
     /// </summary>
     public void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens)
+        => VerifyBatch(tokens, startPos, predictedTokens, perStepSnapshots: null);
+
+    public void VerifyBatch(ReadOnlySpan<int> tokens, int startPos, Span<int> predictedTokens, byte[][]? perStepSnapshots)
     {
         if (tokens.IsEmpty) return;
         ValidatePositionRange(startPos, tokens.Length, nameof(startPos));
@@ -646,6 +845,20 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         else if (_gpuModel != null)
         {
             _gpuModel.VerifyBatch(tokens, startPos, predictedTokens);
+        }
+#if !ANDROID
+        else if (_d3d12Model is Qwen3HybridD3D12Model qhD3dVerify)
+        {
+            qhD3dVerify.VerifyBatch(tokens, startPos, predictedTokens, perStepSnapshots);
+        }
+        else if (_d3d12Model is Qwen35VulkanModel vk35Verify)
+        {
+            vk35Verify.VerifyBatch(tokens, startPos, predictedTokens, perStepSnapshots);
+        }
+#endif
+        else if (_cpuModel is { SupportsBatchVerification: true })
+        {
+            _cpuModel.VerifyBatch(tokens, startPos, predictedTokens, _kvCache, perStepSnapshots);
         }
         else
         {
@@ -673,6 +886,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     }
 
     public void VerifyBatchLogits(ReadOnlySpan<int> tokens, int startPos, Span<float> batchLogitsOut)
+        => VerifyBatchLogits(tokens, startPos, batchLogitsOut, perStepSnapshots: null);
+
+    public void VerifyBatchLogits(ReadOnlySpan<int> tokens, int startPos, Span<float> batchLogitsOut, byte[][]? perStepSnapshots)
     {
         if (tokens.IsEmpty) return;
         ValidatePositionRange(startPos, tokens.Length, nameof(startPos));
@@ -682,6 +898,20 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         if (_gpuModel != null)
         {
             _gpuModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut);
+        }
+#if !ANDROID
+        else if (_d3d12Model is Qwen3HybridD3D12Model qhD3dLogits)
+        {
+            qhD3dLogits.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, perStepSnapshots);
+        }
+        else if (_d3d12Model is Qwen35VulkanModel vk35Logits)
+        {
+            vk35Logits.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, perStepSnapshots);
+        }
+#endif
+        else if (_cpuModel is { SupportsBatchVerification: true })
+        {
+            _cpuModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, _kvCache, perStepSnapshots);
         }
         else
         {
@@ -693,9 +923,41 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         }
     }
 
-    public void SaveRecurrentState(Span<byte> destination) => _cpuModel?.SaveRecurrentState(destination);
+    public void SaveRecurrentState(Span<byte> destination)
+    {
+        if (_cpuModel != null)
+        {
+            _cpuModel.SaveRecurrentState(destination);
+        }
+#if !ANDROID
+        else if (_d3d12Model is Qwen3HybridD3D12Model qhD3d)
+        {
+            qhD3d.SaveRecurrentState(destination);
+        }
+        else if (_d3d12Model is Qwen35VulkanModel vk35)
+        {
+            vk35.SaveRecurrentState(destination);
+        }
+#endif
+    }
 
-    public void RestoreRecurrentState(ReadOnlySpan<byte> snapshot) => _cpuModel?.RestoreRecurrentState(snapshot);
+    public void RestoreRecurrentState(ReadOnlySpan<byte> snapshot)
+    {
+        if (_cpuModel != null)
+        {
+            _cpuModel.RestoreRecurrentState(snapshot);
+        }
+#if !ANDROID
+        else if (_d3d12Model is Qwen3HybridD3D12Model qhD3d)
+        {
+            qhD3d.RestoreRecurrentState(snapshot);
+        }
+        else if (_d3d12Model is Qwen35VulkanModel vk35)
+        {
+            vk35.RestoreRecurrentState(snapshot);
+        }
+#endif
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ForwardToken(int token, int pos, bool computeLogits)
@@ -787,7 +1049,8 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             _d3d12Model?.Dispose();
             _cpuModel?.Dispose();
             _kvCache?.Dispose();
-            _gguf.Dispose();
+            _weights?.Dispose();
+            _gguf?.Dispose();
             _disposed = true;
         }
         GC.SuppressFinalize(this);

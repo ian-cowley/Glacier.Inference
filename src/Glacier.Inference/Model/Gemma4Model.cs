@@ -20,73 +20,192 @@ public sealed unsafe class Gemma4KvCache : IDisposable
 {
     private readonly int _layers;
     private readonly int _maxSeqLen;
+    private readonly KvCachePrecision _precision;
     private readonly int[] _layerHeadsKv;
     private readonly int[] _layerHeadDims;
-    private readonly long[] _layerOffsetsK;
-    private readonly long[] _layerOffsetsV;
+    private readonly long[] _layerSlotBytes;
+    private readonly long[] _layerByteOffsetsK;
+    private readonly long[] _layerByteOffsetsV;
     private readonly long _totalBytes;
 
-    private float* _kBuffer;
-    private float* _vBuffer;
+    private byte* _kBuffer;
+    private byte* _vBuffer;
     private bool _disposed;
 
     public int MaxSeqLen => _maxSeqLen;
     public int Layers => _layers;
+    public KvCachePrecision Precision => _precision;
+    public long TotalBytes => _totalBytes * 2L;
 
-    public Gemma4KvCache(int layers, int maxSeqLen, bool[]? swaPattern, int[]? headsKvPattern, int defaultHeadDim)
+    public Gemma4KvCache(
+        int layers,
+        int maxSeqLen,
+        bool[]? swaPattern,
+        int[]? headsKvPattern,
+        int defaultHeadDim,
+        KvCachePrecision precision = KvCachePrecision.Fp32,
+        int[]? headDimsPattern = null)
     {
         _layers = layers;
         _maxSeqLen = maxSeqLen;
+        _precision = precision == KvCachePrecision.Auto ? KvCachePrecision.Fp32 : precision;
 
         _layerHeadsKv = new int[layers];
         _layerHeadDims = new int[layers];
-        _layerOffsetsK = new long[layers];
-        _layerOffsetsV = new long[layers];
+        _layerSlotBytes = new long[layers];
+        _layerByteOffsetsK = new long[layers];
+        _layerByteOffsetsV = new long[layers];
 
-        long runningOffset = 0;
+        long runningByteOffset = 0;
         for (int l = 0; l < layers; l++)
         {
             bool isSwa = swaPattern != null && l < swaPattern.Length ? swaPattern[l] : ((l + 1) % 6 != 0);
             int headsKv = headsKvPattern != null && l < headsKvPattern.Length ? headsKvPattern[l] : (isSwa ? 8 : 2);
-            int headDim = isSwa ? 256 : (defaultHeadDim > 0 ? defaultHeadDim : 512);
+            int headDim = (headDimsPattern != null && l < headDimsPattern.Length && headDimsPattern[l] > 0)
+                ? headDimsPattern[l]
+                : (isSwa ? 256 : (defaultHeadDim > 0 ? defaultHeadDim : 512));
+            long slotBytes = KVCache.GetSlotByteSize(headDim, _precision);
 
             _layerHeadsKv[l] = headsKv;
             _layerHeadDims[l] = headDim;
-            _layerOffsetsK[l] = runningOffset;
-            _layerOffsetsV[l] = runningOffset;
+            _layerSlotBytes[l] = slotBytes;
+            _layerByteOffsetsK[l] = runningByteOffset;
+            _layerByteOffsetsV[l] = runningByteOffset;
 
-            long layerFloats = (long)headsKv * maxSeqLen * headDim;
-            runningOffset += layerFloats;
+            runningByteOffset += (long)headsKv * maxSeqLen * slotBytes;
         }
 
-        long totalBytes = runningOffset * sizeof(float);
-        _totalBytes = totalBytes;
-        _kBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
-        _vBuffer = (float*)NativeMemory.AllocZeroed((nuint)totalBytes);
+        _totalBytes = runningByteOffset;
+        _kBuffer = (byte*)NativeMemory.AllocZeroed((nuint)_totalBytes);
+        _vBuffer = (byte*)NativeMemory.AllocZeroed((nuint)_totalBytes);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private byte* GetKeySlotPtr(int layer, int headKv, int pos)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
+
+        long slotBytes = _layerSlotBytes[layer];
+        long offset = _layerByteOffsetsK[layer] + ((long)headKv * _maxSeqLen + pos) * slotBytes;
+        return _kBuffer + offset;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private byte* GetValSlotPtr(int layer, int headKv, int pos)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if ((uint)pos >= (uint)_maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
+
+        long slotBytes = _layerSlotBytes[layer];
+        long offset = _layerByteOffsetsV[layer] + ((long)headKv * _maxSeqLen + pos) * slotBytes;
+        return _vBuffer + offset;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetKeyPtr(int layer, int headKv, int pos)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if ((uint)pos >= (uint)_maxSeqLen)
-            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
-
-        int headDim = _layerHeadDims[layer];
-        long offset = _layerOffsetsK[layer] + ((long)headKv * _maxSeqLen + pos) * headDim;
-        return _kBuffer + offset;
+        if (_precision != KvCachePrecision.Fp32)
+            throw new InvalidOperationException("Direct float* pointer access requires KvCachePrecision.Fp32.");
+        return (float*)GetKeySlotPtr(layer, headKv, pos);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public float* GetValPtr(int layer, int headKv, int pos)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        if ((uint)pos >= (uint)_maxSeqLen)
-            throw new ArgumentOutOfRangeException(nameof(pos), pos, $"Position {pos} is out of range [0, {_maxSeqLen}).");
+        if (_precision != KvCachePrecision.Fp32)
+            throw new InvalidOperationException("Direct float* pointer access requires KvCachePrecision.Fp32.");
+        return (float*)GetValSlotPtr(layer, headKv, pos);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public void StoreHead(int layer, int headKv, int pos, float* kSrc, float* vSrc)
+    {
+        int headDim = _layerHeadDims[layer];
+        long slotBytes = _layerSlotBytes[layer];
+        byte* kDst = GetKeySlotPtr(layer, headKv, pos);
+        byte* vDst = GetValSlotPtr(layer, headKv, pos);
+
+        switch (_precision)
+        {
+            case KvCachePrecision.Fp32:
+                Buffer.MemoryCopy(kSrc, kDst, slotBytes, slotBytes);
+                Buffer.MemoryCopy(vSrc, vDst, slotBytes, slotBytes);
+                break;
+            case KvCachePrecision.Fp16:
+                QuantKernels.QuantizeF16(kSrc, (Half*)kDst, headDim);
+                QuantKernels.QuantizeF16(vSrc, (Half*)vDst, headDim);
+                break;
+            case KvCachePrecision.Fp8:
+                QuantKernels.QuantizeFp8E4M3(kSrc, kDst, headDim);
+                QuantKernels.QuantizeFp8E4M3(vSrc, vDst, headDim);
+                break;
+            case KvCachePrecision.Q4_0:
+                QuantKernels.QuantizeQ4_0(kSrc, (BlockQ4_0*)kDst, headDim);
+                QuantKernels.QuantizeQ4_0(vSrc, (BlockQ4_0*)vDst, headDim);
+                break;
+            default:
+                throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    public float DotKey(int layer, int headKv, int pos, float* query)
+    {
+        int headDim = _layerHeadDims[layer];
+        byte* src = GetKeySlotPtr(layer, headKv, pos);
+        return _precision switch
+        {
+            KvCachePrecision.Fp32 => QuantKernels.VecDotF32(query, (float*)src, headDim),
+            KvCachePrecision.Fp16 => QuantKernels.VecDotF16((Half*)src, query, headDim),
+            KvCachePrecision.Fp8 => QuantKernels.VecDotFp8E4M3(src, query, headDim),
+            KvCachePrecision.Q4_0 => QuantKernels.VecDotQ4_0Any((BlockQ4_0*)src, query, headDim),
+            _ => throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.")
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    public void AccumulateValue(int layer, int headKv, int pos, float weight, float* outHead)
+    {
+        if (weight == 0f) return;
 
         int headDim = _layerHeadDims[layer];
-        long offset = _layerOffsetsV[layer] + ((long)headKv * _maxSeqLen + pos) * headDim;
-        return _vBuffer + offset;
+        byte* src = GetValSlotPtr(layer, headKv, pos);
+        switch (_precision)
+        {
+            case KvCachePrecision.Fp32:
+                float* vPtr = (float*)src;
+                int d = 0;
+                if (Vector256.IsHardwareAccelerated)
+                {
+                    var vProb = Vector256.Create(weight);
+                    int vecLimit = headDim - 8;
+                    for (; d <= vecLimit; d += 8)
+                    {
+                        var vAttn = Vector256.Load(outHead + d);
+                        var vVal = Vector256.Load(vPtr + d);
+                        (vAttn + vVal * vProb).Store(outHead + d);
+                    }
+                }
+                for (; d < headDim; d++)
+                {
+                    outHead[d] += vPtr[d] * weight;
+                }
+                break;
+            case KvCachePrecision.Fp16:
+                QuantKernels.AccumulateScaledF16((Half*)src, weight, outHead, headDim);
+                break;
+            case KvCachePrecision.Fp8:
+                QuantKernels.AccumulateScaledFp8E4M3(src, weight, outHead, headDim);
+                break;
+            case KvCachePrecision.Q4_0:
+                QuantKernels.AccumulateScaledQ4_0((BlockQ4_0*)src, weight, outHead, headDim);
+                break;
+            default:
+                throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
+        }
     }
 
     public void Reset()
@@ -179,7 +298,8 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         int maxSeqLen = 4096,
         int startLayer = 0,
         int layerCount = -1,
-        bool isLastStage = true)
+        bool isLastStage = true,
+        KvCachePrecision kvPrecision = KvCachePrecision.Fp32)
         : base(weights, maxSeqLen, startLayer, layerCount, isLastStage)
     {
         _sharedFfnDim = weights.FeedForwardLength; // 2112
@@ -235,12 +355,19 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         _outNormSums = (float*)NativeMemory.AllocZeroed((nuint)((_dim / 32) * sizeof(float)));
 
         // Dedicated Gemma4 KV cache
+        int[] headDimsPattern = new int[weights.BlockCount];
+        for (int l = 0; l < weights.BlockCount; l++)
+        {
+            headDimsPattern[l] = weights.Layers[l].HeadDim;
+        }
         _gemmaKvCache = new Gemma4KvCache(
             weights.BlockCount,
             maxSeqLen,
             weights.SlidingWindowPattern,
             weights.HeadCountKvPattern,
-            weights.HeadDim);
+            weights.HeadDim,
+            kvPrecision,
+            headDimsPattern);
     }
 
     /// <summary>
@@ -442,10 +569,7 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         // 3. Write K and V to Gemma4 KV Cache
         for (int hKv = 0; hKv < headsKv; hKv++)
         {
-            float* kDst = _gemmaKvCache.GetKeyPtr(modelLayer, hKv, pos);
-            float* vDst = _gemmaKvCache.GetValPtr(modelLayer, hKv, pos);
-            Buffer.MemoryCopy(_k + hKv * headDim, kDst, (ulong)(headDim * sizeof(float)), (ulong)(headDim * sizeof(float)));
-            Buffer.MemoryCopy(_v + hKv * headDim, vDst, (ulong)(headDim * sizeof(float)), (ulong)(headDim * sizeof(float)));
+            _gemmaKvCache.StoreHead(modelLayer, hKv, pos, _k + hKv * headDim, _v + hKv * headDim);
         }
 
         // 4. Attention Context Calculation
@@ -465,8 +589,7 @@ public sealed unsafe class Gemma4Model : CpuModelBase
             float attnScale = headDim > 0 ? (1.0f / MathF.Sqrt(headDim)) : 1.0f;
             for (int p = windowStart; p <= pos; p++)
             {
-                float* kPtr = _gemmaKvCache.GetKeyPtr(modelLayer, kvHead, p);
-                float score = QuantKernels.VecDotF32(qHead, kPtr, headDim) * attnScale;
+                float score = _gemmaKvCache.DotKey(modelLayer, kvHead, p, qHead) * attnScale;
                 if (_attnLogitSoftcapping > 0f)
                 {
                     score = _attnLogitSoftcapping * MathF.Tanh(score / _attnLogitSoftcapping);
@@ -482,24 +605,7 @@ public sealed unsafe class Gemma4Model : CpuModelBase
             {
                 float prob = _headScores[p - windowStart];
                 if (prob == 0.0f) continue;
-                float* vPtr = _gemmaKvCache.GetValPtr(modelLayer, kvHead, p);
-
-                int d = 0;
-                if (Vector256.IsHardwareAccelerated)
-                {
-                    var vProb = Vector256.Create(prob);
-                    int vecLimit = headDim - 8;
-                    for (; d <= vecLimit; d += 8)
-                    {
-                        var vAttn = Vector256.Load(attnOutHead + d);
-                        var vVal = Vector256.Load(vPtr + d);
-                        (vAttn + vVal * vProb).Store(attnOutHead + d);
-                    }
-                }
-                for (; d < headDim; d++)
-                {
-                    attnOutHead[d] += vPtr[d] * prob;
-                }
+                _gemmaKvCache.AccumulateValue(modelLayer, kvHead, p, prob, attnOutHead);
             }
         }
 
@@ -626,6 +732,38 @@ public sealed unsafe class Gemma4Model : CpuModelBase
         {
             bool isLast = (i == tokens.Length - 1);
             ForwardStage(tokens[i], startPos + i, default, default, isLast && computeLogits ? logits : Span<float>.Empty, isLast && computeLogits, kvCache);
+        }
+    }
+
+    public override void VerifyBatch(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<int> greedyTokens,
+        KVCache? kvCache = null,
+        byte[][]? perStepSnapshots = null)
+    {
+        int vocabSize = _weights.VocabSize;
+        float* logitsBuf = EnsureVerifyLogitsBuffer(1);
+        var tokenLogits = new Span<float>(logitsBuf, vocabSize);
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            ForwardStage(tokens[i], startPos + i, default, default, tokenLogits, computeLogits: true, kvCache);
+            greedyTokens[i] = ComputeGreedyArgmax(logitsBuf, vocabSize);
+        }
+    }
+
+    public override void VerifyBatchLogits(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        Span<float> logitsOut,
+        int vocabStride,
+        KVCache? kvCache = null,
+        byte[][]? perStepSnapshots = null)
+    {
+        int vocabSize = _weights.VocabSize;
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            ForwardStage(tokens[i], startPos + i, default, default, logitsOut.Slice(i * vocabStride, vocabSize), computeLogits: true, kvCache);
         }
     }
 

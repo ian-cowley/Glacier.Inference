@@ -1,7 +1,12 @@
 namespace Glacier.Inference.Model;
 
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using Glacier.Inference.Gguf;
+using Glacier.Inference.Memory;
+using Glacier.Inference.Quant;
 
 /// <summary>
 /// Pointers to quantized and float tensors for a single transformer layer.
@@ -9,8 +14,8 @@ using Glacier.Inference.Gguf;
 /// </summary>
 public sealed unsafe class LayerWeights
 {
-    public required float* AttnNormWeight { get; init; }
-    public required GgufType AttnNormType { get; init; }
+    public float* AttnNormWeight { get; init; }
+    public GgufType AttnNormType { get; init; }
 
     public byte* QWeight { get; init; }
     public GgufType QType { get; init; }
@@ -39,6 +44,7 @@ public sealed unsafe class LayerWeights
     public byte* AttnGateWeight { get; init; }
     public GgufType AttnGateType { get; init; }
     public float* SsmConv1dWeight { get; init; }
+    public ulong[]? SsmConv1dDimensions { get; init; }
     public float* SsmAWeight { get; init; }
     public byte* SsmAlphaWeight { get; init; }
     public GgufType SsmAlphaType { get; init; }
@@ -82,8 +88,8 @@ public sealed unsafe class LayerWeights
     // Optional Attention Sinks (OpenAI gpt-oss, StreamingLLM)
     public float* AttnSinksWeight { get; init; }
 
-    public required float* FfnNormWeight { get; init; }
-    public required GgufType FfnNormType { get; init; }
+    public float* FfnNormWeight { get; init; }
+    public GgufType FfnNormType { get; init; }
 
     // Dense FFN
     public byte* FfnGateWeight { get; init; }
@@ -104,15 +110,15 @@ public sealed unsafe class LayerWeights
     public float* FfnGateInpWeight { get; init; }
     public float* FfnGateInpBias { get; init; }
 
-    public byte* FfnGateExpsWeight { get; init; }
+    public byte* FfnGateExpsWeight { get; set; }
     public GgufType FfnGateExpsType { get; init; }
     public float* FfnGateExpsBias { get; init; }
 
-    public byte* FfnUpExpsWeight { get; init; }
+    public byte* FfnUpExpsWeight { get; set; }
     public GgufType FfnUpExpsType { get; init; }
     public float* FfnUpExpsBias { get; init; }
 
-    public byte* FfnDownExpsWeight { get; init; }
+    public byte* FfnDownExpsWeight { get; set; }
     public GgufType FfnDownExpsType { get; init; }
     public float* FfnDownExpsBias { get; init; }
 
@@ -142,16 +148,54 @@ public sealed unsafe class LayerWeights
     public float* FfnPreNorm2Weight { get; init; }
     public float* FfnPostNorm2Weight { get; init; }
     public float* FfnGateInpScaleWeight { get; init; }
-    public byte* FfnGateUpExpsWeight { get; init; }
+    public byte* FfnGateUpExpsWeight { get; set; }
     public GgufType FfnGateUpExpsType { get; init; }
     public float* FfnDownExpsScaleWeight { get; init; }
     public float* LayerOutputScaleWeight { get; init; }
+
+    // Qwen3.8-Flash-Next (qwen4exp): Gated Multi-Stream Hyper-Connections
+    public bool HasHyperConnections { get; init; }
+    public float* HcAttnNormWeight { get; init; }
+    public byte* HcAttnDownWeight { get; init; }
+    public GgufType HcAttnDownType { get; init; }
+    public byte* HcAttnUpWeight { get; init; }
+    public GgufType HcAttnUpType { get; init; }
+    public byte* HcAttnInjectWeight { get; init; }
+    public GgufType HcAttnInjectType { get; init; }
+    public float* HcFfnNormWeight { get; init; }
+    public byte* HcFfnDownWeight { get; init; }
+    public GgufType HcFfnDownType { get; init; }
+    public byte* HcFfnUpWeight { get; init; }
+    public GgufType HcFfnUpType { get; init; }
+    public byte* HcFfnInjectWeight { get; init; }
+    public GgufType HcFfnInjectType { get; init; }
+
+    // Qwen3.8-Flash-Next (qwen4exp): QSA Sparse Attention Indexer
+    public bool IsQsa { get; init; }
+    public byte* IndexerQProjWeight { get; init; }
+    public GgufType IndexerQProjType { get; init; }
+    public byte* IndexerKProjWeight { get; init; }
+    public GgufType IndexerKProjType { get; init; }
+    public float* IndexerQNormWeight { get; init; }
+    public float* IndexerKNormWeight { get; init; }
+    public int IndexerCompressRatio { get; init; }
+
+    // Qwen3.8-Flash-Next (qwen4exp): Per-Layer N-gram Embedding (PLE)
+    public bool HasPle { get; init; }
+    public byte* PleKeyWeight { get; init; }
+    public GgufType PleKeyType { get; init; }
+    public byte* PleValueWeight { get; init; }
+    public GgufType PleValueType { get; init; }
+    public float* PleNormKeyWeight { get; init; }
+    public float* PleNormQueryWeight { get; init; }
+    public float* PleNormConvWeight { get; init; }
+    public float* PleConv1dWeight { get; init; }
 }
 
 /// <summary>
 /// Memory-mapped weight pointers and architecture metadata for Transformer and MoE models.
 /// </summary>
-public sealed unsafe class ModelWeights
+public sealed unsafe class ModelWeights : IDisposable
 {
     public GgufFile Gguf { get; }
     public UniversalArchitecture ArchitectureFamily => ModelArchitectureDetector.Detect(Gguf.Architecture, Gguf);
@@ -196,6 +240,7 @@ public sealed unsafe class ModelWeights
     public int ExpertCount => Gguf.ExpertCount;
     public int ExpertUsedCount => Gguf.ExpertUsedCount;
     public int ExpertFeedForwardLength => Gguf.ExpertFeedForwardLength > 0 ? Gguf.ExpertFeedForwardLength : FeedForwardLength;
+    public int SharedExpertFeedForwardLength { get; }
     public int ExpertSharedCount => Gguf.ExpertSharedCount;
 
     // Gemma metadata
@@ -218,23 +263,114 @@ public sealed unsafe class ModelWeights
     public byte* OutWeight { get; }
     public GgufType OutType { get; }
 
+    // Qwen3.8-Flash-Next (qwen4exp): Hyper-Connections, QSA Indexer, PLE, and embedded MTP block index
+    public int HyperConnectionCount { get; }
+    public int HyperConnectionLowRank { get; }
+    public float* OutputHcNormWeight { get; }
+    public byte* OutputHcDownWeight { get; }
+    public GgufType OutputHcDownType { get; }
+    public byte* OutputHcUpWeight { get; }
+    public GgufType OutputHcUpType { get; }
+
+    public int IndexerHeadCount => Gguf.IndexerHeadCount;
+    public int IndexerKeyLength => Gguf.IndexerKeyLength;
+    public int IndexerTopK => Gguf.IndexerTopK;
+    public PleHashConfig? PleHashConfig { get; }
+    public int EmbeddedMtpBlockIndex { get; } = -1;
+
+    private readonly List<IntPtr> _ownedFloatBuffers = new();
+    private HostRamExpertArena? _expertArena;
+    private bool _disposed;
+
     public LayerWeights[] Layers { get; }
+    public HostRamExpertArena? ExpertArena => _expertArena;
 
     public ModelWeights(GgufFile gguf)
     {
         Gguf = gguf;
 
+        int embeddedMtpBlockIndex = -1;
         int blockCount = gguf.BlockCount;
         while (blockCount > 0 && gguf.TryGetTensor($"blk.{blockCount - 1}.nextn.eh_proj.weight", out var nextnProj) && nextnProj != null)
+        {
+            embeddedMtpBlockIndex = blockCount - 1;
             blockCount--;
+        }
+        if (embeddedMtpBlockIndex < 0 && gguf.TryGetTensor($"blk.{blockCount}.nextn.eh_proj.weight", out var trailingMtp) && trailingMtp != null)
+        {
+            embeddedMtpBlockIndex = blockCount;
+        }
+        EmbeddedMtpBlockIndex = embeddedMtpBlockIndex;
         BlockCount = blockCount;
         ContextLength = gguf.ContextLength;
         EmbeddingLength = gguf.EmbeddingLength;
         FeedForwardLength = gguf.FeedForwardLength;
+        int sharedFfn = (int)gguf.GetMetadataUInt32($"{gguf.Architecture}.expert_shared_feed_forward_length",
+            gguf.GetMetadataUInt32("expert_shared_feed_forward_length", 0));
+        if (sharedFfn <= 0)
+        {
+            for (int i = 0; i < blockCount; i++)
+            {
+                if (gguf.TryGetTensor($"blk.{i}.ffn_gate_shexp.weight", out var shGate) && shGate != null && shGate.Dimensions.Length >= 2)
+                {
+                    sharedFfn = (int)shGate.Dimensions[1];
+                    break;
+                }
+                if (gguf.TryGetTensor($"blk.{i}.ffn_up_shexp.weight", out var shUp) && shUp != null && shUp.Dimensions.Length >= 2)
+                {
+                    sharedFfn = (int)shUp.Dimensions[1];
+                    break;
+                }
+            }
+        }
+        SharedExpertFeedForwardLength = sharedFfn;
         HeadCount = gguf.HeadCount;
         HeadCountKv = gguf.HeadCountKv;
         RopeFreqBase = gguf.RopeFreqBase;
         RmsNormEps = gguf.RmsNormEps;
+
+        HyperConnectionCount = gguf.HyperConnectionCount;
+        if (HyperConnectionCount == 0 && gguf.TryGetTensor("blk.0.hc_attn_inject.weight", out var hcInjProbe) && hcInjProbe != null && hcInjProbe.Dimensions.Length >= 2)
+        {
+            HyperConnectionCount = (int)hcInjProbe.Dimensions[1];
+        }
+        if (HyperConnectionCount == 0 && gguf.TryGetTensor("blk.0.hc_attn_norm.weight", out var hcNormProbe) && hcNormProbe != null)
+        {
+            if (hcNormProbe.Dimensions.Length >= 2)
+            {
+                HyperConnectionCount = (int)hcNormProbe.Dimensions[1];
+            }
+            else if (EmbeddingLength > 0 && hcNormProbe.ElementCount > (ulong)EmbeddingLength && hcNormProbe.ElementCount % (ulong)EmbeddingLength == 0)
+            {
+                HyperConnectionCount = (int)(hcNormProbe.ElementCount / (ulong)EmbeddingLength);
+            }
+        }
+        HyperConnectionLowRank = gguf.HyperConnectionLowRank;
+        if (HyperConnectionLowRank == 0 && gguf.TryGetTensor("blk.0.hc_attn_down.weight", out var hcDownProbe) && hcDownProbe != null && hcDownProbe.Dimensions.Length >= 2)
+        {
+            HyperConnectionLowRank = (int)hcDownProbe.Dimensions[1];
+        }
+        if (HyperConnectionLowRank == 0 && HyperConnectionCount > 0 && gguf.TryGetTensor("blk.0.hc_attn_down_inject.weight", out var hcDownInjProbe) && hcDownInjProbe != null && hcDownInjProbe.Dimensions.Length >= 2)
+        {
+            int nLo = (int)hcDownInjProbe.Dimensions[1] - HyperConnectionCount;
+            if (nLo > 0) HyperConnectionLowRank = nLo;
+        }
+
+        if (gguf.PleLayers is { Length: > 0 } || gguf.Tensors.ContainsKey("per_layer_token_embd.weight"))
+        {
+            PleHashConfig = new PleHashConfig
+            {
+                NgramSize = gguf.PleNgramSize,
+                HeadsPerNgram = gguf.PleHeadsPerNgram,
+                HeadDim = gguf.PleRowDim,
+                ConvKernel = gguf.PleConvKernel,
+                EosTokenId = gguf.PleEosTokenId,
+                ImageTokenId = gguf.PleImageTokenId,
+                Multipliers = gguf.PleLayerMultipliers ?? PleHashConfig.DefaultMultipliers,
+                HeadOffsets = gguf.PleHeadOffsets ?? PleHashConfig.DefaultHeadOffsets,
+                HeadVocabSizes = gguf.PleHeadVocabSizes ?? PleHashConfig.DefaultHeadVocabSizes
+            };
+        }
 
         // Precomputed RoPE frequencies (Meta LLaMA 3.1)
         if (gguf.TryGetTensor("rope_freqs.weight", out var ropeFreqs) && ropeFreqs != null)
@@ -261,12 +397,12 @@ public sealed unsafe class ModelWeights
         // Final output norm
         if (gguf.TryGetTensor("output_norm.weight", out var outNormInfo) && outNormInfo != null)
         {
-            OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
+            OutNormWeight = LoadFloat32Pointer(outNormInfo);
             OutNormType = outNormInfo.Type;
         }
         else if (gguf.TryGetTensor("norm.weight", out outNormInfo) && outNormInfo != null)
         {
-            OutNormWeight = (float*)gguf.GetTensorPointer(outNormInfo);
+            OutNormWeight = LoadFloat32Pointer(outNormInfo);
             OutNormType = outNormInfo.Type;
         }
         else
@@ -275,7 +411,25 @@ public sealed unsafe class ModelWeights
             OutNormType = GgufType.F32;
         }
 
-        // Output head
+        // Output head & optional Hyper-Connection output mixer
+        if ((gguf.TryGetTensor("output_hc_norm.weight", out var outHcNorm) && outHcNorm != null) ||
+            (gguf.TryGetTensor("hc_head_norm.weight", out outHcNorm) && outHcNorm != null))
+        {
+            OutputHcNormWeight = LoadFloat32Pointer(outHcNorm);
+        }
+        if ((gguf.TryGetTensor("output_hc_down.weight", out var outHcDown) && outHcDown != null) ||
+            (gguf.TryGetTensor("hc_head_down.weight", out outHcDown) && outHcDown != null))
+        {
+            OutputHcDownWeight = gguf.GetTensorPointer(outHcDown);
+            OutputHcDownType = outHcDown.Type;
+        }
+        if ((gguf.TryGetTensor("output_hc_up.weight", out var outHcUp) && outHcUp != null) ||
+            (gguf.TryGetTensor("hc_head_up.weight", out outHcUp) && outHcUp != null))
+        {
+            OutputHcUpWeight = gguf.GetTensorPointer(outHcUp);
+            OutputHcUpType = outHcUp.Type;
+        }
+
         if (gguf.TryGetTensor("output.weight", out var outInfo) && outInfo != null)
         {
             OutWeight = gguf.GetTensorPointer(outInfo);
@@ -301,7 +455,8 @@ public sealed unsafe class ModelWeights
                 gguf.TryGetTensor($"blk.{l}.input_layernorm.weight", out attnNorm);
             }
 
-            if (attnNorm == null)
+            gguf.TryGetTensor($"blk.{l}.hc_attn_norm.weight", out var hcAttnNorm);
+            if (attnNorm == null && hcAttnNorm == null)
             {
                 // Layer not present in this stage slice
                 continue;
@@ -329,6 +484,7 @@ public sealed unsafe class ModelWeights
             byte* attnGateWeight = null;
             GgufType attnGateType = GgufType.F32;
             float* ssmConv1dWeight = null;
+            ulong[]? ssmConv1dDims = null;
             float* ssmAWeight = null;
             byte* ssmAlphaWeight = null;
             GgufType ssmAlphaType = GgufType.F32;
@@ -374,13 +530,57 @@ public sealed unsafe class ModelWeights
                     attnGateWeight = gguf.GetTensorPointer(gdnGate);
                     attnGateType = gdnGate.Type;
                 }
+                if (qkvWeight == null && attnGateWeight == null &&
+                    gguf.TryGetTensor($"blk.{l}.attn_qkv_gate.weight", out var gdnQkvGate) &&
+                    gdnQkvGate != null && gdnQkvGate.Dimensions.Length >= 2)
+                {
+                    int inDim = (int)gdnQkvGate.Dimensions[0];
+                    int totalRows = (int)gdnQkvGate.Dimensions[1];
+                    int nZ = gguf.SsmStateSize * gguf.SsmTimeStepRank;
+                    int nQkv = totalRows - nZ;
+                    if (nQkv > 0 && nZ > 0)
+                    {
+                        byte* basePtr = gguf.GetTensorPointer(gdnQkvGate);
+                        long rowBytes = GgufTypes.GetRowBytes(gdnQkvGate.Type, inDim);
+                        qkvWeight = basePtr;
+                        qkvType = gdnQkvGate.Type;
+                        attnGateWeight = basePtr + (long)nQkv * rowBytes;
+                        attnGateType = gdnQkvGate.Type;
+                    }
+                }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_conv1d.weight", out var gdnConv) && gdnConv != null)
                 {
-                    ssmConv1dWeight = (float*)gguf.GetTensorPointer(gdnConv);
+                    int convKernel = gguf.SsmConvKernel;
+                    long expectedConvChannels = ArchitectureFamily == UniversalArchitecture.Mamba2
+                        ? (long)gguf.SsmInnerSize + 2L * gguf.SsmGroupCount * gguf.SsmStateSize
+                        : ((long)gguf.SsmGroupCount * 2L + gguf.SsmTimeStepRank) * gguf.SsmStateSize;
+                    long expectedConvElements = (long)convKernel * expectedConvChannels;
+
+                    bool validConvShape = convKernel > 0 && expectedConvChannels > 0 && (
+                        (gdnConv.Dimensions.Length == 2 &&
+                         gdnConv.Dimensions[0] == (ulong)convKernel &&
+                         gdnConv.Dimensions[1] == (ulong)expectedConvChannels) ||
+                        (gdnConv.Dimensions.Length == 1 &&
+                         gdnConv.Dimensions[0] == (ulong)expectedConvElements));
+
+                    if (!validConvShape)
+                    {
+                        throw new InvalidDataException(
+                            $"Invalid shape [{string.Join(", ", gdnConv.Dimensions)}] for 'blk.{l}.ssm_conv1d.weight' on layer {l}; " +
+                            $"expected [{convKernel}, {expectedConvChannels}] (or 1D [{expectedConvElements}]).");
+                    }
+
+                    ssmConv1dDims = gdnConv.Dimensions;
+                    ssmConv1dWeight = LoadFloat32Pointer(gdnConv);
+                }
+                else if (attnGateWeight != null)
+                {
+                    throw new InvalidDataException(
+                        $"Model '{Path.GetFileName(gguf.FilePath)}' is missing required GDN tensor 'blk.{l}.ssm_conv1d.weight' on layer {l}.");
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_a", out var gdnA) && gdnA != null)
                 {
-                    ssmAWeight = (float*)gguf.GetTensorPointer(gdnA);
+                    ssmAWeight = LoadFloat32Pointer(gdnA);
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_alpha.weight", out var gdnAlpha) && gdnAlpha != null)
                 {
@@ -392,13 +592,31 @@ public sealed unsafe class ModelWeights
                     ssmBetaWeight = (byte*)gguf.GetTensorPointer(gdnBeta);
                     ssmBetaType = gdnBeta.Type;
                 }
+                if (ssmAlphaWeight == null && ssmBetaWeight == null &&
+                    ((gguf.TryGetTensor($"blk.{l}.ssm_beta_alpha.weight", out var gdnBa) && gdnBa != null) ||
+                     (gguf.TryGetTensor($"blk.{l}.ssm_ba.weight", out gdnBa) && gdnBa != null)) &&
+                    gdnBa.Dimensions.Length >= 2)
+                {
+                    int inDim = (int)gdnBa.Dimensions[0];
+                    int totalRows = (int)gdnBa.Dimensions[1];
+                    int nBeta = totalRows / 2;
+                    if (nBeta > 0)
+                    {
+                        byte* basePtr = gguf.GetTensorPointer(gdnBa);
+                        long rowBytes = GgufTypes.GetRowBytes(gdnBa.Type, inDim);
+                        ssmBetaWeight = basePtr;
+                        ssmBetaType = gdnBa.Type;
+                        ssmAlphaWeight = basePtr + (long)nBeta * rowBytes;
+                        ssmAlphaType = gdnBa.Type;
+                    }
+                }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_dt.bias", out var gdnDt) && gdnDt != null)
                 {
-                    ssmDtBias = (float*)gguf.GetTensorPointer(gdnDt);
+                    ssmDtBias = LoadFloat32Pointer(gdnDt);
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ssm_norm.weight", out var gdnNorm) && gdnNorm != null)
                 {
-                    ssmNormWeight = (float*)gguf.GetTensorPointer(gdnNorm);
+                    ssmNormWeight = LoadFloat32Pointer(gdnNorm);
                 }
                 ssmOutWeight = gguf.GetTensorPointer(ssmOut!);
                 ssmOutType = ssmOut!.Type;
@@ -437,11 +655,47 @@ public sealed unsafe class ModelWeights
                 }
                 else if (gguf.TryGetTensor($"blk.{l}.attn_qkv.weight", out var qkv) && qkv != null)
                 {
-                    qkvWeight = gguf.GetTensorPointer(qkv);
-                    qkvType = qkv.Type;
-                    if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
+                    int layerHeadsKv = (gguf.HeadCountKvPattern != null && l < gguf.HeadCountKvPattern.Length)
+                        ? gguf.HeadCountKvPattern[l]
+                        : HeadCountKv;
+                    int qkvHeadDim = (gguf.TryGetTensor($"blk.{l}.attn_q_norm.weight", out var qNormProbe) && qNormProbe != null && qNormProbe.Dimensions.Length > 0)
+                        ? (int)qNormProbe.Dimensions[0]
+                        : HeadDim;
+                    int qDim = HeadCount * qkvHeadDim;
+                    int kvDim = layerHeadsKv * qkvHeadDim;
+
+                    bool isQGateFused = qkv.Dimensions.Length >= 2 && qkv.Dimensions[1] == (ulong)(2 * qDim + 2 * kvDim);
+                    bool isHybridFused = gguf.IsHybridSsm && qkv.Dimensions.Length >= 2 && qkv.Dimensions[1] == (ulong)(qDim + 2 * kvDim);
+                    if (isQGateFused || isHybridFused)
                     {
-                        qkvBias = (float*)gguf.GetTensorPointer(qkvB);
+                        int inDim = (int)qkv.Dimensions[0];
+                        int qRows = isQGateFused ? 2 * qDim : qDim;
+                        byte* basePtr = gguf.GetTensorPointer(qkv);
+                        long rowBytes = GgufTypes.GetRowBytes(qkv.Type, inDim);
+                        qWeight = basePtr;
+                        qType = qkv.Type;
+                        hasQGate = isQGateFused;
+                        kWeight = basePtr + (long)qRows * rowBytes;
+                        kType = qkv.Type;
+                        vWeight = basePtr + (long)(qRows + kvDim) * rowBytes;
+                        vType = qkv.Type;
+
+                        if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
+                        {
+                            float* bPtr = LoadFloat32Pointer(qkvB);
+                            qb = bPtr;
+                            kb = bPtr + qRows;
+                            vb = bPtr + qRows + kvDim;
+                        }
+                    }
+                    else
+                    {
+                        qkvWeight = gguf.GetTensorPointer(qkv);
+                        qkvType = qkv.Type;
+                        if (gguf.TryGetTensor($"blk.{l}.attn_qkv.bias", out var qkvB) && qkvB != null)
+                        {
+                            qkvBias = (float*)gguf.GetTensorPointer(qkvB);
+                        }
                     }
                 }
 
@@ -516,11 +770,12 @@ public sealed unsafe class ModelWeights
                 }
             }
 
-            if (ffnNorm == null)
+            gguf.TryGetTensor($"blk.{l}.hc_ffn_norm.weight", out var hcFfnNorm);
+            if (ffnNorm == null && hcFfnNorm == null)
             {
                 string fileName = Path.GetFileName(gguf.FilePath);
                 throw new InvalidDataException(
-                    $"Model '{fileName}' is missing FFN normalization tensor for layer {l} ('blk.{l}.ffn_norm.weight' / 'blk.{l}.post_attention_norm.weight').");
+                    $"Model '{fileName}' is missing FFN normalization tensor for layer {l} ('blk.{l}.ffn_norm.weight' / 'blk.{l}.hc_ffn_norm.weight').");
             }
 
             // Check if this layer has MoE experts
@@ -607,21 +862,21 @@ public sealed unsafe class ModelWeights
 
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_inp.weight", out var ffnGateInp) && ffnGateInp != null)
                 {
-                    gateInpWeight = (float*)gguf.GetTensorPointer(ffnGateInp);
+                    gateInpWeight = LoadFloat32Pointer(ffnGateInp);
                 }
 
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_inp.bias", out var ffnGateInpB) && ffnGateInpB != null)
                 {
-                    gateInpBias = (float*)gguf.GetTensorPointer(ffnGateInpB);
+                    gateInpBias = LoadFloat32Pointer(ffnGateInpB);
                 }
                 else if (gguf.TryGetTensor($"blk.{l}.exp_probs_b.bias", out var expProbsB) && expProbsB != null)
                 {
-                    gateInpBias = (float*)gguf.GetTensorPointer(expProbsB);
+                    gateInpBias = LoadFloat32Pointer(expProbsB);
                 }
 
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_inp_shexp.weight", out var ffnGateInpShexp) && ffnGateInpShexp != null)
                 {
-                    shexpGateInpWeight = (float*)gguf.GetTensorPointer(ffnGateInpShexp);
+                    shexpGateInpWeight = LoadFloat32Pointer(ffnGateInpShexp);
                 }
                 if (gguf.TryGetTensor($"blk.{l}.ffn_gate_shexp.weight", out var ffnGateShexp) && ffnGateShexp != null)
                 {
@@ -772,10 +1027,90 @@ public sealed unsafe class ModelWeights
                 layerHeadDim = isSwa ? 256 : 512;
             }
 
+            // Qwen3.8-Flash-Next (qwen4exp): Hyper-Connections, QSA Indexer, and PLE
+            float* hcAttnNormWeight = LoadFloat32Pointer(hcAttnNorm);
+            byte* hcAttnDownWeight = null;
+            GgufType hcAttnDownType = GgufType.F32;
+            byte* hcAttnUpWeight = null;
+            GgufType hcAttnUpType = GgufType.F32;
+            byte* hcAttnInjectWeight = null;
+            GgufType hcAttnInjectType = GgufType.F32;
+
+            if (gguf.TryGetTensor($"blk.{l}.hc_attn_down.weight", out var hcAd) && hcAd != null) { hcAttnDownWeight = gguf.GetTensorPointer(hcAd); hcAttnDownType = hcAd.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.hc_attn_up.weight", out var hcAu) && hcAu != null) { hcAttnUpWeight = gguf.GetTensorPointer(hcAu); hcAttnUpType = hcAu.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.hc_attn_inject.weight", out var hcAi) && hcAi != null) { hcAttnInjectWeight = gguf.GetTensorPointer(hcAi); hcAttnInjectType = hcAi.Type; }
+            if (hcAttnDownWeight == null && hcAttnInjectWeight == null &&
+                gguf.TryGetTensor($"blk.{l}.hc_attn_down_inject.weight", out var hcAdi) && hcAdi != null &&
+                hcAdi.Dimensions.Length >= 2 && HyperConnectionCount > 0)
+            {
+                int hcDim = (int)hcAdi.Dimensions[0];
+                int nLo = (int)hcAdi.Dimensions[1] - HyperConnectionCount;
+                if (nLo > 0)
+                {
+                    byte* basePtr = gguf.GetTensorPointer(hcAdi);
+                    long rowBytes = GgufTypes.GetRowBytes(hcAdi.Type, hcDim);
+                    hcAttnDownWeight = basePtr;
+                    hcAttnDownType = hcAdi.Type;
+                    hcAttnInjectWeight = basePtr + (long)nLo * rowBytes;
+                    hcAttnInjectType = hcAdi.Type;
+                }
+            }
+
+            float* hcFfnNormWeight = LoadFloat32Pointer(hcFfnNorm);
+            byte* hcFfnDownWeight = null;
+            GgufType hcFfnDownType = GgufType.F32;
+            byte* hcFfnUpWeight = null;
+            GgufType hcFfnUpType = GgufType.F32;
+            byte* hcFfnInjectWeight = null;
+            GgufType hcFfnInjectType = GgufType.F32;
+
+            if (gguf.TryGetTensor($"blk.{l}.hc_ffn_down.weight", out var hcFd) && hcFd != null) { hcFfnDownWeight = gguf.GetTensorPointer(hcFd); hcFfnDownType = hcFd.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.hc_ffn_up.weight", out var hcFu) && hcFu != null) { hcFfnUpWeight = gguf.GetTensorPointer(hcFu); hcFfnUpType = hcFu.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.hc_ffn_inject.weight", out var hcFi) && hcFi != null) { hcFfnInjectWeight = gguf.GetTensorPointer(hcFi); hcFfnInjectType = hcFi.Type; }
+            if (hcFfnDownWeight == null && hcFfnInjectWeight == null &&
+                gguf.TryGetTensor($"blk.{l}.hc_ffn_down_inject.weight", out var hcFdi) && hcFdi != null &&
+                hcFdi.Dimensions.Length >= 2 && HyperConnectionCount > 0)
+            {
+                int hcDim = (int)hcFdi.Dimensions[0];
+                int nLo = (int)hcFdi.Dimensions[1] - HyperConnectionCount;
+                if (nLo > 0)
+                {
+                    byte* basePtr = gguf.GetTensorPointer(hcFdi);
+                    long rowBytes = GgufTypes.GetRowBytes(hcFdi.Type, hcDim);
+                    hcFfnDownWeight = basePtr;
+                    hcFfnDownType = hcFdi.Type;
+                    hcFfnInjectWeight = basePtr + (long)nLo * rowBytes;
+                    hcFfnInjectType = hcFdi.Type;
+                }
+            }
+
+            byte* qsaQProjWeight = null, qsaKProjWeight = null;
+            GgufType qsaQProjType = GgufType.F32, qsaKProjType = GgufType.F32;
+            float* qsaQNormWeight = null, qsaKNormWeight = null;
+            if (gguf.TryGetTensor($"blk.{l}.indexer.q_proj.weight", out var qsaQp) && qsaQp != null) { qsaQProjWeight = gguf.GetTensorPointer(qsaQp); qsaQProjType = qsaQp.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.indexer.k_proj.weight", out var qsaKp) && qsaKp != null) { qsaKProjWeight = gguf.GetTensorPointer(qsaKp); qsaKProjType = qsaKp.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.indexer.q_norm.weight", out var qsaQn) && qsaQn != null) { qsaQNormWeight = LoadFloat32Pointer(qsaQn); }
+            if (gguf.TryGetTensor($"blk.{l}.indexer.k_norm.weight", out var qsaKn) && qsaKn != null) { qsaKNormWeight = LoadFloat32Pointer(qsaKn); }
+
+            int[]? compressRatios = gguf.AttentionCompressRatios;
+            int idxCompressRatio = compressRatios != null && l < compressRatios.Length && compressRatios[l] > 0
+                ? compressRatios[l]
+                : (qsaQProjWeight != null && qsaKProjWeight != null ? 4 : 0);
+
+            byte* pleKeyWeight = null, pleValueWeight = null;
+            GgufType pleKeyType = GgufType.F32, pleValueType = GgufType.F32;
+            float* pleNormKeyWeight = null, pleNormQueryWeight = null, pleNormConvWeight = null, pleConv1dWeight = null;
+            if (gguf.TryGetTensor($"blk.{l}.ple_key.weight", out var pkT) && pkT != null) { pleKeyWeight = gguf.GetTensorPointer(pkT); pleKeyType = pkT.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.ple_value.weight", out var pvT) && pvT != null) { pleValueWeight = gguf.GetTensorPointer(pvT); pleValueType = pvT.Type; }
+            if (gguf.TryGetTensor($"blk.{l}.ple_norm_key.weight", out var pnkT) && pnkT != null) { pleNormKeyWeight = LoadFloat32Pointer(pnkT); }
+            if (gguf.TryGetTensor($"blk.{l}.ple_norm_query.weight", out var pnqT) && pnqT != null) { pleNormQueryWeight = LoadFloat32Pointer(pnqT); }
+            if (gguf.TryGetTensor($"blk.{l}.ple_norm_conv.weight", out var pncT) && pncT != null) { pleNormConvWeight = LoadFloat32Pointer(pncT); }
+            if (gguf.TryGetTensor($"blk.{l}.ple_conv1d.weight", out var pcT) && pcT != null) { pleConv1dWeight = LoadFloat32Pointer(pcT); }
+
             Layers[l] = new LayerWeights
             {
-                AttnNormWeight = (float*)gguf.GetTensorPointer(attnNorm!),
-                AttnNormType = attnNorm!.Type,
+                AttnNormWeight = LoadFloat32Pointer(attnNorm),
+                AttnNormType = attnNorm?.Type ?? GgufType.F32,
                 QkvWeight = qkvWeight,
                 QkvType = qkvType,
                 QkvBias = qkvBias,
@@ -809,14 +1144,15 @@ public sealed unsafe class ModelWeights
                 AttnOutWeight = attnOutWeight!,
                 AttnOutType = attnOutType,
                 AttnOutBias = attnOutB,
-                AttnQNormWeight = qNorm != null ? (float*)gguf.GetTensorPointer(qNorm) : null,
-                AttnKNormWeight = kNorm != null ? (float*)gguf.GetTensorPointer(kNorm) : null,
-                AttnSinksWeight = attnSinks != null ? (float*)gguf.GetTensorPointer(attnSinks) : null,
+                AttnQNormWeight = LoadFloat32Pointer(qNorm),
+                AttnKNormWeight = LoadFloat32Pointer(kNorm),
+                AttnSinksWeight = LoadFloat32Pointer(attnSinks),
                 IsGdn = isGdn,
                 HasQGate = hasQGate,
                 AttnGateWeight = attnGateWeight,
                 AttnGateType = attnGateType,
                 SsmConv1dWeight = ssmConv1dWeight,
+                SsmConv1dDimensions = ssmConv1dDims,
                 SsmAWeight = ssmAWeight,
                 SsmAlphaWeight = ssmAlphaWeight,
                 SsmAlphaType = ssmAlphaType,
@@ -828,8 +1164,8 @@ public sealed unsafe class ModelWeights
                 SsmConv1dBias = ssmConv1dBias,
                 SsmOutWeight = ssmOutWeight,
                 SsmOutType = ssmOutType,
-                FfnNormWeight = (float*)gguf.GetTensorPointer(ffnNorm!),
-                FfnNormType = ffnNorm!.Type,
+                FfnNormWeight = LoadFloat32Pointer(ffnNorm),
+                FfnNormType = ffnNorm?.Type ?? GgufType.F32,
                 IsMoe = hasMoE,
                 FfnGateWeight = ffnGateWeight,
                 FfnGateType = ffnGateType,
@@ -868,8 +1204,117 @@ public sealed unsafe class ModelWeights
                 FfnGateUpExpsWeight = gateUpExpsWeight,
                 FfnGateUpExpsType = gateUpExpsType,
                 FfnDownExpsScaleWeight = downExpsScale,
-                LayerOutputScaleWeight = layerOutScale
+                LayerOutputScaleWeight = layerOutScale,
+                HasHyperConnections = hcAttnDownWeight != null && hcFfnDownWeight != null,
+                HcAttnNormWeight = hcAttnNormWeight,
+                HcAttnDownWeight = hcAttnDownWeight,
+                HcAttnDownType = hcAttnDownType,
+                HcAttnUpWeight = hcAttnUpWeight,
+                HcAttnUpType = hcAttnUpType,
+                HcAttnInjectWeight = hcAttnInjectWeight,
+                HcAttnInjectType = hcAttnInjectType,
+                HcFfnNormWeight = hcFfnNormWeight,
+                HcFfnDownWeight = hcFfnDownWeight,
+                HcFfnDownType = hcFfnDownType,
+                HcFfnUpWeight = hcFfnUpWeight,
+                HcFfnUpType = hcFfnUpType,
+                HcFfnInjectWeight = hcFfnInjectWeight,
+                HcFfnInjectType = hcFfnInjectType,
+                IsQsa = qsaQProjWeight != null && qsaKProjWeight != null,
+                IndexerQProjWeight = qsaQProjWeight,
+                IndexerQProjType = qsaQProjType,
+                IndexerKProjWeight = qsaKProjWeight,
+                IndexerKProjType = qsaKProjType,
+                IndexerQNormWeight = qsaQNormWeight,
+                IndexerKNormWeight = qsaKNormWeight,
+                IndexerCompressRatio = idxCompressRatio,
+                HasPle = pleKeyWeight != null && pleValueWeight != null,
+                PleKeyWeight = pleKeyWeight,
+                PleKeyType = pleKeyType,
+                PleValueWeight = pleValueWeight,
+                PleValueType = pleValueType,
+                PleNormKeyWeight = pleNormKeyWeight,
+                PleNormQueryWeight = pleNormQueryWeight,
+                PleNormConvWeight = pleNormConvWeight,
+                PleConv1dWeight = pleConv1dWeight
             };
         }
+    }
+
+    internal float* LoadFloat32Pointer(GgufTensorInfo? tensor) =>
+        DequantizeTensorToFloat32(Gguf, tensor, _ownedFloatBuffers);
+
+    internal static float* DequantizeTensorToFloat32(GgufFile gguf, GgufTensorInfo? tensor, List<IntPtr> ownedBuffers)
+    {
+        if (tensor == null) return null;
+        byte* raw = gguf.GetTensorPointer(tensor);
+        if (tensor.Type == GgufType.F32)
+            return (float*)raw;
+
+        ulong count = tensor.ElementCount;
+        float* buf = (float*)NativeMemory.Alloc((nuint)Math.Max(1UL, count), (nuint)sizeof(float));
+        if (tensor.Type == GgufType.BF16)
+        {
+            QuantKernels.DequantizeBF16((ushort*)raw, buf, (int)count);
+        }
+        else if (tensor.Type == GgufType.F16)
+        {
+            Half* h = (Half*)raw;
+            for (ulong i = 0; i < count; i++) buf[i] = (float)h[i];
+        }
+        else
+        {
+            try
+            {
+                int rowWidth = tensor.Dimensions.Length >= 1 ? (int)tensor.Dimensions[0] : (int)count;
+                if (rowWidth <= 0 || count % (ulong)rowWidth != 0)
+                {
+                    rowWidth = (int)count;
+                }
+                int nRows = rowWidth > 0 ? (int)(count / (ulong)rowWidth) : 1;
+                for (int r = 0; r < nRows; r++)
+                {
+                    QuantKernels.ExtractEmbedding(tensor.Type, raw, r, buf + (long)r * rowWidth, rowWidth);
+                }
+            }
+            catch
+            {
+                NativeMemory.Free(buf);
+                throw;
+            }
+        }
+
+        ownedBuffers.Add((IntPtr)buf);
+        return buf;
+    }
+
+    public HostRamExpertArena? AttachExpertArena(ulong budgetBytes, bool preferUnbufferedIo = true)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _expertArena?.Dispose();
+        _expertArena = HostRamExpertArena.TryAttach(this, budgetBytes, preferUnbufferedIo);
+        return _expertArena;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        _expertArena?.Dispose();
+        _expertArena = null;
+
+        for (int i = 0; i < _ownedFloatBuffers.Count; i++)
+        {
+            IntPtr ptr = _ownedFloatBuffers[i];
+            if (ptr != IntPtr.Zero) NativeMemory.Free((void*)ptr);
+        }
+        _ownedFloatBuffers.Clear();
+        GC.SuppressFinalize(this);
+    }
+
+    ~ModelWeights()
+    {
+        Dispose();
     }
 }

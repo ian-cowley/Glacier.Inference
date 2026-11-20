@@ -44,10 +44,46 @@ public sealed unsafe class D3D12Context : IDisposable
     private ulong _sharedSystemMemory;
     public ulong DedicatedVideoMemory => _dedicatedVideoMemory;
     public ulong SharedSystemMemory => _sharedSystemMemory;
+    public bool IsUnifiedMemoryArchitecture => _dedicatedVideoMemory < 4_000_000_000UL;
     public ulong TotalAccessibleMemory => (_dedicatedVideoMemory < 4_000_000_000UL || _deviceName.Contains("Radeon", StringComparison.OrdinalIgnoreCase) || _deviceName.Contains("Intel", StringComparison.OrdinalIgnoreCase))
         ? (_dedicatedVideoMemory + _sharedSystemMemory)
         : _dedicatedVideoMemory;
     public IDXGIAdapter1? Adapter => _adapter;
+
+    /// <summary>
+    /// Queries DXGI local video memory budget and usage, returning WDDM cliff headroom metrics.
+    /// </summary>
+    public Glacier.Inference.Memory.VramHeadroomSnapshot QueryVramHeadroom(ulong? explicitReserveBytes = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        ulong budget = _dedicatedVideoMemory;
+        ulong usage = 0UL;
+
+        try
+        {
+            using var adapter3 = _adapter?.QueryInterfaceOrNull<IDXGIAdapter3>();
+            if (adapter3 != null)
+            {
+                var info = adapter3.QueryVideoMemoryInfo(0u, MemorySegmentGroup.Local);
+                if (info.Budget > 0)
+                    budget = info.Budget;
+                usage = info.CurrentUsage;
+            }
+        }
+        catch
+        {
+            // Fallback to reported DedicatedVideoMemory when DXGI 1.4 memory query is unavailable
+        }
+
+        return Glacier.Inference.Memory.WddmVramGuard.EvaluateHeadroom(
+            _dedicatedVideoMemory,
+            budget,
+            usage,
+            OperatingSystem.IsWindows(),
+            IsUnifiedMemoryArchitecture,
+            explicitReserveBytes);
+    }
 
     /// <summary>
     /// Returns true if Direct3D 12 compute is supported and at least one hardware adapter is present.
@@ -750,15 +786,22 @@ public sealed unsafe class D3D12Context : IDisposable
                 GgufType.Q5_K => D3D12Shaders.GemvQ5K,
                 GgufType.Q6_K => D3D12Shaders.GemvQ6K,
                 GgufType.Q3_K => D3D12Shaders.GemvQ3K,
+                GgufType.Q4_0 => D3D12Shaders.GemvQ4_0,
+                GgufType.Q5_0 => D3D12Shaders.GemvQ5_0,
                 GgufType.Q8_0 => D3D12Shaders.GemvQ8_0,
                 GgufType.Q2_K => D3D12Shaders.GemvQ2_K,
                 GgufType.Q2_0 => D3D12Shaders.GemvQ2_0,
+                GgufType.GgmlQ2_0 => D3D12Shaders.GemvGgmlQ2_0,
                 GgufType.IQ2_XXS => D3D12Shaders.GemvIQ2_XXS,
+                GgufType.IQ2_XS => D3D12Shaders.GemvIQ2_XS,
+                GgufType.IQ2_S => D3D12Shaders.GemvIQ2_S,
+                GgufType.IQ3_XXS => D3D12Shaders.GemvIQ3_XXS,
                 GgufType.IQ4_NL => D3D12Shaders.GemvIQ4_NL,
                 GgufType.IQ4_XS => D3D12Shaders.GemvIQ4_XS,
                 GgufType.MXFP4 => D3D12Shaders.GemvMXFP4,
                 GgufType.IQ3_S => D3D12Shaders.GemvIQ3_S,
                 GgufType.Ternary_1_58 or GgufType.PQ2_0 => D3D12Shaders.GemvTernary,
+                GgufType.BF16 => D3D12Shaders.GemvBf16,
                 GgufType.F32 => D3D12Shaders.GemvFp32,
                 _ => throw new NotSupportedException($"Expert GEMV does not support tensor quantization type {type}.")
             };

@@ -136,6 +136,64 @@ public unsafe struct BlockIQ2_XXS
 }
 
 /// <summary>
+/// IQ2_XS (Type 17) quantization super-block: 256 elements in 74 bytes (2.3125 b/w).
+/// 2-byte FP16 super-scale + 32 16-bit grid/sign words (9-bit grid + 7-bit sign index) + 8 4-bit-pair sub-block scales.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ2_XS
+{
+    public Half Delta;          // 2 bytes: super-block scale
+    public fixed ushort Qs[32]; // 64 bytes: 9-bit grid index + 7-bit KSignsIq2Xs index
+    public fixed byte Scales[8];// 8 bytes: 2x 4-bit sub-block scales per 32-weight group
+}
+
+/// <summary>
+/// IQ2_S (Type 22) quantization super-block: 256 elements in 82 bytes (2.5625 b/w).
+/// 2-byte FP16 super-scale + 32 low grid bytes + 32 raw sign bytes + 8 high-bit bytes + 8 scale bytes.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ2_S
+{
+    public Half Delta;          // 2 bytes: super-block scale
+    public fixed byte Qs[64];   // 64 bytes: Qs[0..31] low grid bits, Qs[32..63] raw sign bytes
+    public fixed byte Qh[8];    // 8 bytes: high 2 grid bits per 8-weight group
+    public fixed byte Scales[8];// 8 bytes: 2x 4-bit sub-block scales per 32-weight group
+}
+
+/// <summary>
+/// IQ3_XXS (Type 18) quantization super-block: 256 elements in 98 bytes (3.0625 b/w).
+/// 2-byte FP16 super-scale + 64 8-bit quad grid indices + 8 uint32 aux words (signs + sub-block scale).
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ3_XXS
+{
+    public Half Delta;          // 2 bytes: super-block scale
+    public fixed byte Qs[96];   // 96 bytes: Qs[0..63] grid indices, Qs[64..95] 8x uint32 aux32
+}
+
+/// <summary>
+/// IQ1_S (Type 19) quantization super-block: 256 elements in 50 bytes.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ1_S
+{
+    public Half Delta;          // 2 bytes: super-block scale
+    public fixed byte Qs[32];   // 32 bytes: low 8 bits of 11-bit grid indices
+    public fixed ushort Qh[8];  // 16 bytes: high 3 grid bits, delta sign, and 3-bit sub-block scale
+}
+
+/// <summary>
+/// IQ1_M (Type 29) quantization super-block: 256 elements in 56 bytes.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockIQ1_M
+{
+    public fixed byte Qs[32];   // 32 bytes
+    public fixed byte Qh[16];   // 16 bytes
+    public fixed byte Scales[8];// 8 bytes: packed sub-block scales and super-scale nibbles
+}
+
+/// <summary>
 /// IQ4_NL (Type 20) non-linear 4-bit quantization block: 32 elements in 18 bytes (4.50 b/w).
 /// Compatible with non-256-multiple dimensions (such as 640-col ffn_down_exps in Qwen3.8-Flash-Next).
 /// Uses the 16-entry non-linear KValuesIq4Nl codebook.
@@ -158,6 +216,17 @@ public unsafe struct BlockQ2_0
     public Half Delta;        // 2 bytes: FP16 scale
     public Half Min;          // 2 bytes: FP16 min / zero-point offset
     public fixed byte Qs[16]; // 16 bytes: 64 2-bit quants (4 per byte: bits 0..1, 2..3, 4..5, 6..7)
+}
+
+/// <summary>
+/// Upstream GGML_TYPE_Q2_0 (Type 42) 2-bit quantization block: 64 elements in 18 bytes (2.25 b/w).
+/// Consecutive 2-bit values in Qs[j/4] shifted by (j%4)*2 encode {-1, 0, +1, +2} * Delta.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockGgmlQ2_0
+{
+    public Half Delta;        // 2 bytes: FP16 scale
+    public fixed byte Qs[16]; // 16 bytes: 64 2-bit quants, 4 consecutive elements per byte: ((Qs[j/4] >> ((j%4)*2)) & 3) - 1
 }
 
 /// <summary>

@@ -51,4 +51,9 @@ public interface IDraftProvider : IDisposable
         }
         return drafted;
     }
+
+    /// <summary>
+    /// Optional telemetry feedback invoked by <see cref="SpeculativeEngine"/> after each speculative verification round.
+    /// </summary>
+    void OnVerificationResult(int draftedCount, int acceptedCount, double roundElapsedMs) { }
 }

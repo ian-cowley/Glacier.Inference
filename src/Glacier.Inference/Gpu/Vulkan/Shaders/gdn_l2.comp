@@ -4,15 +4,24 @@
 // Layout of buf: Q [nGroups*128] then K [nGroups*128] (then V, untouched).
 layout(local_size_x = 128) in;
 layout(std430, binding = 0) buffer B { float buf[]; };
+#ifdef BATCH
+layout(push_constant) uniform PC { uint nGroups; uint stride; } pc;
+#else
 layout(push_constant) uniform PC { uint nGroups; } pc;
+#endif
 shared float rq[128];
 shared float rk[128];
 void main() {
     uint g = gl_WorkGroupID.x;
     if (g >= pc.nGroups) return;
+#ifdef BATCH
+    uint base = gl_WorkGroupID.y * pc.stride;
+#else
+    uint base = 0u;
+#endif
     uint t = gl_LocalInvocationID.x;
-    uint qi = g * 128u + t;
-    uint ki = pc.nGroups * 128u + g * 128u + t;
+    uint qi = base + g * 128u + t;
+    uint ki = base + pc.nGroups * 128u + g * 128u + t;
     float q = buf[qi], k = buf[ki];
     rq[t] = q * q; rk[t] = k * k;
     barrier();

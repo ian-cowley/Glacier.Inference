@@ -12,7 +12,11 @@ layout(std430, binding = 3) readonly buffer DT { float dtBias[]; }; // [nV]
 layout(std430, binding = 4) readonly buffer AW { float aW[]; };     // [nV]  (= -exp(A_log))
 layout(std430, binding = 5) buffer ST { float st[]; };              // [nV][128*128]
 layout(std430, binding = 6) writeonly buffer Y { float y[]; };      // [nV*128]
+#ifdef BATCH
+layout(push_constant) uniform PC { uint nK; uint nV; uint ch; uint tokIdx; } pc;
+#else
 layout(push_constant) uniform PC { uint nK; uint nV; } pc;
+#endif
 shared float sq[128];
 shared float sk[128];
 void main() {
@@ -20,14 +24,23 @@ void main() {
     if (h >= pc.nV) return;
     uint i = gl_LocalInvocationID.x;
     uint g = h % pc.nK;
-    sq[i] = qkv[g * 128u + i];
-    sk[i] = qkv[pc.nK * 128u + g * 128u + i];
+#ifdef BATCH
+    uint qkvOff = pc.tokIdx * pc.ch;
+    uint headOff = pc.tokIdx * pc.nV;
+    uint yOff = pc.tokIdx * pc.nV * 128u;
+#else
+    uint qkvOff = 0u;
+    uint headOff = 0u;
+    uint yOff = 0u;
+#endif
+    sq[i] = qkv[qkvOff + g * 128u + i];
+    sk[i] = qkv[qkvOff + pc.nK * 128u + g * 128u + i];
     barrier();
 
-    float a = alpha[h] + dtBias[h];
+    float a = alpha[headOff + h] + dtBias[h];
     float dt = a > 20.0 ? a : log(1.0 + exp(a));
     float decay = exp(aW[h] * dt);
-    float beta = 1.0 / (1.0 + exp(-betaIn[h]));
+    float beta = 1.0 / (1.0 + exp(-betaIn[headOff + h]));
 
     uint base = h * 128u * 128u;
     float kv = 0.0;
@@ -36,7 +49,7 @@ void main() {
         st[base + j * 128u + i] = s;
         kv += s * sk[j];
     }
-    float v = qkv[2u * pc.nK * 128u + h * 128u + i];
+    float v = qkv[qkvOff + 2u * pc.nK * 128u + h * 128u + i];
     float delta = (v - kv) * beta;
     float dot = 0.0;
     for (uint j = 0u; j < 128u; j++) {
@@ -44,5 +57,5 @@ void main() {
         st[base + j * 128u + i] = s;
         dot += s * sq[j];
     }
-    y[h * 128u + i] = dot;
+    y[yOff + h * 128u + i] = dot;
 }

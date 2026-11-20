@@ -186,7 +186,10 @@ public static class ModelArchitectureDetector
                 return UniversalArchitecture.Lfm2;
         }
 
-        if (HasSsmTensors(gguf))
+        if (string.Equals(arch, "qwen4exp", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arch, "qwen38", StringComparison.OrdinalIgnoreCase) ||
+            (gguf?.Tensors != null && gguf.Tensors.ContainsKey("blk.0.hc_attn_norm.weight")) ||
+            HasSsmTensors(gguf))
         {
             return UniversalArchitecture.HybridSsm;
         }

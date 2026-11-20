@@ -47,6 +47,9 @@ public static partial class Program
         string? kvPrecisionStr = null;
         string? split = null;
         int maxSeqLen = 2048;
+        int defaultMaxThinkTokens = ReasoningBudgetPolicy.AutoBudgetSentinel;
+        bool enableSleepMemory = false;
+        int sleepBudget = 400;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -81,6 +84,31 @@ public static partial class Program
                 kvPrecisionStr = args[++i];
             else if (args[i] == "--split" && i + 1 < args.Length)
                 split = args[++i];
+            else if (args[i] == "--max-think-tokens" && i + 1 < args.Length)
+            {
+                if (!ReasoningBudgetPolicy.TryParseSetting(args[++i], out int parsedThink))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: --max-think-tokens must be 'auto', 'off', '0', or a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
+                defaultMaxThinkTokens = parsedThink;
+            }
+            else if (args[i] == "--sleep-memory")
+                enableSleepMemory = true;
+            else if (args[i] == "--sleep-budget" && i + 1 < args.Length)
+            {
+                if (!int.TryParse(args[++i], out int sbVal) || sbVal <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Error: --sleep-budget must be a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
+                sleepBudget = sbVal;
+                enableSleepMemory = true;
+            }
             else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length)
             {
                 if (!int.TryParse(args[++i], out int cLen) || cLen <= 0)
@@ -122,10 +150,10 @@ public static partial class Program
         KvCachePrecision kvPrecision = KvCachePrecision.Auto;
         if (!string.IsNullOrWhiteSpace(kvPrecisionStr))
         {
-            if (!Enum.TryParse<KvCachePrecision>(kvPrecisionStr, ignoreCase: true, out var parsedPrecision))
+            if (!KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error: Unknown KV precision '{kvPrecisionStr}'. Valid values: Auto, Fp32, Fp16, Q8_0, Q4_0.");
+                Console.WriteLine($"Error: Unknown KV precision '{kvPrecisionStr}'. Valid values: Auto, Fp32, Fp16, Fp8 (Q8_0), Q4_0 (Int4).");
                 Console.ResetColor();
                 return 1;
             }
@@ -155,11 +183,15 @@ public static partial class Program
         Console.WriteLine($"KV Precision: {kvPrecision}");
         if (!string.IsNullOrEmpty(split))
             Console.WriteLine($"Pipeline Split: {split}");
+        Console.WriteLine($"Think Budget: {(defaultMaxThinkTokens < 0 ? "auto" : defaultMaxThinkTokens == 0 ? "off" : $"{defaultMaxThinkTokens} tokens")}");
+        if (enableSleepMemory)
+            Console.WriteLine($"Sleep Memory: Enabled (budget={sleepBudget} tokens)");
         Console.WriteLine();
 
         Console.WriteLine(">> Initializing inference session...");
         using var session = new InferenceSession(modelPath, maxSeqLen: maxSeqLen, device: device, engine: engine, kvPrecision: kvPrecision, split: split);
-        await using var app = CreateServeApp(session, modelPath, apiKey, host, port);
+        await using SleepMemoryService? sleepMemory = enableSleepMemory ? new SleepMemoryService(sleepBudget) : null;
+        await using var app = CreateServeApp(session, modelPath, apiKey, host, port, defaultMaxThinkTokens, sleepMemory);
 
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine($"\n>>> Glacier.Inference server running on http://{host}:{port}");
@@ -175,7 +207,9 @@ public static partial class Program
         string modelPath,
         string? apiKey = null,
         string host = "127.0.0.1",
-        int port = 11434)
+        int port = 11434,
+        int defaultMaxThinkTokens = ReasoningBudgetPolicy.AutoBudgetSentinel,
+        SleepMemoryService? sleepMemory = null)
     {
         var appBuilder = WebApplication.CreateBuilder();
         appBuilder.Services.Configure<Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerOptions>(options =>
@@ -188,7 +222,7 @@ public static partial class Program
             app.Urls.Add($"http://{host}:{port}");
         }
 
-        ConfigureServeEndpoints(app, session, modelPath, apiKey);
+        ConfigureServeEndpoints(app, session, modelPath, apiKey, defaultMaxThinkTokens, sleepMemory);
         return app;
     }
 
@@ -196,7 +230,9 @@ public static partial class Program
         WebApplication app,
         InferenceSession session,
         string modelPath,
-        string? apiKey = null)
+        string? apiKey = null,
+        int defaultMaxThinkTokens = ReasoningBudgetPolicy.AutoBudgetSentinel,
+        SleepMemoryService? sleepMemory = null)
     {
         string modelName = Path.GetFileNameWithoutExtension(modelPath);
 
@@ -301,6 +337,11 @@ public static partial class Program
             }
 
             string prompt = req.TryGetProperty("prompt", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() ?? "" : "";
+            string rawPromptForSleep = prompt;
+            if (sleepMemory != null)
+            {
+                prompt = await sleepMemory.ConsolidatePromptAsync(prompt, ctx.RequestAborted);
+            }
             bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False;
 
             if (string.IsNullOrEmpty(prompt))
@@ -310,7 +351,7 @@ public static partial class Program
                 return;
             }
 
-            var options = ParseSamplingOptions(req);
+            var options = ParseSamplingOptions(req, defaultMaxThinkTokens);
 
             await s_inferenceLock.WaitAsync(ctx.RequestAborted);
             try
@@ -318,6 +359,7 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(prompt, options, formatChat: true, ct: ctx.RequestAborted);
+                    sleepMemory?.RecordTurnCompletion(rawPromptForSleep, result.Text);
                     var respObj = new OllamaGenerateResponse
                     {
                         Model = modelName,
@@ -372,6 +414,7 @@ public static partial class Program
                 }
 
                 var genResult = await genTask;
+                sleepMemory?.RecordTurnCompletion(rawPromptForSleep, genResult.Text);
                 var finalChunk = new OllamaGenerateResponse
                 {
                     Model = modelName,
@@ -421,7 +464,12 @@ public static partial class Program
             }
 
             bool stream = req.TryGetProperty("stream", out var s) && (s.ValueKind == JsonValueKind.True || (s.ValueKind != JsonValueKind.False && s.GetBoolean()));
-            var options = ParseSamplingOptions(req);
+            var options = ParseSamplingOptions(req, defaultMaxThinkTokens);
+            string rawLastUser = ExtractLastUserMessage(messages);
+            if (sleepMemory != null)
+            {
+                messages = await sleepMemory.ConsolidateMessagesAsync(messages, ctx.RequestAborted);
+            }
             string formattedPrompt = session.Tokenizer.FormatChat(messages);
             string completionId = $"chatcmpl-{Guid.NewGuid():N}";
             long createdTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -432,6 +480,7 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
+                    sleepMemory?.RecordTurnCompletion(rawLastUser, result.Text);
                     var resp = new OpenAiChatCompletionResponse
                     {
                         Id = completionId,
@@ -524,6 +573,7 @@ public static partial class Program
                 }
 
                 var genResult = await genTask;
+                sleepMemory?.RecordTurnCompletion(rawLastUser, genResult.Text);
                 var finalChunk = new OpenAiChatChunkResponse
                 {
                     Id = completionId,
@@ -562,6 +612,29 @@ public static partial class Program
             ]
         }, InferenceCliJsonContext.Default.OpenAiModelsResponse));
 
+        // 4b. GET /api/sleep/status & POST /api/sleep/trigger (Pillar 16 Sleep Memory telemetry)
+        app.MapGet("/api/sleep/status", () =>
+        {
+            var payload = sleepMemory != null
+                ? sleepMemory.GetStatus()
+                : new SleepStatusResponse { Enabled = false, TokenBudget = 0, State = "Disabled" };
+            return Results.Json(payload, InferenceCliJsonContext.Default.SleepStatusResponse);
+        });
+
+        app.MapPost("/api/sleep/trigger", async (HttpContext ctx) =>
+        {
+            if (sleepMemory == null)
+            {
+                return Results.Json(
+                    new SleepStatusResponse { Enabled = false, TokenBudget = 0, State = "Disabled" },
+                    InferenceCliJsonContext.Default.SleepStatusResponse,
+                    statusCode: 400);
+            }
+
+            await sleepMemory.TriggerSleepAsync(ctx.RequestAborted);
+            return Results.Json(sleepMemory.GetStatus(), InferenceCliJsonContext.Default.SleepStatusResponse);
+        });
+
         // 5. POST /api/chat (Ollama chat endpoint)
         app.MapPost("/api/chat", async (HttpContext ctx) =>
         {
@@ -592,7 +665,12 @@ public static partial class Program
             }
 
             bool stream = !req.TryGetProperty("stream", out var s) || s.ValueKind != JsonValueKind.False;
-            var options = ParseSamplingOptions(req);
+            var options = ParseSamplingOptions(req, defaultMaxThinkTokens);
+            string rawLastUser = ExtractLastUserMessage(messages);
+            if (sleepMemory != null)
+            {
+                messages = await sleepMemory.ConsolidateMessagesAsync(messages, ctx.RequestAborted);
+            }
             string formattedPrompt = session.Tokenizer.FormatChat(messages);
 
             await s_inferenceLock.WaitAsync(ctx.RequestAborted);
@@ -601,6 +679,7 @@ public static partial class Program
                 if (!stream)
                 {
                     var result = await session.GenerateAsync(formattedPrompt, options, formatChat: false, ct: ctx.RequestAborted);
+                    sleepMemory?.RecordTurnCompletion(rawLastUser, result.Text);
                     var respObj = new OllamaChatResponse
                     {
                         Model = modelName,
@@ -655,6 +734,7 @@ public static partial class Program
                 }
 
                 var genResult = await genTask;
+                sleepMemory?.RecordTurnCompletion(rawLastUser, genResult.Text);
                 var finalChunk = new OllamaChatResponse
                 {
                     Model = modelName,
@@ -675,7 +755,7 @@ public static partial class Program
         });
     }
 
-    private static SamplingOptions ParseSamplingOptions(JsonElement req)
+    public static SamplingOptions ParseSamplingOptions(JsonElement req, int defaultMaxThinkTokens = ReasoningBudgetPolicy.AutoBudgetSentinel)
     {
         var options = new SamplingOptions();
         if (req.TryGetProperty("temperature", out var tempProp) && tempProp.TryGetSingle(out float temp))
@@ -705,7 +785,59 @@ public static partial class Program
             if (subOpt.TryGetProperty("repeat_penalty", out var subRep) && subRep.TryGetSingle(out float sr))
                 options.RepetitionPenalty = sr;
         }
+        int configuredThinkBudget = defaultMaxThinkTokens;
+        if (TryExtractThinkBudget(req, out int rootThinkBudget))
+        {
+            configuredThinkBudget = rootThinkBudget;
+        }
+        else if (req.TryGetProperty("options", out var optsForThink) && optsForThink.ValueKind == JsonValueKind.Object &&
+                 TryExtractThinkBudget(optsForThink, out int nestedThinkBudget))
+        {
+            configuredThinkBudget = nestedThinkBudget;
+        }
+        options.MaxReasoningTokens = ReasoningBudgetPolicy.ResolveBudget(configuredThinkBudget, options.MaxTokens);
+
         return options;
+    }
+
+    private static string ExtractLastUserMessage(List<(string Role, string Content)> messages)
+    {
+        for (int i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role.Equals("user", StringComparison.OrdinalIgnoreCase))
+            {
+                return messages[i].Content;
+            }
+        }
+        return messages.Count > 0 ? messages[^1].Content : "";
+    }
+
+    private static bool TryExtractThinkBudget(JsonElement obj, out int budget)
+    {
+        foreach (string propName in new[] { "max_thinking_tokens", "reasoning_budget", "max_think_tokens" })
+        {
+            if (obj.TryGetProperty(propName, out var prop))
+            {
+                if (prop.ValueKind == JsonValueKind.Number && prop.TryGetInt32(out int numVal) && numVal >= 0)
+                {
+                    budget = numVal;
+                    return true;
+                }
+                if (prop.ValueKind == JsonValueKind.False)
+                {
+                    budget = 0;
+                    return true;
+                }
+                if (prop.ValueKind == JsonValueKind.String && ReasoningBudgetPolicy.TryParseSetting(prop.GetString(), out int strVal))
+                {
+                    budget = strVal;
+                    return true;
+                }
+            }
+        }
+
+        budget = 0;
+        return false;
     }
 
     private static List<(string Role, string Content)> ParseMessages(JsonElement req)

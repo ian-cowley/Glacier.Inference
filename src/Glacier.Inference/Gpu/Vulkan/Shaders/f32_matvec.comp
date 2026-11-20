@@ -1,20 +1,29 @@
 #version 450
-// F32 mat-vec: y[row] = dot(W[row,:], x). One workgroup (64 threads) per row; vec4 loads. K must be a multiple of 4.
-layout(local_size_x = 64) in;
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// F32 mat-vec: y[row] = dot(W[row,:], x). Four rows per workgroup (64x4 threads); vec4 loads. K must be a multiple of 4.
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
 layout(std430, binding = 0) readonly buffer W { vec4 w4[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 layout(push_constant) uniform PC { uint K; uint N; } pc;
-shared float partial[64];
+shared float partial[4][64];
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= pc.N) return;
+    uint ly = gl_LocalInvocationID.y;
     uint tid = gl_LocalInvocationID.x;
-    uint k4 = pc.K >> 2;
+    uint row = gl_WorkGroupID.x * 4u + ly;
     float acc = 0.0;
-    for (uint i = tid; i < k4; i += 64u) acc += dot(w4[row * k4 + i], x4[i]);
-    partial[tid] = acc;
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) partial[tid] += partial[tid + s]; barrier(); }
-    if (tid == 0u) y[row] = partial[0];
+    if (row < pc.N) {
+        uint k4 = pc.K >> 2;
+        uint rowBase = row * k4;
+        for (uint i = tid; i < k4; i += 64u) acc += dot(w4[rowBase + i], x4[i]);
+    }
+    if (gl_SubgroupSize == 64u) {
+        acc = subgroupAdd(acc);
+        if (tid == 0u && row < pc.N) y[row] = acc;
+    } else {
+        partial[ly][tid] = acc;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) { if (tid < s) partial[ly][tid] += partial[ly][tid + s]; barrier(); }
+        if (tid == 0u && row < pc.N) y[row] = partial[ly][0];
+    }
 }
