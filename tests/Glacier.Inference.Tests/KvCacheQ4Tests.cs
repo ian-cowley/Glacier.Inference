@@ -215,8 +215,19 @@ public unsafe class KvCacheQ4Tests
     [Fact]
     public void CudaKernels_Q4_0_StoreAndAttention_MatchReference_WhenCudaAvailable()
     {
-        if (!GpuContext.IsSupported)
+        try
+        {
+            if (!GpuContext.IsSupported)
+                return;
+        }
+        catch (DllNotFoundException)
+        {
             return;
+        }
+        catch (TypeInitializationException)
+        {
+            return;
+        }
 
         using var gpu = new GpuContext(0);
         gpu.MakeCurrent();
