@@ -31,7 +31,7 @@ public static partial class Program
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q8_0|q4_0|fp32> KV-cache precision (default: auto)");
         Console.WriteLine("  --raw                                Skip chat template wrapping");
         Console.WriteLine("  --json                               Emit machine-readable AOT JSON output");
         Console.WriteLine("  -h, --help                           Show this help message");
@@ -60,32 +60,85 @@ public static partial class Program
 
         for (int i = 0; i < args.Length; i++)
         {
-            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
-                candidatePath = args[++i];
-            else if ((args[i] == "--ref" || args[i] == "--reference") && i + 1 < args.Length)
-                referencePath = args[++i];
-            else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
-                prompts.Add(args[++i]);
-            else if (args[i] == "--threshold" && i + 1 < args.Length && double.TryParse(args[++i], CultureInfo.InvariantCulture, out double th))
+            string flag = args[i];
+            if (flag is "-m" or "--model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                candidatePath = val;
+            }
+            else if (flag is "--ref" or "--reference")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                referencePath = val;
+            }
+            else if (flag is "-p" or "--prompt")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                prompts.Add(val);
+            }
+            else if (flag == "--threshold")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!double.TryParse(val, CultureInfo.InvariantCulture, out double th))
+                {
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    return 1;
+                }
                 threshold = th;
-            else if (args[i] == "--max-kl" && i + 1 < args.Length && double.TryParse(args[++i], CultureInfo.InvariantCulture, out double mk))
+            }
+            else if (flag == "--max-kl")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!double.TryParse(val, CultureInfo.InvariantCulture, out double mk))
+                {
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    return 1;
+                }
                 maxKlThreshold = mk;
-            else if (args[i] == "--min-top1" && i + 1 < args.Length && double.TryParse(args[++i], CultureInfo.InvariantCulture, out double mt))
+            }
+            else if (flag == "--min-top1")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!double.TryParse(val, CultureInfo.InvariantCulture, out double mt))
+                {
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    return 1;
+                }
                 minTop1 = mt;
-            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int ctx))
+            }
+            else if (flag is "-c" or "--ctx" or "--context-length")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int ctx) || ctx <= 0)
+                {
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'. Expected a positive integer.");
+                    return 1;
+                }
                 maxSeqLen = ctx;
-            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
-                device = args[++i];
-            else if (args[i] == "--engine" && i + 1 < args.Length)
-                engineStr = args[++i];
-            else if (args[i] == "--kv-precision" && i + 1 < args.Length)
-                kvPrecisionStr = args[++i];
-            else if (args[i] == "--raw")
+            }
+            else if (flag is "-d" or "--device")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                device = val;
+            }
+            else if (flag == "--engine")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                engineStr = val;
+            }
+            else if (flag == "--kv-precision")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                kvPrecisionStr = val;
+            }
+            else if (flag.StartsWith("--kv-precision=", StringComparison.Ordinal))
+                kvPrecisionStr = flag["--kv-precision=".Length..];
+            else if (flag == "--raw")
                 rawPrompt = true;
-            else if (args[i] == "--json")
+            else if (flag == "--json")
                 jsonOutput = true;
-            else if (!args[i].StartsWith("-") && candidatePath == null)
-                candidatePath = args[i];
+            else if (!flag.StartsWith("-") && candidatePath == null)
+                candidatePath = flag;
         }
 
         if (string.IsNullOrWhiteSpace(candidatePath) || string.IsNullOrWhiteSpace(referencePath))
@@ -104,9 +157,11 @@ public static partial class Program
         if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
             engine = parsedEngine;
 
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
-            kvPrecision = parsedPrecision;
+        if (!TryParseKvPrecisionArg(kvPrecisionStr, out var kvPrecision, out var kvError))
+        {
+            Console.Error.WriteLine(kvError);
+            return 1;
+        }
 
         var opts = new KlDivergenceOptions
         {

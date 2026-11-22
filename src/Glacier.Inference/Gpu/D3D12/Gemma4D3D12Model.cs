@@ -160,6 +160,7 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         {
             KvCachePrecision.Auto => KvCachePrecision.Fp16,
             KvCachePrecision.Fp8 => KvCachePrecision.Fp16,
+            KvCachePrecision.Q8_0 => KvCachePrecision.Fp16,
             _ => kvPrecision
         };
         _dim = weights.EmbeddingLength;

@@ -701,6 +701,353 @@ __global__ void paged_attention_gqa_batch_f16_kernel(
 }
 
 // =========================================================================
+// 9r. PagedAttention Q4_0 GQA Single-Token Kernel
+// Pool layout: [num_blocks, num_layers, n_heads_kv, block_size, blocks_per_head]
+// =========================================================================
+__global__ void paged_attention_gqa_q4_0_kernel(
+    const float* __restrict__ q,
+    const BlockQ4_0* __restrict__ k_pool,
+    const BlockQ4_0* __restrict__ v_pool,
+    float* __restrict__ attn_out,
+    const int* __restrict__ block_table,
+    int pos,
+    int layer,
+    int num_layers,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads_q || pos < 0 || block_size <= 0) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q[(size_t)h * head_dim + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        int logical_block = t / block_size;
+        int offset_in_block = t % block_size;
+        int phys_block = block_table[logical_block];
+        if (phys_block < 0) continue;
+
+        size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h_kv) * block_size + offset_in_block;
+        size_t k_blk_base = head_slot * k_blocks_per_head;
+        size_t v_blk_base = head_slot * v_blocks_per_head;
+
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* k_blk = &k_pool[k_blk_base + blk];
+            float k_d = __half2float(k_blk->d);
+            int q_nib = (k_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            dot_part += q_reg[c] * (k_d * (float)(q_nib - 8));
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* v_blk = &v_pool[v_blk_base + blk];
+            float v_d = __half2float(v_blk->d);
+            int q_nib = (v_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            acc[c] = acc[c] * alpha + w_t * (v_d * (float)(q_nib - 8));
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out[(size_t)h * v_head_dim + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
+// 9s. PagedAttention Q4_0 GQA Batched Prefill Kernel
+// 2D grid: blockIdx.x = h (0..n_heads_q - 1), blockIdx.y = b (0..batch_size - 1)
+// =========================================================================
+__global__ void paged_attention_gqa_batch_q4_0_kernel(
+    const float* __restrict__ q_batch,
+    const BlockQ4_0* __restrict__ k_pool,
+    const BlockQ4_0* __restrict__ v_pool,
+    float* __restrict__ attn_out_batch,
+    const int* __restrict__ block_table,
+    int start_pos,
+    int batch_size,
+    int layer,
+    int num_layers,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads_q || b >= batch_size || block_size <= 0) return;
+
+    int pos = start_pos + b;
+    if (pos < 0) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+
+    size_t q_base = ((size_t)b * n_heads_q + h) * head_dim;
+    size_t out_base = ((size_t)b * n_heads_q + h) * v_head_dim;
+
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q_batch[q_base + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        int logical_block = t / block_size;
+        int offset_in_block = t % block_size;
+        int phys_block = block_table[logical_block];
+        if (phys_block < 0) continue;
+
+        size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h_kv) * block_size + offset_in_block;
+        size_t k_blk_base = head_slot * k_blocks_per_head;
+        size_t v_blk_base = head_slot * v_blocks_per_head;
+
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* k_blk = &k_pool[k_blk_base + blk];
+            float k_d = __half2float(k_blk->d);
+            int q_nib = (k_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            dot_part += q_reg[c] * (k_d * (float)(q_nib - 8));
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ4_0* v_blk = &v_pool[v_blk_base + blk];
+            float v_d = __half2float(v_blk->d);
+            int q_nib = (v_blk->qs[elem & 15] >> ((elem >> 4) << 2)) & 0x0F;
+            acc[c] = acc[c] * alpha + w_t * (v_d * (float)(q_nib - 8));
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out_batch[out_base + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
+// 9t. PagedAttention Q8_0 GQA Single-Token Kernel
+// =========================================================================
+__global__ void paged_attention_gqa_q8_0_kernel(
+    const float* __restrict__ q,
+    const BlockQ8_0* __restrict__ k_pool,
+    const BlockQ8_0* __restrict__ v_pool,
+    float* __restrict__ attn_out,
+    const int* __restrict__ block_table,
+    int pos,
+    int layer,
+    int num_layers,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads_q || pos < 0 || block_size <= 0) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q[(size_t)h * head_dim + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        int logical_block = t / block_size;
+        int offset_in_block = t % block_size;
+        int phys_block = block_table[logical_block];
+        if (phys_block < 0) continue;
+
+        size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h_kv) * block_size + offset_in_block;
+        size_t k_blk_base = head_slot * k_blocks_per_head;
+        size_t v_blk_base = head_slot * v_blocks_per_head;
+
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ8_0* k_blk = &k_pool[k_blk_base + blk];
+            dot_part += q_reg[c] * (__half2float(k_blk->d) * (float)k_blk->qs[elem]);
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ8_0* v_blk = &v_pool[v_blk_base + blk];
+            acc[c] = acc[c] * alpha + w_t * (__half2float(v_blk->d) * (float)v_blk->qs[elem]);
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out[(size_t)h * v_head_dim + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
+// 9u. PagedAttention Q8_0 GQA Batched Prefill Kernel
+// 2D grid: blockIdx.x = h (0..n_heads_q - 1), blockIdx.y = b (0..batch_size - 1)
+// =========================================================================
+__global__ void paged_attention_gqa_batch_q8_0_kernel(
+    const float* __restrict__ q_batch,
+    const BlockQ8_0* __restrict__ k_pool,
+    const BlockQ8_0* __restrict__ v_pool,
+    float* __restrict__ attn_out_batch,
+    const int* __restrict__ block_table,
+    int start_pos,
+    int batch_size,
+    int layer,
+    int num_layers,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size,
+    float attn_scale
+) {
+    int h = blockIdx.x;
+    int b = blockIdx.y;
+    if (h >= n_heads_q || b >= batch_size || block_size <= 0) return;
+
+    int pos = start_pos + b;
+    if (pos < 0) return;
+
+    int tid = threadIdx.x;
+    int group_size = n_heads_q / n_heads_kv;
+    int h_kv = h / group_size;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+
+    size_t q_base = ((size_t)b * n_heads_q + h) * head_dim;
+    size_t out_base = ((size_t)b * n_heads_q + h) * v_head_dim;
+
+    float q_reg[MAX_ATTN_CHUNKS];
+    float acc[MAX_ATTN_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_ATTN_CHUNKS; c++) {
+        int d = tid + c * blockDim.x;
+        q_reg[c] = (d < head_dim) ? q_batch[q_base + d] : 0.0f;
+        acc[c] = 0.0f;
+    }
+
+    float m = -1e30f;
+    float l = 0.0f;
+
+    for (int t = 0; t <= pos; t++) {
+        int logical_block = t / block_size;
+        int offset_in_block = t % block_size;
+        int phys_block = block_table[logical_block];
+        if (phys_block < 0) continue;
+
+        size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h_kv) * block_size + offset_in_block;
+        size_t k_blk_base = head_slot * k_blocks_per_head;
+        size_t v_blk_base = head_slot * v_blocks_per_head;
+
+        float dot_part = 0.0f;
+        for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ8_0* k_blk = &k_pool[k_blk_base + blk];
+            dot_part += q_reg[c] * (__half2float(k_blk->d) * (float)k_blk->qs[elem]);
+        }
+
+        float s_t = block_reduce_sum(dot_part) * attn_scale;
+
+        float m_new = fmaxf(m, s_t);
+        float alpha = expf(m - m_new);
+        float w_t = expf(s_t - m_new);
+
+        for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+            int blk = d >> 5;
+            int elem = d & 31;
+            const BlockQ8_0* v_blk = &v_pool[v_blk_base + blk];
+            acc[c] = acc[c] * alpha + w_t * (__half2float(v_blk->d) * (float)v_blk->qs[elem]);
+        }
+        l = l * alpha + w_t;
+        m = m_new;
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (int d = tid, c = 0; d < v_head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
+        attn_out_batch[out_base + d] = acc[c] * inv_l;
+    }
+}
+
+// =========================================================================
 // 9i. Training Causal GQA Attention Forward Kernel
 // =========================================================================
 __global__ void attention_causal_gqa_train_fwd(

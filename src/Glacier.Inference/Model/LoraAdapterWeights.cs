@@ -1,6 +1,8 @@
 namespace Glacier.Inference.Model;
 
 using System;
+using System.Buffers;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -48,6 +50,8 @@ public sealed class LoraLayerProjections
 /// </summary>
 public sealed unsafe class LoraAdapterWeights
 {
+    private const int StackAllocRankThreshold = 256;
+
     private readonly int _layerCount;
     private readonly int _rank;
     private readonly float _alpha;
@@ -62,6 +66,11 @@ public sealed unsafe class LoraAdapterWeights
 
     public LoraAdapterWeights(int layerCount, int rank, float alpha)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(layerCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(rank);
+        if (!float.IsFinite(alpha))
+            throw new ArgumentOutOfRangeException(nameof(alpha), alpha, "LoRA alpha must be finite.");
+
         _layerCount = layerCount;
         _rank = rank;
         _alpha = alpha;
@@ -75,6 +84,7 @@ public sealed unsafe class LoraAdapterWeights
 
     public static LoraAdapterWeights Load(string path)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
         if (!File.Exists(path))
             throw new FileNotFoundException($"LoRA adapter file not found: {path}");
 
@@ -94,22 +104,40 @@ public sealed unsafe class LoraAdapterWeights
         float alpha = br.ReadSingle();
         int tensorCount = br.ReadInt32();
 
+        if (layerCount < 0)
+            throw new InvalidDataException($"Invalid LoRA layer count: {layerCount}");
+        if (rank < 0 || (tensorCount > 0 && rank <= 0))
+            throw new InvalidDataException($"Invalid LoRA rank: {rank}");
+        if (!float.IsFinite(alpha))
+            throw new InvalidDataException($"Invalid non-finite LoRA alpha: {alpha}");
+        if (tensorCount < 0)
+            throw new InvalidDataException($"Invalid LoRA tensor count: {tensorCount}");
+
         var weights = new LoraAdapterWeights(layerCount, rank, alpha);
+        bool sawGlacier = false;
+        bool sawPeft = false;
+        List<(int layer, LoraProjection proj, bool isA)>? squareTensors = null;
 
         for (int t = 0; t < tensorCount; t++)
         {
             string name = br.ReadString();
             int dim0 = br.ReadInt32();
             int dim1 = br.ReadInt32();
-            int elemCount = dim0 * dim1;
+            if (dim0 <= 0 || dim1 <= 0)
+                throw new InvalidDataException($"Invalid LoRA tensor '{name}' dimensions [{dim0}, {dim1}].");
 
-            byte[] byteData = br.ReadBytes(elemCount * sizeof(float));
-            float[] floatData = new float[elemCount];
-            Buffer.BlockCopy(byteData, 0, floatData, 0, byteData.Length);
+            long elemCount = (long)dim0 * dim1;
+            long byteCount = elemCount * sizeof(float);
+            if (elemCount > int.MaxValue || byteCount > fs.Length - fs.Position)
+                throw new InvalidDataException($"LoRA tensor '{name}' byte length {byteCount} exceeds remaining stream bytes ({fs.Length - fs.Position}).");
 
             // Parse tensor name: e.g. blk.0.attn_q.lora_a.weight
             var parts = name.Split('.');
-            if (parts.Length >= 5 && parts[0] == "blk" && int.TryParse(parts[1], out int layerIdx) && layerIdx < layerCount)
+            if (parts.Length >= 5 &&
+                parts[0] == "blk" &&
+                int.TryParse(parts[1], out int layerIdx) &&
+                layerIdx >= 0 &&
+                layerIdx < layerCount)
             {
                 string projName = parts[2];
                 string matrixType = parts[3]; // lora_a or lora_b
@@ -126,19 +154,82 @@ public sealed unsafe class LoraAdapterWeights
                     _ => (LoraProjection)(-1)
                 };
 
-                if ((int)proj >= 0)
+                if ((int)proj >= 0 && (matrixType == "lora_a" || matrixType == "lora_b"))
                 {
+                    float[] floatData = new float[(int)elemCount];
+                    fs.ReadExactly(MemoryMarshal.AsBytes(floatData.AsSpan()));
+
                     ref var slot = ref weights._layers[layerIdx].Get(proj);
                     if (matrixType == "lora_a")
                     {
-                        slot.A = floatData;
-                        slot.inDim = dim0;
+                        if (dim0 == rank && dim1 == rank)
+                        {
+                            slot.A = floatData;
+                            slot.inDim = rank;
+                            (squareTensors ??= new List<(int, LoraProjection, bool)>()).Add((layerIdx, proj, true));
+                        }
+                        else if (dim1 == rank)
+                        {
+                            sawGlacier = true;
+                            slot.A = floatData;
+                            slot.inDim = dim0;
+                        }
+                        else if (dim0 == rank)
+                        {
+                            sawPeft = true;
+                            slot.A = Transpose2D(floatData, dim0, dim1);
+                            slot.inDim = dim1;
+                        }
+                        else
+                        {
+                            throw new InvalidDataException($"LoRA tensor '{name}' shape [{dim0}, {dim1}] is incompatible with rank {rank}.");
+                        }
                     }
-                    else if (matrixType == "lora_b")
+                    else // lora_b
                     {
-                        slot.B = floatData;
-                        slot.outDim = dim1;
+                        if (dim0 == rank && dim1 == rank)
+                        {
+                            slot.B = floatData;
+                            slot.outDim = rank;
+                            (squareTensors ??= new List<(int, LoraProjection, bool)>()).Add((layerIdx, proj, false));
+                        }
+                        else if (dim0 == rank)
+                        {
+                            sawGlacier = true;
+                            slot.B = floatData;
+                            slot.outDim = dim1;
+                        }
+                        else if (dim1 == rank)
+                        {
+                            sawPeft = true;
+                            slot.B = Transpose2D(floatData, dim0, dim1);
+                            slot.outDim = dim0;
+                        }
+                        else
+                        {
+                            throw new InvalidDataException($"LoRA tensor '{name}' shape [{dim0}, {dim1}] is incompatible with rank {rank}.");
+                        }
                     }
+
+                    continue;
+                }
+            }
+
+            fs.Seek(byteCount, SeekOrigin.Current);
+        }
+
+        if (sawPeft && !sawGlacier && squareTensors != null)
+        {
+            foreach (var (layerIdx, proj, isA) in squareTensors)
+            {
+                ref var slot = ref weights._layers[layerIdx].Get(proj);
+                if (isA && slot.A != null)
+                {
+                    TransposeSquareInPlace(slot.A, rank);
+                }
+                else if (!isA && slot.B != null)
+                {
+                    TransposeSquareInPlace(slot.B, rank);
                 }
             }
         }
@@ -146,50 +237,101 @@ public sealed unsafe class LoraAdapterWeights
         return weights;
     }
 
+    private static float[] Transpose2D(float[] src, int rows, int cols)
+    {
+        float[] dst = new float[src.Length];
+        for (int r = 0; r < rows; r++)
+        {
+            int srcRow = r * cols;
+            for (int c = 0; c < cols; c++)
+            {
+                dst[c * rows + r] = src[srcRow + c];
+            }
+        }
+        return dst;
+    }
+
+    private static void TransposeSquareInPlace(float[] mat, int n)
+    {
+        for (int r = 0; r < n; r++)
+        {
+            for (int c = r + 1; c < n; c++)
+            {
+                int i0 = r * n + c;
+                int i1 = c * n + r;
+                (mat[i0], mat[i1]) = (mat[i1], mat[i0]);
+            }
+        }
+    }
+
     /// <summary>
     /// Applies LoRA low-rank delta directly to projection output:
     /// y += (alpha / r) * (x * A) * B
-    /// Uses stackalloc for rank-16 intermediate vector, guaranteeing 0 heap allocations.
+    /// Uses stackalloc for rank &lt;= 256 (0 heap allocations) and pooled memory for larger ranks.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
     public void Apply(int layer, LoraProjection proj, float* x, float* y, int inDim, int outDim)
     {
-        if (layer < 0 || layer >= _layers.Length) return;
+        if (_rank <= 0 || x == null || y == null || inDim <= 0 || outDim <= 0 || (uint)layer >= (uint)_layers.Length) return;
 
         ref readonly var p = ref _layers[layer].Get(proj);
         if (p.A == null || p.B == null) return;
 
         int rank = _rank;
-        float* lowRank = stackalloc float[rank];
-        new Span<float>(lowRank, rank).Clear();
-
-        fixed (float* pA = p.A, pB = p.B)
+        long expectedA = (long)inDim * rank;
+        long expectedB = (long)rank * outDim;
+        if ((p.inDim > 0 && p.inDim != inDim) ||
+            (p.outDim > 0 && p.outDim != outDim) ||
+            p.A.LongLength < expectedA ||
+            p.B.LongLength < expectedB)
         {
-            // 1. lowRank = x * A:  x is [inDim], A is [inDim, rank]
-            // For row-major A [inDim, rank]: A[i, r] = pA[i * rank + r]
-            for (int i = 0; i < inDim; i++)
+            throw new InvalidOperationException(
+                $"LoRA projection {proj} at layer {layer} dimension mismatch: adapter has inDim={p.inDim}, outDim={p.outDim}, rank={rank} (A={p.A.LongLength}, B={p.B.LongLength}), caller expected inDim={inDim}, outDim={outDim}.");
+        }
+
+        Span<float> stackBuf = rank <= StackAllocRankThreshold ? stackalloc float[rank] : default;
+        float[]? rented = rank > StackAllocRankThreshold ? ArrayPool<float>.Shared.Rent(rank) : null;
+        try
+        {
+            Span<float> lowRankSpan = rented is null ? stackBuf : rented.AsSpan(0, rank);
+            lowRankSpan.Clear();
+
+            fixed (float* lowRank = lowRankSpan)
+            fixed (float* pA = p.A, pB = p.B)
             {
-                float xi = x[i];
-                float* aRow = pA + (long)i * rank;
+                // 1. lowRank = x * A:  x is [inDim], A is [inDim, rank]
+                // For row-major A [inDim, rank]: A[i, r] = pA[i * rank + r]
+                for (int i = 0; i < inDim; i++)
+                {
+                    float xi = x[i];
+                    float* aRow = pA + (long)i * rank;
+                    for (int r = 0; r < rank; r++)
+                    {
+                        lowRank[r] += xi * aRow[r];
+                    }
+                }
+
+                // 2. delta = lowRank * B: lowRank is [rank], B is [rank, outDim]
+                // y[d] += scaling * sum_{r=0..rank-1} lowRank[r] * B[r * outDim + d]
+                float scaling = _scaling;
                 for (int r = 0; r < rank; r++)
                 {
-                    lowRank[r] += xi * aRow[r];
+                    float lr = lowRank[r] * scaling;
+                    if (lr == 0.0f) continue;
+
+                    float* bRow = pB + (long)r * outDim;
+                    for (int d = 0; d < outDim; d++)
+                    {
+                        y[d] += lr * bRow[d];
+                    }
                 }
             }
-
-            // 2. delta = lowRank * B: lowRank is [rank], B is [rank, outDim]
-            // y[d] += scaling * sum_{r=0..rank-1} lowRank[r] * B[r * outDim + d]
-            float scaling = _scaling;
-            for (int r = 0; r < rank; r++)
+        }
+        finally
+        {
+            if (rented != null)
             {
-                float lr = lowRank[r] * scaling;
-                if (lr == 0.0f) continue;
-
-                float* bRow = pB + (long)r * outDim;
-                for (int d = 0; d < outDim; d++)
-                {
-                    y[d] += lr * bRow[d];
-                }
+                ArrayPool<float>.Shared.Return(rented);
             }
         }
     }

@@ -211,6 +211,10 @@ public sealed class OpenAiChatChunkResponse
 
     [JsonPropertyName("choices")]
     public required OpenAiChatChunkChoice[] Choices { get; init; }
+
+    [JsonPropertyName("usage")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public OpenAiUsage? Usage { get; init; }
 }
 
 public sealed class OpenAiChatChunkChoice
@@ -258,74 +262,6 @@ public sealed class OllamaBenchOptions
 
     [JsonPropertyName("temperature")]
     public double Temperature { get; init; }
-}
-
-public sealed class BounceStatusResponse
-{
-    [JsonPropertyName("primary_endpoint")]
-    public required string PrimaryEndpoint { get; init; }
-
-    [JsonPropertyName("critic_endpoint")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? CriticEndpoint { get; init; }
-
-    [JsonPropertyName("compiler_bounce_enabled")]
-    public bool CompilerBounceEnabled { get; init; }
-
-    [JsonPropertyName("max_repairs")]
-    public int MaxRepairs { get; init; }
-
-    [JsonPropertyName("total_requests")]
-    public long TotalRequests { get; init; }
-
-    [JsonPropertyName("bypassed_requests")]
-    public long BypassedRequests { get; init; }
-
-    [JsonPropertyName("critic_assisted_requests")]
-    public long CriticAssistedRequests { get; init; }
-
-    [JsonPropertyName("critic_fallbacks")]
-    public long CriticFallbacks { get; init; }
-
-    [JsonPropertyName("verifier_checks")]
-    public long VerifierChecks { get; init; }
-
-    [JsonPropertyName("verifier_first_pass_ok")]
-    public long VerifierFirstPassOk { get; init; }
-
-    [JsonPropertyName("repair_attempts")]
-    public long RepairAttempts { get; init; }
-
-    [JsonPropertyName("repairs_succeeded")]
-    public long RepairsSucceeded { get; init; }
-}
-
-public sealed class BounceChatPayload
-{
-    [JsonPropertyName("model")]
-    public required string Model { get; init; }
-
-    [JsonPropertyName("messages")]
-    public required OllamaChatMessageDto[] Messages { get; init; }
-
-    [JsonPropertyName("temperature")]
-    public double Temperature { get; init; }
-
-    [JsonPropertyName("max_tokens")]
-    public int MaxTokens { get; init; }
-
-    [JsonPropertyName("stream")]
-    public bool Stream { get; init; }
-
-    [JsonPropertyName("chat_template_kwargs")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public BounceChatTemplateKwargs? ChatTemplateKwargs { get; init; }
-}
-
-public sealed class BounceChatTemplateKwargs
-{
-    [JsonPropertyName("enable_thinking")]
-    public bool EnableThinking { get; init; }
 }
 
 public sealed class KlDivergenceCliReport
@@ -391,9 +327,6 @@ public sealed class KlDivergenceCliReport
 [JsonSerializable(typeof(OpenAiChatCompletionResponse))]
 [JsonSerializable(typeof(OpenAiChatChunkResponse))]
 [JsonSerializable(typeof(OllamaBenchRequest))]
-[JsonSerializable(typeof(SleepStatusResponse))]
-[JsonSerializable(typeof(BounceStatusResponse))]
-[JsonSerializable(typeof(BounceChatPayload))]
 [JsonSerializable(typeof(KlDivergenceCliReport))]
 public partial class InferenceCliJsonContext : JsonSerializerContext
 {

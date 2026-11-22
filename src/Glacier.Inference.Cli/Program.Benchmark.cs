@@ -43,16 +43,26 @@ public static partial class Program
 
         for (int i = 0; i < args.Length; i++)
         {
-            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
-                modelPath = args[++i];
-            else if ((args[i] == "-f" || args[i] == "--filter") && i + 1 < args.Length)
-                tensorFilter = args[++i];
-            else if (args[i] == "--print-tensor" && i + 1 < args.Length)
-                printTensor = args[++i];
-            else if (args[i] == "-a" || args[i] == "--all")
+            string flag = args[i];
+            if (flag is "-m" or "--model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                modelPath = val;
+            }
+            else if (flag is "-f" or "--filter")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                tensorFilter = val;
+            }
+            else if (flag == "--print-tensor")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                printTensor = val;
+            }
+            else if (flag is "-a" or "--all")
                 showAllTensors = true;
-            else if (!args[i].StartsWith("-") && modelPath == null)
-                modelPath = args[i];
+            else if (!flag.StartsWith("-") && modelPath == null)
+                modelPath = flag;
         }
 
         if (string.IsNullOrEmpty(modelPath))
@@ -212,50 +222,159 @@ public static partial class Program
 
         for (int i = 0; i < args.Length; i++)
         {
-            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
-                modelPath = args[++i];
-            else if ((args[i] == "-n" || args[i] == "--tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int n))
+            string flag = args[i];
+            if (flag is "-m" or "--model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                modelPath = val;
+            }
+            else if (flag is "-n" or "--tokens")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int n) || n <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'. Expected a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 targetTokens = n;
-            else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
-                prompt = args[++i];
-            else if (args[i] == "--compare-ollama" && i + 1 < args.Length)
-                compareOllamaUrl = args[++i];
-            else if (args[i] == "--compare-model" && i + 1 < args.Length)
-                compareModel = args[++i];
-            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
-                device = args[++i];
-            else if (args[i] == "--engine" && i + 1 < args.Length)
-                engineStr = args[++i];
-            else if (args[i] == "--kv-precision" && i + 1 < args.Length)
-                kvPrecisionStr = args[++i];
-            else if (args[i] == "--split" && i + 1 < args.Length)
-                split = args[++i];
-            else if (args[i] == "--ple-io" && i + 1 < args.Length)
-                pleIoStr = args[++i];
-            else if (args[i] == "--host-arena-gib" && i + 1 < args.Length && double.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+            }
+            else if (flag is "-p" or "--prompt")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                prompt = val;
+            }
+            else if (flag == "--compare-ollama")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                compareOllamaUrl = val;
+            }
+            else if (flag == "--compare-model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                compareModel = val;
+            }
+            else if (flag is "-d" or "--device")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                device = val;
+            }
+            else if (flag == "--engine")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                engineStr = val;
+            }
+            else if (flag == "--kv-precision")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                kvPrecisionStr = val;
+            }
+            else if (flag.StartsWith("--kv-precision=", StringComparison.Ordinal))
+                kvPrecisionStr = flag["--kv-precision=".Length..];
+            else if (flag == "--split")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                split = val;
+            }
+            else if (flag == "--ple-io")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                pleIoStr = val;
+            }
+            else if (flag == "--host-arena-gib")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!double.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 hostArenaGib = Math.Max(0.0, arenaGib);
-            else if (args[i] == "--tiered-moe")
+            }
+            else if (flag == "--tiered-moe")
                 tieredMoeOverride = true;
-            else if (args[i] == "--speculative" && i + 1 < args.Length)
-                speculativeStr = args[++i];
-            else if (args[i] == "--draft-model" && i + 1 < args.Length)
-                draftModelPath = args[++i];
-            else if (args[i] == "--draft-tokens" && i + 1 < args.Length && int.TryParse(args[++i], out int dt))
+            else if (flag == "--speculative")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                speculativeStr = val;
+            }
+            else if (flag == "--draft-model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                draftModelPath = val;
+            }
+            else if (flag == "--draft-tokens")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int dt))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 draftTokens = Math.Max(0, dt);
-            else if (args[i] == "--dflash-steps" && i + 1 < args.Length && int.TryParse(args[++i], out int dfs))
+            }
+            else if (flag == "--dflash-steps")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int dfs))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 dflashSteps = Math.Max(1, dfs);
-            else if (args[i] == "--draft-vocab" && i + 1 < args.Length)
-                draftVocabStr = args[++i];
-            else if (args[i] == "--moe-tail-skip" && i + 1 < args.Length && int.TryParse(args[++i], out int mts))
+            }
+            else if (flag == "--draft-vocab")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                draftVocabStr = val;
+            }
+            else if (flag == "--moe-tail-skip")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int mts))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 moeTailSkip = Math.Max(0, mts);
-            else if ((args[i] == "--temp" || args[i] == "--temperature") && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float tempVal))
+            }
+            else if (flag is "--temp" or "--temperature")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!float.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, out float tempVal))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 temperature = tempVal;
-            else if (args[i] == "--raw")
+            }
+            else if (flag == "--raw")
                 rawPrompt = true;
-            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+            else if (flag is "-c" or "--ctx" or "--context-length")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int cLen) || cLen <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'. Expected a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 maxSeqLen = cLen;
-            else if (!args[i].StartsWith("-") && modelPath == null)
-                modelPath = args[i];
+            }
+            else if (!flag.StartsWith("-") && modelPath == null)
+                modelPath = flag;
         }
 
         if (string.IsNullOrEmpty(modelPath))
@@ -274,10 +393,12 @@ public static partial class Program
             engine = parsedEngine;
         }
 
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
+        if (!TryParseKvPrecisionArg(kvPrecisionStr, out var kvPrecision, out var kvError))
         {
-            kvPrecision = parsedPrecision;
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Error.WriteLine(kvError);
+            Console.ResetColor();
+            return 1;
         }
 
         PleIoMode pleIoMode = ParsePleIoMode(pleIoStr);
@@ -473,6 +594,8 @@ public static partial class Program
         string? draftVocabStr = "full";
         int moeTailSkip = 0;
         string? loraPath = null;
+        string? loraName = null;
+        int loraCount = 0;
         int maxSeqLen = 2048;
         int maxTokens = 512;
         float temperature = 0.7f;
@@ -482,53 +605,194 @@ public static partial class Program
 
         for (int i = 0; i < args.Length; i++)
         {
-            if ((args[i] == "-m" || args[i] == "--model") && i + 1 < args.Length)
-                modelPath = args[++i];
-            else if ((args[i] == "-d" || args[i] == "--device") && i + 1 < args.Length)
-                device = args[++i];
-            else if ((args[i] == "-p" || args[i] == "--prompt") && i + 1 < args.Length)
-                promptParts.Add(args[++i]);
-            else if (args[i] == "--raw")
+            string flag = args[i];
+            if (flag is "-m" or "--model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                modelPath = val;
+            }
+            else if (flag is "-d" or "--device")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                device = val;
+            }
+            else if (flag is "-p" or "--prompt")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                promptParts.Add(val);
+            }
+            else if (flag == "--raw")
                 rawPrompt = true;
-            else if (args[i] == "--lora" && i + 1 < args.Length)
-                loraPath = args[++i];
-            else if (args[i] == "--engine" && i + 1 < args.Length)
-                engineStr = args[++i];
-            else if (args[i] == "--kv-precision" && i + 1 < args.Length)
-                kvPrecisionStr = args[++i];
-            else if (args[i] == "--split" && i + 1 < args.Length)
-                split = args[++i];
-            else if (args[i] == "--ple-io" && i + 1 < args.Length)
-                pleIoStr = args[++i];
-            else if (args[i] == "--host-arena-gib" && i + 1 < args.Length && double.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+            else if (flag == "--lora" || flag.StartsWith("--lora=", StringComparison.Ordinal))
+            {
+                string loraSpec;
+                if (flag == "--lora")
+                {
+                    if (!TryRequireFlagValue(args, ref i, flag, out loraSpec)) return 1;
+                }
+                else
+                {
+                    loraSpec = flag["--lora=".Length..];
+                }
+
+                if (!TryParseLoraSpec(loraSpec, out var parsedLoraName, out var parsedLoraPath, out var loraError))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine(loraError);
+                    Console.ResetColor();
+                    return 1;
+                }
+                loraCount++;
+                if (loraCount > 1)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine("Error: 'glacier run' supports attaching a single --lora adapter at a time; use 'glacier serve' to host multiple named adapters.");
+                    Console.ResetColor();
+                    return 1;
+                }
+                loraName = parsedLoraName;
+                loraPath = parsedLoraPath;
+            }
+            else if (flag == "--engine")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                engineStr = val;
+            }
+            else if (flag == "--kv-precision")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                kvPrecisionStr = val;
+            }
+            else if (flag.StartsWith("--kv-precision=", StringComparison.Ordinal))
+                kvPrecisionStr = flag["--kv-precision=".Length..];
+            else if (flag == "--split")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                split = val;
+            }
+            else if (flag == "--ple-io")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                pleIoStr = val;
+            }
+            else if (flag == "--host-arena-gib")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!double.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, out double arenaGib))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 hostArenaGib = Math.Max(0.0, arenaGib);
-            else if (args[i] == "--tiered-moe")
+            }
+            else if (flag == "--tiered-moe")
                 tieredMoeOverride = true;
-            else if (args[i] == "--speculative" && i + 1 < args.Length)
-                speculativeStr = args[++i];
-            else if (args[i] == "--draft-model" && i + 1 < args.Length)
-                draftModelPath = args[++i];
-            else if (args[i] == "--draft-tokens" && i + 1 < args.Length && int.TryParse(args[++i], out int dt))
+            else if (flag == "--speculative")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                speculativeStr = val;
+            }
+            else if (flag == "--draft-model")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                draftModelPath = val;
+            }
+            else if (flag == "--draft-tokens")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int dt))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 draftTokens = Math.Max(0, dt);
-            else if (args[i] == "--dflash-steps" && i + 1 < args.Length && int.TryParse(args[++i], out int dfs))
+            }
+            else if (flag == "--dflash-steps")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int dfs))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 dflashSteps = Math.Max(1, dfs);
-            else if (args[i] == "--draft-vocab" && i + 1 < args.Length)
-                draftVocabStr = args[++i];
-            else if (args[i] == "--moe-tail-skip" && i + 1 < args.Length && int.TryParse(args[++i], out int mts))
+            }
+            else if (flag == "--draft-vocab")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                draftVocabStr = val;
+            }
+            else if (flag == "--moe-tail-skip")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int mts))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 moeTailSkip = Math.Max(0, mts);
-            else if ((args[i] == "-c" || args[i] == "--ctx" || args[i] == "--context-length") && i + 1 < args.Length && int.TryParse(args[++i], out int cLen))
+            }
+            else if (flag is "-c" or "--ctx" or "--context-length")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int cLen) || cLen <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'. Expected a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 maxSeqLen = cLen;
-            else if ((args[i] == "-n" || args[i] == "--tokens" || args[i] == "--max-tokens") && i + 1 < args.Length && int.TryParse(args[++i], out int tok))
+            }
+            else if (flag is "-n" or "--tokens" or "--max-tokens")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!int.TryParse(val, out int tok) || tok <= 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'. Expected a positive integer.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 maxTokens = tok;
-            else if ((args[i] == "--temp" || args[i] == "--temperature") && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float t))
+            }
+            else if (flag is "--temp" or "--temperature")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!float.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, out float t))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 temperature = t;
-            else if (args[i] == "--top-p" && i + 1 < args.Length && float.TryParse(args[++i], System.Globalization.CultureInfo.InvariantCulture, out float p))
+            }
+            else if (flag == "--top-p")
+            {
+                if (!TryRequireFlagValue(args, ref i, flag, out string val)) return 1;
+                if (!float.TryParse(val, System.Globalization.CultureInfo.InvariantCulture, out float p))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.Error.WriteLine($"Error: Invalid {flag} '{val}'.");
+                    Console.ResetColor();
+                    return 1;
+                }
                 topP = p;
-            else if (!args[i].StartsWith("-") && modelPath == null)
-                modelPath = args[i];
+            }
+            else if (!flag.StartsWith("-") && modelPath == null)
+                modelPath = flag;
             else
             {
-                promptParts.Add(args[i]);
+                promptParts.Add(flag);
             }
         }
 
@@ -544,21 +808,20 @@ public static partial class Program
 
         string? initialPrompt = promptParts.Count > 0 ? string.Join(" ", promptParts) : null;
 
-        if (!string.IsNullOrEmpty(loraPath) && device == null)
-        {
-            device = "cpu"; // LoRA dynamic inference runs on SIMD AVX2/AVX-512 CPU path
-        }
-
         InferenceEngineType engine = InferenceEngineType.Auto;
         if (!string.IsNullOrWhiteSpace(engineStr) && Enum.TryParse<InferenceEngineType>(engineStr, ignoreCase: true, out var parsedEngine))
         {
             engine = parsedEngine;
         }
 
-        KvCachePrecision kvPrecision = KvCachePrecision.Auto;
-        if (!string.IsNullOrWhiteSpace(kvPrecisionStr) && KvCachePrecisionExtensions.TryParse(kvPrecisionStr, out var parsedPrecision))
+        (device, engine) = ResolveSingleLoraTarget(!string.IsNullOrEmpty(loraPath), device, engine);
+
+        if (!TryParseKvPrecisionArg(kvPrecisionStr, out var kvPrecision, out var kvError))
         {
-            kvPrecision = parsedPrecision;
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Error.WriteLine(kvError);
+            Console.ResetColor();
+            return 1;
         }
 
         PleIoMode pleIoMode = ParsePleIoMode(pleIoStr);
@@ -575,7 +838,7 @@ public static partial class Program
         {
             session.AttachLora(loraPath);
             Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine($">> Attached Pure C# LoRA Adapter: {Path.GetFileName(loraPath)} (Rank={session.CpuModel?.LoraWeights?.Rank}, Alpha={session.CpuModel?.LoraWeights?.Alpha})");
+            Console.WriteLine($">> Attached Pure C# LoRA Adapter: {loraName ?? Path.GetFileName(loraPath)} ({Path.GetFileName(loraPath)}, Rank={session.CpuModel?.LoraWeights?.Rank}, Alpha={session.CpuModel?.LoraWeights?.Alpha})");
             Console.ResetColor();
         }
 

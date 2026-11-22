@@ -5,10 +5,16 @@ using System.Buffers;
 using Glacier.Inference.Sampling;
 using Xunit;
 
+[CollectionDefinition("ZeroAllocInferenceTests", DisableParallelization = true)]
+public sealed class ZeroAllocInferenceTestsCollectionDefinition
+{
+}
+
 /// <summary>
 /// Adversarial stress tests and boundary condition validation for REC-1:
 /// Reasoning-loop detection, logit clamping, and sampler robustness under extreme conditions.
 /// </summary>
+[Collection("ZeroAllocInferenceTests")]
 public sealed class ReasoningLoopAdversarialStressTests
 {
     // =========================================================================
@@ -424,8 +430,17 @@ public sealed class ReasoningLoopAdversarialStressTests
         Array.Fill(tokens, 42);
 
         // Warm up JIT
-        _ = Sampler.DetectPeriodicReasoningLoop(tokens.AsSpan());
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        for (int w = 0; w < 200; w++)
+        {
+            _ = Sampler.DetectPeriodicReasoningLoop(tokens.AsSpan());
+        }
 
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
         int sum = 0;
         long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
         for (int iter = 0; iter < 100; iter++)
@@ -486,8 +501,17 @@ public sealed class ReasoningLoopAdversarialStressTests
         };
 
         // Warm up JIT
-        _ = sampler.Sample(logits.AsSpan(), options, recentTokens.AsSpan());
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        for (int w = 0; w < 200; w++)
+        {
+            _ = sampler.Sample(logits.AsSpan(), options, recentTokens.AsSpan());
+        }
 
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
         long beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
         for (int iter = 0; iter < 50; iter++)
         {

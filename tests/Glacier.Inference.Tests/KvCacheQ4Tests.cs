@@ -39,7 +39,7 @@ public unsafe class KvCacheQ4Tests
         Assert.True(KvCachePrecisionExtensions.TryParse("fp16", out p)); Assert.Equal(KvCachePrecision.Fp16, p);
         Assert.True(KvCachePrecisionExtensions.TryParse("F16", out p)); Assert.Equal(KvCachePrecision.Fp16, p);
         Assert.True(KvCachePrecisionExtensions.TryParse("fp8", out p)); Assert.Equal(KvCachePrecision.Fp8, p);
-        Assert.True(KvCachePrecisionExtensions.TryParse("q8_0", out p)); Assert.Equal(KvCachePrecision.Fp8, p);
+        Assert.True(KvCachePrecisionExtensions.TryParse("q8_0", out p)); Assert.Equal(KvCachePrecision.Q8_0, p);
         Assert.True(KvCachePrecisionExtensions.TryParse("e4m3", out p)); Assert.Equal(KvCachePrecision.Fp8, p);
         Assert.True(KvCachePrecisionExtensions.TryParse("q4_0", out p)); Assert.Equal(KvCachePrecision.Q4_0, p);
         Assert.True(KvCachePrecisionExtensions.TryParse("q4", out p)); Assert.Equal(KvCachePrecision.Q4_0, p);

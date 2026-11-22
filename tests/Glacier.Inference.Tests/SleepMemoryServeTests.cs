@@ -14,6 +14,8 @@ using System.Threading.Tasks;
 using Glacier.Inference.Cli;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
+using Glacier.Serve.Daemons;
+using Glacier.Serve.Serialization;
 using Xunit;
 
 public sealed class SleepMemoryServeTests : IDisposable
@@ -67,7 +69,7 @@ public sealed class SleepMemoryServeTests : IDisposable
         Assert.DoesNotContain("[cluster/", userPrompt);
         Assert.True(userPrompt.Length < 4_000, $"Expected compact consolidated prompt, got {userPrompt.Length} chars.");
 
-        SleepStatusResponse status = sleep.GetStatus();
+        SleepMemoryStatusResponse status = sleep.GetStatus();
         Assert.True(status.Enabled);
         Assert.Equal(400, status.TokenBudget);
         Assert.True(status.SleepCycles >= 1, $"Expected >= 1 sleep cycle on large haystack ingest, got {status.SleepCycles}");
@@ -143,7 +145,7 @@ public sealed class SleepMemoryServeTests : IDisposable
             try
             {
                 using var disabledClient = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{disabledPort}") };
-                var stResp = await disabledClient.GetFromJsonAsync<SleepStatusResponse>("/api/sleep/status");
+                var stResp = await disabledClient.GetFromJsonAsync<SleepMemoryStatusResponse>("/api/sleep/status");
                 Assert.NotNull(stResp);
                 Assert.False(stResp!.Enabled);
                 var trigResp = await disabledClient.PostAsync("/api/sleep/trigger", content: null);
@@ -162,7 +164,7 @@ public sealed class SleepMemoryServeTests : IDisposable
         {
             using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}") };
 
-            var initial = await client.GetFromJsonAsync<SleepStatusResponse>("/api/sleep/status");
+            var initial = await client.GetFromJsonAsync<SleepMemoryStatusResponse>("/api/sleep/status");
             Assert.NotNull(initial);
             Assert.True(initial!.Enabled);
             Assert.Equal(400, initial.TokenBudget);
@@ -173,13 +175,13 @@ public sealed class SleepMemoryServeTests : IDisposable
             var triggerHttp = await client.PostAsync("/api/sleep/trigger", content: null);
             Assert.Equal(HttpStatusCode.OK, triggerHttp.StatusCode);
 
-            var triggered = await triggerHttp.Content.ReadFromJsonAsync<SleepStatusResponse>();
+            var triggered = await triggerHttp.Content.ReadFromJsonAsync<SleepMemoryStatusResponse>();
             Assert.NotNull(triggered);
             Assert.True(triggered!.Enabled);
             Assert.True(triggered.RawChunks >= 2);
             Assert.True(triggered.SleepCycles >= 1);
 
-            var polled = await client.GetFromJsonAsync<SleepStatusResponse>("/api/sleep/status");
+            var polled = await client.GetFromJsonAsync<SleepMemoryStatusResponse>("/api/sleep/status");
             Assert.NotNull(polled);
             Assert.Equal(triggered.SleepCycles, polled!.SleepCycles);
         }

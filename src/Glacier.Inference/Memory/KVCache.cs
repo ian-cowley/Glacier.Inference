@@ -11,7 +11,8 @@ using Glacier.Inference.Quant;
 /// Contiguous unmanaged Key-Value Cache for autoregressive Transformer inference.
 /// Zero-allocation ring/linear buffer supporting Grouped Query Attention (GQA)
 /// across <see cref="KvCachePrecision.Fp32"/>, <see cref="KvCachePrecision.Fp16"/>,
-/// <see cref="KvCachePrecision.Fp8"/>, and packed 4-bit <see cref="KvCachePrecision.Q4_0"/> (<see cref="KvCachePrecision.Int4"/>).
+/// <see cref="KvCachePrecision.Fp8"/>, symmetric 8-bit <see cref="KvCachePrecision.Q8_0"/>,
+/// and packed 4-bit <see cref="KvCachePrecision.Q4_0"/> (<see cref="KvCachePrecision.Int4"/>).
 /// Instances are NOT thread-safe; single-thread access per generation stream is required.
 /// </summary>
 public sealed unsafe class KVCache : IDisposable
@@ -76,6 +77,7 @@ public sealed unsafe class KVCache : IDisposable
             KvCachePrecision.Fp32 => (long)dim * sizeof(float),
             KvCachePrecision.Fp16 => (long)dim * sizeof(ushort),
             KvCachePrecision.Fp8 => dim,
+            KvCachePrecision.Q8_0 => (long)((dim + 31) / 32) * sizeof(BlockQ8_0),
             KvCachePrecision.Q4_0 => (long)((dim + 31) / 32) * sizeof(BlockQ4_0),
             _ => throw new ArgumentOutOfRangeException(nameof(precision), precision, $"Unsupported KV cache precision: {precision}.")
         };
@@ -262,6 +264,10 @@ public sealed unsafe class KVCache : IDisposable
                     QuantKernels.QuantizeQ4_0(kHead, (BlockQ4_0*)kDst, _headDim);
                     QuantKernels.QuantizeQ4_0(vHead, (BlockQ4_0*)vDst, _vHeadDim);
                     break;
+                case KvCachePrecision.Q8_0:
+                    QuantKernels.QuantizeQ8_0(kHead, (BlockQ8_0*)kDst, _headDim);
+                    QuantKernels.QuantizeQ8_0(vHead, (BlockQ8_0*)vDst, _vHeadDim);
+                    break;
                 default:
                     throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
             }
@@ -303,6 +309,9 @@ public sealed unsafe class KVCache : IDisposable
             case KvCachePrecision.Q4_0:
                 QuantKernels.DequantizeQ4_0((BlockQ4_0*)src, dst, _headDim);
                 break;
+            case KvCachePrecision.Q8_0:
+                QuantKernels.DequantizeQ8_0((BlockQ8_0*)src, dst, _headDim);
+                break;
             default:
                 throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
         }
@@ -340,6 +349,9 @@ public sealed unsafe class KVCache : IDisposable
             case KvCachePrecision.Q4_0:
                 QuantKernels.DequantizeQ4_0((BlockQ4_0*)src, dst, _vHeadDim);
                 break;
+            case KvCachePrecision.Q8_0:
+                QuantKernels.DequantizeQ8_0((BlockQ8_0*)src, dst, _vHeadDim);
+                break;
             default:
                 throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
         }
@@ -369,6 +381,7 @@ public sealed unsafe class KVCache : IDisposable
             KvCachePrecision.Fp16 => QuantKernels.VecDotF16((Half*)src, query, _headDim),
             KvCachePrecision.Fp8 => QuantKernels.VecDotFp8E4M3(src, query, _headDim),
             KvCachePrecision.Q4_0 => QuantKernels.VecDotQ4_0Any((BlockQ4_0*)src, query, _headDim),
+            KvCachePrecision.Q8_0 => QuantKernels.VecDotQ8_0Any((BlockQ8_0*)src, query, _headDim),
             _ => throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.")
         };
     }
@@ -423,6 +436,9 @@ public sealed unsafe class KVCache : IDisposable
                 break;
             case KvCachePrecision.Q4_0:
                 QuantKernels.AccumulateScaledQ4_0((BlockQ4_0*)src, weight, outHead, _vHeadDim);
+                break;
+            case KvCachePrecision.Q8_0:
+                QuantKernels.AccumulateScaledQ8_0((BlockQ8_0*)src, weight, outHead, _vHeadDim);
                 break;
             default:
                 throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");

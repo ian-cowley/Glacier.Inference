@@ -38,6 +38,12 @@ public enum InferenceEngineType
     Cpu,
 
     /// <summary>
+    /// OpenAI-compatible local NPU sidecar runtime (e.g., AMD FastFlowLM <c>flm serve</c> or Lemonade Server
+    /// on AMD XDNA 2 / Ryzen AI NPUs) for zero-VRAM offloading of critic, embedding, or low-power LLM workloads.
+    /// </summary>
+    NpuSidecar,
+
+    /// <summary>
     /// Backward-compatible alias for BareMetal.
     /// </summary>
     [Obsolete("Use BareMetal instead. Glacier does not use the CUDA Toolkit runtime.")]

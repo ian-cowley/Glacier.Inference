@@ -119,6 +119,10 @@ public sealed class GlacierSettings
             {
                 engine = InferenceEngineType.Cpu;
             }
+            else if (clean is "npu" or "npusidecar" or "npu-sidecar" or "flm" or "fastflowlm" or "lemonade" or "xdna" or "xdna2")
+            {
+                engine = InferenceEngineType.NpuSidecar;
+            }
             else if (clean is "auto")
             {
                 engine = InferenceEngineType.Auto;
@@ -129,7 +133,7 @@ public sealed class GlacierSettings
             }
             else
             {
-                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, baremetal, vulkan, directml, cpu");
+                throw new ArgumentException($"Unknown engine '{cliEngine}'. Valid options: auto, baremetal, vulkan, directml, cpu, npusidecar");
             }
         }
         else if (string.IsNullOrWhiteSpace(cliDevice) && settings.Engine != InferenceEngineType.Auto)

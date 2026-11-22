@@ -30,6 +30,7 @@ public sealed record DeviceInfo
     public required ulong DedicatedVramBytes { get; init; }
     public required ulong SharedVramBytes { get; init; }
     public required bool IsDisplayDevice { get; init; }
+    public bool IsNpu { get; init; }
     public required IReadOnlyList<InferenceEngineType> SupportedEngines { get; init; }
     public required InferenceEngineType RecommendedEngine { get; init; }
     public required string SafetyNotes { get; init; }

@@ -336,6 +336,7 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         {
             Glacier.Inference.Memory.KvCachePrecision.Auto => Glacier.Inference.Memory.KvCachePrecision.Fp16,
             Glacier.Inference.Memory.KvCachePrecision.Fp8 => Glacier.Inference.Memory.KvCachePrecision.Fp16,
+            Glacier.Inference.Memory.KvCachePrecision.Q8_0 => Glacier.Inference.Memory.KvCachePrecision.Fp16,
             _ => kvPrecision
         };
 

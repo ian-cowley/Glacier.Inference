@@ -129,7 +129,7 @@ public static partial class Program
         Console.WriteLine("Global Hardware & Engine Options (bench, run, serve):");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu, 0)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto safe selection)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto adaptive)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q8_0|q4_0|fp32> KV-cache precision (default: auto adaptive)");
         Console.WriteLine("  --ctx, -c <len>                      Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU pipeline split (e.g. 'auto', 'nvidia-rtx-4060:14,amd-890m:14')");
         Console.WriteLine();
@@ -165,6 +165,9 @@ public static partial class Program
                 break;
             case "eval-kl":
                 PrintEvalKlHelp();
+                break;
+            case "bounce":
+                PrintBounceHelp();
                 break;
             case "voice":
                 PrintVoiceHelp();
@@ -366,7 +369,7 @@ public static partial class Program
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q8_0|q4_0|fp32> KV-cache precision (default: auto)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  --temp, --temperature <float>        Sampling temperature (default: 0.7; 0 for greedy)");
         Console.WriteLine("  --raw                                Skip chat template wrapping for the benchmark prompt");
@@ -415,7 +418,8 @@ public static partial class Program
         Console.WriteLine("  --top-p <float>                      Top-p nucleus sampling cutoff (default: 0.9)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q8_0|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --lora <[name=]path>                 Attach 0x41524F4C LoRA adapter binary/directory (CPU)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  --ple-io <auto|direct|mmap>          PLE table transport mode (default: auto)");
         Console.WriteLine("  --host-arena-gib <float>             Host-RAM Expert Arena cap in GiB (0 = disable, default: auto)");
@@ -457,11 +461,15 @@ public static partial class Program
         Console.WriteLine("  -c, --ctx, --context-length <len>    Maximum context sequence length (default: 2048)");
         Console.WriteLine("  --device <id|name>                   Target GPU/CPU (e.g. nvidia-rtx-4060, amd-890m, cpu)");
         Console.WriteLine("  --engine <baremetal|vulkan|directml|cpu|auto> Execution engine (default: auto)");
-        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --kv-precision <auto|fp16|fp8|q8_0|q4_0|fp32> KV-cache precision (default: auto)");
+        Console.WriteLine("  --lora <[name=]path>                 Hot-load 0x41524F4C LoRA adapter (repeatable; dense CPU/CUDA)");
+        Console.WriteLine("  --blocks <count>                     PagedAttention KV blocks (continuous batching mode)");
+        Console.WriteLine("  -b, --batch-size <count>             Max parallel sequences (continuous batching mode, default: 16)");
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU split (e.g. 'auto', 'nvidia:14,amd:14')");
         Console.WriteLine("  --max-think-tokens <auto|off|0|N>    Cap <think> tokens & auto-close (default: auto)");
         Console.WriteLine("  --sleep-memory                       Enable pillar-16 HOPE+MemEx sleep consolidation");
         Console.WriteLine("  --sleep-budget <tokens>              Sleep memory context budget in tokens (default: 400)");
+        Console.WriteLine("  --sleep-checkpoint <path>            Persist Sleep MoE expansion weights on consolidation");
         Console.WriteLine("  -h, --help                           Show this help message");
         Console.WriteLine();
         Console.WriteLine("HTTP API Endpoints:");
@@ -470,13 +478,164 @@ public static partial class Program
         Console.WriteLine("  GET  /api/tags                       Ollama model tags listing");
         Console.WriteLine("  GET  /api/sleep/status               Sleep consolidation telemetry & trace stats");
         Console.WriteLine("  POST /api/sleep/trigger              Trigger immediate offline sleep consolidation cycle");
+        Console.WriteLine("  GET  /v1/sleep/status                Glacier.Studio sleep status telemetry");
+        Console.WriteLine("  POST /v1/sleep/trigger               Glacier.Studio sleep consolidation trigger");
         Console.WriteLine("  POST /v1/chat/completions            OpenAI-compatible chat completions");
-        Console.WriteLine("  GET  /v1/models                      OpenAI-compatible model list");
+        Console.WriteLine("  POST /v1/completions                 OpenAI-compatible text completions (continuous batch mode)");
+        Console.WriteLine("  GET  /v1/models                      OpenAI-compatible model & LoRA adapter list");
         Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine("  glacier serve model.gguf                              # Listen on port 11434 (Ollama default)");
         Console.WriteLine("  glacier serve model.gguf --port 8080 --host 127.0.0.1  # Bind to localhost:8080");
         Console.WriteLine("  glacier serve model.gguf --device nvidia-rtx-4060 --engine baremetal");
+    }
+
+    private static void PrintBounceHelp()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("glacier bounce - 3-Machine Peer Critic + OS-Sandboxed Compiler Bounce Proxy");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  glacier bounce [options]");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  --primary <url>                      Primary Glacier/OpenAI server endpoint (default: http://192.168.1.108:18080)");
+        Console.WriteLine("  --critic, --peer-critic <url>        Optional peer critic endpoint");
+        Console.WriteLine("  --host <string>                      Listen host (default: 127.0.0.1)");
+        Console.WriteLine("  --port <int>                         Listen port (default: 18090)");
+        Console.WriteLine("  --harness <path>                     Optional EvaluationHarness executable path");
+        Console.WriteLine("  --max-repairs <int>                  Max compiler/critic repair passes (0-3, default: 2)");
+        Console.WriteLine("  --compiler-bounce                    Enable OS-sandboxed compiler/syntax verifier (default)");
+        Console.WriteLine("  --no-compiler-bounce                 Disable compiler/syntax verifier");
+        Console.WriteLine("  --model-alias <name>                 Model ID exposed on /v1/models (default: Glacier-3Machine-Bounce)");
+        Console.WriteLine("  -h, --help                           Show this help message");
+    }
+
+    public static bool TryParseLoraSpec(string? spec, out string name, out string resolvedPath, out string? error)
+    {
+        name = string.Empty;
+        resolvedPath = string.Empty;
+        error = null;
+
+        if (string.IsNullOrWhiteSpace(spec))
+        {
+            error = "Error: --lora requires a <[name=]path> value.";
+            return false;
+        }
+
+        string trimmedSpec = spec.Trim();
+        string rawPath;
+        if (!File.Exists(trimmedSpec) && !Directory.Exists(trimmedSpec))
+        {
+            int eqIdx = trimmedSpec.IndexOf('=');
+            if (eqIdx == 0)
+            {
+                error = "Error: LoRA adapter name before '=' cannot be empty.";
+                return false;
+            }
+            if (eqIdx > 0)
+            {
+                name = trimmedSpec[..eqIdx].Trim();
+                rawPath = trimmedSpec[(eqIdx + 1)..].Trim();
+            }
+            else
+            {
+                rawPath = trimmedSpec;
+                name = DeriveLoraName(rawPath);
+            }
+        }
+        else
+        {
+            rawPath = trimmedSpec;
+            name = DeriveLoraName(rawPath);
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            error = $"Error: Could not derive a valid adapter name from '{spec}'.";
+            return false;
+        }
+
+        if (name.Contains(':', StringComparison.Ordinal))
+        {
+            error = $"Error: LoRA adapter name '{name}' cannot contain ':'.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            error = "Error: LoRA adapter file path cannot be empty.";
+            return false;
+        }
+
+        resolvedPath = Directory.Exists(rawPath)
+            ? Path.Combine(rawPath, "adapter_model.bin")
+            : rawPath;
+
+        if (!File.Exists(resolvedPath))
+        {
+            error = $"Error: LoRA adapter file not found: '{resolvedPath}'.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string DeriveLoraName(string rawPath)
+    {
+        string trimmed = rawPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (Directory.Exists(rawPath))
+            return Path.GetFileName(trimmed);
+        return Path.GetFileNameWithoutExtension(trimmed);
+    }
+
+    public static bool TryParseKvPrecisionArg(string? rawValue, out KvCachePrecision precision, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            precision = KvCachePrecision.Auto;
+            return true;
+        }
+
+        if (!KvCachePrecisionExtensions.TryParse(rawValue, out precision))
+        {
+            error = $"Error: Unknown KV precision '{rawValue}'. Valid values: Auto, Fp32, Fp16, Fp8, Q8_0, Q4_0 (Int4).";
+            return false;
+        }
+
+        return true;
+    }
+
+    internal static bool TryRequireFlagValue(string[] args, ref int index, string flag, out string value)
+    {
+        if (index + 1 >= args.Length)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.Error.WriteLine($"Error: Option '{flag}' requires a value.");
+            Console.ResetColor();
+            value = string.Empty;
+            return false;
+        }
+
+        value = args[++index];
+        return true;
+    }
+
+    public static (string? Device, InferenceEngineType Engine) ResolveSingleLoraTarget(
+        bool hasLora,
+        string? device,
+        InferenceEngineType engine)
+    {
+        if (hasLora &&
+            (string.IsNullOrWhiteSpace(device) || string.Equals(device.Trim(), "auto", StringComparison.OrdinalIgnoreCase)) &&
+            engine == InferenceEngineType.Auto)
+        {
+            return ("cpu", InferenceEngineType.Cpu);
+        }
+
+        return (device, engine);
     }
 
     private static int HandleUnknownCommand(string command)

@@ -83,6 +83,7 @@ public sealed unsafe partial class Qwen2GpuModel
             KvCachePrecision.Fp16 => _fnKvCacheStoreF16,
             KvCachePrecision.Fp8 => _fnKvCacheStoreFp8,
             KvCachePrecision.Q4_0 => _fnKvCacheStoreQ4_0,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
             _ => _fnKvCacheStore
         };
 
@@ -96,7 +97,14 @@ public sealed unsafe partial class Qwen2GpuModel
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private uint GetAttentionBlockSize() => (uint)Math.Min(256, Math.Max(32, ((_headDim + 31) / 32) * 32));
+    private uint GetAttentionBlockSize() => GetAttentionBlockSize(_headDim, _headDim);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static uint GetAttentionBlockSize(int headDim, int vHeadDim)
+    {
+        int maxDim = Math.Max(headDim, vHeadDim);
+        return (uint)Math.Min(256, Math.Max(32, ((maxDim + 31) / 32) * 32));
+    }
 
     private void LaunchAttention(int layer, int pos) => LaunchAttention(layer, pos, _dQ, _dAttnOut);
 
@@ -132,6 +140,7 @@ public sealed unsafe partial class Qwen2GpuModel
             KvCachePrecision.Fp16 => _fnAttentionGqaF16,
             KvCachePrecision.Fp8 => _fnAttentionGqaFp8,
             KvCachePrecision.Q4_0 => _fnAttentionGqaQ4_0,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
             _ => _fnAttentionGqa
         };
 
@@ -180,6 +189,7 @@ public sealed unsafe partial class Qwen2GpuModel
             KvCachePrecision.Fp16 => _fnAttentionGqaBatchF16,
             KvCachePrecision.Fp8 => _fnAttentionGqaBatchFp8,
             KvCachePrecision.Q4_0 => _fnAttentionGqaBatchQ4_0,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
             _ => _fnAttentionGqaBatch
         };
 
@@ -599,6 +609,7 @@ public sealed unsafe partial class Qwen2GpuModel
             KvCachePrecision.Fp16 => _fnKvCacheStoreBatchF16,
             KvCachePrecision.Fp8 => _fnKvCacheStoreBatchFp8,
             KvCachePrecision.Q4_0 => _fnKvCacheStoreBatchQ4_0,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
             _ => _fnKvCacheStoreBatch
         };
 
@@ -803,4 +814,251 @@ public sealed unsafe partial class Qwen2GpuModel
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(paged_attention_gqa_batch_f16_kernel)");
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static KvCachePrecision ResolvePagedKvPrecision(KvCachePrecision requested) => requested switch
+    {
+        KvCachePrecision.Auto => KvCachePrecision.Fp16,
+        KvCachePrecision.Fp16 or KvCachePrecision.Q8_0 or KvCachePrecision.Q4_0 => requested,
+        _ => throw new NotSupportedException($"Unsupported CUDA paged KV cache precision: {requested}. Supported: Fp16, Q8_0, Q4_0.")
+    };
+
+    private void LaunchPagedKvStore(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize, KvCachePrecision kvPrecision)
+    {
+        switch (ResolvePagedKvPrecision(kvPrecision))
+        {
+            case KvCachePrecision.Fp16:
+                LaunchPagedKvStoreF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q8_0:
+                LaunchPagedKvStoreQ8_0(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q4_0:
+                LaunchPagedKvStoreQ4_0(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+        }
+    }
+
+    private void LaunchPagedKvStoreBatch(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize, KvCachePrecision kvPrecision)
+    {
+        switch (ResolvePagedKvPrecision(kvPrecision))
+        {
+            case KvCachePrecision.Fp16:
+                LaunchPagedKvStoreBatchF16(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q8_0:
+                LaunchPagedKvStoreBatchQ8_0(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q4_0:
+                LaunchPagedKvStoreBatchQ4_0(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+        }
+    }
+
+    private void LaunchPagedAttention(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize, KvCachePrecision kvPrecision)
+    {
+        switch (ResolvePagedKvPrecision(kvPrecision))
+        {
+            case KvCachePrecision.Fp16:
+                LaunchPagedAttentionF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q8_0:
+                LaunchPagedAttentionQ8_0(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q4_0:
+                LaunchPagedAttentionQ4_0(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+                break;
+        }
+    }
+
+    private void LaunchPagedAttentionBatch(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize, KvCachePrecision kvPrecision)
+    {
+        switch (ResolvePagedKvPrecision(kvPrecision))
+        {
+            case KvCachePrecision.Fp16:
+                LaunchPagedAttentionBatchF16(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q8_0:
+                LaunchPagedAttentionBatchQ8_0(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+            case KvCachePrecision.Q4_0:
+                LaunchPagedAttentionBatchQ4_0(dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+                break;
+        }
+    }
+
+    private void LaunchPagedKvStoreQuantized(IntPtr fn, string name, IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        int maxBlocksPerHead = Math.Max((headDim + 31) / 32, (vHeadDim + 31) / 32);
+        int totalWarps = nHeadsKv * maxBlocksPerHead;
+        uint threads = 256;
+        uint gridSize = (uint)((totalWarps + 7) / 8);
+
+        IntPtr dK = _dK;
+        IntPtr dV = _dV;
+
+        void** pArgs = stackalloc void*[12];
+        pArgs[0] = &dK;
+        pArgs[1] = &dV;
+        pArgs[2] = &dKPool;
+        pArgs[3] = &dVPool;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &pos;
+        pArgs[6] = &modelLayer;
+        pArgs[7] = &numLayers;
+        pArgs[8] = &nHeadsKv;
+        pArgs[9] = &headDim;
+        pArgs[10] = &vHeadDim;
+        pArgs[11] = &kvBlockSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), $"LaunchKernel({name})");
+    }
+
+    private void LaunchPagedKvStoreBatchQuantized(IntPtr fn, string name, IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        int maxBlocksPerHead = Math.Max((headDim + 31) / 32, (vHeadDim + 31) / 32);
+        int totalWarps = batchSize * nHeadsKv * maxBlocksPerHead;
+        uint threads = 256;
+        uint gridSize = (uint)((totalWarps + 7) / 8);
+
+        IntPtr dK = _dKBatch;
+        IntPtr dV = _dVBatch;
+
+        void** pArgs = stackalloc void*[13];
+        pArgs[0] = &dK;
+        pArgs[1] = &dV;
+        pArgs[2] = &dKPool;
+        pArgs[3] = &dVPool;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &modelLayer;
+        pArgs[8] = &numLayers;
+        pArgs[9] = &nHeadsKv;
+        pArgs[10] = &headDim;
+        pArgs[11] = &vHeadDim;
+        pArgs[12] = &kvBlockSize;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), $"LaunchKernel({name})");
+    }
+
+    private void LaunchPagedAttentionQuantized(IntPtr fn, string name, IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        uint gridSize = (uint)_nHeads;
+        uint threads = GetAttentionBlockSize(_headDim, _headDim);
+
+        IntPtr dQ = _dQ;
+        IntPtr dOut = _dAttnOut;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[14];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKPool;
+        pArgs[2] = &dVPool;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &pos;
+        pArgs[6] = &modelLayer;
+        pArgs[7] = &numLayers;
+        pArgs[8] = &nHeadsQ;
+        pArgs[9] = &nHeadsKv;
+        pArgs[10] = &headDim;
+        pArgs[11] = &vHeadDim;
+        pArgs[12] = &kvBlockSize;
+        pArgs[13] = &attnScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridSize, 1, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), $"LaunchKernel({name})");
+    }
+
+    private void LaunchPagedAttentionBatchQuantized(IntPtr fn, string name, IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+    {
+        uint gridX = (uint)_nHeads;
+        uint gridY = (uint)batchSize;
+        uint threads = GetAttentionBlockSize(_headDim, _headDim);
+
+        IntPtr dQ = _dQBatch;
+        IntPtr dOut = _dAttnOutBatch;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int vHeadDim = _headDim;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[15];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKPool;
+        pArgs[2] = &dVPool;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dBlockTable;
+        pArgs[5] = &startPos;
+        pArgs[6] = &batchSize;
+        pArgs[7] = &modelLayer;
+        pArgs[8] = &numLayers;
+        pArgs[9] = &nHeadsQ;
+        pArgs[10] = &nHeadsKv;
+        pArgs[11] = &headDim;
+        pArgs[12] = &vHeadDim;
+        pArgs[13] = &kvBlockSize;
+        pArgs[14] = &attnScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fn,
+            gridX, gridY, 1,
+            threads, 1, 1,
+            0, IntPtr.Zero,
+            (IntPtr)pArgs,
+            IntPtr.Zero), $"LaunchKernel({name})");
+    }
+
+    private void LaunchPagedKvStoreQ4_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedKvStoreQuantized(_fnPagedKvStoreQ4_0, "paged_kv_cache_store_q4_0_kernel", dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedKvStoreBatchQ4_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedKvStoreBatchQuantized(_fnPagedKvStoreBatchQ4_0, "paged_kv_cache_store_batch_q4_0_kernel", dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedAttentionQ4_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedAttentionQuantized(_fnPagedAttnGqaQ4_0, "paged_attention_gqa_q4_0_kernel", dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedAttentionBatchQ4_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedAttentionBatchQuantized(_fnPagedAttnGqaBatchQ4_0, "paged_attention_gqa_batch_q4_0_kernel", dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedKvStoreQ8_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedKvStoreQuantized(_fnPagedKvStoreQ8_0, "paged_kv_cache_store_q8_0_kernel", dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedKvStoreBatchQ8_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedKvStoreBatchQuantized(_fnPagedKvStoreBatchQ8_0, "paged_kv_cache_store_batch_q8_0_kernel", dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedAttentionQ8_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int pos, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedAttentionQuantized(_fnPagedAttnGqaQ8_0, "paged_attention_gqa_q8_0_kernel", dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, kvBlockSize);
+
+    private void LaunchPagedAttentionBatchQ8_0(IntPtr dKPool, IntPtr dVPool, IntPtr dBlockTable, int startPos, int batchSize, int modelLayer, int numLayers, int kvBlockSize)
+        => LaunchPagedAttentionBatchQuantized(_fnPagedAttnGqaBatchQ8_0, "paged_attention_gqa_batch_q8_0_kernel", dKPool, dVPool, dBlockTable, startPos, batchSize, modelLayer, numLayers, kvBlockSize);
 }

@@ -6,7 +6,8 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Glacier.Inference.Cli;
+using Glacier.Serve.Inference.Batching;
+using Glacier.Serve.Inference.Bounce;
 using Xunit;
 
 namespace Glacier.Inference.Tests;
@@ -55,7 +56,7 @@ public sealed class PeerBounceTests
     [Fact]
     public void ClassifyRequest_BypassesSleepMemoryAndDetectsCodeTasks()
     {
-        var memMsgs = new OllamaChatMessageDto[]
+        var memMsgs = new ChatMessage[]
         {
             new() { Role = "system", Content = "CONSOLIDATED EPISODIC MEMORY:\nFact 1: port=8080" },
             new() { Role = "user", Content = "What port is configured?" }
@@ -94,7 +95,7 @@ public sealed class PeerBounceTests
         using var http = new HttpClient(handler);
         var svc = new PeerBounceService(http, verifier, "http://primary.local:18080", "http://critic.local:8080", maxRepairs: 2);
 
-        var msgs = new OllamaChatMessageDto[]
+        var msgs = new ChatMessage[]
         {
             new() { Role = "system", Content = "CONSOLIDATED EPISODIC MEMORY: port is 8080." },
             new() { Role = "user", Content = "What is the port?" }
@@ -148,7 +149,7 @@ public sealed class PeerBounceTests
         using var http = new HttpClient(handler);
         var svc = new PeerBounceService(http, verifier, "http://primary.local:18080", "http://critic.local:8080", maxRepairs: 2);
 
-        var msgs = new OllamaChatMessageDto[]
+        var msgs = new ChatMessage[]
         {
             new() { Role = "user", Content = "Write a C# .NET 10 Vector256 SIMD dot product over ReadOnlySpan<float>." }
         };

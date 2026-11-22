@@ -45,6 +45,7 @@ struct __align__(2) BlockQ8_0 {
     half d;
     int8_t qs[32];
 };
+static_assert(sizeof(BlockQ8_0) == 34, "BlockQ8_0 must be 34 bytes");
 
 #define QK4_0 32
 

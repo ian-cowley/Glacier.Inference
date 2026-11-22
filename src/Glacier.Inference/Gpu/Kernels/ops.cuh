@@ -642,6 +642,228 @@ __global__ void paged_kv_cache_store_batch_f16_kernel(
 }
 
 // =========================================================================
+// 17f. PagedAttention Q4_0 / Q8_0 KV Cache Store Kernels (1 warp per 32-elem block)
+// Pool layout: [num_blocks, num_layers, n_heads_kv, block_size, blocks_per_head]
+// =========================================================================
+__device__ __forceinline__ void quantize_warp_q8_0(float val, int lane_id, BlockQ8_0* dst_blk) {
+    float amax = isfinite(val) ? fabsf(val) : (isinf(val) ? 8319008.0f : 0.0f);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+    amax = fminf(amax, 8319008.0f);
+
+    half dh = __float2half(amax / 127.0f);
+    float d_quant = __half2float(dh);
+    if (!isfinite(d_quant)) {
+        d_quant = 65504.0f;
+        dh = __float2half(65504.0f);
+    }
+    float inv_d = (d_quant > 0.0f) ? (1.0f / d_quant) : 0.0f;
+
+    int q;
+    if (isnan(val)) {
+        q = 0;
+    } else if (isinf(val)) {
+        q = (val > 0.0f) ? 127 : -127;
+    } else {
+        q = (d_quant > 0.0f) ? __float2int_rn(val * inv_d) : 0;
+        q = min(max(q, -127), 127);
+    }
+
+    dst_blk->qs[lane_id] = (int8_t)q;
+    if (lane_id == 0) {
+        dst_blk->d = dh;
+    }
+}
+
+__global__ void paged_kv_cache_store_q4_0_kernel(
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    BlockQ4_0* __restrict__ k_pool,
+    BlockQ4_0* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int pos,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (pos < 0 || block_size <= 0) return;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+    int max_blocks_per_head = (k_blocks_per_head > v_blocks_per_head) ? k_blocks_per_head : v_blocks_per_head;
+    int total_blocks = n_heads_kv * max_blocks_per_head;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    int h = warp_id / max_blocks_per_head;
+    int b = warp_id % max_blocks_per_head;
+    int d = b * 32 + lane_id;
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+
+    if (b < k_blocks_per_head) {
+        float k_val = (d < head_dim) ? k[(size_t)h * head_dim + d] : 0.0f;
+        quantize_warp_q4_0(k_val, lane_id, &k_pool[head_slot * k_blocks_per_head + b]);
+    }
+    if (b < v_blocks_per_head) {
+        float v_val = (d < v_head_dim) ? v[(size_t)h * v_head_dim + d] : 0.0f;
+        quantize_warp_q4_0(v_val, lane_id, &v_pool[head_slot * v_blocks_per_head + b]);
+    }
+}
+
+__global__ void paged_kv_cache_store_batch_q4_0_kernel(
+    const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch,
+    BlockQ4_0* __restrict__ k_pool,
+    BlockQ4_0* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int start_pos,
+    int batch_size,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (batch_size <= 0 || block_size <= 0) return;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+    int max_blocks_per_head = (k_blocks_per_head > v_blocks_per_head) ? k_blocks_per_head : v_blocks_per_head;
+    int blocks_per_token = n_heads_kv * max_blocks_per_head;
+    int total_blocks = batch_size * blocks_per_token;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int t = warp_id / blocks_per_token;
+    int rem = warp_id % blocks_per_token;
+    int h = rem / max_blocks_per_head;
+    int b = rem % max_blocks_per_head;
+    int pos = start_pos + t;
+    if (pos < 0) return;
+
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    int d = b * 32 + lane_id;
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+
+    if (b < k_blocks_per_head) {
+        float k_val = (d < head_dim) ? k_batch[((size_t)t * n_heads_kv + h) * head_dim + d] : 0.0f;
+        quantize_warp_q4_0(k_val, lane_id, &k_pool[head_slot * k_blocks_per_head + b]);
+    }
+    if (b < v_blocks_per_head) {
+        float v_val = (d < v_head_dim) ? v_batch[((size_t)t * n_heads_kv + h) * v_head_dim + d] : 0.0f;
+        quantize_warp_q4_0(v_val, lane_id, &v_pool[head_slot * v_blocks_per_head + b]);
+    }
+}
+
+__global__ void paged_kv_cache_store_q8_0_kernel(
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    BlockQ8_0* __restrict__ k_pool,
+    BlockQ8_0* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int pos,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (pos < 0 || block_size <= 0) return;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+    int max_blocks_per_head = (k_blocks_per_head > v_blocks_per_head) ? k_blocks_per_head : v_blocks_per_head;
+    int total_blocks = n_heads_kv * max_blocks_per_head;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    int h = warp_id / max_blocks_per_head;
+    int b = warp_id % max_blocks_per_head;
+    int d = b * 32 + lane_id;
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+
+    if (b < k_blocks_per_head) {
+        float k_val = (d < head_dim) ? k[(size_t)h * head_dim + d] : 0.0f;
+        quantize_warp_q8_0(k_val, lane_id, &k_pool[head_slot * k_blocks_per_head + b]);
+    }
+    if (b < v_blocks_per_head) {
+        float v_val = (d < v_head_dim) ? v[(size_t)h * v_head_dim + d] : 0.0f;
+        quantize_warp_q8_0(v_val, lane_id, &v_pool[head_slot * v_blocks_per_head + b]);
+    }
+}
+
+__global__ void paged_kv_cache_store_batch_q8_0_kernel(
+    const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch,
+    BlockQ8_0* __restrict__ k_pool,
+    BlockQ8_0* __restrict__ v_pool,
+    const int* __restrict__ block_table,
+    int start_pos,
+    int batch_size,
+    int layer,
+    int num_layers,
+    int n_heads_kv,
+    int head_dim,
+    int v_head_dim,
+    int block_size
+) {
+    if (batch_size <= 0 || block_size <= 0) return;
+    int k_blocks_per_head = (head_dim + 31) >> 5;
+    int v_blocks_per_head = (v_head_dim + 31) >> 5;
+    int max_blocks_per_head = (k_blocks_per_head > v_blocks_per_head) ? k_blocks_per_head : v_blocks_per_head;
+    int blocks_per_token = n_heads_kv * max_blocks_per_head;
+    int total_blocks = batch_size * blocks_per_token;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane_id = threadIdx.x & 31;
+    if (warp_id >= total_blocks) return;
+
+    int t = warp_id / blocks_per_token;
+    int rem = warp_id % blocks_per_token;
+    int h = rem / max_blocks_per_head;
+    int b = rem % max_blocks_per_head;
+    int pos = start_pos + t;
+    if (pos < 0) return;
+
+    int logical_block = pos / block_size;
+    int offset_in_block = pos % block_size;
+    int phys_block = block_table[logical_block];
+    if (phys_block < 0) return;
+
+    int d = b * 32 + lane_id;
+    size_t head_slot = (((size_t)phys_block * num_layers + layer) * n_heads_kv + h) * block_size + offset_in_block;
+
+    if (b < k_blocks_per_head) {
+        float k_val = (d < head_dim) ? k_batch[((size_t)t * n_heads_kv + h) * head_dim + d] : 0.0f;
+        quantize_warp_q8_0(k_val, lane_id, &k_pool[head_slot * k_blocks_per_head + b]);
+    }
+    if (b < v_blocks_per_head) {
+        float v_val = (d < v_head_dim) ? v_batch[((size_t)t * n_heads_kv + h) * v_head_dim + d] : 0.0f;
+        quantize_warp_q8_0(v_val, lane_id, &v_pool[head_slot * v_blocks_per_head + b]);
+    }
+}
+
+// =========================================================================
 // 18. GPU Argmax Reduction Kernel
 // Finds the token ID with the maximum logit across the entire vocabulary.
 // Runs in ~3 microseconds, completely eliminating 608 KB DtoH PCIe transfers!

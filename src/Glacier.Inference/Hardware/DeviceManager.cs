@@ -19,34 +19,48 @@ public static class DeviceManager
 
     public static IReadOnlyList<DeviceInfo> GetDevices() => _devices.Value;
 
+    /// <summary>
+    /// Returns all detected Neural Processing Units (NPUs), such as AMD XDNA 2 / XDNA 1 or Intel AI Boost.
+    /// </summary>
+    public static IReadOnlyList<DeviceInfo> GetNpuDevices()
+    {
+        var npus = new List<DeviceInfo>();
+        foreach (var dev in GetDevices())
+        {
+            if (dev.IsNpu)
+                npus.Add(dev);
+        }
+        return npus;
+    }
+
     public static DeviceInfo GetOptimalDevice()
     {
         var list = GetDevices();
         // 1. Prefer NVIDIA discrete GPU with Bare-Metal SASS if available
         foreach (var dev in list)
         {
-            if (dev.Vendor == GpuVendor.Nvidia && dev.SupportedEngines.Contains(InferenceEngineType.BareMetal))
+            if (!dev.IsNpu && dev.Vendor == GpuVendor.Nvidia && dev.SupportedEngines.Contains(InferenceEngineType.BareMetal))
                 return dev;
         }
 
         // 2. Prefer AMD GPU (Ryzen iGPU or Radeon dGPU)
         foreach (var dev in list)
         {
-            if (dev.Vendor == GpuVendor.Amd)
+            if (!dev.IsNpu && dev.Vendor == GpuVendor.Amd)
                 return dev;
         }
 
         // 3. Prefer Intel GPU (Arc discrete or Core Ultra Xe integrated)
         foreach (var dev in list)
         {
-            if (dev.Vendor == GpuVendor.Intel)
+            if (!dev.IsNpu && dev.Vendor == GpuVendor.Intel)
                 return dev;
         }
 
         // 4. Prefer any other GPU
         foreach (var dev in list)
         {
-            if (dev.Vendor is not GpuVendor.Cpu)
+            if (!dev.IsNpu && dev.Vendor is not GpuVendor.Cpu)
                 return dev;
         }
 
@@ -101,20 +115,25 @@ public static class DeviceManager
         }
 
         // Vendor keyword shortcuts
+        if (q is "npu" or "xdna" or "xdna2" or "xdna1" or "amd-xdna2" or "amd-xdna1" or "ryzen-ai" or "flm" or "fastflowlm" or "lemonade" or "npusidecar")
+        {
+            foreach (var dev in list)
+                if (dev.IsNpu) return dev;
+        }
         if (q is "nvidia" or "geforce" or "rtx" or "gtx" or "cuda" or "baremetal" or "sass")
         {
             foreach (var dev in list)
-                if (dev.Vendor == GpuVendor.Nvidia) return dev;
+                if (!dev.IsNpu && dev.Vendor == GpuVendor.Nvidia) return dev;
         }
         if (q is "amd" or "radeon" or "rdna" or "890m" or "880m" or "780m" or "760m" or "680m" or "660m" or "apu" or "igpu" or "rx")
         {
             foreach (var dev in list)
-                if (dev.Vendor == GpuVendor.Amd) return dev;
+                if (!dev.IsNpu && dev.Vendor == GpuVendor.Amd) return dev;
         }
         if (q is "intel" or "arc" or "xe" or "iris" or "uhd" or "battlemage" or "alchemist")
         {
             foreach (var dev in list)
-                if (dev.Vendor == GpuVendor.Intel) return dev;
+                if (!dev.IsNpu && dev.Vendor == GpuVendor.Intel) return dev;
         }
         if (q is "cpu" or "host" or "simd" or "ryzen" or "core")
         {
@@ -152,6 +171,16 @@ public static class DeviceManager
             {
                 // Fallback if native driver discovery fails
             }
+        }
+
+        // Detect Neural Processing Units (AMD XDNA 2 / XDNA 1, Intel AI Boost) via zero-dependency OS APIs
+        try
+        {
+            EnumerateNpuAccelerators(results);
+        }
+        catch
+        {
+            // Ignore NPU discovery errors on restricted environments
         }
 
         // Always add Host CPU
@@ -592,8 +621,168 @@ public static class DeviceManager
     }
 
     // =========================================================================
+    // Zero-Dependency NPU Discovery (Windows cfgmgr32 / Linux /sys/class/accel)
+    // =========================================================================
+
+    private const uint CR_SUCCESS = 0;
+    private const uint CM_GETIDLIST_FILTER_CLASS = 0x00000200;
+    private const uint CM_GETIDLIST_FILTER_PRESENT = 0x00000100;
+    private const string GUID_DEVCLASS_COMPUTEACCELERATOR = "{F01A9D53-3FF6-48D2-9F97-C8A7004BE10C}";
+
+    private static void EnumerateNpuAccelerators(List<DeviceInfo> results)
+    {
+        ulong totalRam = GetPhysicalMemoryBytes();
+
+        if (OperatingSystem.IsWindows())
+        {
+            uint flags = CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT;
+            if (CM_Get_Device_ID_List_SizeW(out uint length, GUID_DEVCLASS_COMPUTEACCELERATOR, flags) == CR_SUCCESS && length > 1)
+            {
+                char[] buffer = new char[length];
+                if (CM_Get_Device_ID_ListW(GUID_DEVCLASS_COMPUTEACCELERATOR, buffer, length, flags) == CR_SUCCESS)
+                {
+                    int start = 0;
+                    while (start < buffer.Length)
+                    {
+                        int end = Array.IndexOf(buffer, '\0', start);
+                        if (end <= start) break;
+
+                        string instanceId = new string(buffer, start, end - start);
+                        start = end + 1;
+
+                        var npu = ParseNpuHardwareId(instanceId, totalRam, results.Count);
+                        if (npu != null && !results.Exists(d => d.Id.Equals(npu.Id, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            results.Add(npu);
+                        }
+                    }
+                }
+            }
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            const string accelRoot = "/sys/class/accel";
+            if (!Directory.Exists(accelRoot))
+                return;
+
+            foreach (string accelDir in Directory.EnumerateDirectories(accelRoot, "accel*"))
+            {
+                try
+                {
+                    string vendorPath = Path.Combine(accelDir, "device", "vendor");
+                    string devicePath = Path.Combine(accelDir, "device", "device");
+                    if (!File.Exists(vendorPath) || !File.Exists(devicePath))
+                        continue;
+
+                    string vendorHex = File.ReadAllText(vendorPath).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase).ToUpperInvariant();
+                    string deviceHex = File.ReadAllText(devicePath).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase).ToUpperInvariant();
+                    string syntheticId = $"PCI\\VEN_{vendorHex}&DEV_{deviceHex}";
+
+                    var npu = ParseNpuHardwareId(syntheticId, totalRam, results.Count);
+                    if (npu != null && !results.Exists(d => d.Id.Equals(npu.Id, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        results.Add(npu);
+                    }
+                }
+                catch
+                {
+                    // Skip unreadable sysfs entries
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parses a Windows PnP instance ID or Linux sysfs PCI vendor/device tuple into a <see cref="DeviceInfo"/>
+    /// for supported Neural Processing Units (AMD XDNA 2 / XDNA 1, Intel AI Boost).
+    /// </summary>
+    internal static DeviceInfo? ParseNpuHardwareId(string? hardwareOrInstanceId, ulong totalPhysicalRamBytes, int index)
+    {
+        if (string.IsNullOrWhiteSpace(hardwareOrInstanceId))
+            return null;
+
+        string upper = hardwareOrInstanceId.ToUpperInvariant();
+        // Windows WDDM/MCDM caps NPU shared system memory at ~50% of total physical RAM
+        ulong npuSharedCapBytes = totalPhysicalRamBytes / 2;
+        double capGb = npuSharedCapBytes / (1024.0 * 1024.0 * 1024.0);
+
+        if (upper.Contains("VEN_1022", StringComparison.Ordinal))
+        {
+            if (upper.Contains("DEV_17F0", StringComparison.Ordinal))
+            {
+                string capacityHint = capGb >= 28.0
+                    ? $"~{capGb:F1} GB NPU cap supports up to 35B sparse MoE (e.g. Qwen3.6-35B-A3B Q4NX), 1B-14B LLMs, embeddings, and Whisper."
+                    : $"~{capGb:F1} GB NPU cap (50% of RAM) supports 1B-14B LLMs, EmbeddingGemma, and Whisper; 35B MoE full-context requires >=64 GB RAM.";
+
+                return new DeviceInfo
+                {
+                    Id = "amd-xdna2",
+                    Index = index,
+                    Name = "AMD XDNA 2 NPU (Ryzen AI 50 TOPS)",
+                    Vendor = GpuVendor.Amd,
+                    DedicatedVramBytes = 0,
+                    SharedVramBytes = npuSharedCapBytes,
+                    IsDisplayDevice = false,
+                    IsNpu = true,
+                    SupportedEngines = [InferenceEngineType.NpuSidecar],
+                    RecommendedEngine = InferenceEngineType.NpuSidecar,
+                    SafetyNotes = $"AMD XDNA 2 NPU (PCI 1022:17F0) via FastFlowLM (flm serve) or Lemonade Server OpenAI sidecar. {capacityHint}"
+                };
+            }
+
+            if (upper.Contains("DEV_1502", StringComparison.Ordinal))
+            {
+                return new DeviceInfo
+                {
+                    Id = "amd-xdna1",
+                    Index = index,
+                    Name = "AMD XDNA 1 NPU (Ryzen AI)",
+                    Vendor = GpuVendor.Amd,
+                    DedicatedVramBytes = 0,
+                    SharedVramBytes = npuSharedCapBytes,
+                    IsDisplayDevice = false,
+                    IsNpu = true,
+                    SupportedEngines = [InferenceEngineType.NpuSidecar],
+                    RecommendedEngine = InferenceEngineType.NpuSidecar,
+                    SafetyNotes = $"AMD XDNA 1 NPU (PCI 1022:1502, ~{capGb:F1} GB shared cap). Note: FastFlowLM Q4NX requires XDNA 2; use Lemonade/ONNX sidecar for XDNA 1."
+                };
+            }
+        }
+
+        if (upper.Contains("VEN_8086", StringComparison.Ordinal) &&
+            (upper.Contains("DEV_7D1D", StringComparison.Ordinal) ||
+             upper.Contains("DEV_AD1D", StringComparison.Ordinal) ||
+             upper.Contains("DEV_643E", StringComparison.Ordinal) ||
+             upper.Contains("DEV_B03E", StringComparison.Ordinal)))
+        {
+            return new DeviceInfo
+            {
+                Id = "intel-npu",
+                Index = index,
+                Name = "Intel AI Boost NPU",
+                Vendor = GpuVendor.Intel,
+                DedicatedVramBytes = 0,
+                SharedVramBytes = npuSharedCapBytes,
+                IsDisplayDevice = false,
+                IsNpu = true,
+                SupportedEngines = [InferenceEngineType.NpuSidecar],
+                RecommendedEngine = InferenceEngineType.NpuSidecar,
+                SafetyNotes = $"Intel AI Boost NPU (~{capGb:F1} GB shared cap) via OpenAI-compatible local NPU sidecar."
+            };
+        }
+
+        return null;
+    }
+
+    // =========================================================================
     // DXGI & Win32 Interop
     // =========================================================================
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern uint CM_Get_Device_ID_List_SizeW(out uint pulLen, string pszFilter, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern uint CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] buffer, uint bufferLen, uint ulFlags);
 
     [DllImport("dxgi.dll", ExactSpelling = true)]
     private static extern int CreateDXGIFactory1(ref Guid riid, out IntPtr ppFactory);

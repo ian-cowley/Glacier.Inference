@@ -23,52 +23,73 @@ public static partial class Program
         var devices = DeviceManager.GetDevices();
         var (activeDevice, activeEngine) = GlacierSettings.ResolveTarget(null, null);
 
-        Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("============================================================================================================");
-        Console.WriteLine("                                  GLACIER DETECTED ACCELERATORS & ENGINES                                   ");
-        Console.WriteLine("============================================================================================================");
-        Console.ResetColor();
-        Console.WriteLine($"{"[ID]",-18} | {"Device Name",-34} | {"Memory",-15} | {"Safe Driver Engines",-25}");
-        Console.WriteLine(new string('-', 108));
+        WriteDevicesReport(devices, activeDevice, activeEngine, Console.Out, useColors: true);
+        return 0;
+    }
+
+    internal static string FormatDeviceMemory(DeviceInfo dev)
+    {
+        if (dev.Vendor == GpuVendor.Cpu)
+        {
+            return $"{dev.SharedVramGb:F1} GB RAM";
+        }
+        if (dev.IsNpu)
+        {
+            return $"{dev.SharedVramGb:F1} GB NPU Cap";
+        }
+        if (dev.DedicatedVramGb < 1.0 && dev.SharedVramGb > 0)
+        {
+            return $"{dev.SharedVramGb:F1} GB Unified";
+        }
+        return $"{dev.DedicatedVramGb:F1} GB VRAM";
+    }
+
+    internal static void WriteDevicesReport(
+        IReadOnlyList<DeviceInfo> devices,
+        DeviceInfo activeDevice,
+        InferenceEngineType activeEngine,
+        TextWriter output,
+        bool useColors = false)
+    {
+        if (useColors) Console.ForegroundColor = ConsoleColor.Cyan;
+        output.WriteLine("============================================================================================================");
+        output.WriteLine("                                  GLACIER DETECTED ACCELERATORS & ENGINES                                   ");
+        output.WriteLine("============================================================================================================");
+        if (useColors) Console.ResetColor();
+        output.WriteLine($"{"[ID]",-18} | {"Device Name",-34} | {"Memory",-15} | {"Safe Driver Engines",-25}");
+        output.WriteLine(new string('-', 108));
 
         foreach (var dev in devices)
         {
-            string memStr;
-            if (dev.Vendor == GpuVendor.Cpu)
-            {
-                memStr = $"{dev.SharedVramGb:F1} GB RAM";
-            }
-            else if (dev.DedicatedVramGb < 1.0 && dev.SharedVramGb > 0)
-            {
-                memStr = $"{dev.SharedVramGb:F1} GB Unified";
-            }
-            else
-            {
-                memStr = $"{dev.DedicatedVramGb:F1} GB VRAM";
-            }
-
+            string memStr = FormatDeviceMemory(dev);
             string safeEngines = string.Join(", ", dev.SupportedEngines.Select(FormatEngineName));
             bool isCurrent = dev.Id == activeDevice.Id;
 
-            if (isCurrent) Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"{dev.Id,-18} | {dev.Name,-34} | {memStr,-15} | {safeEngines,-25} {(isCurrent ? $"[ACTIVE: {FormatEngineName(activeEngine)}]" : "")}");
-            if (isCurrent) Console.ResetColor();
+            if (useColors && isCurrent) Console.ForegroundColor = ConsoleColor.Green;
+            output.WriteLine($"{dev.Id,-18} | {dev.Name,-34} | {memStr,-15} | {safeEngines,-25} {(isCurrent ? $"[ACTIVE: {FormatEngineName(activeEngine)}]" : "")}");
+            if (useColors && isCurrent) Console.ResetColor();
 
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.WriteLine($"  └─ Driver Safety: {dev.SafetyNotes}");
-            Console.ResetColor();
+            if (useColors) Console.ForegroundColor = ConsoleColor.DarkGray;
+            output.WriteLine($"  └─ Driver Safety: {dev.SafetyNotes}");
+            if (useColors) Console.ResetColor();
         }
 
-        Console.WriteLine(new string('-', 108));
-        Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine("* To switch your active hardware & driver engine:");
-        Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
-        Console.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine baremetal");
-        Console.WriteLine("  Example: glacier config --device amd-890m --engine vulkan");
-        Console.WriteLine("  Example: glacier config --device cpu");
-        Console.ResetColor();
+        output.WriteLine(new string('-', 108));
+        if (devices.Any(d => d.IsNpu))
+        {
+            if (useColors) Console.ForegroundColor = ConsoleColor.Cyan;
+            output.WriteLine("* NPU Sidecar detected: run 'flm serve <model>' (FastFlowLM) or 'lemonade-server' and offload critic/RAG:");
+            output.WriteLine("  glacier bounce --primary http://127.0.0.1:11434 --critic auto-npu");
+            if (useColors) Console.ResetColor();
+        }
 
-        return 0;
+        if (useColors) Console.ForegroundColor = ConsoleColor.Yellow;
+        output.WriteLine("* To switch your active hardware & driver engine:");
+        output.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
+        output.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine baremetal");
+        output.WriteLine("  Example: glacier config --device amd-890m --engine vulkan");
+        output.WriteLine("  Example: glacier config --device cpu");
+        if (useColors) Console.ResetColor();
     }
 
     // =========================================================================
@@ -154,11 +175,12 @@ public static partial class Program
         return 1;
     }
 
-    private static string FormatEngineName(InferenceEngineType engine) => engine switch
+    internal static string FormatEngineName(InferenceEngineType engine) => engine switch
     {
         InferenceEngineType.BareMetal => "Native Driver (SASS/HIP)",
         InferenceEngineType.Vulkan => "Vulkan (CoopMat / WMMA)",
         InferenceEngineType.DirectML => "DirectML",
+        InferenceEngineType.NpuSidecar => "NPU Sidecar (FLM / Lemonade)",
         InferenceEngineType.Cpu => "Cpu",
         _ => engine.ToString()
     };
@@ -381,7 +403,7 @@ public static partial class Program
 
 #pragma warning disable GLACIER_EXP001
             using var whisper = new WhisperEngine();
-            string transcript = whisper.Transcribe(audioSamples);
+            string transcript = whisper.Transcribe(audioSamples, sampleRate);
 #pragma warning restore GLACIER_EXP001
             sw.Stop();
 

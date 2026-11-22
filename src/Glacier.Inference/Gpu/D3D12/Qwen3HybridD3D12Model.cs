@@ -267,6 +267,7 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
         {
             KvCachePrecision.Auto => KvCachePrecision.Fp16,
             KvCachePrecision.Fp8 => KvCachePrecision.Fp16,
+            KvCachePrecision.Q8_0 => KvCachePrecision.Fp16,
             _ => kvPrecision
         };
         EffectiveVramReserveBytes = WddmVramGuard.ResolveModelSafetyReserveBytes(

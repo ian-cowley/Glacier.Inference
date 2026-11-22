@@ -132,7 +132,7 @@ public sealed record TieredStepTelemetry
 /// across Host DDR5 RAM (<see cref="HostRamExpertArena"/>), PCIe shared memory, and
 /// adaptive <see cref="ExpertRoutingProfile"/> / <see cref="BandwidthCoScheduler"/> splitting.
 /// </summary>
-public sealed unsafe class TieredMoERunner : ISpeculativeTarget
+public sealed class TieredMoERunner : ISpeculativeTarget
 {
     private const ulong SlotSubAlignmentBytes = 256UL;
 
@@ -170,7 +170,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
     private bool[]? _layerHasFusedExps;
     private bool[]? _layerHasBiases;
     private ID3D12Resource? _uploadExpertPcieStaging;
-    private byte* _pUploadExpertPcieStaging;
+    private unsafe byte* _pUploadExpertPcieStaging;
     private int _pcieStagingCapacity;
     private Qwen2D3D12Model.ExpertCpuWorkspace[]? _cpuWorkspaces;
     private float[]? _cpuNormXSums;
@@ -355,7 +355,10 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
             if (_weights.IsMoe && _d3dModel.TieredMoe)
             {
                 InitializeD3D12TieredExpertResources();
-                _d3dModel.TieredMoeBatchHandler = HandleD3D12TieredMoeLayerBatch;
+                unsafe
+                {
+                    _d3dModel.TieredMoeBatchHandler = HandleD3D12TieredMoeLayerBatch;
+                }
             }
         }
         else
@@ -405,7 +408,10 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
                         _routingProfile);
                 }
 
-                _cpuModel.TieredMoeBatchHandler = HandleCpuTieredMoeLayerBatch;
+                unsafe
+                {
+                    _cpuModel.TieredMoeBatchHandler = HandleCpuTieredMoeLayerBatch;
+                }
             }
         }
     }
@@ -482,7 +488,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         bool isSpeculativeDraftBatch)
         => ExecuteSyntheticMoELayerBatchCore(layerIdx, normXBatch, ffnOutBatch, batchSize, isSpeculativeDraftBatch, emitTelemetry: true);
 
-    private BatchLayerMissSplitResult ExecuteSyntheticMoELayerBatchCore(
+    private unsafe BatchLayerMissSplitResult ExecuteSyntheticMoELayerBatchCore(
         int layerIdx,
         ReadOnlySpan<float> normXBatch,
         Span<float> ffnOutBatch,
@@ -567,7 +573,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
     /// Executes an end-to-end synthetic multi-layer batch (e.g. speculative draft verification or prefill)
     /// across all configured MoE layers, computing output logits and emitting <see cref="TieredStepTelemetry"/>.
     /// </summary>
-    internal void EvaluateSyntheticBatch(
+    internal unsafe void EvaluateSyntheticBatch(
         ReadOnlySpan<float> inputHiddenBatch,
         int batchSize,
         bool isSpeculativeDraftBatch,
@@ -651,7 +657,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         EmitStepTelemetry(primaryTokenId, primaryTokenText, totalMs, attentionMs: 0.0);
     }
 
-    private BatchLayerMissSplitResult ExecutePlannedMoELayerCore(
+    private unsafe BatchLayerMissSplitResult ExecutePlannedMoELayerCore(
         int layerIdx,
         LayerWeights lw,
         int dim,
@@ -751,7 +757,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         return split;
     }
 
-    private void InitializeD3D12TieredExpertResources()
+    private unsafe void InitializeD3D12TieredExpertResources()
     {
         if (_d3dCtx == null || _weights == null || !_weights.IsMoe)
             return;
@@ -877,7 +883,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         return _dVramSlotSegments[segIdx].GPUVirtualAddress + (ulong)localIdx * _maxAlignedSlotBytes;
     }
 
-    private ulong StageExpertIntoPcieBuffer(LayerWeights lw, int modelLayer, int expertIdx, int expertFfnDim, int dim, byte* dstPtr)
+    private unsafe ulong StageExpertIntoPcieBuffer(LayerWeights lw, int modelLayer, int expertIdx, int expertFfnDim, int dim, byte* dstPtr)
     {
         bool fused = _layerHasFusedExps![modelLayer];
         ulong gateAligned = _layerGateAlignedBytes![modelLayer];
@@ -914,7 +920,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         return gateAligned + upAligned + downAligned;
     }
 
-    private bool HandleD3D12TieredMoeLayerBatch(
+    private unsafe bool HandleD3D12TieredMoeLayerBatch(
         int modelLayer,
         int chunkSize,
         int topK,
@@ -1223,7 +1229,7 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
         return gpuInitializedOut;
     }
 
-    private void HandleCpuTieredMoeLayerBatch(
+    private unsafe void HandleCpuTieredMoeLayerBatch(
         int modelLayer,
         int batchSize,
         int topK,
@@ -1708,7 +1714,10 @@ public sealed unsafe class TieredMoERunner : ISpeculativeTarget
                 _uploadExpertPcieStaging.Unmap(0);
                 _uploadExpertPcieStaging.Dispose();
                 _uploadExpertPcieStaging = null;
-                _pUploadExpertPcieStaging = null;
+                unsafe
+                {
+                    _pUploadExpertPcieStaging = null;
+                }
             }
 
             _d3dModel?.Dispose();

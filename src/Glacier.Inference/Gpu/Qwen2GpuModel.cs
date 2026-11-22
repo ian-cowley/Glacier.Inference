@@ -89,6 +89,14 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnPagedKvStoreBatchF16;
     private IntPtr _fnPagedAttnGqaF16;
     private IntPtr _fnPagedAttnGqaBatchF16;
+    private IntPtr _fnPagedKvStoreQ4_0;
+    private IntPtr _fnPagedKvStoreBatchQ4_0;
+    private IntPtr _fnPagedAttnGqaQ4_0;
+    private IntPtr _fnPagedAttnGqaBatchQ4_0;
+    private IntPtr _fnPagedKvStoreQ8_0;
+    private IntPtr _fnPagedKvStoreBatchQ8_0;
+    private IntPtr _fnPagedAttnGqaQ8_0;
+    private IntPtr _fnPagedAttnGqaBatchQ8_0;
     private IntPtr _fnArgmax;
     private IntPtr _fnRepetitionPenalty;
 
@@ -178,6 +186,42 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         }
     }
 
+    public static long GetPagedKvSlotBytes(int dim, KvCachePrecision precision)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(dim);
+        return precision switch
+        {
+            KvCachePrecision.Auto or KvCachePrecision.Fp16 => (long)dim * sizeof(ushort),
+            KvCachePrecision.Q8_0 => (long)((dim + 31) / 32) * sizeof(BlockQ8_0),
+            KvCachePrecision.Q4_0 => (long)((dim + 31) / 32) * sizeof(BlockQ4_0),
+            KvCachePrecision.Fp32 => (long)dim * sizeof(float),
+            KvCachePrecision.Fp8 => dim,
+            _ => throw new NotSupportedException($"Unsupported paged KV cache precision: {precision}.")
+        };
+    }
+
+    public static (nuint PoolBytesK, nuint PoolBytesV) GetPagedPoolByteSizes(
+        int totalBlocks,
+        int layers,
+        int headsKv,
+        int headDim,
+        int vHeadDim,
+        int blockSize,
+        KvCachePrecision precision)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(totalBlocks);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layers);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headsKv);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+
+        int resolvedVHeadDim = vHeadDim > 0 ? vHeadDim : headDim;
+        long slots = checked((long)totalBlocks * layers * headsKv * blockSize);
+        nuint bytesK = checked((nuint)(slots * GetPagedKvSlotBytes(headDim, precision)));
+        nuint bytesV = checked((nuint)(slots * GetPagedKvSlotBytes(resolvedVHeadDim, precision)));
+        return (bytesK, bytesV);
+    }
+
     public Qwen2GpuModel(
         GpuContext gpu,
         ModelWeights weights,
@@ -215,9 +259,10 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         if (kvPrecision == KvCachePrecision.Auto)
         {
             // Adaptive resolution based on sequence length and 8GB laptop VRAM limits:
-            // maxSeqLen <= 4096: FP16 (lossless, 235 MB @ 4k, halves attention bandwidth)
-            // maxSeqLen > 4096: FP8 (4x compression, 470 MB @ 16k, enables up to 32k on 8 GB GPU)
-            KvPrecision = maxSeqLen <= 4096 ? KvCachePrecision.Fp16 : KvCachePrecision.Fp8;
+            // Paged mode defaults to FP16; contiguous mode uses FP16 <= 4096 and FP8 > 4096.
+            KvPrecision = !_allocateContiguousKvCache
+                ? KvCachePrecision.Fp16
+                : (maxSeqLen <= 4096 ? KvCachePrecision.Fp16 : KvCachePrecision.Fp8);
         }
         else
         {
@@ -227,6 +272,11 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         nuint kvBytes = 0;
         if (_allocateContiguousKvCache)
         {
+            if (KvPrecision == KvCachePrecision.Q8_0)
+            {
+                throw new NotSupportedException(
+                    "Qwen2GpuModel contiguous KV cache does not support KvCachePrecision.Q8_0; use paged KV mode (allocateContiguousKvCache: false) or Fp16/Fp8/Q4_0/Fp32.");
+            }
             if (KvPrecision == KvCachePrecision.Q4_0)
             {
                 long blocksPerHead = (_headDim + 31) / 32;
@@ -324,6 +374,14 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreBatchF16, _module, "paged_kv_cache_store_batch_f16_kernel"), "ModuleGetFunction(paged_kv_cache_store_batch_f16_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaF16, _module, "paged_attention_gqa_f16_kernel"), "ModuleGetFunction(paged_attention_gqa_f16_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaBatchF16, _module, "paged_attention_gqa_batch_f16_kernel"), "ModuleGetFunction(paged_attention_gqa_batch_f16_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreQ4_0, _module, "paged_kv_cache_store_q4_0_kernel"), "ModuleGetFunction(paged_kv_cache_store_q4_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreBatchQ4_0, _module, "paged_kv_cache_store_batch_q4_0_kernel"), "ModuleGetFunction(paged_kv_cache_store_batch_q4_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaQ4_0, _module, "paged_attention_gqa_q4_0_kernel"), "ModuleGetFunction(paged_attention_gqa_q4_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaBatchQ4_0, _module, "paged_attention_gqa_batch_q4_0_kernel"), "ModuleGetFunction(paged_attention_gqa_batch_q4_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreQ8_0, _module, "paged_kv_cache_store_q8_0_kernel"), "ModuleGetFunction(paged_kv_cache_store_q8_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedKvStoreBatchQ8_0, _module, "paged_kv_cache_store_batch_q8_0_kernel"), "ModuleGetFunction(paged_kv_cache_store_batch_q8_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaQ8_0, _module, "paged_attention_gqa_q8_0_kernel"), "ModuleGetFunction(paged_attention_gqa_q8_0_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnPagedAttnGqaBatchQ8_0, _module, "paged_attention_gqa_batch_q8_0_kernel"), "ModuleGetFunction(paged_attention_gqa_batch_q8_0_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnArgmax, _module, "argmax_kernel"), "ModuleGetFunction(argmax_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRepetitionPenalty, _module, "apply_repetition_penalty_kernel"), "ModuleGetFunction(apply_repetition_penalty_kernel)");
 

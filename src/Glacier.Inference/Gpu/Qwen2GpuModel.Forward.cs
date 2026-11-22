@@ -622,7 +622,7 @@ public sealed unsafe partial class Qwen2GpuModel
     }
 
     /// <summary>
-    /// Executes a single-token decode step against an external FP16 PagedAttention KV block pool.
+    /// Executes a single-token decode step against an external PagedAttention KV block pool using <see cref="KvPrecision"/>.
     /// </summary>
     public void ForwardPagedToken(
         int token,
@@ -634,12 +634,30 @@ public sealed unsafe partial class Qwen2GpuModel
         Span<float> logits = default,
         bool computeLogits = true)
     {
+        ForwardPagedToken(token, pos, dKPool, dVPool, dBlockTable, blockSize, KvPrecision, logits, computeLogits);
+    }
+
+    /// <summary>
+    /// Executes a single-token decode step against an external PagedAttention KV block pool using <paramref name="kvPrecision"/>.
+    /// </summary>
+    public void ForwardPagedToken(
+        int token,
+        int pos,
+        IntPtr dKPool,
+        IntPtr dVPool,
+        IntPtr dBlockTable,
+        int blockSize,
+        KvCachePrecision kvPrecision,
+        Span<float> logits = default,
+        bool computeLogits = true)
+    {
         if (pos < 0)
             throw new ArgumentOutOfRangeException(nameof(pos), pos, "Token position must be non-negative.");
         if (blockSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Block size must be positive.");
         if (dKPool == IntPtr.Zero || dVPool == IntPtr.Zero || dBlockTable == IntPtr.Zero)
             throw new ArgumentException("PagedAttention device pointers must be non-zero.");
+        KvCachePrecision resolvedPrecision = ResolvePagedKvPrecision(kvPrecision);
         ValidateTokenId(token, nameof(token));
 
         _gpu.MakeCurrent();
@@ -699,8 +717,8 @@ public sealed unsafe partial class Qwen2GpuModel
                 LaunchRmsNormHeads(_dK, lw.AttnKNormWeight, _nHeadsKv, _headDim, _weights.RmsNormEps);
 
             LaunchRope(_dQ, _dK, pos);
-            LaunchPagedKvStoreF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize);
-            LaunchPagedAttentionF16(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize);
+            LaunchPagedKvStore(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize, resolvedPrecision);
+            LaunchPagedAttention(dKPool, dVPool, dBlockTable, pos, modelLayer, numLayers, blockSize, resolvedPrecision);
 
             LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, qDim, _dim, IntPtr.Zero, _dX);
             LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
@@ -731,7 +749,7 @@ public sealed unsafe partial class Qwen2GpuModel
     }
 
     /// <summary>
-    /// Executes batched prefill (chunked internally by MaxBatchSize) against an external FP16 PagedAttention KV block pool.
+    /// Executes batched prefill (chunked internally by MaxBatchSize) against an external PagedAttention KV block pool using <see cref="KvPrecision"/>.
     /// </summary>
     public void ForwardPagedBatch(
         ReadOnlySpan<int> tokens,
@@ -743,6 +761,23 @@ public sealed unsafe partial class Qwen2GpuModel
         Span<float> logits = default,
         bool computeLogits = true)
     {
+        ForwardPagedBatch(tokens, startPos, dKPool, dVPool, dBlockTable, blockSize, KvPrecision, logits, computeLogits);
+    }
+
+    /// <summary>
+    /// Executes batched prefill (chunked internally by MaxBatchSize) against an external PagedAttention KV block pool using <paramref name="kvPrecision"/>.
+    /// </summary>
+    public void ForwardPagedBatch(
+        ReadOnlySpan<int> tokens,
+        int startPos,
+        IntPtr dKPool,
+        IntPtr dVPool,
+        IntPtr dBlockTable,
+        int blockSize,
+        KvCachePrecision kvPrecision,
+        Span<float> logits = default,
+        bool computeLogits = true)
+    {
         if (tokens.IsEmpty) return;
         if (startPos < 0)
             throw new ArgumentOutOfRangeException(nameof(startPos), startPos, "Start position must be non-negative.");
@@ -750,6 +785,7 @@ public sealed unsafe partial class Qwen2GpuModel
             throw new ArgumentOutOfRangeException(nameof(blockSize), blockSize, "Block size must be positive.");
         if (dKPool == IntPtr.Zero || dVPool == IntPtr.Zero || dBlockTable == IntPtr.Zero)
             throw new ArgumentException("PagedAttention device pointers must be non-zero.");
+        KvCachePrecision resolvedPrecision = ResolvePagedKvPrecision(kvPrecision);
         ValidateTokenIds(tokens, nameof(tokens));
 
         _gpu.MakeCurrent();
@@ -767,6 +803,7 @@ public sealed unsafe partial class Qwen2GpuModel
                 dVPool,
                 dBlockTable,
                 blockSize,
+                resolvedPrecision,
                 isLastChunk && computeLogits ? logits : Span<float>.Empty,
                 isLastChunk && computeLogits);
             offset += batchSize;
@@ -780,6 +817,7 @@ public sealed unsafe partial class Qwen2GpuModel
         IntPtr dVPool,
         IntPtr dBlockTable,
         int blockSize,
+        KvCachePrecision kvPrecision,
         Span<float> logits,
         bool computeLogits)
     {
@@ -822,8 +860,8 @@ public sealed unsafe partial class Qwen2GpuModel
                 LaunchRmsNormBatchHeads(_dKBatch, lw.AttnKNormWeight, _nHeadsKv, _headDim, batchSize, _weights.RmsNormEps);
 
             LaunchRopeBatch(_dQBatch, _dKBatch, chunkStartPos, batchSize);
-            LaunchPagedKvStoreBatchF16(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize);
-            LaunchPagedAttentionBatchF16(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize);
+            LaunchPagedKvStoreBatch(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize, kvPrecision);
+            LaunchPagedAttentionBatch(dKPool, dVPool, dBlockTable, chunkStartPos, batchSize, modelLayer, numLayers, blockSize, kvPrecision);
 
             LaunchGemmBatch(lw.AttnOutType, IntPtr.Zero, _dAttnOutBatch, lw.AttnOutWeight, qDim, _dim, batchSize, IntPtr.Zero, _dXBatch);
             LaunchRmsNormBatch(_dXBatch, lw.FfnNormWeight, _dNormXBatch, _dim, _weights.RmsNormEps, batchSize);
