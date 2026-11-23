@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Glacier.Inference.Gguf;
@@ -262,11 +263,17 @@ public unsafe class KvCacheQ8AndCudaPagedTests
     [Fact]
     public void Qwen2GpuModel_CudaPagedFp16Q8AndQ4_SingleAndBatchedMatchCpuFp32()
     {
-        if (!GpuContext.IsSupported)
+        if (!CuDriver.IsAvailable() || !GpuContext.IsSupported)
         {
             return;
         }
 
+        RunCudaPagedFp16Q8AndQ4Test();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunCudaPagedFp16Q8AndQ4Test()
+    {
         string tempDir = Directory.CreateTempSubdirectory("glacier_cuda_paged_").FullName;
         try
         {
