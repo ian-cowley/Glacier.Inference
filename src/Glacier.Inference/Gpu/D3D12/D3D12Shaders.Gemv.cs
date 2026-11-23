@@ -275,10 +275,10 @@ cbuffer Params : register(b0)
 };
 
 ByteAddressBuffer W : register(t0);
-StructuredBuffer<float> bias : register(t1);
+ByteAddressBuffer bias : register(t1);
 RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
@@ -378,9 +378,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";
@@ -397,10 +401,10 @@ cbuffer Params : register(b0)
 };
 
 ByteAddressBuffer W : register(t0);
-StructuredBuffer<float> bias : register(t1);
+ByteAddressBuffer bias : register(t1);
 RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
@@ -497,9 +501,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";
@@ -641,10 +649,10 @@ cbuffer Params : register(b0)
 };
 
 ByteAddressBuffer W : register(t0);
-StructuredBuffer<float> bias : register(t1);
+ByteAddressBuffer bias : register(t1);
 RWByteAddressBuffer x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
@@ -699,9 +707,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";
@@ -718,10 +730,10 @@ cbuffer Params : register(b0)
 };
 
 StructuredBuffer<float> W : register(t0);
-StructuredBuffer<float> bias : register(t1);
+ByteAddressBuffer bias : register(t1);
 RWStructuredBuffer<float> x : register(u0);
-RWStructuredBuffer<float> residual : register(u1);
-RWStructuredBuffer<float> y : register(u2);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
 
 groupshared float s_mem[128];
 
@@ -764,9 +776,13 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (lane_id == 0 && warp_id < m_rows)
     {
         float final_sum = s_mem[row_in_grp * 32];
-        if (has_bias != 0) final_sum += bias[warp_id];
-        if (has_residual != 0) residual[warp_id] += final_sum;
-        if (has_y != 0) y[warp_id] = final_sum;
+        if (has_bias != 0) final_sum += asfloat(bias.Load(warp_id * 4));
+        if (has_residual != 0)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4));
+            residual.Store(warp_id * 4, asuint(prev + final_sum));
+        }
+        if (has_y != 0) y.Store(warp_id * 4, asuint(final_sum));
     }
 }
 ";

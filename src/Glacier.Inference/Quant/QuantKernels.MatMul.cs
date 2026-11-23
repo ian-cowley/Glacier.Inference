@@ -140,7 +140,7 @@ public static unsafe partial class QuantKernels
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float ComputeDot(GgufType type, byte* rowPtr, float* x, float* xSums, int nCols)
+    internal static float ComputeDot(GgufType type, byte* rowPtr, float* x, float* xSums, int nCols)
     {
         return type switch
         {
@@ -154,6 +154,7 @@ public static unsafe partial class QuantKernels
             GgufType.Q2_K => VecDotQ2_K((BlockQ2_K*)rowPtr, x, nCols),
             GgufType.Q2_0 => VecDotQ2_0((BlockQ2_0*)rowPtr, x, nCols),
             GgufType.MXFP4 => VecDotMXFP4((BlockMXFP4*)rowPtr, x, nCols),
+            GgufType.NVFP4 => VecDotNVFP4((BlockNVFP4*)rowPtr, x, nCols),
             GgufType.GgmlQ2_0 => VecDotGgmlQ2_0((BlockGgmlQ2_0*)rowPtr, x, nCols),
             GgufType.IQ4_XS => VecDotIQ4_XS((BlockIQ4_XS*)rowPtr, x, nCols),
             GgufType.IQ4_NL => VecDotIQ4_NL((BlockIQ4_NL*)rowPtr, x, nCols),

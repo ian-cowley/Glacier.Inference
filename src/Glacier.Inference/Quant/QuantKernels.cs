@@ -97,6 +97,9 @@ public static unsafe partial class QuantKernels
             case GgufType.MXFP4:
                 DequantizeMXFP4((BlockMXFP4*)rowPtr, dst, embeddingDim);
                 break;
+            case GgufType.NVFP4:
+                DequantizeNVFP4((BlockNVFP4*)rowPtr, dst, embeddingDim);
+                break;
             case GgufType.Q8_0:
                 for (int i = 0; i < embeddingDim / 32; i++)
                 {

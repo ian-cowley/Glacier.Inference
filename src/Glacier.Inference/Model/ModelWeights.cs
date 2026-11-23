@@ -283,6 +283,7 @@ public sealed unsafe class ModelWeights : IDisposable
     private bool _disposed;
 
     public LayerWeights[] Layers { get; }
+    public Inkling2Weights? Inkling2 { get; }
     public HostRamExpertArena? ExpertArena => _expertArena;
 
     public ModelWeights(GgufFile gguf)
@@ -447,6 +448,14 @@ public sealed unsafe class ModelWeights : IDisposable
         }
 
         // Layers
+        if (ArchitectureFamily == UniversalArchitecture.Inkling2)
+        {
+            Inkling2 = new Inkling2Weights(gguf);
+            VocabSize = Inkling2.VocabSizeUnpadded;
+            Layers = [];
+            return;
+        }
+
         Layers = new LayerWeights[BlockCount];
         for (int l = 0; l < BlockCount; l++)
         {
@@ -1303,6 +1312,8 @@ public sealed unsafe class ModelWeights : IDisposable
 
         _expertArena?.Dispose();
         _expertArena = null;
+
+        Inkling2?.Dispose();
 
         for (int i = 0; i < _ownedFloatBuffers.Count; i++)
         {

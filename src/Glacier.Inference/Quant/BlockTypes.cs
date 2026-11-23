@@ -99,6 +99,17 @@ public unsafe struct BlockMXFP4
 }
 
 /// <summary>
+/// NVFP4 (Type 40) quantization block: 64 elements in 36 bytes (4 sub-blocks of 16).
+/// 4 bytes UE4M3 scales (one per 16-element sub-block) + 32 bytes packed 4-bit E2M1 values.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockNVFP4
+{
+    public fixed byte Scales[4];
+    public fixed byte Qs[32];
+}
+
+/// <summary>
 /// IQ4_XS (Type 23) quantization super-block: 256 elements in 136 bytes.
 /// Non-linear 4-bit quantization with 8 sub-blocks of 32 using kvalues_iq4nl lookup table.
 /// </summary>
@@ -256,6 +267,18 @@ public unsafe struct BlockTernary256
     public Half Delta;         // 2 bytes: super-block scale (d = mean(|W|))
     public ushort Pad;         // 2 bytes: alignment padding for 4-byte GPU coalescing
     public fixed byte Qs[64];  // 64 bytes: 256 2-bit ternary quants (4 per byte)
+}
+
+/// <summary>
+/// Pre-quantized Q8 activation block matching NVFP4's 64-element layout (16 x 4 sub-blocks)
+/// for single-instruction AVX-512 BW + AVX-512 VNNI (VPSHUFB + VPDPBUSD) dot products.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct BlockQ8NVFP4
+{
+    public fixed sbyte Qs[64];   // [s0_lo(8), s1_lo(8), s2_lo(8), s3_lo(8), s0_hi(8), s1_hi(8), s2_hi(8), s3_hi(8)]
+    public fixed float Dx[16];   // [dx0,dx0, dx1,dx1, dx2,dx2, dx3,dx3, dx0,dx0, dx1,dx1, dx2,dx2, dx3,dx3]
+    public fixed float Bias[16]; // [12*sum0,0, 12*sum1,0, 12*sum2,0, 12*sum3,0, 0..0]
 }
 
 

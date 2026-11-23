@@ -188,6 +188,37 @@ public static unsafe partial class QuantKernels
     }
 
     /// <summary>
+    /// Dequantizes a row of NVFP4 (Type 40) blocks into 32-bit floating point array.
+    /// Each block holds 64 elements as 4 sub-blocks of 16 with per-sub-block UE4M3 scales.
+    /// </summary>
+    public static void DequantizeNVFP4(BlockNVFP4* src, float* dst, int k)
+    {
+        int nb = k / 64;
+        fixed (float* lut = E2M1Table)
+        fixed (float* scaleLut = Ue4M3Table)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                byte* scales = src[i].Scales;
+                byte* qs = src[i].Qs;
+                for (int s = 0; s < 4; s++)
+                {
+                    float scale = scaleLut[scales[s]];
+                    byte* qSub = qs + s * 8;
+                    float* dSub = dst + s * 16;
+                    for (int j = 0; j < 8; j++)
+                    {
+                        byte packed = qSub[j];
+                        dSub[j] = scale * lut[packed & 0x0F];
+                        dSub[j + 8] = scale * lut[(packed >> 4) & 0x0F];
+                    }
+                }
+                dst += 64;
+            }
+        }
+    }
+
+    /// <summary>
     /// Computes dot product between a Q4_K quantized row and a float vector x of length k.
     /// Uses vectorized AVX2/FMA nibble extraction and precalculated block sums.
     /// </summary>

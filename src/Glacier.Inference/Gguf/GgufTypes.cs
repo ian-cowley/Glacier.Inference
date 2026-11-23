@@ -56,6 +56,7 @@ public enum GgufType : uint
     Q4_0_8_8 = 33,
     Q2_0 = 36,
     MXFP4 = 39,
+    NVFP4 = 40,
     GgmlQ2_0 = 42,
     Ternary_1_58 = 100,
     PQ2_0 = 142
@@ -86,6 +87,8 @@ public static class GgufTypes
                 blockSize = 32; blockBytes = 24; return true;
             case GgufType.MXFP4:
                 blockSize = 32; blockBytes = 17; return true;
+            case GgufType.NVFP4:
+                blockSize = 64; blockBytes = 36; return true;
             case GgufType.Q2_0:
                 blockSize = 64; blockBytes = 20; return true;
             case GgufType.GgmlQ2_0:

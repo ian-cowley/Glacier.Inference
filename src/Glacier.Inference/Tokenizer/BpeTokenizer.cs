@@ -158,6 +158,22 @@ public sealed partial class BpeTokenizer
         RegisterSpecialToken("<|think|>");
         RegisterSpecialToken("<eos>");
 
+        // Thinking Machines Inkling-2 special control tokens (IDs 200000..200057)
+        RegisterSpecialToken("<|message_user|>");
+        RegisterSpecialToken("<|message_model|>");
+        RegisterSpecialToken("<|message_system|>");
+        RegisterSpecialToken("<|message_tool|>");
+        RegisterSpecialToken("<|content_text|>");
+        RegisterSpecialToken("<|content_thinking|>");
+        RegisterSpecialToken("<|content_image|>");
+        RegisterSpecialToken("<|content_xml|>");
+        RegisterSpecialToken("<|content_invoke_tool_json|>");
+        RegisterSpecialToken("<|content_invoke_tool_text|>");
+        RegisterSpecialToken("<|content_tool_error|>");
+        RegisterSpecialToken("<|end_message|>");
+        RegisterSpecialToken("<|content_model_end_sampling|>");
+        RegisterSpecialToken("<|unused_200054|>");
+
         // Dynamically register model's configured BOS/EOS
         if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
         {
@@ -169,8 +185,9 @@ public sealed partial class BpeTokenizer
             RegisterStopToken(_idToToken[EosTokenId]);
         }
 
-        // Initialize stop tokens
+        // Initialize stop tokens (NEVER register <|end_message|>: it delimits internal blocks within one turn)
         if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
+        RegisterStopToken("<|content_model_end_sampling|>");
         RegisterStopToken("<|im_end|>");
         RegisterStopToken("<|endoftext|>");
         RegisterStopToken("<|end_of_text|>");
@@ -273,6 +290,51 @@ public sealed partial class BpeTokenizer
     /// </summary>
     public string FormatConversation(IEnumerable<(string Role, string Content)> messages, bool thinkingMode = false)
     {
+        // 0. Thinking Machines Inkling-2 format (<|message_user|><|content_text|>...<|end_message|>)
+        if (_specialTokens.ContainsKey("<|message_user|>") && _specialTokens.ContainsKey("<|end_message|>"))
+        {
+            var sb = new StringBuilder();
+            bool effortEmitted = false;
+            string effortStr = thinkingMode ? "0.7" : "0.2";
+            foreach (var (role, content) in messages)
+            {
+                bool isSystem = role.Equals("system", StringComparison.OrdinalIgnoreCase);
+                if (!effortEmitted && !isSystem)
+                {
+                    sb.Append("<|message_system|><|content_text|>Thinking effort level: ")
+                      .Append(effortStr)
+                      .Append("<|end_message|>");
+                    effortEmitted = true;
+                }
+
+                string safeContent = role.Equals("assistant", StringComparison.OrdinalIgnoreCase) ? content : SanitizePrompt(content);
+                string roleTok = role.ToLowerInvariant() switch
+                {
+                    "system" => "<|message_system|>",
+                    "user" => "<|message_user|>",
+                    "assistant" => "<|message_model|>",
+                    "tool" => "<|message_tool|>",
+                    _ => "<|message_user|>"
+                };
+                sb.Append(roleTok).Append("<|content_text|>").Append(safeContent).Append("<|end_message|>");
+                if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+                {
+                    sb.Append("<|content_model_end_sampling|>");
+                }
+            }
+            if (!effortEmitted)
+            {
+                sb.Append("<|message_system|><|content_text|>Thinking effort level: ")
+                  .Append(effortStr)
+                  .Append("<|end_message|>");
+            }
+            if (!thinkingMode)
+            {
+                sb.Append("<|message_model|><|content_text|>");
+            }
+            return sb.ToString();
+        }
+
         // 1. DeepSeek V3 / R1 / V4 format (from deepseek-recipe)
         if ((_specialTokens.ContainsKey("<｜User｜>") || _specialTokens.ContainsKey("<｜begin of sentence｜>") || _specialTokens.ContainsKey("<｜begin▁of▁sentence｜>"))
             && !_chatTemplate.Contains("User: "))

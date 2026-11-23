@@ -85,6 +85,12 @@ public enum UniversalArchitecture
     Lfm2,
 
     /// <summary>
+    /// Thinking Machines Lab Inkling 2 Mini 3-Pass Looped MoE with Block-Attention Residuals,
+    /// Relative Positional Attention, Causal Short-Convolutions, SWA-1024, SiTU, and NVFP4 experts.
+    /// </summary>
+    Inkling2,
+
+    /// <summary>
     /// Generic or custom Transformer architecture.
     /// </summary>
     Generic
@@ -155,6 +161,13 @@ public static class ModelArchitectureDetector
                                       gguf.Tensors.ContainsKey("diffusion_model.input_blocks.0.0.weight"))))
         {
             return UniversalArchitecture.StableDiffusion;
+        }
+
+        if (string.Equals(arch, "inkling2", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arch, "inkling2_loop", StringComparison.OrdinalIgnoreCase) ||
+            arch.StartsWith("inkling2", StringComparison.OrdinalIgnoreCase))
+        {
+            return UniversalArchitecture.Inkling2;
         }
 
         if (string.Equals(arch, "gemma4", StringComparison.OrdinalIgnoreCase) ||

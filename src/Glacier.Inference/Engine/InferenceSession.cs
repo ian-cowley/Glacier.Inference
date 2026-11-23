@@ -215,7 +215,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             ? PipelineSplitConfig.ResolveStages(effectiveSplit, _weights)
             : null;
 
-        if (stageSpecs != null && stageSpecs.Count > 1)
+        if (stageSpecs != null && stageSpecs.Count > 1 && _weights.ArchitectureFamily != UniversalArchitecture.Inkling2)
         {
             _pipelineSession = PipelineSession.Create(_weights, stageSpecs, maxSeqLen, kvPrecision, explicitVramReserveBytes);
             _kvCache = null;
@@ -262,7 +262,50 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
             }
 
-            if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
+            if (_weights.ArchitectureFamily == UniversalArchitecture.Inkling2)
+            {
+                _kvCache = new KVCache(1, 1, 1, maxSeqLen);
+#if !ANDROID
+                if (OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu)
+                {
+                    try
+                    {
+                        var d3dCtx = new D3D12Context(targetDevice.Index);
+                        var fullGpu = new Inkling2D3D12Model(d3dCtx, _weights, maxSeqLen, ownsContext: true, explicitVramReserveBytes);
+                        _cpuModel = fullGpu;
+                        double gb = fullGpu.PinnedVramBytes / (1024.0 * 1024.0 * 1024.0);
+                        double l0Gb = fullGpu.OverflowUploadBytes / (1024.0 * 1024.0 * 1024.0);
+                        Device = targetDevice;
+                        Engine = InferenceEngineType.DirectML;
+                        string memDesc = fullGpu.OverflowMoePhysicalLayers > 0
+                            ? $"{gb:F2} GB VRAM + {l0Gb:F2} GB L0"
+                            : $"{gb:F2} GB VRAM";
+                        string residency = fullGpu.IsFullyGpuResident
+                            ? (fullGpu.OverflowMoePhysicalLayers > 0
+                                ? $"100% GPU-Resident ({fullGpu.PinnedMoePhysicalLayers} VRAM + {fullGpu.OverflowMoePhysicalLayers} L0, 1 sync/tok)"
+                                : "100% GPU-Resident (1 sync/tok)")
+                            : $"Full-GPU Attn+KV+LM + MoE {fullGpu.TotalGpuMoePhysicalLayers}/24 phys ({fullGpu.PinnedMoePhysicalLayers} VRAM + {fullGpu.OverflowMoePhysicalLayers} L0, {fullGpu.TotalGpuMoeLogicalPasses}/48 passes)";
+                        ActiveDevice = $"{fullGpu.DeviceName} [Engine: Pure C# D3D12 {residency}, {memDesc} | Arch: Inkling2]";
+                    }
+                    catch (Exception ex)
+                    {
+                        GlacierDiagnostics.LogWarning($"Inkling2 D3D12 full-GPU init failed ({ex.Message}); falling back to AVX-512 CPU.", ex);
+                        _cpuModel = new Inkling2Model(_weights, maxSeqLen);
+                        Device = DeviceManager.ResolveDevice("cpu");
+                        Engine = InferenceEngineType.Cpu;
+                        ActiveDevice = $"{Device.Name} [Engine: Pure C# SIMD AVX2/AVX-512 (Inkling 2 Mini 3-Pass Looped MoE + NVFP4)]";
+                    }
+                }
+                else
+#endif
+                {
+                    _cpuModel = new Inkling2Model(_weights, maxSeqLen);
+                    Device = DeviceManager.ResolveDevice("cpu");
+                    Engine = InferenceEngineType.Cpu;
+                    ActiveDevice = $"{Device.Name} [Engine: Pure C# SIMD AVX2/AVX-512 (Inkling 2 Mini 3-Pass Looped MoE + NVFP4)]";
+                }
+            }
+            else if (!_weights.IsHybridSsm && !_weights.IsMoe && !_weights.IsMla && !_weights.Layers[0].HasFusedQkv && targetEngine == InferenceEngineType.BareMetal && GpuContext.IsSupported && targetDevice.Vendor == GpuVendor.Nvidia)
             {
                 try
                 {
@@ -987,6 +1030,25 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             throw new NotSupportedException(
                 "Runtime LoRA adapter attachment currently requires BackendPreference.Cpu; for GPU inference, merge the adapter offline with Glacier.Tune GgufMerger.");
+        }
+
+        uint magic = 0;
+        using (var fs = File.OpenRead(loraPath))
+        using (var br = new BinaryReader(fs))
+        {
+            if (fs.Length >= 4) magic = br.ReadUInt32();
+        }
+
+        if (magic == Inkling2HeadLoraAdapter.Magic)
+        {
+#if !ANDROID
+            if (_cpuModel is Gpu.D3D12.Inkling2D3D12Model d3d)
+            {
+                d3d.HeadLora = Inkling2HeadLoraAdapter.Load(loraPath);
+                return;
+            }
+#endif
+            throw new NotSupportedException("Inkling-2 head LoRA adapter requires Inkling2D3D12Model.");
         }
 
         var lora = LoraAdapterWeights.Load(loraPath);

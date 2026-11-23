@@ -18,6 +18,11 @@ public static class CpuModelFactory
         PleIoMode pleIoMode = PleIoMode.DirectIo,
         KvCachePrecision kvPrecision = KvCachePrecision.Fp32)
     {
+        if (weights.ArchitectureFamily == UniversalArchitecture.Inkling2)
+        {
+            return new Inkling2Model(weights, maxSeqLen);
+        }
+
         if (weights.ArchitectureFamily == UniversalArchitecture.Gemma4)
         {
             return new Gemma4Model(weights, maxSeqLen, startLayer, layerCount, isLastStage, kvPrecision);

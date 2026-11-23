@@ -322,6 +322,393 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 }
 ";
 
+    public const string GemvNVFP4 = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint has_bias;
+    uint has_residual;
+    uint has_y;
+    uint row_offset;
+};
+
+ByteAddressBuffer W : register(t0);
+ByteAddressBuffer bias : register(t1);
+RWByteAddressBuffer x : register(u0);
+RWByteAddressBuffer residual : register(u1);
+RWByteAddressBuffer y : register(u2);
+
+static const float kvalues_nvfp4[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+groupshared float s_mem[128];
+
+float decode_ue4m3(uint b)
+{
+    b &= 0x7Fu;
+    if (b == 0u || b == 127u) return 0.0f;
+    uint exp_bits = b >> 3;
+    uint man_bits = b & 7u;
+    if (exp_bits == 0u) return (float)man_bits * 0.001953125f;
+    return asfloat(((exp_bits + 120u) << 23) | (man_bits << 20));
+}
+
+[numthreads(32, 4, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = row_offset + gid.x * 4u + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 32u + lane_id;
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 64u;
+        uint row_byte_offset = warp_id * nb * 36u;
+        float row_sum = 0.0f;
+
+        uint sub = lane_id >> 3;
+        uint j = lane_id & 7u;
+        uint q_word_off = 4u + (lane_id & ~3u);
+        uint q_byte_shift = (lane_id & 3u) * 8u;
+
+        for (uint b = 0u; b < nb; b++)
+        {
+            uint blk_addr = row_byte_offset + b * 36u;
+            uint scales_u32 = W.Load(blk_addr);
+            float d = decode_ue4m3((scales_u32 >> (sub * 8u)) & 0xFFu);
+
+            uint q_word = W.Load(blk_addr + q_word_off);
+            uint q_byte = (q_word >> q_byte_shift) & 0xFFu;
+            float w0 = d * kvalues_nvfp4[q_byte & 0xFu];
+            float w1 = d * kvalues_nvfp4[q_byte >> 4];
+
+            uint col0 = b * 64u + sub * 16u + j;
+            float x0 = asfloat(x.Load(col0 * 4u));
+            float x1 = asfloat(x.Load((col0 + 8u) * 4u));
+            row_sum += w0 * x0 + w1 * x1;
+        }
+
+        s_mem[s_idx] = row_sum;
+    }
+    else
+    {
+        s_mem[s_idx] = 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 16u) s_mem[s_idx] += s_mem[s_idx + 16u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8u)  s_mem[s_idx] += s_mem[s_idx + 8u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4u)  s_mem[s_idx] += s_mem[s_idx + 4u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2u)  s_mem[s_idx] += s_mem[s_idx + 2u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1u)  s_mem[s_idx] += s_mem[s_idx + 1u];
+
+    if (lane_id == 0u && warp_id < m_rows)
+    {
+        float final_sum = s_mem[row_in_grp * 32u];
+        if (has_bias != 0u) final_sum += asfloat(bias.Load(warp_id * 4u));
+        if (has_residual != 0u)
+        {
+            float prev = asfloat(residual.Load(warp_id * 4u));
+            residual.Store(warp_id * 4u, asuint(prev + final_sum));
+        }
+        if (has_y != 0u) y.Store(warp_id * 4u, asuint(final_sum));
+    }
+}
+";
+
+    public const string Inkling2GemvNVFP4 = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint x_offset;
+    uint y_offset;
+};
+
+ByteAddressBuffer W : register(t0);
+RWByteAddressBuffer x : register(u0);
+RWByteAddressBuffer y : register(u1);
+
+static const float kvalues_nvfp4[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+groupshared float s_x[2304];
+groupshared float s_mem[128];
+
+float decode_ue4m3(uint b)
+{
+    b &= 0x7Fu;
+    if (b == 0u || b == 127u) return 0.0f;
+    uint exp_bits = b >> 3;
+    uint man_bits = b & 7u;
+    if (exp_bits == 0u) return (float)man_bits * 0.001953125f;
+    return asfloat(((exp_bits + 120u) << 23) | (man_bits << 20));
+}
+
+[numthreads(32, 4, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = gid.x * 4u + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 32u + lane_id;
+
+    // Cooperative coalesced load of x[0..k_cols) into on-chip LDS/Shared Memory
+    for (uint ci = s_idx; ci < k_cols; ci += 128u)
+    {
+        s_x[ci] = asfloat(x.Load((x_offset + ci) * 4u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 64u;
+        uint row_byte_offset = warp_id * nb * 36u;
+        float row_sum = 0.0f;
+
+        uint sub = lane_id >> 3;
+        uint j = lane_id & 7u;
+        uint q_word_off = 4u + (lane_id & ~3u);
+        uint q_byte_shift = (lane_id & 3u) * 8u;
+
+        for (uint b = 0u; b < nb; b++)
+        {
+            uint blk_addr = row_byte_offset + b * 36u;
+            uint scales_u32 = W.Load(blk_addr);
+            float d = decode_ue4m3((scales_u32 >> (sub * 8u)) & 0xFFu);
+
+            uint q_word = W.Load(blk_addr + q_word_off);
+            uint q_byte = (q_word >> q_byte_shift) & 0xFFu;
+            float w0 = d * kvalues_nvfp4[q_byte & 0xFu];
+            float w1 = d * kvalues_nvfp4[q_byte >> 4];
+
+            uint col0 = b * 64u + sub * 16u + j;
+            row_sum += w0 * s_x[col0] + w1 * s_x[col0 + 8u];
+        }
+
+        s_mem[s_idx] = row_sum;
+    }
+    else
+    {
+        s_mem[s_idx] = 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 16u) s_mem[s_idx] += s_mem[s_idx + 16u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8u)  s_mem[s_idx] += s_mem[s_idx + 8u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4u)  s_mem[s_idx] += s_mem[s_idx + 4u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2u)  s_mem[s_idx] += s_mem[s_idx + 2u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1u)  s_mem[s_idx] += s_mem[s_idx + 1u];
+
+    if (lane_id == 0u && warp_id < m_rows)
+    {
+        y.Store((y_offset + warp_id) * 4u, asuint(s_mem[row_in_grp * 32u]));
+    }
+}
+";
+
+    public const string Inkling2GemvQ6K = @"
+cbuffer Params : register(b0)
+{
+    uint k_cols;
+    uint m_rows;
+    uint x_offset;
+    uint row_offset;
+};
+
+ByteAddressBuffer W : register(t0);
+RWByteAddressBuffer x : register(u0);
+RWByteAddressBuffer y : register(u1);
+
+groupshared float s_x[3072];
+groupshared float s_mem[256];
+
+int decode_s8(uint b)
+{
+    return (int)(b << 24) >> 24;
+}
+
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint row_in_grp = gtid.y;
+    uint warp_id = row_offset + gid.x * 16u + row_in_grp;
+    uint lane_id = gtid.x;
+    uint s_idx = row_in_grp * 16u + lane_id;
+
+    for (uint ci = s_idx; ci < k_cols; ci += 256u)
+    {
+        s_x[ci] = asfloat(x.Load((x_offset + ci) * 4u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (warp_id < m_rows)
+    {
+        uint nb = k_cols / 256u;
+        uint row_byte_offset = warp_id * nb * 212u;
+        float row_sum = 0.0f;
+
+        uint b_lane = lane_id >> 3;
+        uint sub_lane = lane_id & 7u;
+        uint is_idx = sub_lane >> 2;
+        uint byte_off = sub_lane * 4u;
+
+        for (uint b = b_lane; b < nb; b += 2u)
+        {
+            uint blk_addr = row_byte_offset + b * 212u;
+            float d = f16tof32(W.Load(blk_addr + 208u) & 0xFFFFu);
+            uint x_blk = b * 256u;
+
+            uint4 sc = W.Load4(blk_addr + 192u);
+            float blk_sum = 0.0f;
+
+            [unroll]
+            for (uint step = 0u; step < 2u; step++)
+            {
+                uint ql_addr = blk_addr + step * 64u;
+                uint qh_addr = blk_addr + 128u + step * 32u;
+
+                uint qh4 = W.Load(qh_addr + byte_off);
+                uint qlLo4 = W.Load(ql_addr + byte_off);
+                uint qlHi4 = W.Load(ql_addr + 32u + byte_off);
+
+                uint2 sc_words = (step == 0u) ? sc.xy : sc.zw;
+                float fs1 = (float)decode_s8((sc_words.x >> (is_idx * 8u)) & 0xFFu);
+                float fs2 = (float)decode_s8((sc_words.x >> ((is_idx + 2u) * 8u)) & 0xFFu);
+                float fs3 = (float)decode_s8((sc_words.y >> (is_idx * 8u)) & 0xFFu);
+                float fs4 = (float)decode_s8((sc_words.y >> ((is_idx + 2u) * 8u)) & 0xFFu);
+
+                float sum1 = 0.0f;
+                float sum2 = 0.0f;
+                float sum3 = 0.0f;
+                float sum4 = 0.0f;
+                uint base_x = x_blk + step * 128u + byte_off;
+
+                [unroll]
+                for (uint c = 0u; c < 4u; c++)
+                {
+                    uint sh = c * 8u;
+                    uint qh_val = (qh4 >> sh) & 0xFFu;
+                    uint ql_low = (qlLo4 >> sh) & 0xFFu;
+                    uint ql_high = (qlHi4 >> sh) & 0xFFu;
+
+                    int q1 = (int)((ql_low & 0x0Fu) | (((qh_val >> 0u) & 3u) << 4u)) - 32;
+                    int q2 = (int)((ql_high & 0x0Fu) | (((qh_val >> 2u) & 3u) << 4u)) - 32;
+                    int q3 = (int)((ql_low >> 4u) | (((qh_val >> 4u) & 3u) << 4u)) - 32;
+                    int q4 = (int)((ql_high >> 4u) | (((qh_val >> 6u) & 3u) << 4u)) - 32;
+
+                    uint xi = base_x + c;
+                    sum1 += (float)q1 * s_x[xi + 0u];
+                    sum2 += (float)q2 * s_x[xi + 32u];
+                    sum3 += (float)q3 * s_x[xi + 64u];
+                    sum4 += (float)q4 * s_x[xi + 96u];
+                }
+
+                blk_sum += fs1 * sum1 + fs2 * sum2 + fs3 * sum3 + fs4 * sum4;
+            }
+
+            row_sum += d * blk_sum;
+        }
+
+        s_mem[s_idx] = row_sum;
+    }
+    else
+    {
+        s_mem[s_idx] = 0.0f;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 8u) s_mem[s_idx] += s_mem[s_idx + 8u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 4u) s_mem[s_idx] += s_mem[s_idx + 4u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 2u) s_mem[s_idx] += s_mem[s_idx + 2u];
+    GroupMemoryBarrierWithGroupSync();
+    if (lane_id < 1u) s_mem[s_idx] += s_mem[s_idx + 1u];
+
+    if (lane_id == 0u && warp_id < m_rows)
+    {
+        y.Store(warp_id * 4u, asuint(s_mem[row_in_grp * 16u]));
+    }
+}
+";
+
+    public const string Inkling2SituBatch = @"
+cbuffer Params : register(b0)
+{
+    uint n_ff;
+    uint k_count;
+    float beta;
+    float lb;
+};
+
+RWByteAddressBuffer gate_up : register(u0);
+RWByteAddressBuffer hidden_out : register(u1);
+RWByteAddressBuffer meta : register(u2);
+
+[numthreads(256, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    uint idx = dtid.x;
+    uint total = n_ff * k_count;
+    if (idx >= total) return;
+
+    uint k = idx / n_ff;
+    uint j = idx - k * n_ff;
+    float gu_scale = asfloat(meta.Load(k * 4u));
+
+    uint gu_base = k * (2u * n_ff);
+    float g = asfloat(gate_up.Load((gu_base + j) * 4u)) * gu_scale;
+    float u = asfloat(gate_up.Load((gu_base + n_ff + j) * 4u)) * gu_scale;
+    float act = beta * tanh(g / beta) / (1.0f + exp(-g));
+    if (lb > 0.0f) u = lb * tanh(u / lb);
+    hidden_out.Store(idx * 4u, asuint(act * u));
+}
+";
+
+    public const string Inkling2WeightedSum8 = @"
+cbuffer Params : register(b0)
+{
+    uint n_embd;
+    uint k_count;
+    uint weights_offset;
+    uint batch_size;
+};
+
+RWByteAddressBuffer dn_all : register(u0);
+RWByteAddressBuffer dst : register(u1);
+RWByteAddressBuffer meta : register(u2);
+
+[numthreads(256, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
+{
+    uint d = dtid.x;
+    uint t = gid.y;
+    if (d >= n_embd || t >= batch_size) return;
+
+    uint base_k = t * k_count;
+    float sum = 0.0f;
+    for (uint k = 0u; k < k_count; k++)
+    {
+        float w = asfloat(meta.Load((weights_offset + base_k + k) * 4u));
+        sum += asfloat(dn_all.Load(((base_k + k) * n_embd + d) * 4u)) * w;
+    }
+    dst.Store((t * n_embd + d) * 4u, asuint(sum));
+}
+";
+
     public const string GemvQ4_0 = @"
 cbuffer Params : register(b0)
 {

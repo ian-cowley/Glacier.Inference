@@ -584,6 +584,435 @@ public static unsafe partial class QuantKernels
         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
     ];
 
+    private static readonly float[] Ue4M3Table = BuildUe4M3Table();
+
+    private static float[] BuildUe4M3Table()
+    {
+        var table = new float[256];
+        for (int x = 0; x < 256; x++)
+        {
+            if (x == 0 || x == 0x7F)
+            {
+                table[x] = 0.0f;
+                continue;
+            }
+            int exp = (x >> 3) & 0xF;
+            int man = x & 0x7;
+            table[x] = exp == 0
+                ? MathF.ScaleB((float)man, -9)
+                : MathF.ScaleB(1.0f + man / 8.0f, exp - 7);
+        }
+        return table;
+    }
+
+    private static readonly float[] Ue4M3HalfTable = BuildUe4M3HalfTable();
+
+    private static float[] BuildUe4M3HalfTable()
+    {
+        var table = new float[256];
+        for (int x = 0; x < 256; x++)
+        {
+            table[x] = Ue4M3Table[x] * 0.5f;
+        }
+        return table;
+    }
+
+    /// <summary>
+    /// Computes dot product between an NVFP4 (Type 40) quantized row and a float vector x of length k.
+    /// 64 elements per block = 4 sub-blocks of 16 with per-sub-block UE4M3 scales.
+    /// Hardware-accelerated with AVX-512 / AVX2+FMA PSHUFB nibble LUT decoding.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotNVFP4(BlockNVFP4* row, float* x, int k)
+    {
+        int nb = k / 64;
+
+        if (Avx512F.IsSupported && Avx2.IsSupported)
+        {
+            var vLut128 = Vector128.Create((sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12).AsByte();
+            var vLut256 = Vector256.Create(vLut128, vLut128);
+            var vMask256 = Vector256.Create((byte)0x0F);
+            var vAcc0 = Vector512<float>.Zero;
+            var vAcc1 = Vector512<float>.Zero;
+
+            fixed (float* halfScaleLut = Ue4M3HalfTable)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* scales = row[i].Scales;
+                    var raw = Vector256.Load(row[i].Qs);
+                    var lo = Avx2.And(raw, vMask256);
+                    var hi = Avx2.And(Avx2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), vMask256);
+                    var wLo = Avx2.Shuffle(vLut256, lo).AsSByte();
+                    var wHi = Avx2.Shuffle(vLut256, hi).AsSByte();
+
+                    var s0_s2 = Avx2.UnpackLow(wLo.AsUInt64(), wHi.AsUInt64()).AsSByte();
+                    var s1_s3 = Avx2.UnpackHigh(wLo.AsUInt64(), wHi.AsUInt64()).AsSByte();
+
+                    var wf0 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s0_s2.GetLower()));
+                    var wf1 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s1_s3.GetLower()));
+                    var wf2 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s0_s2.GetUpper()));
+                    var wf3 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s1_s3.GetUpper()));
+
+                    vAcc0 = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf0, Vector512.Create(halfScaleLut[scales[0]])), Vector512.Load(x + 0), vAcc0);
+                    vAcc1 = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf1, Vector512.Create(halfScaleLut[scales[1]])), Vector512.Load(x + 16), vAcc1);
+                    vAcc0 = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf2, Vector512.Create(halfScaleLut[scales[2]])), Vector512.Load(x + 32), vAcc0);
+                    vAcc1 = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf3, Vector512.Create(halfScaleLut[scales[3]])), Vector512.Load(x + 48), vAcc1);
+                    x += 64;
+                }
+            }
+
+            return Vector512.Sum(vAcc0 + vAcc1);
+        }
+
+        if (Avx512F.IsSupported && Ssse3.IsSupported)
+        {
+            var vLut = Vector128.Create((sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12).AsByte();
+            var vMask = Vector128.Create((byte)0x0F);
+            var vAcc = Vector512<float>.Zero;
+
+            fixed (float* halfScaleLut = Ue4M3HalfTable)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* scales = row[i].Scales;
+                    byte* qs = row[i].Qs;
+                    for (int s = 0; s < 4; s++)
+                    {
+                        float scale = halfScaleLut[scales[s]];
+                        ulong packed8 = *(ulong*)(qs + s * 8);
+                        var raw = Vector128.CreateScalarUnsafe(packed8).AsByte();
+                        var lo = Sse2.And(raw, vMask);
+                        var hi = Sse2.And(Sse2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), vMask);
+                        var idx16 = Sse2.UnpackLow(lo.AsUInt64(), hi.AsUInt64()).AsByte();
+                        var w16 = Ssse3.Shuffle(vLut, idx16).AsSByte();
+                        var wf16 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(w16));
+                        var vx16 = Vector512.Load(x + s * 16);
+                        vAcc = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf16, Vector512.Create(scale)), vx16, vAcc);
+                    }
+                    x += 64;
+                }
+            }
+
+            return Vector512.Sum(vAcc);
+        }
+
+        if (Avx2.IsSupported && Fma.IsSupported && Ssse3.IsSupported)
+        {
+            var vLut = Vector128.Create((sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12).AsByte();
+            var vMask = Vector128.Create((byte)0x0F);
+            var vAccLo = Vector256<float>.Zero;
+            var vAccHi = Vector256<float>.Zero;
+
+            fixed (float* halfScaleLut = Ue4M3HalfTable)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    byte* scales = row[i].Scales;
+                    byte* qs = row[i].Qs;
+                    for (int s = 0; s < 4; s++)
+                    {
+                        var vScale = Vector256.Create(halfScaleLut[scales[s]]);
+                        ulong packed8 = *(ulong*)(qs + s * 8);
+                        var raw = Vector128.CreateScalarUnsafe(packed8).AsByte();
+                        var lo = Sse2.And(raw, vMask);
+                        var hi = Sse2.And(Sse2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), vMask);
+                        var idx16 = Sse2.UnpackLow(lo.AsUInt64(), hi.AsUInt64()).AsByte();
+                        var w16 = Ssse3.Shuffle(vLut, idx16).AsSByte();
+
+                        var wfLo = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(w16));
+                        var wfHi = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(Sse2.ShiftRightLogical128BitLane(w16, 8)));
+
+                        float* xSub = x + s * 16;
+                        vAccLo = Fma.MultiplyAdd(Avx.Multiply(wfLo, vScale), Vector256.Load(xSub), vAccLo);
+                        vAccHi = Fma.MultiplyAdd(Avx.Multiply(wfHi, vScale), Vector256.Load(xSub + 8), vAccHi);
+                    }
+                    x += 64;
+                }
+            }
+
+            return Vector256.Sum(Avx.Add(vAccLo, vAccHi));
+        }
+
+        float sum = 0f;
+        fixed (float* lut = E2M1Table)
+        fixed (float* scaleLut = Ue4M3Table)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                byte* scales = row[i].Scales;
+                byte* qs = row[i].Qs;
+                for (int s = 0; s < 4; s++)
+                {
+                    float scale = scaleLut[scales[s]];
+                    byte* qSub = qs + s * 8;
+                    float* xSub = x + s * 16;
+                    float subSum = 0f;
+
+                    for (int j = 0; j < 8; j++)
+                    {
+                        byte packed = qSub[j];
+                        subSum += lut[packed & 0x0F] * xSub[j] + lut[(packed >> 4) & 0x0F] * xSub[j + 8];
+                    }
+
+                    sum += scale * subSum;
+                }
+                x += 64;
+            }
+        }
+
+        return sum;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumulateNvfp4BlockAvx512(
+        BlockNVFP4* blk,
+        float* halfScaleLut,
+        Vector256<byte> vLut256,
+        Vector256<byte> vMask256,
+        Vector512<float> vx0,
+        Vector512<float> vx1,
+        Vector512<float> vx2,
+        Vector512<float> vx3,
+        ref Vector512<float> acc)
+    {
+        byte* scales = blk->Scales;
+        var raw = Vector256.Load(blk->Qs);
+        var lo = Avx2.And(raw, vMask256);
+        var hi = Avx2.And(Avx2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), vMask256);
+        var wLo = Avx2.Shuffle(vLut256, lo).AsSByte();
+        var wHi = Avx2.Shuffle(vLut256, hi).AsSByte();
+
+        var s0_s2 = Avx2.UnpackLow(wLo.AsUInt64(), wHi.AsUInt64()).AsSByte();
+        var s1_s3 = Avx2.UnpackHigh(wLo.AsUInt64(), wHi.AsUInt64()).AsSByte();
+
+        var wf0 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s0_s2.GetLower()));
+        var wf1 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s1_s3.GetLower()));
+        var wf2 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s0_s2.GetUpper()));
+        var wf3 = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(s1_s3.GetUpper()));
+
+        acc = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf0, Vector512.Create(halfScaleLut[scales[0]])), vx0, acc);
+        acc = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf1, Vector512.Create(halfScaleLut[scales[1]])), vx1, acc);
+        acc = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf2, Vector512.Create(halfScaleLut[scales[2]])), vx2, acc);
+        acc = Avx512F.FusedMultiplyAdd(Avx512F.Multiply(wf3, Vector512.Create(halfScaleLut[scales[3]])), vx3, acc);
+    }
+
+    /// <summary>
+    /// Computes 4 concurrent NVFP4 dot products against a shared vector x, reusing loaded x registers 4x.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void VecDotNVFP4x4(
+        BlockNVFP4* r0,
+        BlockNVFP4* r1,
+        BlockNVFP4* r2,
+        BlockNVFP4* r3,
+        float* x,
+        int k,
+        out float s0,
+        out float s1,
+        out float s2,
+        out float s3)
+    {
+        if (Avx512F.IsSupported && Avx2.IsSupported)
+        {
+            int nb = k / 64;
+            var vLut128 = Vector128.Create((sbyte)0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12).AsByte();
+            var vLut256 = Vector256.Create(vLut128, vLut128);
+            var vMask256 = Vector256.Create((byte)0x0F);
+
+            var acc0 = Vector512<float>.Zero;
+            var acc1 = Vector512<float>.Zero;
+            var acc2 = Vector512<float>.Zero;
+            var acc3 = Vector512<float>.Zero;
+
+            fixed (float* halfScaleLut = Ue4M3HalfTable)
+            {
+                for (int i = 0; i < nb; i++)
+                {
+                    var vx0 = Vector512.Load(x + 0);
+                    var vx1 = Vector512.Load(x + 16);
+                    var vx2 = Vector512.Load(x + 32);
+                    var vx3 = Vector512.Load(x + 48);
+
+                    AccumulateNvfp4BlockAvx512(r0 + i, halfScaleLut, vLut256, vMask256, vx0, vx1, vx2, vx3, ref acc0);
+                    AccumulateNvfp4BlockAvx512(r1 + i, halfScaleLut, vLut256, vMask256, vx0, vx1, vx2, vx3, ref acc1);
+                    AccumulateNvfp4BlockAvx512(r2 + i, halfScaleLut, vLut256, vMask256, vx0, vx1, vx2, vx3, ref acc2);
+                    AccumulateNvfp4BlockAvx512(r3 + i, halfScaleLut, vLut256, vMask256, vx0, vx1, vx2, vx3, ref acc3);
+                    x += 64;
+                }
+            }
+
+            s0 = Vector512.Sum(acc0);
+            s1 = Vector512.Sum(acc1);
+            s2 = Vector512.Sum(acc2);
+            s3 = Vector512.Sum(acc3);
+            return;
+        }
+
+        s0 = VecDotNVFP4(r0, x, k);
+        s1 = VecDotNVFP4(r1, x, k);
+        s2 = VecDotNVFP4(r2, x, k);
+        s3 = VecDotNVFP4(r3, x, k);
+    }
+
+    public static bool IsNvfp4VnniSupported
+        => Avx512BW.IsSupported && Avx512F.IsSupported && Avx2.IsSupported;
+
+    /// <summary>
+    /// Quantizes an FP32 activation vector x[0..k) into BlockQ8NVFP4 blocks aligned for AVX-512 VNNI VPDPBUSD.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void QuantizeXForNVFP4(float* x, BlockQ8NVFP4* dst, int k)
+    {
+        int nb = k / 64;
+        for (int i = 0; i < nb; i++)
+        {
+            BlockQ8NVFP4* blk = dst + i;
+            for (int b = 0; b < 16; b++) blk->Bias[b] = 0.0f;
+
+            for (int s = 0; s < 4; s++)
+            {
+                float* xs = x + i * 64 + s * 16;
+                float amax = 0.0f;
+                for (int j = 0; j < 16; j++)
+                {
+                    float av = MathF.Abs(xs[j]);
+                    if (av > amax) amax = av;
+                }
+
+                float dx = amax / 127.0f;
+                float invDx = amax > 1e-30f ? 127.0f / amax : 0.0f;
+                int sumQ = 0;
+                for (int j = 0; j < 8; j++)
+                {
+                    int qLo = Math.Clamp((int)MathF.Round(xs[j] * invDx), -127, 127);
+                    int qHi = Math.Clamp((int)MathF.Round(xs[j + 8] * invDx), -127, 127);
+                    blk->Qs[s * 8 + j] = (sbyte)qLo;
+                    blk->Qs[32 + s * 8 + j] = (sbyte)qHi;
+                    sumQ += qLo + qHi;
+                }
+
+                int dOff = s * 2;
+                blk->Dx[dOff] = dx;
+                blk->Dx[dOff + 1] = dx;
+                blk->Dx[8 + dOff] = dx;
+                blk->Dx[8 + dOff + 1] = dx;
+                blk->Bias[dOff] = 12.0f * sumQ;
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumulateNvfp4BlockVnni(
+        BlockNVFP4* blk,
+        float* halfScaleLut,
+        Vector512<byte> vLutU8,
+        Vector256<byte> vMask256,
+        Vector512<short> vOnes16,
+        Vector512<sbyte> vQx,
+        Vector512<float> vDx,
+        Vector512<float> vBias,
+        ref Vector512<float> acc)
+    {
+        byte* scales = blk->Scales;
+        var raw = Vector256.Load(blk->Qs);
+        var lo = Avx2.And(raw, vMask256);
+        var hi = Avx2.And(Avx2.ShiftRightLogical(raw.AsUInt16(), 4).AsByte(), vMask256);
+        var w64 = Avx512BW.Shuffle(vLutU8, Vector512.Create(lo, hi));
+        var prod16 = Avx512BW.MultiplyAddAdjacent(w64, vQx);
+        var dotI32 = Avx512BW.MultiplyAddAdjacent(prod16, vOnes16);
+        var dotF = Avx512F.Subtract(Avx512F.ConvertToVector512Single(dotI32), vBias);
+
+        var vW128 = Vector128.Create(
+            halfScaleLut[scales[0]],
+            halfScaleLut[scales[1]],
+            halfScaleLut[scales[2]],
+            halfScaleLut[scales[3]]);
+        var vW256 = Vector256.Create(Sse.UnpackLow(vW128, vW128), Sse.UnpackHigh(vW128, vW128));
+        var vScale = Avx512F.Multiply(Vector512.Create(vW256, vW256), vDx);
+        acc = Avx512F.FusedMultiplyAdd(dotF, vScale, acc);
+    }
+
+    /// <summary>
+    /// Computes 4 concurrent NVFP4 dot products using AVX-512 BW (VPSHUFB + VPMADDUBSW + VPMADDWD) against pre-quantized Q8 activations.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void VecDotNVFP4x4Q8(
+        BlockNVFP4* r0,
+        BlockNVFP4* r1,
+        BlockNVFP4* r2,
+        BlockNVFP4* r3,
+        BlockQ8NVFP4* qx,
+        int k,
+        out float s0,
+        out float s1,
+        out float s2,
+        out float s3)
+    {
+        int nb = k / 64;
+        var vLut128 = Vector128.Create((byte)12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0);
+        var vLut256 = Vector256.Create(vLut128, vLut128);
+        var vLutU8 = Vector512.Create(vLut256, vLut256);
+        var vMask256 = Vector256.Create((byte)0x0F);
+        var vOnes16 = Vector512.Create((short)1);
+
+        var acc0 = Vector512<float>.Zero;
+        var acc1 = Vector512<float>.Zero;
+        var acc2 = Vector512<float>.Zero;
+        var acc3 = Vector512<float>.Zero;
+
+        fixed (float* halfScaleLut = Ue4M3HalfTable)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                BlockQ8NVFP4* q = qx + i;
+                var vQx = Vector512.Load(q->Qs);
+                var vDx = Vector512.Load(q->Dx);
+                var vBias = Vector512.Load(q->Bias);
+
+                AccumulateNvfp4BlockVnni(r0 + i, halfScaleLut, vLutU8, vMask256, vOnes16, vQx, vDx, vBias, ref acc0);
+                AccumulateNvfp4BlockVnni(r1 + i, halfScaleLut, vLutU8, vMask256, vOnes16, vQx, vDx, vBias, ref acc1);
+                AccumulateNvfp4BlockVnni(r2 + i, halfScaleLut, vLutU8, vMask256, vOnes16, vQx, vDx, vBias, ref acc2);
+                AccumulateNvfp4BlockVnni(r3 + i, halfScaleLut, vLutU8, vMask256, vOnes16, vQx, vDx, vBias, ref acc3);
+            }
+        }
+
+        s0 = Vector512.Sum(acc0);
+        s1 = Vector512.Sum(acc1);
+        s2 = Vector512.Sum(acc2);
+        s3 = Vector512.Sum(acc3);
+    }
+
+    /// <summary>
+    /// Computes a single NVFP4 dot product using AVX-512 BW against pre-quantized Q8 activations.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float VecDotNVFP4Q8(BlockNVFP4* r0, BlockQ8NVFP4* qx, int k)
+    {
+        int nb = k / 64;
+        var vLut128 = Vector128.Create((byte)12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0);
+        var vLut256 = Vector256.Create(vLut128, vLut128);
+        var vLutU8 = Vector512.Create(vLut256, vLut256);
+        var vMask256 = Vector256.Create((byte)0x0F);
+        var vOnes16 = Vector512.Create((short)1);
+
+        var acc0 = Vector512<float>.Zero;
+        fixed (float* halfScaleLut = Ue4M3HalfTable)
+        {
+            for (int i = 0; i < nb; i++)
+            {
+                BlockQ8NVFP4* q = qx + i;
+                var vQx = Vector512.Load(q->Qs);
+                var vDx = Vector512.Load(q->Dx);
+                var vBias = Vector512.Load(q->Bias);
+
+                AccumulateNvfp4BlockVnni(r0 + i, halfScaleLut, vLutU8, vMask256, vOnes16, vQx, vDx, vBias, ref acc0);
+            }
+        }
+
+        return Vector512.Sum(acc0);
+    }
+
     /// <summary>
     /// Computes dot product between an MXFP4 quantized row and a float vector x of length k.
     /// </summary>

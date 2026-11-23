@@ -252,7 +252,12 @@ public sealed unsafe class D3D12Context : IDisposable
             ulong chunkSize = Math.Min(sizeInBytes - offset, StagingUploadBufferSize);
 
             void* pUpload = null;
-            _stagingUploadBuffer.Map(0, null, &pUpload);
+            var mapHr = _stagingUploadBuffer.Map(0, null, &pUpload);
+            if (pUpload == null || !mapHr.Success)
+            {
+                var reason = _device.DeviceRemovedReason;
+                throw new InvalidOperationException($"stagingUploadBuffer.Map failed: {mapHr}, DeviceRemovedReason: {reason}, sizeInBytes: {sizeInBytes}");
+            }
             Buffer.MemoryCopy(pSrc + offset, pUpload, chunkSize, chunkSize);
             _stagingUploadBuffer.Unmap(0);
 
@@ -799,6 +804,7 @@ public sealed unsafe class D3D12Context : IDisposable
                 GgufType.IQ4_NL => D3D12Shaders.GemvIQ4_NL,
                 GgufType.IQ4_XS => D3D12Shaders.GemvIQ4_XS,
                 GgufType.MXFP4 => D3D12Shaders.GemvMXFP4,
+                GgufType.NVFP4 => D3D12Shaders.GemvNVFP4,
                 GgufType.IQ3_S => D3D12Shaders.GemvIQ3_S,
                 GgufType.Ternary_1_58 or GgufType.PQ2_0 => D3D12Shaders.GemvTernary,
                 GgufType.BF16 => D3D12Shaders.GemvBf16,
