@@ -324,6 +324,25 @@ public class KlDivergenceVerifierM3Tests : IDisposable
         Assert.True(fail.MeanKlDivergence > 0.05);
     }
 
+    [Fact]
+    public void ComputeLogSoftmax_And_TokenKl_LargeMargin_AvoidsCollapse()
+    {
+        float[] refLogits = [42f, 0f, 0f];
+        float[] quantLogits = [40f, 0f, 0f];
+        double[] logProbs = new double[3];
+
+        KlDivergenceVerifier.ComputeLogSoftmax(quantLogits, logProbs);
+        double expectedArgMaxLogProb = -2.0 * Math.Exp(-40.0);
+        Assert.True(logProbs[0] < 0.0 && double.IsFinite(logProbs[0]), $"Expected negative logProbs[0], got {logProbs[0]}");
+        Assert.True(Math.Abs(logProbs[0] - expectedArgMaxLogProb) / Math.Abs(expectedArgMaxLogProb) < 1e-6,
+            $"LogSoftmax[0] {logProbs[0]} diverged from {expectedArgMaxLogProb}");
+
+        double expectedKl = 2.0 * Math.Exp(-40.0) - 6.0 * Math.Exp(-42.0);
+        double kl = KlDivergenceVerifier.ComputeTokenKlDivergence(refLogits, quantLogits, epsilon: 1e-30);
+        Assert.True(kl > 0.0 && double.IsFinite(kl), $"Expected positive KL at large margin, got {kl}");
+        Assert.True(Math.Abs(kl - expectedKl) / expectedKl < 1e-4, $"KL {kl} diverged from {expectedKl}");
+    }
+
     private static unsafe TieredMoERunner CreateSyntheticRunner(int dim, int ffnDim, int vocab, float[] lmHeadWeights)
     {
         var layer = new LayerWeights

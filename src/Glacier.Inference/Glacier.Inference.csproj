@@ -13,8 +13,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.9.0</Version>
-    <PackageReleaseNotes>v1.9.0: Adds native pure-C# Thinking Machines Lab Inkling-2-Mini (24->48 looped MoE) engine with D3D12 HLSL compute shaders (NVIDIA &amp; AMD UMA), AVX-512BW INT8-activation NVFP4 CPU fallback, official Inkling-2 control tokens (200000..200057), &lt;=16 MB batched SWA/ShortConv prefix checkpointing, and Inkling2HeadLoraAdapter runtime support.</PackageReleaseNotes>
+    <Version>1.9.1</Version>
+    <PackageReleaseNotes>v1.9.1: Stabilizes KlDivergenceVerifier.ComputeLogSoftmax and ComputeTokenKlCore using Barron's Log1p argmax-excluded split-sum formulation to prevent large-margin softmax collapse.</PackageReleaseNotes>
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
