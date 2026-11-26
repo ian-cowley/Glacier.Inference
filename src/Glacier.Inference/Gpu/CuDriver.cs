@@ -189,6 +189,25 @@ public static class CuDriver
     [DllImport(CudaLib, EntryPoint = "cuStreamWaitEvent")]
     public static extern int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
 
+    [DllImport(CudaLib, EntryPoint = "cuStreamBeginCapture_v2")]
+    public static extern int StreamBeginCapture(IntPtr hStream, uint mode);
+
+    [DllImport(CudaLib, EntryPoint = "cuStreamEndCapture")]
+    public static extern int StreamEndCapture(IntPtr hStream, out IntPtr phGraph);
+
+    [DllImport(CudaLib, EntryPoint = "cuGraphInstantiateWithFlags")]
+    public static extern int GraphInstantiateWithFlags(out IntPtr phGraphExec, IntPtr hGraph, ulong flags);
+
+    [SuppressGCTransition]
+    [DllImport(CudaLib, EntryPoint = "cuGraphLaunch")]
+    public static extern int GraphLaunch(IntPtr hGraphExec, IntPtr hStream);
+
+    [DllImport(CudaLib, EntryPoint = "cuGraphExecDestroy")]
+    public static extern int GraphExecDestroy(IntPtr hGraphExec);
+
+    [DllImport(CudaLib, EntryPoint = "cuGraphDestroy")]
+    public static extern int GraphDestroy(IntPtr hGraph);
+
     public static string GetDeviceName(int device)
     {
         var buf = new byte[256];

@@ -57,32 +57,32 @@ public sealed unsafe class Gemma4VulkanModel : VulkanRunnerBase
             int qDim = nQ * hd, kvDim = nKv * hd, ffnDim = _w.FeedForwardLength;
             float eps = _w.RmsNormEps;
 
-            var dX = _vk.Alloc((long)E * 4);
-            var dNorm = _vk.Alloc((long)E * 4);
-            var dQ = _vk.Alloc((long)qDim * 4);
-            var dK = _vk.Alloc((long)kvDim * 4);
-            var dV = _vk.Alloc((long)kvDim * 4);
-            var dQOut = _vk.Alloc((long)qDim * 4);
-            var dAttnOut = _vk.Alloc((long)qDim * 4);
-            var dProj = _vk.Alloc((long)E * 4);
-            var dGate = _vk.Alloc((long)ffnDim * 4);
-            var dUp = _vk.Alloc((long)ffnDim * 4);
+            var dX = _vk.AllocDeviceOnly((long)E * 4);
+            var dNorm = _vk.AllocDeviceOnly((long)E * 4);
+            var dQ = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dK = _vk.AllocDeviceOnly((long)kvDim * 4);
+            var dV = _vk.AllocDeviceOnly((long)kvDim * 4);
+            var dQOut = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dAttnOut = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dProj = _vk.AllocDeviceOnly((long)E * 4);
+            var dGate = _vk.AllocDeviceOnly((long)ffnDim * 4);
+            var dUp = _vk.AllocDeviceOnly((long)ffnDim * 4);
             _dLogits = _vk.Alloc((long)_vocab * 4);
-            var dDummyNorm = _vk.Alloc(4);
+            var dDummyNorm = AllocDeviceZero(4);
 
             int nExp = _w.ExpertCount, topK = _w.ExpertUsedCount, moeF = _w.ExpertFeedForwardLength;
             VulkanCompute.GBuf? dRouterLogits = null, dIdx = null, dTw = null;
             VulkanCompute.GBuf? dMoeGate = null, dMoeUp = null, dMoeAct = null, dMoeDown = null, dZeroE = null;
             if (_w.IsMoe)
             {
-                dRouterLogits = _vk.Alloc((long)nExp * 4);
-                dIdx = _vk.Alloc((long)topK * 4);
-                dTw = _vk.Alloc((long)topK * 4);
-                dMoeGate = _vk.Alloc((long)topK * moeF * 4);
-                dMoeUp = _vk.Alloc((long)topK * moeF * 4);
-                dMoeAct = _vk.Alloc((long)topK * moeF * 4);
-                dMoeDown = _vk.Alloc((long)topK * E * 4);
-                dZeroE = _vk.Alloc((long)E * 4);
+                dRouterLogits = _vk.AllocDeviceOnly((long)nExp * 4);
+                dIdx = _vk.AllocDeviceOnly((long)topK * 4);
+                dTw = _vk.AllocDeviceOnly((long)topK * 4);
+                dMoeGate = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeUp = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeAct = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeDown = _vk.AllocDeviceOnly((long)topK * E * 4);
+                dZeroE = AllocDeviceZero((long)E * 4);
             }
 
             var dEmbd = UploadBytes(_w.EmbdWeight, GgufTypeSize(_w.EmbdType, (long)_vocab * E));
@@ -108,8 +108,8 @@ public sealed unsafe class Gemma4VulkanModel : VulkanRunnerBase
                 var dGateW = UploadBytes(l.FfnGateWeight, GgufTypeSize(l.FfnGateType, (long)ffnDim * E));
                 var dUpW = UploadBytes(l.FfnUpWeight, GgufTypeSize(l.FfnUpType, (long)ffnDim * E));
                 var dDownW = UploadBytes(l.FfnDownWeight, GgufTypeSize(l.FfnDownType, (long)E * ffnDim));
-                var kCache = _vk.Alloc(kvBytes);
-                var vCache = _vk.Alloc(kvBytes);
+                var kCache = _vk.AllocDeviceOnly(kvBytes);
+                var vCache = _vk.AllocDeviceOnly(kvBytes);
 
                 AddRmsNorm(_layerOps, dX, dAttnNorm, dNorm, E, eps);
                 AddQmv(_layerOps, l.QType, dQW, dNorm, dQ, E, qDim);

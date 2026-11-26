@@ -108,18 +108,18 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
             float attnScale = 1.0f / MathF.Sqrt(hd);
             uint isNeox = (_w.ArchitectureFamily is UniversalArchitecture.Qwen or UniversalArchitecture.HybridSsm) ? 1u : 0u;
 
-            _dX = _vk.Alloc((long)E * 4);
-            _dNorm = _vk.Alloc((long)E * 4);
-            _dQ = _vk.Alloc((long)qDim * 4);
-            _dK = _vk.Alloc((long)kvDim * 4);
-            _dV = _vk.Alloc((long)kvDim * 4);
-            _dQOut = _vk.Alloc((long)qDim * 4);
-            _dAttnOut = _vk.Alloc((long)attnOutDim * 4);
-            _dProj = _vk.Alloc((long)E * 4);
-            _dGate = _vk.Alloc((long)ffnDim * 4);
-            _dUp = _vk.Alloc((long)ffnDim * 4);
+            _dX = _vk.AllocDeviceOnly((long)E * 4);
+            _dNorm = _vk.AllocDeviceOnly((long)E * 4);
+            _dQ = _vk.AllocDeviceOnly((long)qDim * 4);
+            _dK = _vk.AllocDeviceOnly((long)kvDim * 4);
+            _dV = _vk.AllocDeviceOnly((long)kvDim * 4);
+            _dQOut = _vk.AllocDeviceOnly((long)qDim * 4);
+            _dAttnOut = _vk.AllocDeviceOnly((long)attnOutDim * 4);
+            _dProj = _vk.AllocDeviceOnly((long)E * 4);
+            _dGate = _vk.AllocDeviceOnly((long)ffnDim * 4);
+            _dUp = _vk.AllocDeviceOnly((long)ffnDim * 4);
             _dLogits = _vk.Alloc((long)_vocab * 4);
-            _dDummyNorm = _vk.Alloc(4);
+            _dDummyNorm = AllocDeviceZero(4);
 
             int nExp = _w.ExpertCount;
             int topK = _w.ExpertUsedCount;
@@ -132,39 +132,39 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
             VulkanCompute.GBuf? dScIn = null, dScOut = null;
             if (_w.ArchitectureFamily == UniversalArchitecture.Lfm2)
             {
-                dScIn = _vk.Alloc((long)E * 3 * 4);
-                dScOut = _vk.Alloc((long)E * 4);
+                dScIn = _vk.AllocDeviceOnly((long)E * 3 * 4);
+                dScOut = _vk.AllocDeviceOnly((long)E * 4);
             }
             if (_w.IsMla)
             {
-                dKvA = _vk.Alloc((long)(_w.KvLoraRank + _w.RopeDimensionCount) * 4);
-                dKvNormBuf = _vk.Alloc((long)_w.KvLoraRank * 4);
-                dKvB = _vk.Alloc((long)nQ * (_w.QkNopeHeadDim + mlaVDim) * 4);
+                dKvA = _vk.AllocDeviceOnly((long)(_w.KvLoraRank + _w.RopeDimensionCount) * 4);
+                dKvNormBuf = _vk.AllocDeviceOnly((long)_w.KvLoraRank * 4);
+                dKvB = _vk.AllocDeviceOnly((long)nQ * (_w.QkNopeHeadDim + mlaVDim) * 4);
                 if (_w.IsDsa)
                 {
-                    dIdxQ = _vk.Alloc((long)_w.DsaIndexHeadCount * _w.DsaIndexHeadDim * 4);
-                    dIdxK = _vk.Alloc((long)_w.DsaIndexHeadDim * 4);
-                    dIdxW = _vk.Alloc((long)_w.DsaIndexHeadCount * 4);
-                    dTopIdx = _vk.Alloc((long)_w.DsaTopK * 4);
+                    dIdxQ = _vk.AllocDeviceOnly((long)_w.DsaIndexHeadCount * _w.DsaIndexHeadDim * 4);
+                    dIdxK = _vk.AllocDeviceOnly((long)_w.DsaIndexHeadDim * 4);
+                    dIdxW = _vk.AllocDeviceOnly((long)_w.DsaIndexHeadCount * 4);
+                    dTopIdx = _vk.AllocDeviceOnly((long)_w.DsaTopK * 4);
                 }
             }
             if (_w.IsMoe)
             {
-                dRouterLogits = _vk.Alloc((long)nExp * 4);
-                dIdx = _vk.Alloc((long)topK * 4);
-                dTw = _vk.Alloc((long)topK * 4);
-                dMoeGate = _vk.Alloc((long)topK * moeF * 4);
-                dMoeUp = _vk.Alloc((long)topK * moeF * 4);
-                dMoeAct = _vk.Alloc((long)topK * moeF * 4);
-                dMoeDown = _vk.Alloc((long)topK * E * 4);
-                dZeroE = _vk.Alloc((long)E * 4);
+                dRouterLogits = _vk.AllocDeviceOnly((long)nExp * 4);
+                dIdx = _vk.AllocDeviceOnly((long)topK * 4);
+                dTw = _vk.AllocDeviceOnly((long)topK * 4);
+                dMoeGate = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeUp = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeAct = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeDown = _vk.AllocDeviceOnly((long)topK * E * 4);
+                dZeroE = AllocDeviceZero((long)E * 4);
                 if (shF > 0)
                 {
-                    dShGate = _vk.Alloc((long)shF * 4);
-                    dShUp = _vk.Alloc((long)shF * 4);
-                    dShAct = _vk.Alloc((long)shF * 4);
+                    dShGate = _vk.AllocDeviceOnly((long)shF * 4);
+                    dShUp = _vk.AllocDeviceOnly((long)shF * 4);
+                    dShAct = _vk.AllocDeviceOnly((long)shF * 4);
                 }
-                dShDown = _vk.Alloc((long)E * 4);
+                dShDown = _vk.AllocDeviceOnly((long)E * 4);
             }
 
             _dEmbd = UploadBytes(_w.EmbdWeight, GgufTypeSize(_w.EmbdType, (long)_vocab * E));
@@ -208,8 +208,8 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                     var dKvAMqa = UploadBytes(l.AttnKvAMqaWeight, GgufTypeSize(l.AttnKvAMqaType, (long)kvMqaDim * E));
                     var dKvANorm = UploadFloats(l.AttnKvANormWeight, _w.KvLoraRank);
                     var dKvBW = UploadBytes(l.AttnKvBWeight, GgufTypeSize(l.AttnKvBType, (long)decompKvDim * _w.KvLoraRank));
-                    var mlaKCache = _vk.Alloc((long)nQ * _maxSeqLen * mlaKDim * 4);
-                    var mlaVCache = _vk.Alloc((long)nQ * _maxSeqLen * mlaVDim * 4);
+                    var mlaKCache = _vk.AllocDeviceOnly((long)nQ * _maxSeqLen * mlaKDim * 4);
+                    var mlaVCache = _vk.AllocDeviceOnly((long)nQ * _maxSeqLen * mlaVDim * 4);
 
                     AddQmv(_layerOps, l.QType, dQ, _dNorm, _dQ, E, qDim);
                     if (l.QBias != null)
@@ -237,7 +237,7 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                         var dIdxQW = UploadBytes(l.AttnIdxQWeight, GgufTypeSize(l.AttnIdxQType, (long)nIdxH * idxD * E));
                         var dIdxKW = UploadBytes(l.AttnIdxKWeight, GgufTypeSize(l.AttnIdxKType, (long)idxD * E));
                         var dIdxWW = UploadBytes(l.AttnIdxWWeight, GgufTypeSize(l.AttnIdxWType, (long)nIdxH * E));
-                        var dIdxKCache = _vk.Alloc((long)_maxSeqLen * idxD * 4);
+                        var dIdxKCache = _vk.AllocDeviceOnly((long)_maxSeqLen * idxD * 4);
                         // Compute indexer Q, K (for current token in dIdxK scratch; dsa_topk stores it into dIdxKCache[curPos]), and head weights
                         AddQmv(_layerOps, l.AttnIdxQType, dIdxQW, _dNorm, dIdxQ!, E, nIdxH * idxD);
                         AddQmv(_layerOps, l.AttnIdxKType, dIdxKW, _dNorm, dIdxK!, E, idxD);
@@ -281,8 +281,8 @@ public sealed unsafe class Qwen2VulkanModel : VulkanRunnerBase
                 {
                     var dQNorm = l.AttnQNormWeight != null ? UploadFloats(l.AttnQNormWeight, hd) : _dDummyNorm;
                     var dKNorm = l.AttnKNormWeight != null ? UploadFloats(l.AttnKNormWeight, hd) : _dDummyNorm;
-                    var kCache = _vk.Alloc(kvBytes);
-                    var vCache = _vk.Alloc(kvBytes);
+                    var kCache = _vk.AllocDeviceOnly(kvBytes);
+                    var vCache = _vk.AllocDeviceOnly(kvBytes);
 
                     if (l.HasFusedQkv)
                     {

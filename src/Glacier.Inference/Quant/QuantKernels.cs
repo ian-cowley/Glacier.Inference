@@ -27,6 +27,14 @@ public static unsafe partial class QuantKernels
     /// </summary>
     public static void ExtractEmbedding(GgufType type, byte* embdData, int tokenId, float* dst, int embeddingDim)
     {
+        if (GgufTypes.IsTrellis(type))
+        {
+            if (!TrellisWeightRegistry.TryGet(embdData, out var trellis) || trellis == null)
+                throw new InvalidOperationException($"NariQ trellis embedding ({type}) was not registered in TrellisWeightRegistry.");
+            TrellisKernels.DecodeEmbeddingRow(trellis, tokenId, dst);
+            return;
+        }
+
         int rowBytes = (int)GgufTypes.GetRowBytes(type, embeddingDim);
         byte* rowPtr = embdData + (long)tokenId * rowBytes;
 

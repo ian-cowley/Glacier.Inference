@@ -12,7 +12,7 @@ using Glacier.Inference.Quant;
 public sealed unsafe partial class Qwen2GpuModel
 {
 
-    private void LaunchRope(IntPtr dQ, IntPtr dK, int pos)
+    private void LaunchRope(IntPtr dQ, IntPtr dK, int pos, IntPtr hStream = default)
     {
         int halfDim = _headDim / 2;
         int totalHalf = (_nHeads + _nHeadsKv) * halfDim;
@@ -39,12 +39,44 @@ public sealed unsafe partial class Qwen2GpuModel
             _fnRope,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(rope)");
     }
 
-    private void LaunchKvStore(int layer, int pos)
+    private void LaunchRopeDpos(IntPtr dQ, IntPtr dK, IntPtr dPos, IntPtr hStream = default)
+    {
+        int halfDim = _headDim / 2;
+        int totalHalf = (_nHeads + _nHeadsKv) * halfDim;
+        uint blockSize = 256;
+        uint gridSize = (uint)((totalHalf + (int)blockSize - 1) / (int)blockSize);
+
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        float freqBase = _weights.RopeFreqBase;
+        float freqScale = 1.0f;
+
+        void** pArgs = stackalloc void*[8];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dK;
+        pArgs[2] = &nHeadsQ;
+        pArgs[3] = &nHeadsKv;
+        pArgs[4] = &headDim;
+        pArgs[5] = &dPos;
+        pArgs[6] = &freqBase;
+        pArgs[7] = &freqScale;
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            _fnRopeDpos,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(rope_dpos)");
+    }
+
+    private void LaunchKvStore(int layer, int pos, IntPtr hStream = default)
     {
         uint blockSize = 256;
         uint gridSize;
@@ -91,9 +123,61 @@ public sealed unsafe partial class Qwen2GpuModel
             fnKv,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(kv_cache_store)");
+    }
+
+    private void LaunchKvStoreDpos(int layer, IntPtr dPos, IntPtr hStream = default)
+    {
+        uint blockSize = 256;
+        uint gridSize;
+        if (KvPrecision == KvCachePrecision.Q4_0)
+        {
+            int blocksPerHead = (_headDim + 31) / 32;
+            int totalBlocks = _nHeadsKv * blocksPerHead;
+            gridSize = (uint)((totalBlocks + 7) / 8);
+        }
+        else
+        {
+            int total = _nHeadsKv * _headDim;
+            gridSize = (uint)((total + (int)blockSize - 1) / (int)blockSize);
+        }
+
+        IntPtr dKCache = _dKeyCache[layer];
+        IntPtr dVCache = _dValCache[layer];
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int maxSeq = _maxSeqLen;
+        IntPtr dK = _dK;
+        IntPtr dV = _dV;
+
+        void** pArgs = stackalloc void*[8];
+        pArgs[0] = &dKCache;
+        pArgs[1] = &dVCache;
+        pArgs[2] = &dK;
+        pArgs[3] = &dV;
+        pArgs[4] = &nHeadsKv;
+        pArgs[5] = &headDim;
+        pArgs[6] = &maxSeq;
+        pArgs[7] = &dPos;
+
+        IntPtr fnKv = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnKvCacheStoreF16Dpos,
+            KvCachePrecision.Fp8 => _fnKvCacheStoreFp8Dpos,
+            KvCachePrecision.Q4_0 => _fnKvCacheStoreQ4_0Dpos,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
+            _ => _fnKvCacheStoreDpos
+        };
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fnKv,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(kv_cache_store_dpos)");
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -108,7 +192,7 @@ public sealed unsafe partial class Qwen2GpuModel
 
     private void LaunchAttention(int layer, int pos) => LaunchAttention(layer, pos, _dQ, _dAttnOut);
 
-    private void LaunchAttention(int layer, int pos, IntPtr dQ, IntPtr dOut)
+    private void LaunchAttention(int layer, int pos, IntPtr dQ, IntPtr dOut, IntPtr hStream = default)
     {
         uint gridSize = (uint)_nHeads;
         uint blockSize = GetAttentionBlockSize();
@@ -148,9 +232,56 @@ public sealed unsafe partial class Qwen2GpuModel
             fnAttn,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(attention_gqa)");
+    }
+
+    private void LaunchAttentionDpos(int layer, IntPtr dPos, IntPtr hStream = default)
+    {
+        uint gridSize = (uint)_nHeads;
+        uint blockSize = GetAttentionBlockSize();
+
+        IntPtr dQ = _dQ;
+        IntPtr dKCache = _dKeyCache[layer];
+        IntPtr dVCache = _dValCache[layer];
+        IntPtr dOut = _dAttnOut;
+        IntPtr dScores = IntPtr.Zero;
+        int nHeadsQ = _nHeads;
+        int nHeadsKv = _nHeadsKv;
+        int headDim = _headDim;
+        int maxSeq = _maxSeqLen;
+        float attnScale = _attnScale;
+
+        void** pArgs = stackalloc void*[11];
+        pArgs[0] = &dQ;
+        pArgs[1] = &dKCache;
+        pArgs[2] = &dVCache;
+        pArgs[3] = &dOut;
+        pArgs[4] = &dScores;
+        pArgs[5] = &nHeadsQ;
+        pArgs[6] = &nHeadsKv;
+        pArgs[7] = &headDim;
+        pArgs[8] = &maxSeq;
+        pArgs[9] = &dPos;
+        pArgs[10] = &attnScale;
+
+        IntPtr fnAttn = KvPrecision switch
+        {
+            KvCachePrecision.Fp16 => _fnAttentionGqaF16Dpos,
+            KvCachePrecision.Fp8 => _fnAttentionGqaFp8Dpos,
+            KvCachePrecision.Q4_0 => _fnAttentionGqaQ4_0Dpos,
+            KvCachePrecision.Q8_0 => throw new NotSupportedException("Contiguous GPU KV cache does not support Q8_0."),
+            _ => _fnAttentionGqaDpos
+        };
+
+        CuDriver.Check(CuDriver.LaunchKernel(
+            fnAttn,
+            gridSize, 1, 1,
+            blockSize, 1, 1,
+            0, hStream,
+            (IntPtr)pArgs,
+            IntPtr.Zero), "LaunchKernel(attention_gqa_dpos)");
     }
 
     private void LaunchAttentionBatch(int layer, int chunkStartPos, int batchSize)
@@ -272,7 +403,7 @@ public sealed unsafe partial class Qwen2GpuModel
             IntPtr.Zero), "LaunchKernel(gemv)");
     }
 
-    private void LaunchSwigluFused(IntPtr dDst, IntPtr dX, IntPtr dWGate, IntPtr dWUp, int kCols, int mRows)
+    private void LaunchSwigluFused(IntPtr dDst, IntPtr dX, IntPtr dWGate, IntPtr dWUp, int kCols, int mRows, IntPtr hStream = default)
     {
         uint blockSize = 128;
         uint numWarps = 4;
@@ -290,12 +421,12 @@ public sealed unsafe partial class Qwen2GpuModel
             _fnSwigluFused,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(gemv_q4_k_swiglu_fused)");
     }
 
-    private void LaunchRmsNorm(IntPtr dX, IntPtr dWeight, IntPtr dDst, int size, float eps)
+    private void LaunchRmsNorm(IntPtr dX, IntPtr dWeight, IntPtr dDst, int size, float eps, IntPtr hStream = default)
     {
         uint blockSize = 256;
         uint gridSize = 1;
@@ -311,12 +442,12 @@ public sealed unsafe partial class Qwen2GpuModel
             _fnRmsNorm,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(rms_norm)");
     }
 
-    private void LaunchSwiglu(IntPtr dGate, IntPtr dUp, IntPtr dDst, int size)
+    private void LaunchSwiglu(IntPtr dGate, IntPtr dUp, IntPtr dDst, int size, IntPtr hStream = default)
     {
         uint blockSize = 256;
         uint gridSize = (uint)((size + (int)blockSize - 1) / (int)blockSize);
@@ -331,7 +462,7 @@ public sealed unsafe partial class Qwen2GpuModel
             _fnSwiglu,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(swiglu)");
     }
@@ -622,7 +753,7 @@ public sealed unsafe partial class Qwen2GpuModel
             IntPtr.Zero), "LaunchKernel(kv_cache_store_batch)");
     }
 
-    private void LaunchRmsNormHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, float eps)
+    private void LaunchRmsNormHeads(IntPtr dBuf, IntPtr dWeight, int nHeads, int headDim, float eps, IntPtr hStream = default)
     {
         uint blockSize = (uint)Math.Min(256, Math.Max(32, ((headDim + 31) / 32) * 32));
         uint gridSize = (uint)nHeads;
@@ -638,7 +769,7 @@ public sealed unsafe partial class Qwen2GpuModel
             _fnRmsNormHeads,
             gridSize, 1, 1,
             blockSize, 1, 1,
-            0, IntPtr.Zero,
+            0, hStream,
             (IntPtr)pArgs,
             IntPtr.Zero), "LaunchKernel(rms_norm_heads)");
     }

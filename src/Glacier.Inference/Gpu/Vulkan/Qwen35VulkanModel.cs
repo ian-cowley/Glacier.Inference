@@ -7,6 +7,7 @@ using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Model;
+using Glacier.Inference.Quant;
 
 /// <summary>
 /// Vulkan compute inference runner for the Qwen 3.5 / 3.6 hybrid family (Gated DeltaNet + interleaved full attention,
@@ -30,7 +31,22 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         public string Name = "";
     }
 
-    private sealed record Mat(VulkanCompute.GBuf Buf, GgufType Type, int K, int N);
+    private sealed class TrellisGpuMat
+    {
+        public required VulkanCompute.GBuf CodeWords, S16, Pre, Post;
+        public VulkanCompute.GBuf? Pin, Pout;
+        public int K, N, Bits, RowsKind, RowsBlock, ColsKind, ColsBlock;
+        public bool HasPin, HasPout;
+    }
+
+    private sealed class TrellisGpuBanded
+    {
+        public required TrellisGpuMat[] Bands;
+        public required VulkanCompute.GBuf VocabGather;
+        public int TotalN;
+    }
+
+    private sealed record Mat(VulkanCompute.GBuf? Buf, GgufType Type, int K, int N, TrellisGpuMat? Trellis = null, TrellisGpuBanded? Banded = null);
 
     private sealed class BatchLayerMeta
     {
@@ -69,6 +85,9 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
     private readonly VulkanCompute.Kernel _kF32, _kRms, _kSwi, _kAdd, _kConv, _kL2, _kRec, _kTopk, _kComb, _kPrep, _kDec;
     private readonly VulkanCompute.Kernel[] _kMm = new VulkanCompute.Kernel[12], _kEmbedB = new VulkanCompute.Kernel[12];
     private readonly VulkanCompute.Kernel _kF32Mm, _kBiasBatch, _kCopy, _kConvB, _kL2B, _kRecB;
+    private VulkanCompute.Kernel? _kTrlPre, _kTrlPre128, _kTrlGemv, _kTrlGemvSplitK, _kTrlPost, _kTrlPost128, _kTrlGather;
+    private VulkanCompute.GBuf? _gTrlDummyIdx, _gTrlXRot, _gTrlYRot, _gTrlYScaled, _gTrlBandRaw;
+    private float[]? _hostTrellisEmb;
     private bool _batchReady;
     private VulkanCompute.GBuf? _bTokens, _bX, _bNorm, _bProj, _bQkv, _bZ, _bAlpha, _bBeta, _bConvOut, _bY, _bGated;
     private VulkanCompute.GBuf? _bQFull, _bK, _bV, _bQ, _bGate, _bAttnOut, _bScores, _bGateOut, _bUpOut, _bAct;
@@ -139,8 +158,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         return true;
     }
 
-    private static bool IsEmbedKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.BF16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
-    private static bool IsKernelType(GgufType t) => t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16 or GgufType.BF16;
+    private static bool IsEmbedKernelType(GgufType t) => GgufTypes.IsTrellis(t) || t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.F16 or GgufType.BF16 or GgufType.Q4_0 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K;
+    private static bool IsKernelType(GgufType t) => GgufTypes.IsTrellis(t) || t is GgufType.Q4_K or GgufType.Q5_K or GgufType.Q6_K or GgufType.Q8_0 or GgufType.IQ4_XS or GgufType.MXFP4 or GgufType.Q3_K or GgufType.IQ4_NL or GgufType.Q2_K or GgufType.Q4_0 or GgufType.F16 or GgufType.BF16;
 
     private static int QIdx(GgufType t) => t switch
     {
@@ -206,6 +225,27 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
             _kConvB = _vk.LoadEmbedded("gdn_conv_b", 4, 8, (1u << 2) | (1u << 3));
             _kL2B = _vk.LoadEmbedded("gdn_l2_b", 1, 8, 1u << 0);
             _kRecB = _vk.LoadEmbedded("gdn_rec_b", 7, 16, (1u << 5) | (1u << 6));
+            if (weights.HasTrellisWeights && HasEmbeddedShader("trellis_gemv"))
+            {
+                _kTrlPre = _vk.LoadEmbedded("trellis_pre_rht", 5, 16, 1u << 3);
+                if (_ctx.SupportsSubgroupShuffle && HasEmbeddedShader("trellis_pre_rht_128"))
+                    _kTrlPre128 = _vk.LoadEmbedded("trellis_pre_rht_128", 5, 16, 1u << 3);
+                string gemvName = _ctx.SupportsIntegerDotProduct && HasEmbeddedShader("trellis_gemv_dp4a")
+                    ? "trellis_gemv_dp4a"
+                    : "trellis_gemv";
+                _kTrlGemv = _vk.LoadEmbedded(gemvName, 3, 12, 1u << 2);
+                string splitKName = _ctx.SupportsIntegerDotProduct && HasEmbeddedShader("trellis_gemv_splitk_dp4a")
+                    ? "trellis_gemv_splitk_dp4a"
+                    : "trellis_gemv_splitk";
+                if (HasEmbeddedShader(splitKName))
+                    _kTrlGemvSplitK = _vk.LoadEmbedded(splitKName, 3, 12, 1u << 2);
+                _kTrlPost = _vk.LoadEmbedded("trellis_post_rht", 3, 16, 1u << 2);
+                if (_ctx.SupportsSubgroupShuffle && HasEmbeddedShader("trellis_post_rht_128"))
+                    _kTrlPost128 = _vk.LoadEmbedded("trellis_post_rht_128", 3, 16, 1u << 2);
+                _kTrlGather = _vk.LoadEmbedded("trellis_gather_f32", 3, 4, 1u << 2);
+                _gTrlDummyIdx = _vk.Alloc(16);
+                _gTrlDummyIdx.Zero();
+            }
 
             _gLogits = _vk.Alloc((long)_vocab * 4);
             Build();
@@ -220,18 +260,70 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
 
     // ------------------------------------------------------------------ plan construction
 
+    private TrellisGpuMat UploadTrellisBinding(TrellisWeightBinding b)
+    {
+        int bits = GgufTypes.GetTrellisBits(b.Type);
+        long codeBytes = (long)b.K * b.N * bits / 8;
+        int s16Count = b.K / 16;
+        long s16Bytes = Math.Max(4L, ((s16Count + 1) / 2) * 4L);
+        VulkanCompute.GBuf s16Buf;
+        if ((long)s16Count * sizeof(ushort) == s16Bytes)
+        {
+            s16Buf = _vk.AllocDeviceFrom(b.S16, s16Bytes);
+        }
+        else
+        {
+            ushort[] padded = new ushort[s16Bytes / 2];
+            new ReadOnlySpan<ushort>(b.S16, s16Count).CopyTo(padded);
+            fixed (ushort* ps = padded) s16Buf = _vk.AllocDeviceFrom(ps, s16Bytes);
+        }
+        return new TrellisGpuMat
+        {
+            K = b.K, N = b.N, Bits = bits,
+            RowsKind = b.Descriptor[0], RowsBlock = b.Descriptor[1],
+            ColsKind = b.Descriptor[3], ColsBlock = b.Descriptor[4],
+            HasPin = b.Pin != null, HasPout = b.Pout != null,
+            CodeWords = _vk.AllocDeviceFrom(b.CodeData, codeBytes),
+            S16 = s16Buf,
+            Pre = _vk.AllocDeviceFrom(b.Pre, (long)b.K * 4),
+            Post = _vk.AllocDeviceFrom(b.Post, (long)b.N * 4),
+            Pin = b.Pin != null ? _vk.AllocDeviceFrom(b.Pin, (long)b.K * 4) : null,
+            Pout = b.Pout != null ? _vk.AllocDeviceFrom(b.Pout, (long)b.N * 4) : null,
+        };
+    }
+
     private Mat UploadMat(byte* p, GgufType type, int k, int n)
     {
-        QIdx(type);
         if (p == null) throw new InvalidOperationException("Missing weight tensor.");
+        if (GgufTypes.IsTrellis(type))
+        {
+            if (TrellisWeightRegistry.TryGetBanded(p, out var banded) && banded != null)
+            {
+                var gpuBands = new TrellisGpuMat[banded.Bands.Length];
+                for (int i = 0; i < banded.Bands.Length; i++)
+                    gpuBands[i] = UploadTrellisBinding(banded.Bands[i]);
+                var gatherBuf = _vk.AllocDeviceFrom(banded.VocabGather, (long)banded.TotalN * 4);
+                return new Mat(null, type, k, banded.TotalN, Banded: new TrellisGpuBanded
+                {
+                    Bands = gpuBands,
+                    VocabGather = gatherBuf,
+                    TotalN = banded.TotalN,
+                });
+            }
+            if (!TrellisWeightRegistry.TryGet(p, out var binding) || binding == null)
+                throw new InvalidOperationException($"NariQ trellis weight ({type}) not found in TrellisWeightRegistry.");
+            return new Mat(null, type, k, n, Trellis: UploadTrellisBinding(binding));
+        }
+
+        QIdx(type);
         long bytes = (long)n * GgufTypes.GetRowBytes(type, k);
-        return new Mat(_vk.AllocFrom(p, bytes), type, k, n);
+        return new Mat(_vk.AllocDeviceFrom(p, bytes), type, k, n);
     }
 
     private VulkanCompute.GBuf UploadF32(void* p, long count)
     {
         if (p == null) throw new InvalidOperationException("Missing F32 tensor.");
-        return _vk.AllocFrom(p, count * 4);
+        return _vk.AllocDeviceFrom(p, count * 4);
     }
 
     /// <summary>
@@ -248,7 +340,84 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
             for (int r = 0; r < n; r++)
                 Glacier.Inference.Quant.QuantKernels.ExtractEmbedding(type, p, r, dst + (long)r * k, k);
         }
-        fixed (float* src = rows) return _vk.AllocFrom(src, rows.Length * 4L);
+        fixed (float* src = rows) return _vk.AllocDeviceFrom(src, rows.Length * 4L);
+    }
+
+    private void AddTrellisMvOps(List<Op> list, TrellisGpuMat tm, VulkanCompute.GBuf x, VulkanCompute.GBuf y, int outOffset = 0)
+    {
+        bool usePre128 = tm.ColsKind == 1 && tm.ColsBlock == 128 && _kTrlPre128 != null;
+        var kPre = usePre128 ? _kTrlPre128! : _kTrlPre!;
+        int kt = tm.K >> 4;
+        bool useSplitK = tm.N <= 6144 && kt >= 64 && _kTrlGemvSplitK != null;
+        var kGemv = useSplitK ? _kTrlGemvSplitK! : _kTrlGemv!;
+        bool usePost128 = tm.RowsKind == 1 && tm.RowsBlock == 128 && _kTrlPost128 != null;
+        var kPost = usePost128 ? _kTrlPost128! : _kTrlPost!;
+        var xRot = _gTrlXRot!;
+        var yRot = _gTrlYRot!;
+        var yTarget = tm.HasPout ? _gTrlYScaled! : y;
+
+        uint preGrid = tm.ColsKind == 1 ? (uint)(tm.K / tm.ColsBlock) : (uint)((tm.K + 255) / 256);
+        uint gemvGrid = useSplitK ? (uint)((tm.N + 15) / 16) : (uint)((tm.N + 63) / 64);
+        uint postGrid = tm.RowsKind == 1 ? (uint)(tm.N / tm.RowsBlock) : (uint)((tm.N + 255) / 256);
+
+        list.Add(new Op
+        {
+            Name = usePre128 ? $"trl_pre128 K{tm.K}" : $"trl_pre K{tm.K}",
+            K = kPre,
+            Set = _vk.MakeSet(kPre, x, tm.Pre, tm.Pin ?? _gTrlDummyIdx!, xRot, tm.S16),
+            Push = new uint[] { (uint)tm.K, (uint)tm.ColsKind, (uint)tm.ColsBlock, tm.HasPin ? 1u : 0u },
+            Gx = preGrid
+        });
+        list.Add(new Op
+        {
+            Name = useSplitK ? $"trl_gemv_sk b{tm.Bits} K{tm.K} N{tm.N}" : $"trl_gemv b{tm.Bits} K{tm.K} N{tm.N}",
+            K = kGemv,
+            Set = _vk.MakeSet(kGemv, tm.CodeWords, xRot, yRot),
+            Push = new uint[] { (uint)tm.K, (uint)tm.N, (uint)tm.Bits },
+            Gx = gemvGrid
+        });
+        list.Add(new Op
+        {
+            Name = usePost128 ? $"trl_post128 N{tm.N}" : $"trl_post N{tm.N}", K = kPost, Set = _vk.MakeSet(kPost, yRot, tm.Post, yTarget),
+            Push = new uint[] { (uint)tm.N, (uint)tm.RowsKind, (uint)tm.RowsBlock, (uint)(tm.HasPout ? 0 : outOffset) }, Gx = postGrid
+        });
+        if (tm.HasPout)
+        {
+            var kGather = _kTrlGather!;
+            list.Add(new Op
+            {
+                Name = $"trl_pout N{tm.N}", K = kGather, Set = _vk.MakeSet(kGather, yTarget, tm.Pout!, y),
+                Push = new uint[] { (uint)tm.N }, Gx = (uint)((tm.N + 255) / 256)
+            });
+        }
+    }
+
+    private void AddMv(List<Op> list, Mat m, VulkanCompute.GBuf x, VulkanCompute.GBuf y)
+    {
+        if (m.Banded != null)
+        {
+            int offset = 0;
+            for (int b = 0; b < m.Banded.Bands.Length; b++)
+            {
+                var band = m.Banded.Bands[b];
+                AddTrellisMvOps(list, band, x, _gTrlBandRaw!, outOffset: offset);
+                offset += band.N;
+            }
+            var kGather = _kTrlGather!;
+            list.Add(new Op
+            {
+                Name = $"trl_vocab_gather N{m.Banded.TotalN}", K = kGather,
+                Set = _vk.MakeSet(kGather, _gTrlBandRaw!, m.Banded.VocabGather, y),
+                Push = new uint[] { (uint)m.Banded.TotalN }, Gx = (uint)((m.Banded.TotalN + 255) / 256)
+            });
+            return;
+        }
+        if (m.Trellis != null)
+        {
+            AddTrellisMvOps(list, m.Trellis, x, y);
+            return;
+        }
+        list.Add(Mv(m, x, y));
     }
 
     private Op Mv(Mat m, VulkanCompute.GBuf x, VulkanCompute.GBuf y)
@@ -257,7 +426,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         int groups = (m.N + 3) / 4;
         return new Op
         {
-            Name = $"mv_{m.Type} K{m.K} N{m.N}", K = k, Set = _vk.MakeSet(k, m.Buf, x, y),
+            Name = $"mv_{m.Type} K{m.K} N{m.N}", K = k, Set = _vk.MakeSet(k, m.Buf!, x, y),
             Push = new uint[] { (uint)m.K, (uint)m.N },
             Gx = (uint)Math.Min(groups, 32768), Gy = (uint)((groups + 32767) / 32768)
         };
@@ -310,18 +479,27 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         _maxFfn = maxF;
 
         // ---- shared activations / scratch ----
-        var gX = _vk.Alloc(dim * 4L); _gX = gX; var gNorm = _vk.Alloc(dim * 4L); _gNorm = gNorm; var gProj = _vk.Alloc(dim * 4L);
-        var gQkv = _vk.Alloc(ch * 4L); var gZ = _vk.Alloc(inner * 4L); var gAlpha = _vk.Alloc(nV * 4L); var gBeta = _vk.Alloc(nV * 4L);
-        var gConvOut = _vk.Alloc(ch * 4L); var gY = _vk.Alloc(inner * 4L); var gGated = _vk.Alloc(inner * 4L);
-        var gQFull = _vk.Alloc(2L * qDim * 4); var gK = _vk.Alloc(kvDim * 4L); var gV = _vk.Alloc(kvDim * 4L);
-        var gQ = _vk.Alloc(qDim * 4L); var gGate = _vk.Alloc(qDim * 4L); var gAttnOut = _vk.Alloc(qDim * 4L);
-        var gScores = _vk.Alloc((long)nH * _maxSeq * 4);
-        var gIdx = _vk.Alloc(topK * 4L); var gTw = _vk.Alloc(topK * 4L);
-        var gGateOut = _vk.Alloc(maxF * 4L); var gUpOut = _vk.Alloc(maxF * 4L); var gAct = _vk.Alloc(maxF * 4L);
-        var gDownOut = _vk.Alloc((long)topK * dim * 4);
-        var gSg = _vk.Alloc(sFmax * 4L); var gSu = _vk.Alloc(sFmax * 4L); var gSAct = _vk.Alloc(sFmax * 4L); var gSd = _vk.Alloc(dim * 4L);
-        var gDummy = _vk.Alloc(dim * 4L);
-        var gRouterLogits = _vk.Alloc(Math.Max(E, 1) * 4L);
+        var gX = _vk.Alloc(dim * 4L); _gX = gX; var gNorm = _vk.AllocDeviceOnly(dim * 4L); _gNorm = gNorm; var gProj = _vk.AllocDeviceOnly(dim * 4L);
+        var gQkv = _vk.AllocDeviceOnly(ch * 4L); var gZ = _vk.AllocDeviceOnly(inner * 4L); var gAlpha = _vk.AllocDeviceOnly(nV * 4L); var gBeta = _vk.AllocDeviceOnly(nV * 4L);
+        var gConvOut = _vk.AllocDeviceOnly(ch * 4L); var gY = _vk.AllocDeviceOnly(inner * 4L); var gGated = _vk.AllocDeviceOnly(inner * 4L);
+        var gQFull = _vk.AllocDeviceOnly(2L * qDim * 4); var gK = _vk.AllocDeviceOnly(kvDim * 4L); var gV = _vk.AllocDeviceOnly(kvDim * 4L);
+        var gQ = _vk.AllocDeviceOnly(qDim * 4L); var gGate = _vk.AllocDeviceOnly(qDim * 4L); var gAttnOut = _vk.AllocDeviceOnly(qDim * 4L);
+        var gScores = _vk.AllocDeviceOnly((long)nH * _maxSeq * 4);
+        var gIdx = _vk.AllocDeviceOnly(topK * 4L); var gTw = _vk.AllocDeviceOnly(topK * 4L);
+        var gGateOut = _vk.AllocDeviceOnly(maxF * 4L); var gUpOut = _vk.AllocDeviceOnly(maxF * 4L); var gAct = _vk.AllocDeviceOnly(maxF * 4L);
+        var gDownOut = _vk.AllocDeviceOnly((long)topK * dim * 4);
+        var gSg = _vk.AllocDeviceOnly(sFmax * 4L); var gSu = _vk.AllocDeviceOnly(sFmax * 4L); var gSAct = _vk.AllocDeviceOnly(sFmax * 4L); var gSd = _vk.AllocDeviceOnly(dim * 4L);
+        var gDummy = _vk.AllocDeviceOnly(dim * 4L);
+        var gRouterLogits = _vk.AllocDeviceOnly(Math.Max(E, 1) * 4L);
+        if (w.HasTrellisWeights)
+        {
+            int trlMax = Math.Max(Math.Max(Math.Max(dim, maxF), Math.Max(ch, 2 * qDim)), 20480);
+            _gTrlXRot = _vk.AllocDeviceOnly(trlMax * 4L);
+            _gTrlYRot = _vk.AllocDeviceOnly(Math.Max(trlMax, _vocab) * 4L);
+            _gTrlYScaled = _vk.AllocDeviceOnly(Math.Max(trlMax, _vocab) * 4L);
+            if (w.Gguf.TrellisLmHeadBands > 0)
+                _gTrlBandRaw = _vk.AllocDeviceOnly((long)_vocab * 4L);
+        }
 
         // ---- output head ----
         // Allocation order matters on unified-memory APUs: the first ~0.9 GB of GPU allocations are placed in the (fast) UMA
@@ -369,14 +547,14 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                 meta.ConvW = convW; meta.ConvState = convState; meta.AW = aW; meta.DtBias = dtBias;
                 meta.SsmNorm = ssmNorm; meta.RecState = recState; meta.OutW = outW;
 
-                _layerOps.Add(Mv(qkv, gNorm, gQkv));
+                AddMv(_layerOps, qkv, gNorm, gQkv);
                 if (L.QkvBias != null)
                 {
                     var qkvBias = UploadF32(L.QkvBias, ch);
                     meta.QkvBias = qkvBias;
                     _layerOps.Add(Add(gQkv, qkvBias, ch));
                 }
-                _layerOps.Add(Mv(gate, gNorm, gZ));
+                AddMv(_layerOps, gate, gNorm, gZ);
                 _layerOps.Add(MvF32(alphaW, dim, nV, gNorm, gAlpha));
                 _layerOps.Add(MvF32(betaW, dim, nV, gNorm, gBeta));
                 _layerOps.Add(new Op { Name = "gdn_conv", K = _kConv, Set = _vk.MakeSet(_kConv, gQkv, convW, convState, gConvOut), Push = new uint[] { (uint)ch }, Gx = (uint)((ch + 255) / 256) });
@@ -384,7 +562,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                 _layerOps.Add(new Op { Name = "gdn_rec", K = _kRec, Set = _vk.MakeSet(_kRec, gConvOut, gAlpha, gBeta, dtBias, aW, recState, gY), Push = new uint[] { (uint)nK, (uint)nV }, Gx = (uint)nV });
                 _layerOps.Add(Rms(gY, ssmNorm, gY, StateDim, nV));
                 _layerOps.Add(Swiglu(gZ, gY, gGated, inner));
-                _layerOps.Add(Mv(outW, gGated, gProj));
+                AddMv(_layerOps, outW, gGated, gProj);
                 _layerOps.Add(Add(gX, gProj, dim));
             }
             else
@@ -395,15 +573,15 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                 var oW = UploadMat(L.AttnOutWeight, L.AttnOutType, qDim, dim);
                 var qNorm = UploadF32(L.AttnQNormWeight, HeadDim);
                 var kNorm = UploadF32(L.AttnKNormWeight, HeadDim);
-                var kCache = _vk.Alloc((long)nKv * _maxSeq * HeadDim * 4);
-                var vCache = _vk.Alloc((long)nKv * _maxSeq * HeadDim * 4);
+                var kCache = _vk.AllocDeviceOnly((long)nKv * _maxSeq * HeadDim * 4);
+                var vCache = _vk.AllocDeviceOnly((long)nKv * _maxSeq * HeadDim * 4);
 
                 meta.QW = qW; meta.KW = kW; meta.VW = vW; meta.OW = oW;
                 meta.QNorm = qNorm; meta.KNorm = kNorm; meta.KCache = kCache; meta.VCache = vCache;
 
-                _layerOps.Add(Mv(qW, gNorm, gQFull));
-                _layerOps.Add(Mv(kW, gNorm, gK));
-                _layerOps.Add(Mv(vW, gNorm, gV));
+                AddMv(_layerOps, qW, gNorm, gQFull);
+                AddMv(_layerOps, kW, gNorm, gK);
+                AddMv(_layerOps, vW, gNorm, gV);
                 if (L.QBias != null)
                 {
                     var qBias = UploadF32(L.QBias, 2 * qDim);
@@ -434,7 +612,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                     Push = new uint[] { 0, (uint)nH, (uint)nKv, (uint)_maxSeq, VulkanCompute.F(scale) },
                     Gx = (uint)nH, Patch = Patch.KvLen
                 });
-                _layerOps.Add(Mv(oW, gAttnOut, gProj));
+                AddMv(_layerOps, oW, gAttnOut, gProj);
                 if (L.AttnOutBias != null)
                 {
                     var oBias = UploadF32(L.AttnOutBias, dim);
@@ -497,8 +675,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                     var uW = UploadMat(L.FfnUpWeight + (long)ffn * rowBytes, L.FfnUpType, dim, ffn);
                     var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
                     meta.GW = gW; meta.UW = uW; meta.DW = dW;
-                    _layerOps.Add(Mv(gW, gNorm, gGateOut));
-                    _layerOps.Add(Mv(uW, gNorm, gUpOut));
+                    AddMv(_layerOps, gW, gNorm, gGateOut);
+                    AddMv(_layerOps, uW, gNorm, gUpOut);
                     if (L.FfnUpBias != null)
                     {
                         var gBias = UploadF32(L.FfnUpBias, ffn);
@@ -508,7 +686,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                         meta.GBias = gBias; meta.UBias = uBias;
                     }
                     _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
-                    _layerOps.Add(Mv(dW, gAct, gProj));
+                    AddMv(_layerOps, dW, gAct, gProj);
                     _layerOps.Add(Add(gX, gProj, dim));
                 }
                 else
@@ -517,8 +695,8 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                     var uW = UploadMat(L.FfnUpWeight, L.FfnUpType, dim, ffn);
                     var dW = UploadMat(L.FfnDownWeight, L.FfnDownType, ffn, dim);
                     meta.GW = gW; meta.UW = uW; meta.DW = dW;
-                    _layerOps.Add(Mv(gW, gNorm, gGateOut));
-                    _layerOps.Add(Mv(uW, gNorm, gUpOut));
+                    AddMv(_layerOps, gW, gNorm, gGateOut);
+                    AddMv(_layerOps, uW, gNorm, gUpOut);
                     if (L.FfnUpBias != null)
                     {
                         var gBias = UploadF32(L.FfnUpBias, ffn);
@@ -528,7 +706,7 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                         meta.GBias = gBias; meta.UBias = uBias;
                     }
                     _layerOps.Add(Swiglu(gGateOut, gUpOut, gAct, ffn));
-                    _layerOps.Add(Mv(dW, gAct, gProj));
+                    AddMv(_layerOps, dW, gAct, gProj);
                     _layerOps.Add(Add(gX, gProj, dim));
                 }
             }
@@ -537,17 +715,29 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
 
         // ---- output head ----
         _finalOps.Add(Rms(gX, outNorm, gNorm, dim, 1));
-        _finalOps.Add(Mv(outMat, gNorm, _gLogits));
+        AddMv(_finalOps, outMat, gNorm, _gLogits);
 
         // ---- embedding (allocated last: only one row is read per token; see the allocation-order note above) ----
-        var embdBuf = _vk.AllocFrom(w.EmbdWeight, (long)_vocab * GgufTypes.GetRowBytes(w.EmbdType, dim));
-        _embdBuf = embdBuf;
-        _embedOps.Add(new Op
+        if (GgufTypes.IsTrellis(w.EmbdType))
         {
-            Name = "embed", K = _kEmbed[QIdx(w.EmbdType)], Set = _vk.MakeSet(_kEmbed[QIdx(w.EmbdType)], embdBuf, gX),
-            Push = new uint[] { (uint)dim, 0 }, Gx = 1, Patch = Patch.Token
-        });
-        GlacierDiagnostics.LogInformation($"[Vulkan GPU] Model ready on {_ctx.DeviceName}: {_embedOps.Count + _layerOps.Count + _finalOps.Count} dispatches per token.");
+            // Decode 1 embedding row on CPU (<0.05 ms) and upload 20 KB to _gX per token (saves ~0.8 GB VRAM!)
+            _hostTrellisEmb = new float[dim];
+        }
+        else
+        {
+            var embdBuf = _vk.AllocDeviceFrom(w.EmbdWeight, (long)_vocab * GgufTypes.GetRowBytes(w.EmbdType, dim));
+            _embdBuf = embdBuf;
+            _embedOps.Add(new Op
+            {
+                Name = "embed", K = _kEmbed[QIdx(w.EmbdType)], Set = _vk.MakeSet(_kEmbed[QIdx(w.EmbdType)], embdBuf, gX),
+                Push = new uint[] { (uint)dim, 0 }, Gx = 1, Patch = Patch.Token
+            });
+        }
+        GlacierDiagnostics.LogInformation($"[Vulkan GPU] Model ready on {_ctx.DeviceName}: {_embedOps.Count + _layerOps.Count + _finalOps.Count} dispatches per token (staging={_ctx.PreferDeviceLocalStaging}, dp4a={_ctx.SupportsIntegerDotProduct}, sgShfl={_ctx.SupportsSubgroupShuffle}).");
+        if (Environment.GetEnvironmentVariable("GLACIER_VK_PROFILE") == "1")
+        {
+            GlacierDiagnostics.LogInformation("[Vulkan GPU] ProfileReport:\n" + ProfileReport(5));
+        }
     }
 
     // ------------------------------------------------------------------ execution
@@ -630,8 +820,17 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         if ((uint)token >= (uint)_vocab) throw new ArgumentOutOfRangeException(nameof(token), token, "Token id outside vocabulary.");
         bool wantLogits = computeLogits && logits.Length >= _vocab;
 
+        if (_hostTrellisEmb != null)
+        {
+            fixed (float* dst = _hostTrellisEmb)
+            {
+                QuantKernels.ExtractEmbedding(_w.EmbdType, _w.EmbdWeight, token, dst, _dim);
+                _gX.UploadFrom(dst, (long)_dim * 4);
+            }
+        }
+
         _vk.Begin();
-        Run(_embedOps, token, pos);
+        if (_embedOps.Count > 0) Run(_embedOps, token, pos);
         Run(_layerOps, token, pos);
         if (wantLogits) Run(_finalOps, token, pos);
         _vk.SubmitAndWait();
@@ -678,26 +877,26 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         int nK = w.SsmGroupCount, nV = w.SsmTimeStepRank, ch = (2 * nK + nV) * StateDim, inner = w.SsmInnerSize;
 
         _bTokens = _vk.Alloc(BatchMax * 4L);
-        _bX = _vk.Alloc((long)BatchMax * dim * 4L);
-        _bNorm = _vk.Alloc((long)BatchMax * dim * 4L);
-        _bProj = _vk.Alloc((long)BatchMax * dim * 4L);
-        _bQkv = _vk.Alloc((long)BatchMax * ch * 4L);
-        _bConvOut = _vk.Alloc((long)BatchMax * ch * 4L);
-        _bZ = _vk.Alloc((long)BatchMax * inner * 4L);
-        _bAlpha = _vk.Alloc((long)BatchMax * nV * 4L);
-        _bBeta = _vk.Alloc((long)BatchMax * nV * 4L);
-        _bY = _vk.Alloc((long)BatchMax * inner * 4L);
-        _bGated = _vk.Alloc((long)BatchMax * inner * 4L);
-        _bQFull = _vk.Alloc((long)BatchMax * 2L * qDim * 4L);
-        _bK = _vk.Alloc((long)BatchMax * kvDim * 4L);
-        _bV = _vk.Alloc((long)BatchMax * kvDim * 4L);
-        _bQ = _vk.Alloc((long)BatchMax * qDim * 4L);
-        _bGate = _vk.Alloc((long)BatchMax * qDim * 4L);
-        _bAttnOut = _vk.Alloc((long)BatchMax * qDim * 4L);
-        _bScores = _vk.Alloc((long)BatchMax * nH * _maxSeq * 4L);
-        _bGateOut = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
-        _bUpOut = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
-        _bAct = _vk.Alloc((long)BatchMax * _maxFfn * 4L);
+        _bX = _vk.AllocDeviceOnly((long)BatchMax * dim * 4L);
+        _bNorm = _vk.AllocDeviceOnly((long)BatchMax * dim * 4L);
+        _bProj = _vk.AllocDeviceOnly((long)BatchMax * dim * 4L);
+        _bQkv = _vk.AllocDeviceOnly((long)BatchMax * ch * 4L);
+        _bConvOut = _vk.AllocDeviceOnly((long)BatchMax * ch * 4L);
+        _bZ = _vk.AllocDeviceOnly((long)BatchMax * inner * 4L);
+        _bAlpha = _vk.AllocDeviceOnly((long)BatchMax * nV * 4L);
+        _bBeta = _vk.AllocDeviceOnly((long)BatchMax * nV * 4L);
+        _bY = _vk.AllocDeviceOnly((long)BatchMax * inner * 4L);
+        _bGated = _vk.AllocDeviceOnly((long)BatchMax * inner * 4L);
+        _bQFull = _vk.AllocDeviceOnly((long)BatchMax * 2L * qDim * 4L);
+        _bK = _vk.AllocDeviceOnly((long)BatchMax * kvDim * 4L);
+        _bV = _vk.AllocDeviceOnly((long)BatchMax * kvDim * 4L);
+        _bQ = _vk.AllocDeviceOnly((long)BatchMax * qDim * 4L);
+        _bGate = _vk.AllocDeviceOnly((long)BatchMax * qDim * 4L);
+        _bAttnOut = _vk.AllocDeviceOnly((long)BatchMax * qDim * 4L);
+        _bScores = _vk.AllocDeviceOnly((long)BatchMax * nH * _maxSeq * 4L);
+        _bGateOut = _vk.AllocDeviceOnly((long)BatchMax * _maxFfn * 4L);
+        _bUpOut = _vk.AllocDeviceOnly((long)BatchMax * _maxFfn * 4L);
+        _bAct = _vk.AllocDeviceOnly((long)BatchMax * _maxFfn * 4L);
 
         _bEmbedSet = _vk.MakeSet(_kEmbedB[QIdx(w.EmbdType)], _embdBuf, _bX, _bTokens);
         _bAddProjSet = _vk.MakeSet(_kAdd, _bX, _bProj, _bProj);
@@ -767,6 +966,15 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         {
             if ((uint)tokens[i] >= (uint)_vocab)
                 throw new ArgumentOutOfRangeException(nameof(tokens), tokens[i], "Token id outside vocabulary.");
+        }
+
+        if (_w.HasTrellisWeights)
+        {
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                Forward(tokens[i], startPos + i, logits, computeLogits && i == tokens.Length - 1);
+            }
+            return;
         }
 
         if (tokens.Length == 1 || _historyEnabled || _kEmbedB[QIdx(_w.EmbdType)] == null)

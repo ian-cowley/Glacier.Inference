@@ -1,0 +1,211 @@
+#version 450
+#ifdef USE_DP4A
+#extension GL_EXT_integer_dot_product : require
+#endif
+// NariQ Trellis 16x16 Contiguous Split-K GEMV: y_rot = W_rotated * x_rot (TRL1..TRL6, bits = 1..6)
+// Pre-scaled x_rot already includes per-tile s16 scaling (fused in trellis_pre_rht.comp).
+// Optimized for narrow-N / wide-K matrices (N <= 6144 && kt >= 64), e.g. ffn_down, ssm_out, attn_o, attn_k/v:
+//   - 128 threads = 4 warps of 32 lanes cooperating on 1 tile row (16 output rows) per workgroup.
+//   - Each warp streams a contiguous quarter of K-tiles: chunk = (kt + 3) >> 2.
+//   - Vectorized vec2 x_rot loads halve global vector fetches.
+//   - Zero->>2, zero-I2F IEEE-754 magic decode via dotPacked4x8EXT (Vulkan 1.3) or SWAR (Vulkan 1.1).
+//   - Branchless specialized TRL2 (unconditional dual-load + parallel bitfieldExtract), TRL3, and TRL4 paths.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer BufCode { uint code_words[]; };
+layout(set = 0, binding = 1) readonly buffer BufX    { vec2 x_rot2[]; };
+layout(set = 0, binding = 2) writeonly buffer BufY   { float y_rot[]; };
+
+layout(push_constant) uniform PC {
+    int K;
+    int N;
+    int bits;
+};
+
+shared float s_acc0[4][32];
+shared float s_acc1[4][32];
+
+float decode_val(uint st) {
+    uint xv = st * 0x83DCD12Du;
+#ifdef USE_DP4A
+    uint d4 = dotPacked4x8EXT(xv & 0xFCFCFCFCu, 0x01010101u);
+    return uintBitsToFloat(0x4B000000u + d4) - 8389112.0;
+#else
+    uint byteSum = (((xv >> 2) & 0x3F3F3F3Fu) * 0x01010101u) >> 24;
+    return uintBitsToFloat(0x4B000000u + byteSum) - 8388734.0;
+#endif
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x); // 0..127
+    int warp_id = tid >> 5;                // 0..3
+    int lane = tid & 31;                   // 0..31
+    int J = int(gl_WorkGroupID.x);         // 1 tile row (16 outputs) per workgroup
+
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+
+    if (J * 16 < N) {
+        int kt = K >> 4; // K / 16
+        int chunk = (kt + 3) >> 2;
+        int i_start = warp_id * chunk;
+        int i_end = min(i_start + chunk, kt);
+        int cb2 = lane & 3; // 0..3 (vec2 pair offset)
+        int tile_row_base = J * kt;
+
+        if (bits == 2) {
+            int start0 = (16 * lane + 498) & 511;
+            int w0 = start0 >> 5;
+            int w1 = (w0 + 1) & 15;
+            bool odd_lane = (lane & 1) != 0;
+
+            for (int i = i_start; i < i_end; i++) {
+                int base_w = (tile_row_base + i) << 4;
+                uint u0 = code_words[base_w + w0];
+                uint u1 = code_words[base_w + w1];
+                uint hi = odd_lane ? (u0 << 2) : ((u0 << 18) | (u1 >> 14));
+
+                int xb2 = (i << 3) + cb2;
+                vec2 xa = x_rot2[xb2];
+                vec2 xb = x_rot2[xb2 + 4];
+
+                acc0 = fma(decode_val(hi >> 16),                  xa.x, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 14, 16)), xa.y, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 12, 16)), xb.x, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 10, 16)), xb.y, acc0);
+
+                acc1 = fma(decode_val(bitfieldExtract(hi,  8, 16)), xa.x, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(hi,  6, 16)), xa.y, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(hi,  4, 16)), xb.x, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(hi,  2, 16)), xb.y, acc1);
+            }
+        } else if (bits == 3) {
+            int start0 = ((8 * lane + 1) * 3 - 16 + 768) % 768;
+            int w0 = start0 >> 5;
+            int w1 = (w0 == 23) ? 0 : (w0 + 1);
+            int o0 = start0 & 31;
+            int o0_comp = 32 - o0;
+
+            for (int i = i_start; i < i_end; i++) {
+                int base_w = (tile_row_base + i) * 24;
+                uint u0 = code_words[base_w + w0];
+                uint u1 = code_words[base_w + w1];
+                uint hi = (u0 << o0) | (u1 >> o0_comp);
+                uint mid = u1 << o0;
+
+                int xb2 = (i << 3) + cb2;
+                vec2 xa = x_rot2[xb2];
+                vec2 xb = x_rot2[xb2 + 4];
+
+                acc0 = fma(decode_val(hi >> 16),                   xa.x, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 13, 16)), xa.y, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 10, 16)), xb.x, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi,  7, 16)), xb.y, acc0);
+
+                acc1 = fma(decode_val(bitfieldExtract(hi,  4, 16)), xa.x, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(hi,  1, 16)), xa.y, acc1);
+                acc1 = fma(decode_val(((hi << 2) & 0xFFFFu) | (mid >> 30)), xb.x, acc1);
+                acc1 = fma(decode_val(((hi << 5) & 0xFFFFu) | (mid >> 27)), xb.y, acc1);
+            }
+        } else if (bits == 4) {
+            int w0 = (lane + 31) & 31;
+            int w1 = lane;
+
+            for (int i = i_start; i < i_end; i++) {
+                int base_w = (tile_row_base + i) << 5;
+                uint u0 = code_words[base_w + w0];
+                uint u1 = code_words[base_w + w1];
+                uint hi = (u0 << 20) | (u1 >> 12);
+
+                int xb2 = (i << 3) + cb2;
+                vec2 xa = x_rot2[xb2];
+                vec2 xb = x_rot2[xb2 + 4];
+
+                acc0 = fma(decode_val(hi >> 16),                  xa.x, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi, 12, 16)), xa.y, acc0);
+                acc0 = fma(decode_val(bitfieldExtract(hi,  8, 16)), xb.x, acc0);
+                acc0 = fma(decode_val(u1 >> 16),                  xb.y, acc0);
+
+                acc1 = fma(decode_val(bitfieldExtract(u1, 12, 16)), xa.x, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(u1,  8, 16)), xa.y, acc1);
+                acc1 = fma(decode_val(bitfieldExtract(u1,  4, 16)), xb.x, acc1);
+                acc1 = fma(decode_val(u1 & 0xFFFFu),              xb.y, acc1);
+            }
+        } else {
+            int nw = 8 * bits;
+            int total = 256 * bits;
+            int start0 = ((8 * lane + 1) * bits - 16 + total) % total;
+            int w0 = start0 >> 5;
+            int w1 = (w0 + 1) % nw;
+            int w2 = (w0 + 2) % nw;
+            int o0 = start0 & 31;
+            int o0_comp = 32 - o0;
+            int bits_comp = 32 - bits;
+            bool need_u2 = (o0 + 7 * bits + 16) > 64;
+
+            for (int i = i_start; i < i_end; i++) {
+                int base_w = (tile_row_base + i) * nw;
+                uint u0 = code_words[base_w + w0];
+                uint u1 = code_words[base_w + w1];
+
+                uint hi, mid;
+                if (o0 == 0) {
+                    hi = u0;
+                    mid = u1;
+                } else if (!need_u2) {
+                    hi = (u0 << o0) | (u1 >> o0_comp);
+                    mid = u1 << o0;
+                } else {
+                    uint u2 = code_words[base_w + w2];
+                    hi = (u0 << o0) | (u1 >> o0_comp);
+                    mid = (u1 << o0) | (u2 >> o0_comp);
+                }
+
+                int xb2 = (i << 3) + cb2;
+                vec2 xa = x_rot2[xb2];
+                vec2 xb = x_rot2[xb2 + 4];
+
+                acc0 = fma(decode_val(hi >> 16), xa.x, acc0); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc0 = fma(decode_val(hi >> 16), xa.y, acc0); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc0 = fma(decode_val(hi >> 16), xb.x, acc0); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc0 = fma(decode_val(hi >> 16), xb.y, acc0); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+
+                acc1 = fma(decode_val(hi >> 16), xa.x, acc1); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc1 = fma(decode_val(hi >> 16), xa.y, acc1); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc1 = fma(decode_val(hi >> 16), xb.x, acc1); hi = (hi << bits) | (mid >> bits_comp); mid <<= bits;
+                acc1 = fma(decode_val(hi >> 16), xb.y, acc1);
+            }
+        }
+    }
+
+#ifdef USE_DP4A
+    acc0 *= 0.25;
+    acc1 *= 0.25;
+#endif
+
+    s_acc0[warp_id][lane] = acc0;
+    s_acc1[warp_id][lane] = acc1;
+    barrier();
+
+    if (J * 16 < N && tid < 16) {
+        int b = (tid & 7) << 2;
+        float sum;
+        if (tid < 8) {
+            float p0 = (s_acc0[0][b] + s_acc0[0][b + 1]) + (s_acc0[0][b + 2] + s_acc0[0][b + 3]);
+            float p1 = (s_acc0[1][b] + s_acc0[1][b + 1]) + (s_acc0[1][b + 2] + s_acc0[1][b + 3]);
+            float p2 = (s_acc0[2][b] + s_acc0[2][b + 1]) + (s_acc0[2][b + 2] + s_acc0[2][b + 3]);
+            float p3 = (s_acc0[3][b] + s_acc0[3][b + 1]) + (s_acc0[3][b + 2] + s_acc0[3][b + 3]);
+            sum = (p0 + p1) + (p2 + p3);
+        } else {
+            float p0 = (s_acc1[0][b] + s_acc1[0][b + 1]) + (s_acc1[0][b + 2] + s_acc1[0][b + 3]);
+            float p1 = (s_acc1[1][b] + s_acc1[1][b + 1]) + (s_acc1[1][b + 2] + s_acc1[1][b + 3]);
+            float p2 = (s_acc1[2][b] + s_acc1[2][b + 1]) + (s_acc1[2][b + 2] + s_acc1[2][b + 3]);
+            float p3 = (s_acc1[3][b] + s_acc1[3][b + 1]) + (s_acc1[3][b + 2] + s_acc1[3][b + 3]);
+            sum = (p0 + p1) + (p2 + p3);
+        }
+        int out_idx = (J << 4) + tid;
+        if (out_idx < N) {
+            y_rot[out_idx] = sum;
+        }
+    }
+}

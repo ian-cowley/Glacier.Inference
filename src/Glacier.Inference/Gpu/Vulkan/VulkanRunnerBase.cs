@@ -97,8 +97,13 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
         _ => throw new NotSupportedException($"Unsupported Vulkan quant type {t}"),
     };
 
-    private protected VulkanCompute.GBuf UploadBytes(byte* ptr, long bytes) { var b = _vk.Alloc(bytes); b.UploadFrom(ptr, bytes); return b; }
-    private protected VulkanCompute.GBuf UploadFloats(float* ptr, int count) { long bytes = (long)count * 4; var b = _vk.Alloc(bytes); b.UploadFrom(ptr, bytes); return b; }
+    private protected VulkanCompute.GBuf UploadBytes(byte* ptr, long bytes) => _vk.AllocDeviceFrom(ptr, bytes);
+    private protected VulkanCompute.GBuf UploadFloats(float* ptr, int count) => _vk.AllocDeviceFrom(ptr, (long)count * 4);
+    private protected VulkanCompute.GBuf AllocDeviceZero(long bytes)
+    {
+        byte[] z = new byte[Math.Max(bytes, 16)];
+        fixed (byte* p = z) return _vk.AllocDeviceFrom(p, z.Length);
+    }
     private protected VulkanCompute.GBuf AllocStateZero(long bytes) { var b = _vk.Alloc(bytes); b.Zero(); _recurrentStates.Add(b); return b; }
 
     private protected void AddRmsNorm(List<Op> list, VulkanCompute.GBuf x, VulkanCompute.GBuf w, VulkanCompute.GBuf o, int n, float eps) =>

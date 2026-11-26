@@ -334,7 +334,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                 }
             }
 #if !ANDROID
-            else if (!_weights.IsMla && (_weights.IsHybridSsm || _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
+            else if (!_weights.HasTrellisWeights && !_weights.IsMla && (_weights.IsHybridSsm || _weights.ArchitectureFamily == UniversalArchitecture.HybridSsm || !_weights.Layers[0].HasFusedQkv) && (targetEngine == InferenceEngineType.BareMetal || targetEngine == InferenceEngineType.DirectML) &&
                      (targetDevice.Vendor == GpuVendor.Amd || targetDevice.Vendor == GpuVendor.Nvidia || targetDevice.Vendor == GpuVendor.Intel) && OperatingSystem.IsWindows())
             {
                 try
@@ -419,7 +419,18 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
-            else if (!OperatingSystem.IsWindows() && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
+            else if (_weights.HasTrellisWeights && _weights.IsHybridSsm && !_weights.IsMoe &&
+                     targetDevice.Vendor == GpuVendor.Nvidia && targetEngine != InferenceEngineType.Cpu &&
+                     targetEngine != InferenceEngineType.Vulkan && GpuContext.IsSupported &&
+                     Qwen35CudaModel.IsSupported(_weights, out _))
+            {
+                var cudaModel = new Qwen35CudaModel(_weights, maxSeqLen, targetDevice.Index);
+                _d3d12Model = cudaModel;
+                _kvCache = null;
+                Engine = InferenceEngineType.BareMetal;
+                ActiveDevice = $"{cudaModel.DeviceName} [Engine: Pure C# Bare-Metal CUDA SASS (Qwen 3.5/3.8 Gated DeltaNet + NariQ) | KV: FP32 | Arch: HybridSsm]";
+            }
+            else if ((!OperatingSystem.IsWindows() || _weights.HasTrellisWeights) && targetDevice.Vendor != GpuVendor.Cpu && targetEngine != InferenceEngineType.Cpu &&
                      _weights.HyperConnectionCount == 0 && _weights.PleHashConfig == null &&
                      VulkanContext.IsSupported &&
                      (Mamba2VulkanModel.IsSupported(_weights, out _) || Qwen35VulkanModel.IsSupported(_weights, out _) || Gemma4VulkanModel.IsSupported(_weights, out _) || Qwen2VulkanModel.IsSupported(_weights, out _)) &&

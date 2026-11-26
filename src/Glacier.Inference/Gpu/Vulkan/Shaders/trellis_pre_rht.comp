@@ -1,0 +1,112 @@
+#version 450
+#ifdef PRE_RHT_128
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+// NariQ Trellis Pre-Transform with fused s16 pre-scaling:
+//   x_rot[gi] = T_cols(pre * gather_pin(x))[gi] * s16[gi >> 4]
+// Supports kind=0 (identity) and kind=1 (normalized block Sylvester FWHT, block_len <= 4096).
+// When compiled with -DPRE_RHT_128, specializes for kind=1, block_len=128 using 128 threads/block,
+// zero-barrier intra-subgroup shuffle butterflies, and a 512-byte s128[128] shared buffer.
+#ifdef PRE_RHT_128
+layout(local_size_x = 128) in;
+#else
+layout(local_size_x = 256) in;
+#endif
+
+layout(set = 0, binding = 0) readonly buffer BufX    { float x[]; };
+layout(set = 0, binding = 1) readonly buffer BufPre  { float pre[]; };
+layout(set = 0, binding = 2) readonly buffer BufPin  { int   pin[]; };
+layout(set = 0, binding = 3) writeonly buffer BufOut { float x_rot[]; };
+layout(set = 0, binding = 4) readonly buffer BufS16  { uint  s16_packed[]; };
+
+layout(push_constant) uniform PC {
+    int K;
+    int kind;
+    int block_len;
+    int has_pin;
+};
+
+float load_s16(int gi) {
+    int i16 = gi >> 4;
+    vec2 sp = unpackHalf2x16(s16_packed[i16 >> 1]);
+    return ((i16 & 1) == 0) ? sp.x : sp.y;
+}
+
+#ifdef PRE_RHT_128
+
+shared float s128[128];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x); // 0..127
+    int gi = int(gl_WorkGroupID.x) * 128 + tid;
+    int src = (has_pin != 0) ? pin[gi] : gi;
+    float v = x[src] * pre[gi];
+
+    // Intra-subgroup butterflies in registers (zero LDS, zero workgroup barriers).
+    // On RDNA 3.5 Wave64, stages h=1..32 execute barrier-free; only h=64 crosses subgroups.
+    uint sg = gl_SubgroupSize;
+    for (uint h = 1u; h < 128u && h < sg; h <<= 1u) {
+        float p = subgroupShuffleXor(v, h);
+        v = ((uint(tid) & h) == 0u) ? (v + p) : (p - v);
+    }
+
+    // Cross-subgroup butterflies via compact 512-byte shared memory.
+    for (uint h = sg; h < 128u; h <<= 1u) {
+        s128[tid] = v;
+        barrier();
+        float p = s128[tid ^ int(h)];
+        v = ((uint(tid) & h) == 0u) ? (v + p) : (p - v);
+        if ((h << 1u) < 128u) {
+            barrier();
+        }
+    }
+
+    x_rot[gi] = (v * inversesqrt(128.0)) * load_s16(gi);
+}
+
+#else
+
+shared float smem[4096];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (kind == 0) {
+        int idx = int(gl_GlobalInvocationID.x);
+        if (idx < K) {
+            int src = (has_pin != 0) ? pin[idx] : idx;
+            x_rot[idx] = (x[src] * pre[idx]) * load_s16(idx);
+        }
+        return;
+    }
+
+    int b0 = int(gl_WorkGroupID.x) * block_len;
+    for (int i = int(tid); i < block_len; i += 256) {
+        int gi = b0 + i;
+        int src = (has_pin != 0) ? pin[gi] : gi;
+        smem[i] = x[src] * pre[gi];
+    }
+    barrier();
+
+    for (int h = 1; h < block_len; h <<= 1) {
+        int pairs = block_len >> 1;
+        int mask = h - 1;
+        for (int p = int(tid); p < pairs; p += 256) {
+            int idx0 = ((p & ~mask) << 1) | (p & mask);
+            int idx1 = idx0 | h;
+            float a = smem[idx0];
+            float b = smem[idx1];
+            smem[idx0] = a + b;
+            smem[idx1] = a - b;
+        }
+        barrier();
+    }
+
+    float c = inversesqrt(float(block_len));
+    for (int i = int(tid); i < block_len; i += 256) {
+        int gi = b0 + i;
+        x_rot[gi] = (smem[i] * c) * load_s16(gi);
+    }
+}
+
+#endif

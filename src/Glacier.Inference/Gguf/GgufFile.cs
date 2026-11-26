@@ -102,6 +102,13 @@ public sealed unsafe class GgufFile : IDisposable
     public bool IsMoe => ExpertCount > 0 || Tensors.ContainsKey("blk.0.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.1.ffn_gate_exps.weight") || Tensors.ContainsKey("blk.2.ffn_gate_exps.weight");
 
     public bool IsHybridSsm => Architecture == "qwen35" || Architecture == "qwen4exp" || Architecture == "qwen38" || Tensors.ContainsKey("blk.0.ssm_out.weight") || Tensors.ContainsKey("blk.0.ssm_conv1d.weight");
+
+    // NariQ Trellis-Coded Quantization (GGML_TYPE_TRL1..TRL6, nariq/FORMAT.md v1)
+    public uint TrellisVersion => GetMetadataUInt32("trellis.version", 0);
+    public int TrellisEmbedBands => (int)GetMetadataUInt32("trellis.embed_bands", 0);
+    public int TrellisLmHeadBands => (int)GetMetadataUInt32("trellis.lm_head_bands", 0);
+    public bool HasTrellisTensors => TrellisVersion > 0 || TrellisEmbedBands > 0 || TrellisLmHeadBands > 0;
+    public int[]? GetTrellisDescriptor(string baseTensorName) => GetMetadataInt32Array($"trellis.desc.{baseTensorName}");
     public int FullAttentionInterval => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.full_attention_interval", 4), 1, 256);
     public int SsmConvKernel => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.conv_kernel", 4), 1, 256);
     public int SsmStateSize => Math.Clamp((int)GetMetadataUInt32($"{Architecture}.ssm.state_size", 128), 1, 4096);

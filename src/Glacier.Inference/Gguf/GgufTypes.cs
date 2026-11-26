@@ -58,6 +58,13 @@ public enum GgufType : uint
     MXFP4 = 39,
     NVFP4 = 40,
     GgmlQ2_0 = 42,
+    F8_E4M3 = 43,
+    TRL1 = 44,
+    TRL2 = 45,
+    TRL3 = 46,
+    TRL4 = 47,
+    TRL5 = 48,
+    TRL6 = 49,
     Ternary_1_58 = 100,
     PQ2_0 = 142
 }
@@ -67,6 +74,12 @@ public enum GgufType : uint
 /// </summary>
 public static class GgufTypes
 {
+    public static bool IsTrellis(GgufType type) =>
+        type is >= GgufType.TRL1 and <= GgufType.TRL6;
+
+    public static int GetTrellisBits(GgufType type) =>
+        IsTrellis(type) ? (int)type - (int)GgufType.TRL1 + 1 : 0;
+
     public static bool TryGetBlockInfo(GgufType type, out int blockSize, out int blockBytes)
     {
         switch (type)
@@ -93,6 +106,18 @@ public static class GgufTypes
                 blockSize = 64; blockBytes = 20; return true;
             case GgufType.GgmlQ2_0:
                 blockSize = 64; blockBytes = 18; return true;
+            case GgufType.TRL1:
+                blockSize = 16; blockBytes = 2; return true;
+            case GgufType.TRL2:
+                blockSize = 16; blockBytes = 4; return true;
+            case GgufType.TRL3:
+                blockSize = 16; blockBytes = 6; return true;
+            case GgufType.TRL4:
+                blockSize = 16; blockBytes = 8; return true;
+            case GgufType.TRL5:
+                blockSize = 16; blockBytes = 10; return true;
+            case GgufType.TRL6:
+                blockSize = 16; blockBytes = 12; return true;
             case GgufType.Q4_K:
                 blockSize = 256; blockBytes = 144; return true;
             case GgufType.Q6_K:
@@ -192,6 +217,12 @@ public sealed class GgufTensorInfo
             GgufType.Q2_0 => (count / 64) * 20,    // 64 elements in 20 bytes (2.50 b/w fast MoE block)
             GgufType.MXFP4 => (count / 32) * 17,  // 32 elements in 17 bytes (E8M0 + 32x E2M1 FP4)
             GgufType.GgmlQ2_0 => (count / 64) * 18, // 64 elements in 18 bytes (upstream GGML_TYPE_Q2_0 = 42, 2.25 b/w)
+            GgufType.TRL1 => (count / 16) * 2,  // NariQ trellis 1 bpw (16x16 tiles, 2 bytes per 16 elements)
+            GgufType.TRL2 => (count / 16) * 4,  // NariQ trellis 2 bpw
+            GgufType.TRL3 => (count / 16) * 6,  // NariQ trellis 3 bpw
+            GgufType.TRL4 => (count / 16) * 8,  // NariQ trellis 4 bpw
+            GgufType.TRL5 => (count / 16) * 10, // NariQ trellis 5 bpw
+            GgufType.TRL6 => (count / 16) * 12, // NariQ trellis 6 bpw
             GgufType.Ternary_1_58 or GgufType.PQ2_0 => (count / 256) * 68, // 256 elements in 68 bytes (2.125 b/w multiplication-free ternary / Prism PQ2_0)
             _ => count * 2 // conservative fallback
         };

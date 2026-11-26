@@ -15,6 +15,9 @@ internal sealed unsafe class VulkanCompute : IDisposable
     public readonly VulkanContext Ctx;
     private readonly IntPtr _pool;
     private readonly List<(IntPtr Buf, IntPtr Mem)> _bufs = new();
+    private IntPtr _stagingBuf;
+    private IntPtr _stagingMem;
+    private ulong _stagingSize;
     private readonly Dictionary<IntPtr, SetAccessInfo> _setAccess = new();
     private ulong[] _writtenBits = new ulong[16];
     private ulong[] _touchedBits = new ulong[16];
@@ -105,6 +108,111 @@ internal sealed unsafe class VulkanCompute : IDisposable
         var g = Alloc(bytes);
         g.UploadFrom(src, bytes);
         return g;
+    }
+
+    /// <summary>
+    /// Allocates a pure DEVICE_LOCAL storage buffer on discrete GPUs (full GDDR6 bandwidth),
+    /// or a standard UMA buffer on integrated APUs.
+    /// </summary>
+    public GBuf AllocDeviceOnly(long bytes)
+    {
+        if (!Ctx.PreferDeviceLocalStaging)
+        {
+            return Alloc(bytes);
+        }
+
+        const uint hostCoherent = VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VulkanDriver.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        ulong allocBytes = (ulong)Math.Max(bytes, 16);
+        Ctx.CreateBufferPreferred(
+            allocBytes,
+            VulkanDriver.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VulkanDriver.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            out var b,
+            out var m,
+            (VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+            (VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0u),
+            (hostCoherent, 0u));
+
+        int id = _nextBufId++;
+        int word = id >> 6;
+        if (word >= _writtenBits.Length)
+        {
+            int newCap = Math.Max(word + 1, _writtenBits.Length * 2);
+            Array.Resize(ref _writtenBits, newCap);
+            Array.Resize(ref _touchedBits, newCap);
+        }
+
+        _bufs.Add((b, m));
+        return new GBuf { Buf = b, Mem = m, Size = allocBytes, Id = id, Owner = this };
+    }
+
+    /// <summary>
+    /// Allocates a high-bandwidth DEVICE_LOCAL buffer and populates it from host memory via a reusable
+    /// staging buffer + vkCmdCopyBuffer on discrete GPUs (or direct memcpy on UMA APUs).
+    /// </summary>
+    public GBuf AllocDeviceFrom(void* src, long bytes)
+    {
+        if (!Ctx.PreferDeviceLocalStaging)
+        {
+            return AllocFrom(src, bytes);
+        }
+
+        var dst = AllocDeviceOnly(bytes);
+        if (bytes <= 0) return dst;
+
+        const ulong maxChunk = 32UL * 1024UL * 1024UL;
+        ulong wantStaging = Math.Min((ulong)bytes, maxChunk);
+        if (_stagingBuf == IntPtr.Zero || _stagingSize < wantStaging)
+        {
+            if (_stagingBuf != IntPtr.Zero)
+            {
+                Ctx.DestroyBuffer(_stagingBuf, _stagingMem);
+                _stagingBuf = IntPtr.Zero;
+                _stagingMem = IntPtr.Zero;
+                _stagingSize = 0;
+            }
+            ulong allocStaging = Math.Max(wantStaging, 4UL * 1024UL * 1024UL);
+            const uint hostCoherent = VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VulkanDriver.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            Ctx.CreateBufferPreferred(
+                allocStaging,
+                VulkanDriver.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                out _stagingBuf,
+                out _stagingMem,
+                (hostCoherent, VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                (hostCoherent, 0u));
+            _stagingSize = allocStaging;
+        }
+
+        byte* srcPtr = (byte*)src;
+        ulong offset = 0;
+        ulong remaining = (ulong)bytes;
+        IntPtr cb = Cmd;
+
+        while (remaining > 0)
+        {
+            ulong chunk = Math.Min(remaining, _stagingSize);
+            Ctx.CopyToBuffer(_stagingMem, (IntPtr)(srcPtr + offset), chunk);
+
+            VulkanDriver.ResetCommandBuffer(cb, 0);
+            var begin = new VulkanDriver.VkCommandBufferBeginInfo { sType = VulkanDriver.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            Check(VulkanDriver.BeginCommandBuffer(cb, ref begin), "vkBeginCommandBuffer(staging)");
+            var copy = new VulkanDriver.VkBufferCopy { srcOffset = 0, dstOffset = offset, size = chunk };
+            VulkanDriver.CmdCopyBuffer(cb, _stagingBuf, dst.Buf, 1, &copy);
+            Check(VulkanDriver.EndCommandBuffer(cb), "vkEndCommandBuffer(staging)");
+
+            var submit = new VulkanDriver.VkSubmitInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                commandBufferCount = 1,
+                pCommandBuffers = (IntPtr)(&cb)
+            };
+            Check(VulkanDriver.QueueSubmit(Ctx.ComputeQueueHandle, 1, ref submit, IntPtr.Zero), "vkQueueSubmit(staging)");
+            Ctx.Synchronize();
+
+            offset += chunk;
+            remaining -= chunk;
+        }
+
+        return dst;
     }
 
     /// <summary>Loads a kernel from the SPIR-V embedded in this assembly (Gpu/Vulkan/Shaders/&lt;name&gt;.spv).</summary>
@@ -332,6 +440,13 @@ internal sealed unsafe class VulkanCompute : IDisposable
         if (_disposed) return;
         _disposed = true;
         Ctx.Synchronize();
+        if (_stagingBuf != IntPtr.Zero)
+        {
+            Ctx.DestroyBuffer(_stagingBuf, _stagingMem);
+            _stagingBuf = IntPtr.Zero;
+            _stagingMem = IntPtr.Zero;
+            _stagingSize = 0;
+        }
         foreach (var (b, m) in _bufs) Ctx.DestroyBuffer(b, m);
         _bufs.Clear();
     }

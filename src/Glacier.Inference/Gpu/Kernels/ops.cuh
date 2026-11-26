@@ -129,7 +129,7 @@ __global__ void vec_add_weighted_kernel(
 // =========================================================================
 // 7. RoPE Kernel (Rotary Position Embedding, NeOX style)
 // =========================================================================
-__global__ void rope_kernel(
+__device__ __forceinline__ void rope_kernel_impl(
     float* __restrict__ q,
     float* __restrict__ k,
     int n_heads_q,
@@ -163,11 +163,37 @@ __global__ void rope_kernel(
     vec[i + half_dim] = v0 * sin_theta + v1 * cos_theta;
 }
 
+__global__ void rope_kernel(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int pos,
+    float freq_base,
+    float freq_scale
+) {
+    rope_kernel_impl(q, k, n_heads_q, n_heads_kv, head_dim, pos, freq_base, freq_scale);
+}
+
+__global__ void rope_kernel_dpos(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    const int* __restrict__ d_pos,
+    float freq_base,
+    float freq_scale
+) {
+    rope_kernel_impl(q, k, n_heads_q, n_heads_kv, head_dim, *d_pos, freq_base, freq_scale);
+}
+
 // =========================================================================
 // 8. KV Cache Store Kernel: writes K and V vectors for current pos (FP32)
 // Layout in VRAM per layer: [n_heads_kv, max_seq_len, head_dim]
 // =========================================================================
-__global__ void kv_cache_store_kernel(
+__device__ __forceinline__ void kv_cache_store_impl(
     float* __restrict__ k_cache,
     float* __restrict__ v_cache,
     const float* __restrict__ k,
@@ -190,10 +216,36 @@ __global__ void kv_cache_store_kernel(
     v_cache[offset] = v[idx];
 }
 
+__global__ void kv_cache_store_kernel(
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    kv_cache_store_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, pos);
+}
+
+__global__ void kv_cache_store_dpos(
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos
+) {
+    kv_cache_store_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, *d_pos);
+}
+
 // =========================================================================
 // 8b. FP16 KV Cache Store Kernel
 // =========================================================================
-__global__ void kv_cache_store_f16(
+__device__ __forceinline__ void kv_cache_store_f16_impl(
     half* __restrict__ k_cache,
     half* __restrict__ v_cache,
     const float* __restrict__ k,
@@ -216,10 +268,36 @@ __global__ void kv_cache_store_f16(
     v_cache[offset] = __float2half(v[idx]);
 }
 
+__global__ void kv_cache_store_f16(
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    kv_cache_store_f16_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, pos);
+}
+
+__global__ void kv_cache_store_f16_dpos(
+    half* __restrict__ k_cache,
+    half* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos
+) {
+    kv_cache_store_f16_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, *d_pos);
+}
+
 // =========================================================================
 // 8c. FP8 (e4m3) KV Cache Store Kernel
 // =========================================================================
-__global__ void kv_cache_store_fp8(
+__device__ __forceinline__ void kv_cache_store_fp8_impl(
     __nv_fp8_e4m3* __restrict__ k_cache,
     __nv_fp8_e4m3* __restrict__ v_cache,
     const float* __restrict__ k,
@@ -240,6 +318,32 @@ __global__ void kv_cache_store_fp8(
     size_t offset = ((size_t)h * max_seq_len + pos) * head_dim + d;
     k_cache[offset] = __nv_fp8_e4m3(k[idx]);
     v_cache[offset] = __nv_fp8_e4m3(v[idx]);
+}
+
+__global__ void kv_cache_store_fp8(
+    __nv_fp8_e4m3* __restrict__ k_cache,
+    __nv_fp8_e4m3* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    kv_cache_store_fp8_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, pos);
+}
+
+__global__ void kv_cache_store_fp8_dpos(
+    __nv_fp8_e4m3* __restrict__ k_cache,
+    __nv_fp8_e4m3* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos
+) {
+    kv_cache_store_fp8_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, *d_pos);
 }
 
 // =========================================================================
@@ -280,7 +384,7 @@ __device__ __forceinline__ void quantize_warp_q4_0(float val, int lane_id, Block
     }
 }
 
-__global__ void kv_cache_store_q4_0(
+__device__ __forceinline__ void kv_cache_store_q4_0_impl(
     BlockQ4_0* __restrict__ k_cache,
     BlockQ4_0* __restrict__ v_cache,
     const float* __restrict__ k,
@@ -307,6 +411,32 @@ __global__ void kv_cache_store_q4_0(
     size_t dst_idx = ((size_t)h * max_seq_len + pos) * blocks_per_head + b;
     quantize_warp_q4_0(k_val, lane_id, &k_cache[dst_idx]);
     quantize_warp_q4_0(v_val, lane_id, &v_cache[dst_idx]);
+}
+
+__global__ void kv_cache_store_q4_0(
+    BlockQ4_0* __restrict__ k_cache,
+    BlockQ4_0* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos
+) {
+    kv_cache_store_q4_0_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, pos);
+}
+
+__global__ void kv_cache_store_q4_0_dpos(
+    BlockQ4_0* __restrict__ k_cache,
+    BlockQ4_0* __restrict__ v_cache,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos
+) {
+    kv_cache_store_q4_0_impl(k_cache, v_cache, k, v, n_heads_kv, head_dim, max_seq_len, *d_pos);
 }
 
 // =========================================================================

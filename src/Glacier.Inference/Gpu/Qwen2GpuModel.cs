@@ -55,12 +55,19 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnVecAdd;
     private IntPtr _fnVecAddWeighted;
     private IntPtr _fnRope;
+    private IntPtr _fnRopeDpos;
     private IntPtr _fnKvCacheStore;
+    private IntPtr _fnKvCacheStoreDpos;
     private IntPtr _fnKvCacheStoreF16;
+    private IntPtr _fnKvCacheStoreF16Dpos;
     private IntPtr _fnKvCacheStoreFp8;
+    private IntPtr _fnKvCacheStoreFp8Dpos;
     private IntPtr _fnAttentionGqa;
+    private IntPtr _fnAttentionGqaDpos;
     private IntPtr _fnAttentionGqaF16;
+    private IntPtr _fnAttentionGqaF16Dpos;
     private IntPtr _fnAttentionGqaFp8;
+    private IntPtr _fnAttentionGqaFp8Dpos;
     private IntPtr _fnRmsNormHeads;
 
     // Batched Prefill Kernels & Buffers (batchSize <= 32)
@@ -84,7 +91,9 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     private IntPtr _fnAttentionGqaBatchFp8;
     private IntPtr _fnAttentionGqaBatchQ4_0;
     private IntPtr _fnKvCacheStoreQ4_0;
+    private IntPtr _fnKvCacheStoreQ4_0Dpos;
     private IntPtr _fnAttentionGqaQ4_0;
+    private IntPtr _fnAttentionGqaQ4_0Dpos;
     private IntPtr _fnPagedKvStoreF16;
     private IntPtr _fnPagedKvStoreBatchF16;
     private IntPtr _fnPagedAttnGqaF16;
@@ -107,12 +116,17 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
     public long KvCacheBytesPerLayer => (long)_kvBytesPerLayer;
     public long TotalKvCacheBytes => (long)_kvBytesPerLayer * 2L * LayerCount;
 
-    // CUDA Non-Blocking Streams and Events for Concurrent Projections
+    // CUDA Streams, Events, and Graph Capture State for Single-Token Decode
+    private IntPtr _streamMain;
     private IntPtr _streamK;
     private IntPtr _streamV;
     private IntPtr _eventNormDone;
     private IntPtr _eventKDone;
     private IntPtr _eventVDone;
+    private IntPtr _dPos;
+    private IntPtr _graphExecLogits;
+    private IntPtr _graphExecNoLogits;
+    private bool _graphDisabled;
 
     // GPU VRAM Weights
     private IntPtr _dOutNormWeight;
@@ -341,14 +355,23 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAdd, _module, "vec_add_kernel"), "ModuleGetFunction(vec_add_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnVecAddWeighted, _module, "vec_add_weighted_kernel"), "ModuleGetFunction(vec_add_weighted_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRope, _module, "rope_kernel"), "ModuleGetFunction(rope_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRopeDpos, _module, "rope_kernel_dpos"), "ModuleGetFunction(rope_kernel_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStore, _module, "kv_cache_store_kernel"), "ModuleGetFunction(kv_cache_store_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreDpos, _module, "kv_cache_store_dpos"), "ModuleGetFunction(kv_cache_store_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16, _module, "kv_cache_store_f16"), "ModuleGetFunction(kv_cache_store_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreF16Dpos, _module, "kv_cache_store_f16_dpos"), "ModuleGetFunction(kv_cache_store_f16_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8, _module, "kv_cache_store_fp8"), "ModuleGetFunction(kv_cache_store_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreFp8Dpos, _module, "kv_cache_store_fp8_dpos"), "ModuleGetFunction(kv_cache_store_fp8_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreQ4_0, _module, "kv_cache_store_q4_0"), "ModuleGetFunction(kv_cache_store_q4_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnKvCacheStoreQ4_0Dpos, _module, "kv_cache_store_q4_0_dpos"), "ModuleGetFunction(kv_cache_store_q4_0_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqa, _module, "attention_gqa_kernel"), "ModuleGetFunction(attention_gqa_kernel)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaDpos, _module, "attention_gqa_dpos"), "ModuleGetFunction(attention_gqa_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16, _module, "attention_gqa_f16"), "ModuleGetFunction(attention_gqa_f16)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaF16Dpos, _module, "attention_gqa_f16_dpos"), "ModuleGetFunction(attention_gqa_f16_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8, _module, "attention_gqa_fp8"), "ModuleGetFunction(attention_gqa_fp8)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaFp8Dpos, _module, "attention_gqa_fp8_dpos"), "ModuleGetFunction(attention_gqa_fp8_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaQ4_0, _module, "attention_gqa_q4_0"), "ModuleGetFunction(attention_gqa_q4_0)");
+            CuDriver.Check(CuDriver.ModuleGetFunction(out _fnAttentionGqaQ4_0Dpos, _module, "attention_gqa_q4_0_dpos"), "ModuleGetFunction(attention_gqa_q4_0_dpos)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRmsNormHeads, _module, "rms_norm_heads_kernel"), "ModuleGetFunction(rms_norm_heads_kernel)");
 
             // 2b. Retrieve batched prefill kernels
@@ -385,15 +408,21 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnArgmax, _module, "argmax_kernel"), "ModuleGetFunction(argmax_kernel)");
             CuDriver.Check(CuDriver.ModuleGetFunction(out _fnRepetitionPenalty, _module, "apply_repetition_penalty_kernel"), "ModuleGetFunction(apply_repetition_penalty_kernel)");
 
-            // 2c. Create non-blocking streams and events for concurrent Q/K/V projections
+            // 2c. Create streams and events for concurrent Q/K/V projections + CUDA Graph capture
+            // _streamMain uses flags=0 (default-stream-synchronized) so legacy default-stream callers
+            // (SampleGreedy, CopyLogitsToHost, ForwardBatch, ResetKvCache) order cleanly after GraphLaunch.
+            CuDriver.Check(CuDriver.StreamCreate(out _streamMain, 0), "StreamCreate(streamMain)");
             CuDriver.Check(CuDriver.StreamCreate(out _streamK, 1), "StreamCreate(streamK)");
             CuDriver.Check(CuDriver.StreamCreate(out _streamV, 1), "StreamCreate(streamV)");
-            CuDriver.Check(CuDriver.EventCreate(out _eventNormDone, 0), "EventCreate(eventNormDone)");
-            CuDriver.Check(CuDriver.EventCreate(out _eventKDone, 0), "EventCreate(eventKDone)");
-            CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 0), "EventCreate(eventVDone)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventNormDone, 2), "EventCreate(eventNormDone)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventKDone, 2), "EventCreate(eventKDone)");
+            CuDriver.Check(CuDriver.EventCreate(out _eventVDone, 2), "EventCreate(eventVDone)");
+            _graphDisabled = Environment.GetEnvironmentVariable("GLACIER_CUDA_NO_GRAPH") == "1";
 
             // 3. Allocate GPU VRAM scratch buffers (single token)
             int maxAttnOut = Math.Max(_dim, _nHeads * _headDim);
+            _dPos = _gpu.AllocateDevice(16);
+            CuDriver.Check(CuDriver.MemsetD8(_dPos, 0, 16), "MemsetD8(dPos)");
             _dX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
             _dNormX = _gpu.AllocateDevice((nuint)(_dim * sizeof(float)));
             _dQ = _gpu.AllocateDevice((nuint)(_nHeads * _headDim * sizeof(float)));
@@ -609,7 +638,8 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
         if (_disposed) return;
         if (_gpu != null || _module != IntPtr.Zero || _hXPinned != IntPtr.Zero ||
             _eventNormDone != IntPtr.Zero || _eventKDone != IntPtr.Zero || _eventVDone != IntPtr.Zero ||
-            _streamK != IntPtr.Zero || _streamV != IntPtr.Zero)
+            _streamMain != IntPtr.Zero || _streamK != IntPtr.Zero || _streamV != IntPtr.Zero ||
+            _graphExecLogits != IntPtr.Zero || _graphExecNoLogits != IntPtr.Zero)
         {
             DisposeCudaResources();
         }
@@ -625,14 +655,19 @@ public sealed unsafe partial class Qwen2GpuModel : IDisposable
             CuDriver.CtxSetCurrent(_gpu.Handle);
         }
 
+            if (_streamMain != IntPtr.Zero) { CuDriver.StreamSynchronize(_streamMain); }
+            if (_graphExecLogits != IntPtr.Zero) { CuDriver.GraphExecDestroy(_graphExecLogits); _graphExecLogits = IntPtr.Zero; }
+            if (_graphExecNoLogits != IntPtr.Zero) { CuDriver.GraphExecDestroy(_graphExecNoLogits); _graphExecNoLogits = IntPtr.Zero; }
             if (_eventNormDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventNormDone); _eventNormDone = IntPtr.Zero; }
             if (_eventKDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventKDone); _eventKDone = IntPtr.Zero; }
             if (_eventVDone != IntPtr.Zero) { CuDriver.EventDestroy(_eventVDone); _eventVDone = IntPtr.Zero; }
+            if (_streamMain != IntPtr.Zero) { CuDriver.StreamDestroy(_streamMain); _streamMain = IntPtr.Zero; }
             if (_streamK != IntPtr.Zero) { CuDriver.StreamDestroy(_streamK); _streamK = IntPtr.Zero; }
             if (_streamV != IntPtr.Zero) { CuDriver.StreamDestroy(_streamV); _streamV = IntPtr.Zero; }
 
             if (_gpu != null && _gpu.Handle != IntPtr.Zero)
             {
+                _gpu.FreeDevice(_dPos); _dPos = IntPtr.Zero;
                 _gpu.FreeDevice(_dX); _dX = IntPtr.Zero;
                 _gpu.FreeDevice(_dNormX); _dNormX = IntPtr.Zero;
                 _gpu.FreeDevice(_dQ); _dQ = IntPtr.Zero;

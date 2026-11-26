@@ -279,9 +279,11 @@ public sealed unsafe class ModelWeights : IDisposable
     public int EmbeddedMtpBlockIndex { get; } = -1;
 
     private readonly List<IntPtr> _ownedFloatBuffers = new();
+    private readonly List<IntPtr> _registeredTrellisPtrs = new();
     private HostRamExpertArena? _expertArena;
     private bool _disposed;
 
+    public bool HasTrellisWeights => _registeredTrellisPtrs.Count > 0;
     public LayerWeights[] Layers { get; }
     public Inkling2Weights? Inkling2 { get; }
     public HostRamExpertArena? ExpertArena => _expertArena;
@@ -289,6 +291,7 @@ public sealed unsafe class ModelWeights : IDisposable
     public ModelWeights(GgufFile gguf)
     {
         Gguf = gguf;
+        RegisterTrellisWeights(gguf);
 
         int embeddedMtpBlockIndex = -1;
         int blockCount = gguf.BlockCount;
@@ -438,6 +441,15 @@ public sealed unsafe class ModelWeights : IDisposable
             if (embdInfo == null && outInfo.Dimensions.Length >= 2)
             {
                 VocabSize = (int)outInfo.Dimensions[1];
+            }
+        }
+        else if (gguf.TrellisLmHeadBands > 0 && TryRegisterBandedTrellis(gguf, "output", gguf.TrellisLmHeadBands, out var bandedOutPtr, out var bandedOutType, out var bandedVocab))
+        {
+            OutWeight = bandedOutPtr;
+            OutType = bandedOutType;
+            if (embdInfo == null && bandedVocab > 0)
+            {
+                VocabSize = bandedVocab;
             }
         }
         else
@@ -1305,10 +1317,117 @@ public sealed unsafe class ModelWeights : IDisposable
         return _expertArena;
     }
 
+    private void RegisterTrellisWeights(GgufFile gguf)
+    {
+        bool anyTrellis = false;
+        for (int i = 0; i < gguf.TensorList.Count; i++)
+        {
+            if (GgufTypes.IsTrellis(gguf.TensorList[i].Type))
+            {
+                anyTrellis = true;
+                break;
+            }
+        }
+        if (!anyTrellis) return;
+
+        if (gguf.TrellisVersion != 1)
+            throw new InvalidDataException($"Unsupported NariQ trellis.version={gguf.TrellisVersion}; expected 1.");
+
+        for (int i = 0; i < gguf.TensorList.Count; i++)
+        {
+            var t = gguf.TensorList[i];
+            if (!GgufTypes.IsTrellis(t.Type)) continue;
+            if (t.Dimensions.Length != 2 || !t.Name.EndsWith(".weight", StringComparison.Ordinal))
+                continue;
+
+            int k = (int)t.Dimensions[0];
+            int n = (int)t.Dimensions[1];
+            string baseName = t.Name[..^7];
+            int[]? desc = gguf.GetTrellisDescriptor(baseName);
+            if (desc == null || !TrellisKernels.IsDescriptorSupported(k, n, desc))
+                throw new InvalidDataException($"Unsupported or missing trellis descriptor for '{t.Name}'.");
+
+            if (!gguf.TryGetTensor($"{baseName}.trellis_s16", out var s16Info) || s16Info == null ||
+                !gguf.TryGetTensor($"{baseName}.trellis_pre", out var preInfo) || preInfo == null ||
+                !gguf.TryGetTensor($"{baseName}.trellis_post", out var postInfo) || postInfo == null)
+            {
+                throw new InvalidDataException($"Missing required NariQ side tensors (s16/pre/post) for '{t.Name}'.");
+            }
+
+            gguf.TryGetTensor($"{baseName}.trellis_pin", out var pinInfo);
+            gguf.TryGetTensor($"{baseName}.trellis_pout", out var poutInfo);
+
+            byte* codePtr = gguf.GetTensorPointer(t);
+            var binding = new TrellisWeightBinding
+            {
+                Type = t.Type,
+                CodeData = codePtr,
+                K = k,
+                N = n,
+                S16 = (ushort*)gguf.GetTensorPointer(s16Info),
+                Pre = (float*)gguf.GetTensorPointer(preInfo),
+                Post = (float*)gguf.GetTensorPointer(postInfo),
+                Pin = pinInfo != null ? (int*)gguf.GetTensorPointer(pinInfo) : null,
+                Pout = poutInfo != null ? (int*)gguf.GetTensorPointer(poutInfo) : null,
+                Descriptor = desc,
+            };
+            TrellisWeightRegistry.Register(binding);
+            _registeredTrellisPtrs.Add((IntPtr)codePtr);
+        }
+    }
+
+    private bool TryRegisterBandedTrellis(
+        GgufFile gguf, string headName, int bandCount,
+        out byte* keyPtr, out GgufType keyType, out int totalN)
+    {
+        keyPtr = null;
+        keyType = GgufType.F32;
+        totalN = 0;
+
+        if (!gguf.TryGetTensor($"{headName}.vocab_gather", out var gatherInfo) || gatherInfo == null)
+            return false;
+
+        var bands = new TrellisWeightBinding[bandCount];
+        int k = 0;
+        for (int b = 0; b < bandCount; b++)
+        {
+            string tensorName = $"{headName}.band{b:D2}.weight";
+            if (!gguf.TryGetTensor(tensorName, out var info) || info == null)
+                return false;
+            byte* ptr = gguf.GetTensorPointer(info);
+            if (!TrellisWeightRegistry.TryGet(ptr, out var binding) || binding == null)
+                return false;
+            bands[b] = binding;
+            if (b == 0)
+            {
+                keyPtr = ptr;
+                keyType = info.Type;
+                k = binding.K;
+            }
+            totalN += binding.N;
+        }
+
+        var banded = new TrellisBandedWeight
+        {
+            Bands = bands,
+            VocabGather = (int*)gguf.GetTensorPointer(gatherInfo),
+            K = k,
+            TotalN = totalN,
+        };
+        TrellisWeightRegistry.RegisterBanded(keyPtr, banded);
+        return true;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+
+        for (int i = 0; i < _registeredTrellisPtrs.Count; i++)
+        {
+            TrellisWeightRegistry.Unregister((byte*)_registeredTrellisPtrs[i]);
+        }
+        _registeredTrellisPtrs.Clear();
 
         _expertArena?.Dispose();
         _expertArena = null;

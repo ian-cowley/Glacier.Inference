@@ -24,6 +24,19 @@ public static unsafe partial class QuantKernels
     /// </summary>
     public static void MatVecMul(GgufType type, byte* weightData, float* x, float* y, int nCols, int nRows, float* xSums)
     {
+        if (GgufTypes.IsTrellis(type))
+        {
+            if (TrellisWeightRegistry.TryGetBanded(weightData, out var banded) && banded != null)
+            {
+                TrellisKernels.MatVecMulBanded(banded, x, y);
+                return;
+            }
+            if (!TrellisWeightRegistry.TryGet(weightData, out var trellis) || trellis == null)
+                throw new InvalidOperationException($"NariQ trellis weight ({type}) was not registered in TrellisWeightRegistry.");
+            TrellisKernels.MatVecMul(trellis, x, y);
+            return;
+        }
+
         Debug.Assert(nCols > 0 && (type is GgufType.F32 or GgufType.F16 or GgufType.BF16 || nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (type == GgufType.Q4_K && xSums == null && nCols >= 32)
         {
@@ -74,6 +87,21 @@ public static unsafe partial class QuantKernels
         int batchSize,
         float* xSumsBatch = null)
     {
+        if (GgufTypes.IsTrellis(type))
+        {
+            if (TrellisWeightRegistry.TryGetBanded(weightData, out var banded) && banded != null)
+            {
+                for (int b = 0; b < batchSize; b++)
+                    TrellisKernels.MatVecMulBanded(banded, xBatch + (long)b * nCols, yBatch + (long)b * nRows);
+                return;
+            }
+            if (!TrellisWeightRegistry.TryGet(weightData, out var trellis) || trellis == null)
+                throw new InvalidOperationException($"NariQ trellis weight ({type}) was not registered in TrellisWeightRegistry.");
+            for (int b = 0; b < batchSize; b++)
+                TrellisKernels.MatVecMul(trellis, xBatch + (long)b * nCols, yBatch + (long)b * nRows);
+            return;
+        }
+
         Debug.Assert(nCols > 0 && (type is GgufType.F32 or GgufType.F16 or GgufType.BF16 || nCols % 32 == 0), $"Matrix columns ({nCols}) must be a positive multiple of 32 for quantized SIMD dispatch.");
         if (batchSize == 1)
         {

@@ -1,16 +1,15 @@
-# Vulkan Compute Backend (Qwen 3.5 / 3.6 hybrid models)
+# Vulkan Compute Backend (Qwen 3.5 / 3.6 / 3.8 Hybrid & NariQ Models)
 
-Glacier.Inference runs the Qwen 3.5 / 3.6 hybrid family (Gated DeltaNet + interleaved full attention, dense or
-Mixture-of-Experts FFN) on any **Vulkan 1.1** GPU through `Qwen35VulkanModel`. It is the GPU path on **Linux**, where
-Direct3D 12 does not exist, and it needs only a Vulkan driver at runtime: no ROCm, no CUDA toolkit, no native
-libraries.
+Glacier.Inference runs the Qwen 3.5 / 3.6 / 3.8 hybrid family (Gated DeltaNet + interleaved full attention, dense or
+Mixture-of-Experts FFN, including NariQ `TRL1..TRL6` trellis-coded models) on any **Vulkan 1.3** or **Vulkan 1.1** GPU through `Qwen35VulkanModel`.
+It is the primary GPU path on **Linux**, where Direct3D 12 does not exist, and also runs via `--engine vulkan` on Windows with only a Vulkan driver installed (no ROCm or CUDA toolkit).
 
 | | |
 | :--- | :--- |
 | Entry point | `InferenceSession` selects it automatically (non-Windows, hardware Vulkan device, hybrid-SSM model); `--engine vulkan` forces the engine choice |
-| Source | `src/Glacier.Inference/Gpu/Vulkan/` (`Qwen35VulkanModel.cs`, `VulkanCompute.cs`) and `Shaders/*.comp` |
-| Tests | `tests/Glacier.Inference.Tests/VulkanKernelTests.cs` (skipped when no hardware Vulkan device is present) |
-| Windows | Windows keeps using the Direct3D 12 path; the Vulkan runner is not selected there |
+| Source | `src/Glacier.Inference/Gpu/Vulkan/` (`VulkanDriver.cs`, `VulkanContext.cs`, `VulkanRunnerBase.cs`, `TrellisVulkanRunner.cs`, `Qwen35VulkanModel.cs`) and `Shaders/*.spv` |
+| Tests | `tests/Glacier.Inference.Tests/VulkanKernelTests.cs` & `NariQGpuParityTests.cs` (skipped when no hardware Vulkan device is present) |
+| Windows | Windows keeps using Direct3D 12 or bare-metal CUDA by default; `--engine vulkan` runs the Vulkan runner on Windows GPUs too |
 
 ## 1. What is supported
 
@@ -19,62 +18,49 @@ libraries.
   layers with a Q gate, no attention biases, no custom RoPE frequency table. `ssm_alpha` / `ssm_beta` may be F32 or any supported
   quantisation type (quantised ones are dequantised on the host at upload; they are tiny).
   Dense and MoE (with shared expert and sigmoid shared-expert gate) FFNs are both implemented.
-* **Weight types:** `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` for every weight matrix, the token embedding and the output head. A file that
-  contains any other weight type (for example the `IQ4_XS` tensors in `Qwen3.6-27B-UD-Q4_K_XL`) is rejected **before any GPU
-  memory is allocated**; the reason is logged and the CPU engine is used.
-* **Not implemented yet:** batched GPU prefill (prompt tokens are processed one at a time), cooperative-matrix kernels,
-  other quantisation types, multi-GPU pipeline splitting for this runner, and KV-cache precisions other than FP32.
+* **Weight types:**
+  * Standard GGUF quants: `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` across matrix projections, token embedding, and output head.
+  * **NariQ Trellis (`TRL1..TRL6`)**: `Qwen3.8-27B-NariQ` (`2.5bpw` / `3.0bpw`) with `trellis_s16` folded into weight scaling, pre/post Sylvester (`H * H = I`) and Paley/Kronecker (`m in {1, 12, 20, 68}`) Hadamard rotations, `trellis_pin` / `trellis_pout` permutations, and 16-band mixed-bitrate LM heads (`output.band00..15` + `vocab_gather`). Token embeddings decode row-by-row on the CPU to save ~0.8 GB of VRAM.
+  * Unsupported tensors (`IQ4_XS`, `Q2_K`, `Q3_K`, `F16`) are rejected **before GPU allocation**; the reason is logged and execution falls back to CPU.
+* **Not implemented yet:** batched GPU prefill (prompt tokens are processed one at a time), cooperative-matrix kernels in `Qwen35VulkanModel`, multi-GPU pipeline splitting for this runner, and KV-cache precisions other than FP32.
 
 ## 2. How it works
 
 ```mermaid
 flowchart LR
-    G[GGUF mmap] -->|copy once| W[GPU buffers]
-    W --> P[Op plan: ~880 dispatches per token]
+    G[GGUF mmap] -->|staging or UMA copy once| W[DEVICE_LOCAL GPU buffers]
+    W --> P[Op plan: ~880-2082 dispatches per token]
     T[token, pos] --> P
     P -->|one command buffer| Q[Vulkan queue]
     Q --> L[logits]
 ```
 
-1. **Upload.** Weights are copied from the memory-mapped GGUF into host-visible storage buffers. On a unified-memory APU
-   this memory is directly visible to the GPU.
-2. **Plan.** Every dispatch of a token (embedding gather, all layers, output head) is built once as an `Op` (kernel,
-   descriptor set, push constants, grid). Only `pos`, `kvLen` and `token` are patched per token.
-3. **Replay.** A token records the whole plan into one command buffer (about 0.3 ms of CPU time), submits it and waits.
-   Only the logits (`vocab * 4` bytes) are read back, and only when requested (prompt tokens skip the output head).
+1. **Topology-Aware Upload.** `VulkanContext` negotiates Vulkan 1.3 (falling back cleanly to 1.2/1.1/1.0) and enables `VK_KHR_shader_integer_dot_product` (`SupportsIntegerDotProduct`) and subgroup shuffle (`SupportsSubgroupShuffle`). Across `VulkanRunnerBase`, `Qwen2VulkanModel`, `Gemma4VulkanModel`, `Mamba2VulkanModel`, and `Qwen35VulkanModel`, static weights stage into pure `DEVICE_LOCAL` GDDR6 via `_vk.AllocDeviceFrom(...)` when `PreferDeviceLocalStaging` is true (discrete GPUs), and allocate zero-stage host-visible `DEVICE_LOCAL` buffers on unified-memory APUs (`staging=False`).
+2. **Plan.** Every dispatch of a token is built once as an `Op` (kernel, descriptor set, push constants, grid). Only `pos`, `kvLen` and `token` are patched per token (`2,082` dispatches/token for `Qwen3.8-27B-NariQ`).
+3. **Replay.** A token records the whole plan into one command buffer, submits it, and waits. Only logits are read back when requested.
 
-### Kernels (GLSL, `Shaders/`)
+### Kernels (`Shaders/*.spv`)
 
 | Shader | Purpose |
 | :--- | :--- |
-| `qmatvec.comp` (`-DQTYPE=0..3`, optional `-DMOE`) | Mat-vec for Q4_K / Q5_K / Q6_K / Q8_0; MoE variant takes the expert index from a GPU buffer |
-| `embed.comp` | Embedding row gather and dequantisation |
-| `f32_matvec.comp` | F32 mat-vec (`ssm_alpha`, `ssm_beta`, MoE router) |
-| `rmsnorm.comp` | RMSNorm over rows (hidden state, per-head norms, QK-norm) |
-| `elementwise.comp` | SwiGLU and residual add |
-| `gdn_conv.comp`, `gdn_l2.comp`, `gdn_rec.comp` | Gated DeltaNet causal conv + SiLU, Q/K L2 norm, delta-rule state update |
-| `attn_prep.comp`, `attn_decode.comp` | Q/gate split, QK-norm, partial NeoX RoPE, KV store; softmax attention with Q gate |
-| `moe_topk.comp`, `moe_combine.comp` | Softmax + parallel top-K routing; weighted expert sum, shared expert and residual |
+| `qmatvec.comp` (`-DQTYPE=0..3`, optional `-DMOE`) | Mat-vec for Q4_K / Q5_K / Q6_K / Q8_0 |
+| `trellis_gemv_dp4a.spv` / `trellis_gemv.spv` | NariQ `TRL1..TRL6` GEMV using Vulkan 1.3 `dotPacked4x8EXT` (`v_dot4_i32_i8` / `IDP4A`) or Vulkan 1.1 32-bit SWAR fallback, with specialized 32-bit `TRL3` path and fused `s16` removal |
+| `trellis_gemv_splitk_dp4a.spv` / `trellis_gemv_splitk.spv` | 4-warp contiguous Split-K NariQ GEMV dispatched for `N <= 6144 && kt >= 64` |
+| `trellis_pre_rht_128.spv` / `trellis_post_rht_128.spv` / `trellis_pre_rht.spv` / `trellis_post_rht.spv` | Forward & inverse Hadamard rotations (`pre_128` and `post_128` use zero-barrier `GL_KHR_shader_subgroup_shuffle` intra-wave butterflies + 512 B shared memory; `pre` fuses `s16` scaling) |
+| `embed.comp`, `f32_matvec.comp`, `rmsnorm.comp`, `elementwise.comp` | Embedding gather, F32 mat-vec, RMSNorm, SwiGLU, residual add |
+| `gdn_conv.comp`, `gdn_l2.comp`, `gdn_rec.comp`, `attn_prep.comp`, `attn_decode.comp` | Gated DeltaNet state update + full softmax attention |
+| `moe_topk.comp`, `moe_combine.comp`, `trellis_vocab_gather.spv` | Top-K MoE routing/combine and banded LM-head scatter |
 
 Notes that matter when changing kernels:
 
-* **V-head to Q/K-head mapping is tiled** (`g = h % nK`), as in llama.cpp, not grouped (`h / ratio`). The CPU model and
-  the D3D12 shader had the grouped mapping, which produced garbage text for Qwen 3.5/3.6 whenever `nV > nK`; both are fixed.
-* The recurrent state is stored **transposed** on the GPU (`St[j*128 + i]`) so adjacent threads read adjacent memory.
-* `qmatvec` uses `vec4` input loads and one 32-bit weight load per thread; Q6_K and Q8_0 blocks are only 2-byte aligned and
-  use funnel-shifted 32-bit loads.
-* Kernels use no optional extensions (no cooperative matrix, no subgroup arithmetic), so they run on RADV, NVIDIA and
-  Intel drivers.
+* **Avoid large LUTs in Vulkan/CUDA trellis decode:** empirical tests showed a 64 KB packed `int8` LUT in Vulkan ran 2.2x slower on Radeon 890M (`2,524 us` vs `1,136 us`) than procedural `0x83DCD12Du` + `dotPacked4x8EXT`/SWAR decode.
+* **V-head to Q/K-head mapping is tiled** (`g = h % nK`), matching `llama.cpp`.
+* The recurrent state is stored **transposed** on the GPU (`St[j*128 + i]`).
+* **Vulkan 1.3 optional extensions degrade safely:** when `SupportsIntegerDotProduct` or `SupportsSubgroupShuffle` is false on older drivers, `TrellisVulkanRunner` falls back automatically to the Vulkan 1.1 `trellis_gemv.spv`, `trellis_gemv_splitk.spv`, and `trellis_pre_rht.spv` shaders.
 
 ### Rebuilding the shaders
 
-The SPIR-V is checked in and embedded as assembly resources (`vkshader.<name>.spv`), so **building the library does not need
-a shader compiler**. After editing any `.comp` / `.glsl` file, regenerate the binaries and commit them with the source:
-
-```bash
-cd src/Glacier.Inference/Gpu/Vulkan/Shaders
-bash build_shaders.sh        # needs glslc (Vulkan SDK, or the `glslc` package on Linux)
-```
+Embedded `.spv` binaries are checked in under `src/Glacier.Inference/Gpu/Vulkan/Shaders/`. After editing GLSL compute shaders, recompile with `glslc` (`--target-env=vulkan1.3` for `dp4a`/subgroup variants, `vulkan1.1` for fallback variants) before building `Glacier.Inference`.
 
 ## 3. Validation
 
@@ -103,6 +89,17 @@ and one profiling run reached 49.7 ms/token (about 20 tok/s) that could not be r
 steady result of the interleaved three-run benchmark; see section 5 for what is and is not understood about the variation.
 
 Dense model, single CLI run each (Qwen3.5-4B `Q4_K_M`, 2.7 GB): CPU engine 1.9 tok/s, Vulkan runner 21.8 tok/s.
+
+#### Qwen3.8-27B-NariQ (`2.5bpw`, 7.86 GB, 64 layers, 2,082 dispatches/token)
+
+| Machine & GPU | Flags Active | Live Math (64 tok) | Sustained 128-tok C# | Profile Est. (`GLACIER_VK_PROFILE=1`) |
+| :--- | :--- | :---: | :---: | :---: |
+| **AMD Radeon 890M** (Fedora 43, RADV `STRIX1`, 62.6 GB UMA) | `staging=False, dp4a=True, sgShfl=True` | **2.1 tok/s** (exact `391`) | **2.1 tok/s** | 361.62 ms (2.8 tok/s est., down from 454.20 ms) |
+| **NVIDIA RTX 3060 12 GB** (Windows, `--engine vulkan`) | `staging=True, dp4a=True, sgShfl=True` | **8.8 tok/s** (exact `391`) | **8.8 tok/s** | 157.17 ms (`TRL2` 450.4 &mu;s, `TRL4` 216.1 &mu;s; up from 6.1 / 7.6 tok/s) |
+
+Isolated NariQ FFN microbenchmark (`5120 x 17408` / `17408 x 5120`, measured via `NariQGpuParityTests` on Machine B Windows):
+* **AMD Radeon 890M Laptop:** `TRL2` **783.5 &mu;s** (`27.1 GB/s`) / Split-K `17408x5120` **689.3 &mu;s** (`30.8 GB/s`), `TRL3` **857.9 &mu;s** (`37.2 GB/s`)
+* **NVIDIA RTX 4060 Laptop (Vulkan):** `TRL2` **1,011.8 &mu;s** (`21.0 GB/s`), `TRL3` **1,020.4 &mu;s** (`31.2 GB/s`)
 
 Prompt processing is token-at-a-time (no batched prefill); llama.cpp reaches about 169 tok/s on `pp128`.
 

@@ -59,32 +59,32 @@ public sealed unsafe class Mamba2VulkanModel : VulkanRunnerBase
             int qDim = nQ * hd, kvDim = nKv * hd, ffnDim = _w.FeedForwardLength;
             float eps = _w.RmsNormEps;
 
-            var dX = _vk.Alloc((long)E * 4);
-            var dNorm = _vk.Alloc((long)E * 4);
-            var dQ = _vk.Alloc((long)qDim * 4);
-            var dK = _vk.Alloc((long)kvDim * 4);
-            var dV = _vk.Alloc((long)kvDim * 4);
-            var dQOut = _vk.Alloc((long)qDim * 4);
-            var dAttnOut = _vk.Alloc((long)qDim * 4);
-            var dProj = _vk.Alloc((long)E * 4);
-            var dGate = _vk.Alloc((long)ffnDim * 4);
-            var dUp = _vk.Alloc((long)ffnDim * 4);
+            var dX = _vk.AllocDeviceOnly((long)E * 4);
+            var dNorm = _vk.AllocDeviceOnly((long)E * 4);
+            var dQ = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dK = _vk.AllocDeviceOnly((long)kvDim * 4);
+            var dV = _vk.AllocDeviceOnly((long)kvDim * 4);
+            var dQOut = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dAttnOut = _vk.AllocDeviceOnly((long)qDim * 4);
+            var dProj = _vk.AllocDeviceOnly((long)E * 4);
+            var dGate = _vk.AllocDeviceOnly((long)ffnDim * 4);
+            var dUp = _vk.AllocDeviceOnly((long)ffnDim * 4);
             _dLogits = _vk.Alloc((long)_vocab * 4);
-            var dDummyNorm = _vk.Alloc(4);
+            var dDummyNorm = AllocDeviceZero(4);
 
             int nExp = _w.ExpertCount, topK = _w.ExpertUsedCount, moeF = _w.ExpertFeedForwardLength;
             VulkanCompute.GBuf? dRouterLogits = null, dIdx = null, dTw = null;
             VulkanCompute.GBuf? dMoeGate = null, dMoeUp = null, dMoeAct = null, dMoeDown = null, dZeroE = null;
             if (_w.IsMoe)
             {
-                dRouterLogits = _vk.Alloc((long)nExp * 4);
-                dIdx = _vk.Alloc((long)topK * 4);
-                dTw = _vk.Alloc((long)topK * 4);
-                dMoeGate = _vk.Alloc((long)topK * moeF * 4);
-                dMoeUp = _vk.Alloc((long)topK * moeF * 4);
-                dMoeAct = _vk.Alloc((long)topK * moeF * 4);
-                dMoeDown = _vk.Alloc((long)topK * E * 4);
-                dZeroE = _vk.Alloc((long)E * 4);
+                dRouterLogits = _vk.AllocDeviceOnly((long)nExp * 4);
+                dIdx = _vk.AllocDeviceOnly((long)topK * 4);
+                dTw = _vk.AllocDeviceOnly((long)topK * 4);
+                dMoeGate = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeUp = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeAct = _vk.AllocDeviceOnly((long)topK * moeF * 4);
+                dMoeDown = _vk.AllocDeviceOnly((long)topK * E * 4);
+                dZeroE = AllocDeviceZero((long)E * 4);
             }
 
             var dEmbd = UploadBytes(_w.EmbdWeight, GgufTypeSize(_w.EmbdType, (long)_vocab * E));
@@ -100,11 +100,11 @@ public sealed unsafe class Mamba2VulkanModel : VulkanRunnerBase
             VulkanCompute.GBuf? dSsmIn = null, dSsmXbcOut = null, dSsmY = null, dSsmZeroB = null, dSsmZeroD = null;
             if (ssmD > 0)
             {
-                dSsmIn = _vk.Alloc((long)ssmInDim * 4);
-                dSsmXbcOut = _vk.Alloc((long)ssmConvDim * 4);
-                dSsmY = _vk.Alloc((long)ssmD * 4);
-                dSsmZeroB = _vk.Alloc((long)ssmConvDim * 4);
-                dSsmZeroD = _vk.Alloc((long)ssmHeads * 4);
+                dSsmIn = _vk.AllocDeviceOnly((long)ssmInDim * 4);
+                dSsmXbcOut = _vk.AllocDeviceOnly((long)ssmConvDim * 4);
+                dSsmY = _vk.AllocDeviceOnly((long)ssmD * 4);
+                dSsmZeroB = AllocDeviceZero((long)ssmConvDim * 4);
+                dSsmZeroD = AllocDeviceZero((long)ssmHeads * 4);
             }
 
             long kvBytes = (long)nKv * _maxSeqLen * hd * 4;
@@ -140,8 +140,8 @@ public sealed unsafe class Mamba2VulkanModel : VulkanRunnerBase
                     var dKW = UploadBytes(l.KWeight, GgufTypeSize(l.KType, (long)kvDim * E));
                     var dVW = UploadBytes(l.VWeight, GgufTypeSize(l.VType, (long)kvDim * E));
                     var dAttnOutW = UploadBytes(l.AttnOutWeight, GgufTypeSize(l.AttnOutType, (long)E * qDim));
-                    var kCache = _vk.Alloc(kvBytes);
-                    var vCache = _vk.Alloc(kvBytes);
+                    var kCache = _vk.AllocDeviceOnly(kvBytes);
+                    var vCache = _vk.AllocDeviceOnly(kvBytes);
 
                     AddRmsNorm(_layerOps, dX, dAttnNorm, dNorm, E, eps);
                     AddQmv(_layerOps, l.QType, dQW, dNorm, dQ, E, qDim);

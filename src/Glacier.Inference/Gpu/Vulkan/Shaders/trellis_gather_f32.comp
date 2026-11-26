@@ -1,0 +1,18 @@
+#version 450
+// NariQ Trellis Gather: dst[i] = src[gather_idx[i]] (used for pout and banded vocab_gather)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BufSrc { float src[]; };
+layout(set = 0, binding = 1) readonly buffer BufIdx { int   gather_idx[]; };
+layout(set = 0, binding = 2) writeonly buffer BufDst { float dst[]; };
+
+layout(push_constant) uniform PC {
+    int N;
+};
+
+void main() {
+    int idx = int(gl_GlobalInvocationID.x);
+    if (idx < N) {
+        dst[idx] = src[gather_idx[idx]];
+    }
+}

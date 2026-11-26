@@ -3,12 +3,19 @@
 All notable changes to Glacier.Inference are recorded here. Versions follow the package version in
 `src/Glacier.Inference/Glacier.Inference.csproj`.
 
-## Unreleased
+## [1.10.0] - 2026-11-26
 
 ### Added
+- **Full NariQ (`TRL1..TRL6`) support across CPU, CUDA, and Vulkan (`Qwen3.8-27B-NariQ`):**
+  - Added `GGML_TYPE_TRL1..TRL6` format metadata, `TrellisKernels` (Sylvester & Paley/Kronecker Hadamard RHT, permutation indices, 16-band mixed-bitrate LM head + `vocab_gather`, CPU row-by-row embedding decode), `Qwen35CudaModel` + `TrellisCudaRunner` (`trellis.cuh` + `qwen35.cuh`), and Vulkan NariQ runner (`TrellisVulkanRunner`).
+  - CUDA SASS & fusion optimizations (`kernels.cubin`): zero-`>>2` unsigned `IDP.4A.U8.U8` decode, `PRMT` shift-sharing bit unpacking (`40` regs), 8-warp Split-K (`trellis_gemv_splitk8`), dynamic SMEM + warp-shuffle FWHT, fused `trellis_pre_rht_swiglu` & `q35_add_rmsnorm`, GDN state write elimination, and 3-stream CUDA Graph capture (`19.7 tok/s` FullGraph / `19.2 tok/s` live on RTX 3060 `2.5bpw`; `17.9 tok/s` live on `3.0bpw`).
+- **Vulkan 1.3 upgrade (`dotPacked4x8EXT`, subgroup shuffles, Split-K, and discrete `DEVICE_LOCAL` placement):**
+  - Negotiates Vulkan 1.3 (with Vulkan 1.1 SWAR fallback), adds `trellis_gemv_dp4a.spv`, `trellis_gemv_splitk_dp4a.spv`, `trellis_pre_rht_128.spv`, and `trellis_post_rht_128.spv` (using `vec2` loads, zero-`>>2` / zero-`I2F` IEEE-754 `dotPacked4x8EXT`, branchless `bitfieldExtract` `TRL2/TRL3/TRL4`, and subgroup-shuffle butterflies), and places static weights in `DEVICE_LOCAL` VRAM across `VulkanRunnerBase`, `Qwen2VulkanModel`, `Gemma4VulkanModel`, `Mamba2VulkanModel`, and `Qwen35VulkanModel` (`8.8 tok/s` RTX 3060 `--engine vulkan`, `2.1 tok/s` live / `2.8 tok/s` est. profile Fedora Radeon 890M on `2.5bpw`).
+- **CUDA Graph capture for standard transformers (`Qwen2GpuModel`):**
+  - Added 9 device-position (`_dPos`) RoPE/KV-cache/GQA kernels in `ops.cuh` / `attention.cuh` and single/multi-stream graph capture (`GLACIER_CUDA_NO_GRAPH=1` disables), delivering `71.03 tok/s` vs `62.19 tok/s` (`+14.2%`) on RTX 3060 `Qwen3-4B`.
 - **Vulkan compute runner for Qwen 3.5 / 3.6 hybrid models** (`Qwen35VulkanModel`): Gated DeltaNet, full attention (QK-norm, partial RoPE,
-  KV cache, Q gate) and dense or MoE FFN as Vulkan 1.1 compute kernels with embedded SPIR-V. It is the GPU path on Linux, works on any
-  hardware Vulkan device, and needs no ROCm or CUDA install. Supports `Q4_K`, `Q5_K`, `Q6_K` and `Q8_0` weights. On a Radeon 890M,
+  KV cache, Q gate) and dense or MoE FFN as Vulkan compute kernels with embedded SPIR-V. It is the GPU path on Linux, works on any
+  hardware Vulkan device, and needs no ROCm or CUDA install. Supports `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`, and `TRL1..TRL6` weights. On a Radeon 890M,
   Qwen3.6-35B-A3B decodes at about 9.4 tok/s (individual runs 9.4 to 15.2), against 2.7 tok/s on the CPU engine, and Qwen3.5-4B at
   about 21.8 tok/s against 1.9. Greedy output is token-identical to the CPU engine on both. See `docs/VULKAN_BACKEND.md`.
 - `InferenceSession` selects the Vulkan runner automatically on non-Windows platforms and logs why it was not used when a model is

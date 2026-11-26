@@ -20,10 +20,10 @@
 ========================================================================================================
   Cold Startup (Model Load) :  < 15 ms  (vs 2,500 ms in Python vLLM / Ollama — 160x Faster)
   GPU Direct3D 12 Prefill   :  52.46 tok/s (DeepSeek-R1-14B) via 4KB LDS Batched GEMM Shaders
-  GPU Bare-Metal SASS       :  28.1 tok/s (NVIDIA RTX 4060) | 35+ tok/s (DirectX 12 Wave32)
-  Quantization Architecture :  IQ1/IQ2/IQ3/IQ4, Q2_0, Q4_K_M, Q8_0, FP16, and 1.58-bit Ternary SIMD
+  GPU Bare-Metal SASS       :  71.03 tok/s (Qwen3-4B, RTX 3060 CUDA Graph) | 19.7 tok/s FullGraph (Qwen3.8-27B NariQ)
+  Quantization Architecture :  TRL1..TRL6 (NariQ), IQ1..IQ4, Q2_0, Q4_K_M, Q8_0, FP16, and 1.58-bit Ternary SIMD
   CPU SIMD Throughput       :  Multi-threaded AVX-512 & AVX2 Batched GEMM (Zero Allocations)
-  Universal Matrix          :  Meta Llama 3 | DeepSeek-V3/R1 | Qwen 2.5/3.5 | Wan 2.1 Video | FLUX.1 DiT
+  Universal Matrix          :  Meta Llama 3 | DeepSeek-V3/R1 | Qwen 2.5/3.5/3.6/3.8 | Wan 2.1 Video | FLUX.1 DiT
 ========================================================================================================
 ```
 
@@ -84,8 +84,8 @@ flowchart TD
 
     subgraph HardwareHAL ["4. Heterogeneous Hardware Execution Backends"]
         H1[Direct3D 12 Wave32 HLSL Compute] 
-        H2[Vulkan 1.1 SPIR-V Compute]
-        H3[NVIDIA Direct SASS Driver: nvcuda.dll]
+        H2[Vulkan 1.3 SPIR-V Compute + 1.1 Fallback]
+        H3[NVIDIA Direct SASS Driver + CUDA Graphs]
         H4[AMD ROCm / HIP Driver: amdhip64.dll]
         H5[CPU SIMD AVX-512 / AVX2 FMA Kernels]
     end
@@ -138,7 +138,7 @@ Glacier.Inference executes all major open foundation model families with mathema
 | **Meta LLaMA 3 / 3.1 / 3.2 / 3.3** | Grouped-Query Attention (GQA), zero attention bias | Precomputed `rope_freqs.weight` scaling table across 128k context | GQA with SIMD SwiGLU FFN | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
 | **DeepSeek-V2 / V3 / R1** | Multi-Head Latent Attention (MLA) + MoE | Decoupled RoPE + Multi-scale YaRN ($mscaleBase$, $mscaleAllDim$) | 64 routed + 1 shared expert, low-rank KV | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` |
 | **Alibaba Qwen 2 & 2.5** | Dense & MoE GQA with per-head QKV bias | $10^6$ RoPE Base frequency with optional QK-Norm | Fused QKV projection with bias | `Qwen2.5-7B-Instruct-Q4_K_M.gguf` |
-| **Alibaba Qwen 3.5 & 3.6** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with 256-dim Head | Recurrent Associative Memory ($S_t$), Causal Conv1D, Q-Gate RMSNorm | `Qwen3.5-9B`, `Qwen3.6-27B-UD`; GPU: Direct3D 12 (Windows) and the Vulkan runner (Linux, see [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md)): `Qwen3.6-35B-A3B-UD-Q4_K_M` |
+| **Alibaba Qwen 3.5 / 3.6 / 3.8** | Gated DeltaNet (GDN) Linear Attention SSM + Interleaved Full Attention | Partial MRoPE ($dim=64$, $sections=[11,11,10,0]$) with 256-dim Head | Recurrent Associative Memory ($S_t$), Causal Conv1D, Q-Gate RMSNorm, NariQ `TRL1..TRL6` + Hadamard RHT | `Qwen3.8-27B-NariQ-2.5bpw/3.0bpw` (`19.7 tok/s` FullGraph / `19.2` live on RTX 3060 CUDA; `8.8 tok/s` Vulkan 1.3); `Qwen3.6-35B-A3B-UD` |
 | **Alibaba Wan 2.1 Video DiT (1.3B)** | 30-Block Spatio-Temporal Diffusion Transformer + 194-Tensor 3D Causal VAE | 3D-RoPE ($dim=64$) + QK-Norm + Self/Cross Attention | Flow-Matching Euler ODE ($shift=3.0$), 16-channel 3D VAE | `Wan2.1-T2V-1.3B-Q4_K_M.gguf` + `wan_2.1_vae.safetensors` |
 | **Black Forest Labs FLUX.1 (Schnell / Dev)** | 57-Block Diffusion Transformer (19 DoubleStream + 38 SingleStream) + Neural VAE | 3D Rotary Positional Embeddings (3D-RoPE) | In-VRAM Resident GEMM + FlashAttention-2 + GeLU Concat + Tiled VAE | `flux1-schnell-Q4_K_S.gguf` + `ae.safetensors` |
 | **Microsoft Phi-4 & Phi-3** | Fused Attention & Fused Gate/Up FFN | Fast NeOX RoPE ($base = 250,000$) | Fused `attn_qkv` GEMV + Fused `ffn_up` SwiGLU | `phi-4-Q4_K_M.gguf` (15B parameters) |
@@ -229,6 +229,18 @@ Measured on a Ryzen AI 9 HX 370 mini PC (Radeon 890M, 62 GB LPDDR5X, Fedora 43, 
 With greedy decoding the Vulkan runner produced token-identical output to the CPU engine on this model and on the dense Qwen3.5-4B (`Q4_K_M`, single CLI run: CPU 1.9 tok/s, Vulkan 21.8 tok/s).
 
 Decode on this APU is bound by memory placement (the 1 GB BIOS frame-buffer carve-out streams at about 85 GB/s, system-memory GTT at about 16-30 GB/s), not by compute. The method, caveats and the full quality table are in [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
+
+### 3.6 Benchmark 6: Qwen3.8-27B NariQ & CUDA Graph Decode (NVIDIA RTX 3060 12 GB & AMD Radeon 890M)
+
+Measured on Machine A (RTX 3060 12 GB GDDR6, 360 GB/s) and Machine C (Fedora 43, Radeon 890M `RADV STRIX1`, 62.6 GB UMA):
+
+| Hardware & Backend | Model & Format | Measured Throughput | Reference / Notes |
+| :--- | :--- | :---: | :--- |
+| **RTX 3060 — Pure C# CUDA (`Qwen35CudaModel`)** | `Qwen3.8-27B-NariQ-2.5bpw` (7.86 GB) | **19.7 tok/s** FullGraph (`50.78 ms`) / **19.2 tok/s** live (math) / **19.1 tok/s** (160-tok C#) | `nari-llama.cpp`: `24.0 tok/s` |
+| **RTX 3060 — Pure C# CUDA (`Qwen35CudaModel`)** | `Qwen3.8-27B-NariQ-3.0bpw` (9.43 GB) | **17.9 tok/s** live (128-tok C#) | `nari-llama.cpp`: `22.7 tok/s` |
+| **RTX 3060 — Vulkan 1.3 (`--engine vulkan`)** | `Qwen3.8-27B-NariQ-2.5bpw` (7.86 GB) | **8.8 tok/s** live (64 & 128 tok) | `staging=True, dp4a=True, sgShfl=True` (up from 6.1 tok/s) |
+| **Radeon 890M — Vulkan 1.3 (`RADV STRIX1`)** | `Qwen3.8-27B-NariQ-2.5bpw` (7.86 GB) | **2.1 tok/s** live (`2.8 tok/s` est. profile) | `dp4a=True, sgShfl=True, staging=False` |
+| **RTX 3060 — `Qwen2GpuModel` CUDA Graph ON vs OFF** | `Qwen3-4B-Instruct-2507` (`Q4_K_M`, 2.33 GB) | **71.03 tok/s** vs **62.19 tok/s** | **+14.2% faster** (`glacier bench`, 128 tok) |
 
 ---
 

@@ -4,6 +4,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Memory;
@@ -69,21 +70,21 @@ public sealed unsafe partial class Qwen2GpuModel
 
         _gpu.MakeCurrent();
 
-        // 1. Input activation: either extract embedding or copy incoming hidden vector
+        // 1. Input activation: either extract embedding or copy incoming hidden vector onto _streamMain
         if (StartLayer == 0)
         {
             if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdTokenToSlot.TryGetValue(token, out int cachedSlot))
             {
                 // In-VRAM token embedding lookup: 0 B PCIe copy!
                 IntPtr srcCache = _dEmbdCache + (nint)((long)cachedSlot * _dim * sizeof(float));
-                CuDriver.Check(CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
+                CuDriver.Check(CuDriver.MemcpyDtoDAsync(_dX, srcCache, (nuint)(_dim * sizeof(float)), _streamMain), "MemcpyDtoDAsync");
             }
             else
             {
                 fixed (float* pX = _hX)
                 {
                     QuantKernels.ExtractEmbedding(_weights.EmbdType, _weights.EmbdWeight, token, pX, _dim);
-                    _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+                    CuDriver.Check(CuDriver.MemcpyHtoDAsync(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)), _streamMain), "MemcpyHtoDAsync(emb)");
                 }
 
                 if (_dEmbdCache != IntPtr.Zero && _embdTokenToSlot != null && _embdCacheTokens != null)
@@ -101,7 +102,7 @@ public sealed unsafe partial class Qwen2GpuModel
                     _embdTokenToSlot[token] = slot;
 
                     IntPtr dstCache = _dEmbdCache + (nint)((long)slot * _dim * sizeof(float));
-                    CuDriver.Check(CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), IntPtr.Zero), "MemcpyDtoDAsync");
+                    CuDriver.Check(CuDriver.MemcpyDtoDAsync(dstCache, _dX, (nuint)(_dim * sizeof(float)), _streamMain), "MemcpyDtoDAsync");
                 }
             }
         }
@@ -109,108 +110,165 @@ public sealed unsafe partial class Qwen2GpuModel
         {
             fixed (float* pX = inputX)
             {
-                _gpu.CopyToDevice(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)));
+                CuDriver.Check(CuDriver.MemcpyHtoDAsync(_dX, (IntPtr)pX, (nuint)(_dim * sizeof(float)), _streamMain), "MemcpyHtoDAsync(inputX)");
             }
         }
 
-        int qDim = _nHeads * _headDim;
-        int kvDim = _nHeadsKv * _headDim;
+        // Upload 4-byte decode position into device _dPos so the captured CUDA Graph replays identically for every pos!
+        int posLocal = pos;
+        CuDriver.Check(CuDriver.MemcpyHtoDAsync(_dPos, (IntPtr)(&posLocal), sizeof(int), _streamMain), "MemcpyHtoDAsync(pos)");
 
-        // 2. Transformer layers assigned to this stage
-        for (int l = 0; l < LayerCount; l++)
+        // 2. Execute all transformer layers (+ optional LM head) via single CUDA Graph replay (or direct fallback)
+        bool wantHead = IsLastStage && computeLogits;
+        IntPtr graphExec = EnsureDecodeGraph(wantHead);
+        if (graphExec != IntPtr.Zero)
         {
-            var lw = _layerWeights[l];
-
-            // Attention pre-norm in VRAM
-            LaunchRmsNorm(_dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-
-            // Wait on GPU for RMSNorm output to be ready before K and V read it on their streams
-            CuDriver.EventRecord(_eventNormDone, IntPtr.Zero);
-            CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0);
-            CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0);
-
-            // Q, K, V projections on GPU (fused bias addition; K and V launched concurrently on dedicated CUDA streams)
-            LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias);
-            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias, hStream: _streamK);
-            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias, hStream: _streamV);
-
-            // Instruct default stream to wait on GPU for K and V completion prior to RoPE and KV cache storage
-            CuDriver.EventRecord(_eventKDone, _streamK);
-            CuDriver.EventRecord(_eventVDone, _streamV);
-            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventKDone, 0);
-            CuDriver.StreamWaitEvent(IntPtr.Zero, _eventVDone, 0);
-
-            // Optional QK-Norm (Qwen 3 / Qwen 3.8)
-            if (lw.AttnQNormWeight != IntPtr.Zero)
-            {
-                LaunchRmsNormHeads(_dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps);
-            }
-            if (lw.AttnKNormWeight != IntPtr.Zero)
-            {
-                LaunchRmsNormHeads(_dK, lw.AttnKNormWeight, _nHeadsKv, _headDim, _weights.RmsNormEps);
-            }
-
-            // Rotary Position Embedding (RoPE) directly in VRAM
-            LaunchRope(_dQ, _dK, pos);
-
-            // Store in GPU VRAM KV Cache
-            LaunchKvStore(l, pos);
-
-            // Multi-Head / Grouped Query Attention (GQA) in VRAM
-            LaunchAttention(l, pos);
-
-            // Attention out projection (fused residual accumulation directly into _dX: _dX += attnProj)
-            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, qDim, _dim, IntPtr.Zero, _dX);
-
-            // FFN pre-norm
-            LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-
-            // SwiGLU FFN projections on GPU (Fused kernel computes Gate + Up in registers and applies SiLU)
-            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
-            {
-                LaunchSwigluFused(_dFfnAct, _dNormX, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim);
-            }
-            else
-            {
-                LaunchGemv(lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim);
-                LaunchGemv(lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim);
-                LaunchSwiglu(_dGate, _dUp, _dFfnAct, _ffnDim);
-            }
-
-            // FFN down projection (fused residual accumulation directly into _dX: _dX += ffnDown)
-            LaunchGemv(lw.FfnDownType, IntPtr.Zero, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, IntPtr.Zero, _dX);
+            CuDriver.Check(CuDriver.GraphLaunch(graphExec, _streamMain), "cuGraphLaunch(qwen2)");
+        }
+        else
+        {
+            EnqueueDecodeForward(wantHead, _streamMain);
         }
 
+        // 3. Copy requested host outputs (skipped when logits is empty for pure GPU sampling via SampleGreedy)
         if (IsLastStage)
         {
-            if (computeLogits)
+            if (computeLogits && !logits.IsEmpty)
             {
-                // Final RMSNorm
-                LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps);
-
-                // Output projection (LM Head) on GPU
-                LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize);
-
-                // Copy logits from GPU to CPU (skipped when logits buffer is empty for pure GPU sampling)
-                if (!logits.IsEmpty)
+                CuDriver.Check(CuDriver.StreamSynchronize(_streamMain), "StreamSynchronize(logits)");
+                fixed (float* pLogits = logits)
                 {
-                    fixed (float* pLogits = logits)
-                    {
-                        _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
-                    }
+                    _gpu.CopyToHost((IntPtr)pLogits, _dLogits, (nuint)(_weights.VocabSize * sizeof(float)));
                 }
             }
         }
         else
         {
-            // Intermediate stage: copy _dX back to host buffer outputX
             if (!outputX.IsEmpty)
             {
+                CuDriver.Check(CuDriver.StreamSynchronize(_streamMain), "StreamSynchronize(outputX)");
                 fixed (float* pOut = outputX)
                 {
                     _gpu.CopyToHost((IntPtr)pOut, _dX, (nuint)(_dim * sizeof(float)));
                 }
             }
+        }
+    }
+
+    private void EnqueueDecodeForward(bool wantHead, IntPtr stream)
+    {
+        int qDim = _nHeads * _headDim;
+        int kvDim = _nHeadsKv * _headDim;
+
+        for (int l = 0; l < LayerCount; l++)
+        {
+            var lw = _layerWeights[l];
+
+            // Attention pre-norm in VRAM
+            LaunchRmsNorm(_dX, lw.AttnNormWeight, _dNormX, _dim, _weights.RmsNormEps, hStream: stream);
+
+            // Fork to _streamK and _streamV for concurrent Q || K || V projections inside the CUDA Graph
+            CuDriver.Check(CuDriver.EventRecord(_eventNormDone, stream), "EventRecord(normDone)");
+            CuDriver.Check(CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0), "StreamWaitEvent(streamK)");
+            CuDriver.Check(CuDriver.StreamWaitEvent(_streamV, _eventNormDone, 0), "StreamWaitEvent(streamV)");
+
+            LaunchGemv(lw.QType, _dQ, _dNormX, lw.QWeight, _dim, qDim, lw.QBias, hStream: stream);
+            LaunchGemv(lw.KType, _dK, _dNormX, lw.KWeight, _dim, kvDim, lw.KBias, hStream: _streamK);
+            LaunchGemv(lw.VType, _dV, _dNormX, lw.VWeight, _dim, kvDim, lw.VBias, hStream: _streamV);
+
+            // Join _streamK and _streamV back into stream before RoPE and KV cache storage
+            CuDriver.Check(CuDriver.EventRecord(_eventKDone, _streamK), "EventRecord(kDone)");
+            CuDriver.Check(CuDriver.EventRecord(_eventVDone, _streamV), "EventRecord(vDone)");
+            CuDriver.Check(CuDriver.StreamWaitEvent(stream, _eventKDone, 0), "StreamWaitEvent(kDone)");
+            CuDriver.Check(CuDriver.StreamWaitEvent(stream, _eventVDone, 0), "StreamWaitEvent(vDone)");
+
+            // Optional QK-Norm (Qwen 3 / Qwen 3.8)
+            if (lw.AttnQNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormHeads(_dQ, lw.AttnQNormWeight, _nHeads, _headDim, _weights.RmsNormEps, hStream: stream);
+            }
+            if (lw.AttnKNormWeight != IntPtr.Zero)
+            {
+                LaunchRmsNormHeads(_dK, lw.AttnKNormWeight, _nHeadsKv, _headDim, _weights.RmsNormEps, hStream: stream);
+            }
+
+            // Device-side _dPos RoPE + KV cache store + GQA attention (100% static CUDA Graph replay!)
+            LaunchRopeDpos(_dQ, _dK, _dPos, hStream: stream);
+            LaunchKvStoreDpos(l, _dPos, hStream: stream);
+            LaunchAttentionDpos(l, _dPos, hStream: stream);
+
+            // Attention out projection (fused residual accumulation directly into _dX: _dX += attnProj)
+            LaunchGemv(lw.AttnOutType, IntPtr.Zero, _dAttnOut, lw.AttnOutWeight, qDim, _dim, IntPtr.Zero, _dX, hStream: stream);
+
+            // FFN pre-norm
+            LaunchRmsNorm(_dX, lw.FfnNormWeight, _dNormX, _dim, _weights.RmsNormEps, hStream: stream);
+
+            // SwiGLU FFN projections on GPU
+            if (lw.FfnGateType == GgufType.Q4_K && lw.FfnUpType == GgufType.Q4_K)
+            {
+                LaunchSwigluFused(_dFfnAct, _dNormX, lw.FfnGateWeight, lw.FfnUpWeight, _dim, _ffnDim, hStream: stream);
+            }
+            else
+            {
+                // Overlap Gate (stream) || Up (_streamK) inside the CUDA Graph
+                CuDriver.Check(CuDriver.EventRecord(_eventNormDone, stream), "EventRecord(ffnNormDone)");
+                CuDriver.Check(CuDriver.StreamWaitEvent(_streamK, _eventNormDone, 0), "StreamWaitEvent(streamK, ffn)");
+                LaunchGemv(lw.FfnGateType, _dGate, _dNormX, lw.FfnGateWeight, _dim, _ffnDim, hStream: stream);
+                LaunchGemv(lw.FfnUpType, _dUp, _dNormX, lw.FfnUpWeight, _dim, _ffnDim, hStream: _streamK);
+                CuDriver.Check(CuDriver.EventRecord(_eventKDone, _streamK), "EventRecord(ffnUpDone)");
+                CuDriver.Check(CuDriver.StreamWaitEvent(stream, _eventKDone, 0), "StreamWaitEvent(ffnUpDone)");
+                LaunchSwiglu(_dGate, _dUp, _dFfnAct, _ffnDim, hStream: stream);
+            }
+
+            // FFN down projection (fused residual accumulation directly into _dX: _dX += ffnDown)
+            LaunchGemv(lw.FfnDownType, IntPtr.Zero, _dFfnAct, lw.FfnDownWeight, _ffnDim, _dim, IntPtr.Zero, _dX, hStream: stream);
+        }
+
+        if (wantHead)
+        {
+            // Final RMSNorm + Output projection (LM Head)
+            LaunchRmsNorm(_dX, _dOutNormWeight, _dNormX, _dim, _weights.RmsNormEps, hStream: stream);
+            LaunchGemv(_weights.OutType, _dLogits, _dNormX, _dOutWeight, _dim, _weights.VocabSize, hStream: stream);
+        }
+    }
+
+    private IntPtr EnsureDecodeGraph(bool wantHead)
+    {
+        if (_graphDisabled) return IntPtr.Zero;
+        ref IntPtr exec = ref (wantHead ? ref _graphExecLogits : ref _graphExecNoLogits);
+        if (exec != IntPtr.Zero) return exec;
+
+        bool capturing = false;
+        try
+        {
+            CuDriver.Check(CuDriver.StreamSynchronize(_streamMain), "pre-capture sync(main)");
+            CuDriver.Check(CuDriver.StreamSynchronize(_streamK), "pre-capture sync(K)");
+            CuDriver.Check(CuDriver.StreamSynchronize(_streamV), "pre-capture sync(V)");
+            CuDriver.Check(CuDriver.StreamBeginCapture(_streamMain, 0), "cuStreamBeginCapture(qwen2)");
+            capturing = true;
+            EnqueueDecodeForward(wantHead, _streamMain);
+            CuDriver.Check(CuDriver.StreamEndCapture(_streamMain, out IntPtr graph), "cuStreamEndCapture(qwen2)");
+            capturing = false;
+            try
+            {
+                CuDriver.Check(CuDriver.GraphInstantiateWithFlags(out exec, graph, 0), "cuGraphInstantiate(qwen2)");
+            }
+            finally
+            {
+                CuDriver.GraphDestroy(graph);
+            }
+            return exec;
+        }
+        catch (Exception ex)
+        {
+            if (capturing)
+            {
+                if (CuDriver.StreamEndCapture(_streamMain, out IntPtr aborted) == 0 && aborted != IntPtr.Zero)
+                    CuDriver.GraphDestroy(aborted);
+            }
+            GlacierDiagnostics.LogWarning($"[CUDA GPU] Qwen2 CUDA Graph capture unavailable ({ex.Message}); falling back to direct stream launch.");
+            _graphDisabled = true;
+            return IntPtr.Zero;
         }
     }
 

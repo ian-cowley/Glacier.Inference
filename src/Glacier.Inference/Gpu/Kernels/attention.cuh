@@ -14,12 +14,11 @@ extern "C" {
 // 1 block per Q head (blockIdx.x = h, 0..n_heads_q - 1)
 // Supports arbitrary head_dim (e.g. 64, 80, 96, 128, 256, 512) and warp-aligned blockDim.x
 // =========================================================================
-__global__ void attention_gqa_kernel(
+__device__ __forceinline__ void attention_gqa_impl(
     const float* __restrict__ q,
     const float* __restrict__ k_cache,
     const float* __restrict__ v_cache,
     float* __restrict__ attn_out,
-    float* __restrict__ scores_buf,
     int n_heads_q,
     int n_heads_kv,
     int head_dim,
@@ -72,15 +71,46 @@ __global__ void attention_gqa_kernel(
     }
 }
 
+__global__ void attention_gqa_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    attention_gqa_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, pos, attn_scale);
+}
+
+__global__ void attention_gqa_dpos(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos,
+    float attn_scale
+) {
+    attention_gqa_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, *d_pos, attn_scale);
+}
+
 // =========================================================================
 // 9e. FP16 GQA Attention Kernel (2x VRAM compression, lossless)
 // =========================================================================
-__global__ void attention_gqa_f16(
+__device__ __forceinline__ void attention_gqa_f16_impl(
     const float* __restrict__ q,
     const half* __restrict__ k_cache,
     const half* __restrict__ v_cache,
     float* __restrict__ attn_out,
-    float* __restrict__ scores_buf,
     int n_heads_q,
     int n_heads_kv,
     int head_dim,
@@ -133,15 +163,46 @@ __global__ void attention_gqa_f16(
     }
 }
 
+__global__ void attention_gqa_f16(
+    const float* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    attention_gqa_f16_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, pos, attn_scale);
+}
+
+__global__ void attention_gqa_f16_dpos(
+    const float* __restrict__ q,
+    const half* __restrict__ k_cache,
+    const half* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos,
+    float attn_scale
+) {
+    attention_gqa_f16_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, *d_pos, attn_scale);
+}
+
 // =========================================================================
 // 9f. Native FP8 (e4m3) GQA Attention Kernel (4x VRAM compression, Ada sm_89 silicon)
 // =========================================================================
-__global__ void attention_gqa_fp8(
+__device__ __forceinline__ void attention_gqa_fp8_impl(
     const float* __restrict__ q,
     const __nv_fp8_e4m3* __restrict__ k_cache,
     const __nv_fp8_e4m3* __restrict__ v_cache,
     float* __restrict__ attn_out,
-    float* __restrict__ scores_buf,
     int n_heads_q,
     int n_heads_kv,
     int head_dim,
@@ -194,15 +255,46 @@ __global__ void attention_gqa_fp8(
     }
 }
 
+__global__ void attention_gqa_fp8(
+    const float* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k_cache,
+    const __nv_fp8_e4m3* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    attention_gqa_fp8_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, pos, attn_scale);
+}
+
+__global__ void attention_gqa_fp8_dpos(
+    const float* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k_cache,
+    const __nv_fp8_e4m3* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos,
+    float attn_scale
+) {
+    attention_gqa_fp8_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, *d_pos, attn_scale);
+}
+
 // =========================================================================
 // 9f-q4. Packed 4-Bit (Q4_0) GQA Attention Kernel
 // =========================================================================
-__global__ void attention_gqa_q4_0(
+__device__ __forceinline__ void attention_gqa_q4_0_impl(
     const float* __restrict__ q,
     const BlockQ4_0* __restrict__ k_cache,
     const BlockQ4_0* __restrict__ v_cache,
     float* __restrict__ attn_out,
-    float* __restrict__ scores_buf,
     int n_heads_q,
     int n_heads_kv,
     int head_dim,
@@ -264,6 +356,38 @@ __global__ void attention_gqa_q4_0(
     for (int d = tid, c = 0; d < head_dim && c < MAX_ATTN_CHUNKS; d += blockDim.x, c++) {
         attn_out[(size_t)h * head_dim + d] = acc[c] * inv_l;
     }
+}
+
+__global__ void attention_gqa_q4_0(
+    const float* __restrict__ q,
+    const BlockQ4_0* __restrict__ k_cache,
+    const BlockQ4_0* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    int pos,
+    float attn_scale
+) {
+    attention_gqa_q4_0_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, pos, attn_scale);
+}
+
+__global__ void attention_gqa_q4_0_dpos(
+    const float* __restrict__ q,
+    const BlockQ4_0* __restrict__ k_cache,
+    const BlockQ4_0* __restrict__ v_cache,
+    float* __restrict__ attn_out,
+    float* __restrict__ scores_buf,
+    int n_heads_q,
+    int n_heads_kv,
+    int head_dim,
+    int max_seq_len,
+    const int* __restrict__ d_pos,
+    float attn_scale
+) {
+    attention_gqa_q4_0_impl(q, k_cache, v_cache, attn_out, n_heads_q, n_heads_kv, head_dim, max_seq_len, *d_pos, attn_scale);
 }
 
 // =========================================================================

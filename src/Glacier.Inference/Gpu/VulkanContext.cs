@@ -24,6 +24,22 @@ public sealed unsafe class VulkanContext : IDisposable
     public ulong TotalVramBytes { get; }
     public int DeviceOrdinal { get; }
     public bool HasCooperativeMatrix { get; }
+    /// <summary>
+    /// True when the Vulkan 1.3 <c>shaderIntegerDotProduct</c> feature (<c>VK_KHR_shader_integer_dot_product</c>,
+    /// mapping to 1-cycle RDNA 3.5 <c>v_dot4_i32_i8</c> and NVIDIA <c>IDP4A</c>) is supported and enabled.
+    /// </summary>
+    public bool SupportsIntegerDotProduct { get; }
+    /// <summary>
+    /// True when compute shaders support Vulkan 1.1 subgroup shuffle operations (<c>GL_KHR_shader_subgroup_shuffle</c>)
+    /// with a power-of-two subgroup size up to 128.
+    /// </summary>
+    public bool SupportsSubgroupShuffle { get; }
+    public uint SubgroupSize { get; }
+    /// <summary>
+    /// True on discrete GPUs where pure DEVICE_LOCAL VRAM (e.g. 8-24 GB GDDR6) is much larger than
+    /// the host-visible DEVICE_LOCAL BAR (typically 256 MB). False on unified-memory APUs (e.g. Strix Point).
+    /// </summary>
+    public bool PreferDeviceLocalStaging { get; }
     public IntPtr DeviceHandle => _device;
     public IntPtr InstanceHandle => _instance;
     public IntPtr ComputeQueueHandle => _computeQueue;
@@ -153,7 +169,8 @@ public sealed unsafe class VulkanContext : IDisposable
         if (!VulkanDriver.IsAvailable())
             throw new PlatformNotSupportedException("Vulkan driver (vulkan-1.dll / libvulkan.so) is not installed.");
 
-        // 1. Create Vulkan Instance
+        // 1. Create Vulkan Instance (prefer Vulkan 1.3 for integer dot product; fall back cleanly to 1.1)
+        uint requestedApiVersion = VulkanDriver.MakeVersion(1, 3, 0);
         var appInfo = new VulkanDriver.VkApplicationInfo
         {
             sType = VulkanDriver.VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -161,7 +178,7 @@ public sealed unsafe class VulkanContext : IDisposable
             applicationVersion = VulkanDriver.MakeVersion(1, 0, 0),
             pEngineName = Marshal.StringToHGlobalAnsi("GlacierEngine"),
             engineVersion = VulkanDriver.MakeVersion(1, 0, 0),
-            apiVersion = VulkanDriver.MakeVersion(1, 1, 0)
+            apiVersion = requestedApiVersion
         };
 
         var createInfo = new VulkanDriver.VkInstanceCreateInfo
@@ -171,6 +188,12 @@ public sealed unsafe class VulkanContext : IDisposable
         };
 
         int res = VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out _instance);
+        if (res != 0 || _instance == IntPtr.Zero)
+        {
+            requestedApiVersion = VulkanDriver.MakeVersion(1, 1, 0);
+            appInfo.apiVersion = requestedApiVersion;
+            res = VulkanDriver.CreateInstance(ref createInfo, IntPtr.Zero, out _instance);
+        }
         Marshal.FreeHGlobal(appInfo.pApplicationName);
         Marshal.FreeHGlobal(appInfo.pEngineName);
 
@@ -211,17 +234,93 @@ public sealed unsafe class VulkanContext : IDisposable
         VulkanDriver.GetPhysicalDeviceProperties(_physicalDevice, out var props);
         DeviceName = props.deviceName;
 
+        // Query Vulkan 1.1 subgroup shuffle capabilities and Vulkan 1.3 integer dot product support
+        uint vk11 = VulkanDriver.MakeVersion(1, 1, 0);
+        uint vk13 = VulkanDriver.MakeVersion(1, 3, 0);
+        if (props.apiVersion >= vk11)
+        {
+            try
+            {
+                var sgProps = new VulkanDriver.VkPhysicalDeviceSubgroupProperties
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+                    pNext = IntPtr.Zero
+                };
+                var props2 = new VulkanDriver.VkPhysicalDeviceProperties2
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    pNext = new IntPtr(&sgProps)
+                };
+                VulkanDriver.GetPhysicalDeviceProperties2(_physicalDevice, ref props2);
+                SubgroupSize = sgProps.subgroupSize;
+                const uint requiredSgOps = VulkanDriver.VK_SUBGROUP_FEATURE_BASIC_BIT | VulkanDriver.VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+                SupportsSubgroupShuffle =
+                    (sgProps.supportedStages & VulkanDriver.VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+                    (sgProps.supportedOperations & requiredSgOps) == requiredSgOps &&
+                    sgProps.subgroupSize >= 1 &&
+                    sgProps.subgroupSize <= 128 &&
+                    (sgProps.subgroupSize & (sgProps.subgroupSize - 1)) == 0;
+            }
+            catch
+            {
+                SupportsSubgroupShuffle = false;
+            }
+        }
+
+        bool supportsIntDot = false;
+        if (requestedApiVersion >= vk13 && props.apiVersion >= vk13)
+        {
+            try
+            {
+                var dotFeat = new VulkanDriver.VkPhysicalDeviceShaderIntegerDotProductFeatures
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+                    pNext = IntPtr.Zero,
+                    shaderIntegerDotProduct = 0
+                };
+                var feat2 = new VulkanDriver.VkPhysicalDeviceFeatures2
+                {
+                    sType = VulkanDriver.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                    pNext = new IntPtr(&dotFeat)
+                };
+                VulkanDriver.GetPhysicalDeviceFeatures2(_physicalDevice, ref feat2);
+                supportsIntDot = dotFeat.shaderIntegerDotProduct != 0;
+            }
+            catch
+            {
+                supportsIntDot = false;
+            }
+        }
+
         VulkanDriver.GetPhysicalDeviceMemoryProperties(_physicalDevice, out _memProps);
         ulong totalMem = 0;
+        ulong maxDeviceLocalHeap = 0;
+        ulong maxDeviceLocalHostVisibleHeap = 0;
         fixed (byte* pHeaps = _memProps.memoryHeaps)
+        fixed (byte* pTypes = _memProps.memoryTypes)
         {
             var heaps = (VulkanDriver.VkMemoryHeap*)pHeaps;
+            var types = (VulkanDriver.VkMemoryType*)pTypes;
             for (uint h = 0; h < _memProps.memoryHeapCount; h++)
             {
                 totalMem += heaps[h].size;
             }
+            for (uint t = 0; t < _memProps.memoryTypeCount; t++)
+            {
+                uint flags = types[t].propertyFlags;
+                uint hi = types[t].heapIndex;
+                if (hi >= _memProps.memoryHeapCount) continue;
+                ulong hSize = heaps[hi].size;
+                if ((flags & VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0)
+                {
+                    if (hSize > maxDeviceLocalHeap) maxDeviceLocalHeap = hSize;
+                    if ((flags & VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && hSize > maxDeviceLocalHostVisibleHeap)
+                        maxDeviceLocalHostVisibleHeap = hSize;
+                }
+            }
         }
         TotalVramBytes = totalMem;
+        PreferDeviceLocalStaging = maxDeviceLocalHeap > 0 && maxDeviceLocalHeap > maxDeviceLocalHostVisibleHeap * 2;
 
         // 3. Find Compute Queue Family
         uint qfCount = 0;
@@ -254,16 +353,32 @@ public sealed unsafe class VulkanContext : IDisposable
             pQueuePriorities = new IntPtr(&priority)
         };
 
+        var enableDotFeat = new VulkanDriver.VkPhysicalDeviceShaderIntegerDotProductFeatures
+        {
+            sType = VulkanDriver.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+            pNext = IntPtr.Zero,
+            shaderIntegerDotProduct = 1
+        };
+
         var devInfo = new VulkanDriver.VkDeviceCreateInfo
         {
             sType = VulkanDriver.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            pNext = supportsIntDot ? new IntPtr(&enableDotFeat) : IntPtr.Zero,
             queueCreateInfoCount = 1,
             pQueueCreateInfos = new IntPtr(&queueInfo)
         };
 
         int devRes = VulkanDriver.CreateDevice(_physicalDevice, ref devInfo, IntPtr.Zero, out _device);
+        if ((devRes != 0 || _device == IntPtr.Zero) && supportsIntDot)
+        {
+            supportsIntDot = false;
+            devInfo.pNext = IntPtr.Zero;
+            devRes = VulkanDriver.CreateDevice(_physicalDevice, ref devInfo, IntPtr.Zero, out _device);
+        }
         if (devRes != 0 || _device == IntPtr.Zero)
             throw new InvalidOperationException($"Failed to create Vulkan logical device on {DeviceName}: code {devRes}");
+
+        SupportsIntegerDotProduct = supportsIntDot;
 
         VulkanDriver.GetDeviceQueue(_device, _computeQueueIndex, 0, out _computeQueue);
 

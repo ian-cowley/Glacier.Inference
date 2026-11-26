@@ -45,8 +45,14 @@ The benchmark fleet spans four distinct physical machine profiles covering dedic
 | Model | Quantization | Footprint | Active Params | Prompt Prefill (`pp`) | Generation Rate (`tg`) | Turnaround Latency | Status |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **DeepSeek-R1-Distill-Qwen-7B** | `Q4_K_M` | 4.68 GB | 7.0 B | **65.53 tok/s** | **45.19 tok/s** | **1.33 s** | Verified |
-| **Qwen2.5-7B-Instruct** | `Q4_K_M` | 4.68 GB | 7.0 B | **68.20 tok/s** | **46.80 tok/s** | **1.28 s** | Verified |
+| **Qwen2.5-7B-Instruct-1M** (CUDA Graph ON / OFF) | `Q4_K_M` | 4.36 GB | 7.0 B | **57.41 / 62.55 tok/s** | **39.45 / 44.77 tok/s** | **1.69 / 1.57 s** | **Empirical Run (`glacier bench`, 128 tok)** |
+| **Qwen3-4B-Instruct-2507** (CUDA Graph ON / OFF) | `Q4_K_M` | 2.33 GB | 4.0 B | **114.18 / 122.03 tok/s** | **71.03 / 62.19 tok/s** | **1.25 / 1.34 s** | **Empirical Run (`glacier bench`, 128 tok, +14.2%)** |
+| **Qwen3.8-27B-NariQ** (`Qwen35CudaModel`, CUDA Graph) | `TRL2/3 (2.5bpw)` | 7.86 GB | 26.9 B | — | **19.7 tok/s** FullGraph (`50.78 ms`) / **19.1–19.2 tok/s** live | — | **Empirical Run** (vs `24.0 tok/s` `nari-llama.cpp`) |
+| **Qwen3.8-27B-NariQ** (`Qwen35CudaModel`, CUDA Graph) | `TRL2/3/4 (3.0bpw)` | 9.43 GB | 26.9 B | — | **17.9 tok/s** live (128-tok C#) | — | **Empirical Run** (vs `22.7 tok/s` `nari-llama.cpp`) |
+| **Qwen3.8-27B-NariQ** (`--engine vulkan`, `dp4a=True`) | `TRL2/3 (2.5bpw)` | 7.86 GB | 26.9 B | — | **8.8 tok/s** live (64 & 128 tok) | — | **Empirical Run** (up from 6.1 / 7.6 tok/s) |
 | **gpt-oss-20b** | `MXFP4` | 11.28 GB | ~3.5 B | **54.10 tok/s** | **38.40 tok/s** | **1.85 s** | *Untested (Theoretical Future Architecture Projections)* |
+
+On Machine A (`glacier bench` with 128 max tokens), CUDA Graph capture improves decode rate by **+14.2%** (`71.03` vs `62.19 tok/s`) on 36-layer launch-bound `Qwen3-4B`, whereas 28-layer memory-bandwidth-bound `Qwen2.5-7B` shows `39.45` vs `44.77 tok/s` when one-time graph capture latency is included inside a ~46-token generation slice. On `Qwen3.8-27B-NariQ`, 3-stream CUDA Graphs, zero-`>>2` unsigned `IDP.4A.U8.U8` decode, `PRMT` bit unpacking (`40` regs), and fused `add_rmsnorm` / `pre_rht_swiglu` lowered `FullGraph` to **50.78 ms** (`L0.GW = 154.4 us`, `L0.DW = 143.0 us`, `LMHead = 2.10 ms`).
 
 ---
 
@@ -101,6 +107,12 @@ This machine was subjected to direct cross-engine testing on the same physical s
 | **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | `Q4_K_M` (Q8_0 projections) | 20.6 GiB | **Glacier Vulkan runner** | **9.4 tok/s** (9.2 to 9.6, 3 runs) | llama.cpp Vulkan on the same file: 10.4 tok/s (`tg64`) |
 | **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | projections re-quantised to `Q5_K` | 20.1 GiB | **Glacier Vulkan runner** | **12.3 tok/s** | Mean KLD 0.0149, perplexity +0.4%, top-1 agreement 94.0% vs original |
 | **Qwen3.6-35B-A3B-UD** | Hybrid GDN + MoE | projections re-quantised to `Q4_K` | 19.9 GiB | **Glacier Vulkan runner** | **13.0 tok/s** | Mean KLD 0.0367, perplexity +1.5%, top-1 agreement 90.8% vs original |
+| **Qwen3.8-27B-NariQ** | Hybrid GDN + Dense (`64L`) | `TRL2/3` (`2.5bpw`) | 7.86 GB | **Glacier Vulkan 1.3 (`dp4a=True, sgShfl=True`)** | **2.1 tok/s** (`2.8` est. profile) | Exact `391` + coherent .NET 10 C# output (361.62 ms profile) |
+
+Isolated NariQ FFN microbenchmarks (`5120 x 17408`, measured on Machine B via `NariQGpuParityTests`):
+- **NVIDIA RTX 4060 Laptop (CUDA):** `TRL2` **169.2 &mu;s (`125.6 GB/s`)** | `TRL3` **240.6 &mu;s (`132.5 GB/s`)**
+- **NVIDIA RTX 4060 Laptop (Vulkan 1.3):** `TRL2` **1,011.8 &mu;s (`21.0 GB/s`)** | `TRL3` **1,020.4 &mu;s (`31.2 GB/s`)**
+- **AMD Radeon 890M Laptop (Vulkan 1.3):** `TRL2` **783.5 &mu;s (`27.1 GB/s`)** / Split-K `17408x5120` **689.3 &mu;s (`30.8 GB/s`)** | `TRL3` **857.9 &mu;s (`37.2 GB/s`)**
 
 Decode here is bound by where the weights live in unified memory (BIOS frame-buffer carve-out about 85 GB/s, system-memory GTT about 16-30 GB/s), not by compute. Methodology, quality measurements, and the experiments that did not change speed are in [docs/VULKAN_BACKEND.md](docs/VULKAN_BACKEND.md).
 
@@ -340,6 +352,8 @@ Evaluates scalar and quantized vector dot product implementations across AVX-512
 Evaluates row-parallel matrix-vector multiplication (`QuantKernels.MatVecMul`) and batched weight-reuse multiplication (`QuantKernels.MatMulBatch`) across all available CPU threads for a `3584 x 3584` projection matrix:
 - **`MatVecMul_Q4_K`**: Parallelized across all CPU cores with precomputed 32-element chunk sums (`ComputeBlockSums32`).
 - **`MatVecMul_Q8_0`**: Parallelized across all CPU cores with signed integer dot products.
+- **`MatVecMul_TRL2`** (NariQ 2-bit trellis, measured ShortRun AVX-512): **`7.163 ms`** (`Dim = 3584`), **`9.027 ms`** (`Dim = 4096`).
+- **`MatVecMul_TRL3`** (NariQ 3-bit trellis, measured ShortRun AVX-512): **`6.985 ms`** (`Dim = 3584`), **`9.053 ms`** (`Dim = 4096`).
 - **`MatMulBatch_Q4_K_Batch8`**: Weights streamed from memory once and shared across 8 tokens simultaneously.
 - **`MatMulBatch_Q4_K_Batch32`**: Weights streamed once and shared across 32 tokens simultaneously (prefill acceleration).
 

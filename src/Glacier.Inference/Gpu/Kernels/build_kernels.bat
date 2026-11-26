@@ -63,7 +63,7 @@ set SCRIPT_DIR=%~dp0
 cd /d "%SCRIPT_DIR%"
 
 echo [INFO] Compiling kernels.cu to kernels.cubin...
-nvcc -fatbin -O3 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH ^
+nvcc -fatbin -O3 --use_fast_math -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH ^
   -gencode arch=compute_75,code=sm_75 ^
   -gencode arch=compute_80,code=sm_80 ^
   -gencode arch=compute_86,code=sm_86 ^

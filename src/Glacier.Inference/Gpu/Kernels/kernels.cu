@@ -15,3 +15,5 @@
 #include "ops.cuh"
 #include "attention.cuh"
 #include "gemm_batch.cuh"
+#include "trellis.cuh"
+#include "qwen35.cuh"

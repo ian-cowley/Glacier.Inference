@@ -1,0 +1,96 @@
+#version 450
+#ifdef POST_RHT_128
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+// NariQ Trellis Post-Transform: y_scaled = post * T_rows^T(y_rot)
+// Supports kind=0 (identity) and kind=1 (normalized block Sylvester FWHT, block_len <= 4096).
+// When compiled with -DPOST_RHT_128, specializes for kind=1, block_len=128 using 128 threads/block,
+// zero-barrier intra-subgroup shuffle butterflies, and a 512-byte s128[128] shared buffer.
+#ifdef POST_RHT_128
+layout(local_size_x = 128) in;
+#else
+layout(local_size_x = 256) in;
+#endif
+
+layout(set = 0, binding = 0) readonly buffer BufYRot   { float y_rot[]; };
+layout(set = 0, binding = 1) readonly buffer BufPost   { float post[]; };
+layout(set = 0, binding = 2) writeonly buffer BufYOut  { float y_scaled[]; };
+
+layout(push_constant) uniform PC {
+    int N;
+    int kind;
+    int block_len;
+    int out_offset;
+};
+
+#ifdef POST_RHT_128
+
+shared float s128[128];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x); // 0..127
+    int gi = int(gl_WorkGroupID.x) * 128 + tid;
+    float v = y_rot[gi];
+
+    uint sg = gl_SubgroupSize;
+    for (uint h = 1u; h < 128u && h < sg; h <<= 1u) {
+        float p = subgroupShuffleXor(v, h);
+        v = ((uint(tid) & h) == 0u) ? (v + p) : (p - v);
+    }
+
+    for (uint h = sg; h < 128u; h <<= 1u) {
+        s128[tid] = v;
+        barrier();
+        float p = s128[tid ^ int(h)];
+        v = ((uint(tid) & h) == 0u) ? (v + p) : (p - v);
+        if ((h << 1u) < 128u) {
+            barrier();
+        }
+    }
+
+    y_scaled[out_offset + gi] = (v * inversesqrt(128.0)) * post[gi];
+}
+
+#else
+
+shared float smem[4096];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (kind == 0) {
+        int idx = int(gl_GlobalInvocationID.x);
+        if (idx < N) {
+            y_scaled[out_offset + idx] = y_rot[idx] * post[idx];
+        }
+        return;
+    }
+
+    int b0 = int(gl_WorkGroupID.x) * block_len;
+    for (int i = int(tid); i < block_len; i += 256) {
+        smem[i] = y_rot[b0 + i];
+    }
+    barrier();
+
+    for (int h = 1; h < block_len; h <<= 1) {
+        int pairs = block_len >> 1;
+        int mask = h - 1;
+        for (int p = int(tid); p < pairs; p += 256) {
+            int idx0 = ((p & ~mask) << 1) | (p & mask);
+            int idx1 = idx0 | h;
+            float a = smem[idx0];
+            float b = smem[idx1];
+            smem[idx0] = a + b;
+            smem[idx1] = a - b;
+        }
+        barrier();
+    }
+
+    float c = inversesqrt(float(block_len));
+    for (int i = int(tid); i < block_len; i += 256) {
+        int gi = b0 + i;
+        y_scaled[out_offset + gi] = (smem[i] * c) * post[gi];
+    }
+}
+
+#endif

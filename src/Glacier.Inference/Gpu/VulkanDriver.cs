@@ -31,9 +31,17 @@ public static unsafe class VulkanDriver
     public const int VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40;
     public const int VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO = 42;
     public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 = 1000059000;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 = 1000059001;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES = 1000094000;
+    public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES = 1000280000;
     public const int VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR = 1000506000;
 
+    public const uint VK_SUBGROUP_FEATURE_BASIC_BIT = 0x00000001;
+    public const uint VK_SUBGROUP_FEATURE_SHUFFLE_BIT = 0x00000010;
+
     public const uint VK_QUEUE_COMPUTE_BIT = 0x00000002;
+    public const uint VK_BUFFER_USAGE_TRANSFER_SRC_BIT = 0x00000001;
+    public const uint VK_BUFFER_USAGE_TRANSFER_DST_BIT = 0x00000002;
     public const uint VK_BUFFER_USAGE_STORAGE_BUFFER_BIT = 0x00000020;
     public const uint VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT = 0x00000001;
     public const uint VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT = 0x00000002;
@@ -251,6 +259,41 @@ public static unsafe class VulkanDriver
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceProperties2
+    {
+        public int sType;
+        public IntPtr pNext;
+        public VkPhysicalDeviceProperties properties;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceSubgroupProperties
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint subgroupSize;
+        public uint supportedStages;
+        public uint supportedOperations;
+        public uint quadOperationsInAllStages;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceFeatures2
+    {
+        public int sType;
+        public IntPtr pNext;
+        public fixed uint features[55];
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceShaderIntegerDotProductFeatures
+    {
+        public int sType;
+        public IntPtr pNext;
+        public uint shaderIntegerDotProduct;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct VkQueueFamilyProperties
     {
         public uint queueFlags;
@@ -393,6 +436,12 @@ public static unsafe class VulkanDriver
 
     [DllImport(VulkanLib, EntryPoint = "vkGetPhysicalDeviceProperties")]
     public static extern void GetPhysicalDeviceProperties(IntPtr physicalDevice, out VkPhysicalDeviceProperties pProperties);
+
+    [DllImport(VulkanLib, EntryPoint = "vkGetPhysicalDeviceProperties2")]
+    public static extern void GetPhysicalDeviceProperties2(IntPtr physicalDevice, ref VkPhysicalDeviceProperties2 pProperties);
+
+    [DllImport(VulkanLib, EntryPoint = "vkGetPhysicalDeviceFeatures2")]
+    public static extern void GetPhysicalDeviceFeatures2(IntPtr physicalDevice, ref VkPhysicalDeviceFeatures2 pFeatures);
 
     [DllImport(VulkanLib, EntryPoint = "vkGetPhysicalDeviceQueueFamilyProperties")]
     public static extern void GetPhysicalDeviceQueueFamilyProperties(IntPtr physicalDevice, ref uint pQueueFamilyPropertyCount, [Out] VkQueueFamilyProperties[]? pQueueFamilyProperties);
@@ -588,6 +637,14 @@ public static unsafe class VulkanDriver
         public uint dstAccessMask;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkBufferCopy
+    {
+        public ulong srcOffset;
+        public ulong dstOffset;
+        public ulong size;
+    }
+
     [DllImport(VulkanLib, EntryPoint = "vkCreateShaderModule")]
     public static extern int CreateShaderModule(IntPtr device, ref VkShaderModuleCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pShaderModule);
 
@@ -635,6 +692,9 @@ public static unsafe class VulkanDriver
 
     [DllImport(VulkanLib, EntryPoint = "vkCmdDispatch")]
     public static extern void CmdDispatch(IntPtr commandBuffer, uint groupCountX, uint groupCountY, uint groupCountZ);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdCopyBuffer")]
+    public static extern void CmdCopyBuffer(IntPtr commandBuffer, IntPtr srcBuffer, IntPtr dstBuffer, uint regionCount, VkBufferCopy* pRegions);
 
     [DllImport(VulkanLib, EntryPoint = "vkCmdPipelineBarrier")]
     public static extern void CmdPipelineBarrier(IntPtr commandBuffer, uint srcStageMask, uint dstStageMask, uint dependencyFlags, uint memoryBarrierCount, VkMemoryBarrier* pMemoryBarriers, uint bufferMemoryBarrierCount, IntPtr pBufferMemoryBarriers, uint imageMemoryBarrierCount, IntPtr pImageMemoryBarriers);
