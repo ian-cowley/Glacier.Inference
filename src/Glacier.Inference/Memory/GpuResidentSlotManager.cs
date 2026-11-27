@@ -51,6 +51,7 @@ public sealed class GpuResidentSlotManager : IDisposable
     private bool _disposed;
 
     public int SlotCount => _slotCount;
+    public bool HasRealVram => _allocateVram;
     public int ActiveSlotCount
     {
         get
@@ -156,26 +157,28 @@ public sealed class GpuResidentSlotManager : IDisposable
             ? Math.Clamp(initialActiveSlots, 0, slotCount)
             : slotCount;
 
-        bool vramAllocated = false;
-        if (allocateVram && CuDriver.IsAvailable())
-        {
-            vramAllocated = TryAllocateCudaSlots(_slots, slotCount, slotByteSize);
-        }
+        _allocateVram = allocateVram && CuDriver.IsAvailable()
+            ? TryAllocateCudaSlots(_slots, slotCount, slotByteSize)
+            : false;
 
-        _allocateVram = vramAllocated;
-
-        // Initialize unallocated slots with simulated pointer or placeholder
-        for (int i = 0; i < slotCount; i++)
+        if (!_allocateVram)
         {
-            if (_slots[i].DevicePointer == IntPtr.Zero)
+            // Only populate synthetic placeholder addresses when caller explicitly requested CPU simulation (allocateVram: false).
+            // Never fabricate fake CUDA addresses (0x10000000) when real VRAM allocation was requested and failed.
+            for (int i = 0; i < slotCount; i++)
             {
-                _slots[i] = new ExpertSlot
+                if (_slots[i].DevicePointer == IntPtr.Zero)
                 {
-                    SlotIndex = i,
-                    LayerIndex = -1,
-                    ExpertIndex = -1,
-                    DevicePointer = (IntPtr)(0x10000000 + ((long)i * (long)slotByteSize))
-                };
+                    _slots[i] = new ExpertSlot
+                    {
+                        SlotIndex = i,
+                        LayerIndex = -1,
+                        ExpertIndex = -1,
+                        DevicePointer = allocateVram
+                            ? IntPtr.Zero
+                            : (IntPtr)(0x10000000 + ((long)i * (long)slotByteSize))
+                    };
+                }
             }
         }
     }
@@ -784,7 +787,8 @@ public sealed class GpuResidentSlotManager : IDisposable
                 }
                 else
                 {
-                    break;
+                    FreeCudaSlots(slots);
+                    return false;
                 }
             }
             return true;

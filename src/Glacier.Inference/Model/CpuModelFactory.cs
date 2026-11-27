@@ -33,6 +33,14 @@ public static class CpuModelFactory
             return new Qwen3HybridModel(weights, maxSeqLen, startLayer, layerCount, isLastStage, pleTable: null, pleIoMode: pleIoMode);
         }
 
+        if (weights.ArchitectureFamily == UniversalArchitecture.Mamba2 ||
+            weights.ArchitectureFamily == UniversalArchitecture.Lfm2 ||
+            weights.ArchitectureFamily == UniversalArchitecture.LoopedTransformer)
+        {
+            throw new NotSupportedException(
+                $"Architecture '{weights.ArchitectureFamily}' is not supported by CpuModelFactory without a hybrid-SSM or GPU runner.");
+        }
+
         return new Qwen2Model(weights, maxSeqLen, startLayer, layerCount, isLastStage);
     }
 }

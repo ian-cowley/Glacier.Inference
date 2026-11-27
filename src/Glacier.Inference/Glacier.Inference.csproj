@@ -13,8 +13,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.10.0</Version>
-    <PackageReleaseNotes>v1.10.0: Adds native NariQ trellis-coded quantization (TRL1..TRL6) across CPU, CUDA SASS (Qwen35CudaModel), and Vulkan 1.3 (dotPacked4x8EXT, subgroup-shuffle RHT, Split-K, discrete DEVICE_LOCAL staging), plus full CUDA Graph capture in Qwen2GpuModel.</PackageReleaseNotes>
+    <Version>1.10.1</Version>
+    <PackageReleaseNotes>v1.10.1: Safetensors bounds validation, strict unsupported architecture rejection, real-VRAM allocation reporting, and UTF-16 surrogate-safe SentencePiece tokenization.</PackageReleaseNotes>
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>

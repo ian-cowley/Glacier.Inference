@@ -19,6 +19,8 @@ public sealed partial class BpeTokenizer
     private readonly HashSet<int> _stopTokens = new();
     private readonly string _architecture = "";
     private readonly string _chatTemplate = "";
+    private readonly bool _isSentencePiece;
+    private readonly bool _addSpacePrefix;
 
     // Byte-level BPE character mappings
     private static readonly char[] ByteToChar = new char[256];
@@ -201,20 +203,62 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("<eos>");
         RegisterStopToken("<|tool_call>");
         RegisterStopToken("<|tool_response>");
+
+        string tokModel = gguf.GetMetadataString("tokenizer.ggml.model", "");
+        _addSpacePrefix = gguf.GetMetadataBool("tokenizer.ggml.add_space_prefix", fallback: true);
+        bool hasSpSpace = _tokenToId.ContainsKey("\u2581the") || _tokenToId.ContainsKey("\u2581a") || _tokenToId.ContainsKey("\u2581");
+        bool hasGpt2Space = _tokenToId.ContainsKey("\u0120the") || _tokenToId.ContainsKey("\u0120a");
+        _isSentencePiece = string.Equals(tokModel, "llama", StringComparison.OrdinalIgnoreCase) ||
+                           (hasSpSpace && !hasGpt2Space && !string.Equals(tokModel, "gpt2", StringComparison.OrdinalIgnoreCase));
     }
 
     public BpeTokenizer(IEnumerable<string> vocab, int eosTokenId = 151643, int bosTokenId = 151644)
+        : this(vocab, merges: null, isSentencePiece: false, eosTokenId: eosTokenId, bosTokenId: bosTokenId, addSpacePrefix: true)
+    {
+    }
+
+    public BpeTokenizer(
+        IEnumerable<string> vocab,
+        IEnumerable<string>? merges,
+        bool isSentencePiece,
+        int eosTokenId = 2,
+        int bosTokenId = 1,
+        bool addSpacePrefix = true)
     {
         EosTokenId = eosTokenId;
         BosTokenId = bosTokenId;
         PadTokenId = bosTokenId;
+        _isSentencePiece = isSentencePiece;
+        _addSpacePrefix = addSpacePrefix;
 
         var tokenList = new List<string>(vocab);
         _idToToken = tokenList.ToArray();
         for (int i = 0; i < tokenList.Count; i++)
         {
             _tokenToId[tokenList[i]] = i;
-            _specialTokens[tokenList[i]] = i;
+            if (!isSentencePiece || merges == null)
+            {
+                _specialTokens[tokenList[i]] = i;
+            }
+        }
+
+        if (merges != null)
+        {
+            int rank = 0;
+            foreach (string merge in merges)
+            {
+                _bpeRanks[merge] = rank++;
+            }
+        }
+
+        if (isSentencePiece)
+        {
+            _specialTokens.Clear();
+            RegisterSpecialToken("<s>");
+            RegisterSpecialToken("</s>");
+            RegisterSpecialToken("<unk>");
+            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[BosTokenId]);
+            if (EosTokenId >= 0 && EosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[EosTokenId]);
         }
 
         if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
@@ -223,6 +267,7 @@ public sealed partial class BpeTokenizer
         RegisterStopToken("<|end_of_text|>");
         RegisterStopToken("<|eot_id|>");
         RegisterStopToken("</s>");
+        RegisterStopToken("<eos>");
     }
 
     private void RegisterSpecialToken(string token)
@@ -565,7 +610,14 @@ public sealed partial class BpeTokenizer
 
             // Slice span before the next special token
             ReadOnlySpan<char> segment = text.AsSpan(index, nextSpecialIndex - index);
+            bool isFirstSegment = index == 0;
             index = nextSpecialIndex;
+
+            if (_isSentencePiece)
+            {
+                EncodeSentencePieceSegment(segment, isFirstSegment && _addSpacePrefix, word, result);
+                continue;
+            }
 
             // Pre-tokenize segment using source-generated regex with zero-allocation span enumeration
             foreach (var match in GetTokenSplitterRegex().EnumerateMatches(segment))
@@ -649,6 +701,15 @@ public sealed partial class BpeTokenizer
         if (_specialTokens.ContainsKey(piece))
             return Encoding.UTF8.GetBytes(piece);
 
+        if (_isSentencePiece)
+        {
+            if (TryParseByteFallbackToken(piece, out byte spByte))
+            {
+                return [spByte];
+            }
+            return Encoding.UTF8.GetBytes(piece.Replace('\u2581', ' '));
+        }
+
         var byteList = new List<byte>(piece.Length);
         foreach (char c in piece)
         {
@@ -700,6 +761,19 @@ public sealed partial class BpeTokenizer
                 continue;
             }
 
+            if (_isSentencePiece)
+            {
+                if (TryParseByteFallbackToken(piece, out byte spByte))
+                {
+                    byteBuffer.Add(spByte);
+                }
+                else
+                {
+                    byteBuffer.AddRange(Encoding.UTF8.GetBytes(piece.Replace('\u2581', ' ')));
+                }
+                continue;
+            }
+
             foreach (char c in piece)
             {
                 if (CharToByte.TryGetValue(c, out byte b))
@@ -720,5 +794,120 @@ public sealed partial class BpeTokenizer
         }
 
         return sb.ToString();
+    }
+
+    private void EncodeSentencePieceSegment(
+        ReadOnlySpan<char> segment,
+        bool prependSpacePrefix,
+        List<string> workSymbols,
+        List<int> output)
+    {
+        if (segment.IsEmpty) return;
+
+        string normalized = segment.ToString().Replace(' ', '\u2581');
+        if (prependSpacePrefix && !normalized.StartsWith('\u2581'))
+        {
+            normalized = "\u2581" + normalized;
+        }
+
+        if (_bpeRanks.Count == 0)
+        {
+            int pos = 0;
+            while (pos < normalized.Length)
+            {
+                int maxLen = Math.Min(32, normalized.Length - pos);
+                bool matched = false;
+                for (int len = maxLen; len >= 1; len--)
+                {
+                    string candidate = normalized.Substring(pos, len);
+                    if (_tokenToId.TryGetValue(candidate, out int id))
+                    {
+                        output.Add(id);
+                        pos += len;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched)
+                {
+                    int charStep = (pos + 1 < normalized.Length &&
+                                    char.IsHighSurrogate(normalized[pos]) &&
+                                    char.IsLowSurrogate(normalized[pos + 1]))
+                        ? 2
+                        : 1;
+                    AddUtf8ByteFallback(normalized.Substring(pos, charStep), output);
+                    pos += charStep;
+                }
+            }
+            return;
+        }
+
+        workSymbols.Clear();
+        for (int i = 0; i < normalized.Length;)
+        {
+            int charStep = (i + 1 < normalized.Length &&
+                            char.IsHighSurrogate(normalized[i]) &&
+                            char.IsLowSurrogate(normalized[i + 1]))
+                ? 2
+                : 1;
+            workSymbols.Add(normalized.Substring(i, charStep));
+            i += charStep;
+        }
+
+        while (workSymbols.Count > 1)
+        {
+            int bestRank = int.MaxValue;
+            int bestIndex = -1;
+            for (int i = 0; i < workSymbols.Count - 1; i++)
+            {
+                string pair = $"{workSymbols[i]} {workSymbols[i + 1]}";
+                if (_bpeRanks.TryGetValue(pair, out int rank) && rank < bestRank)
+                {
+                    bestRank = rank;
+                    bestIndex = i;
+                }
+            }
+            if (bestIndex == -1) break;
+
+            workSymbols[bestIndex] = workSymbols[bestIndex] + workSymbols[bestIndex + 1];
+            workSymbols.RemoveAt(bestIndex + 1);
+        }
+
+        foreach (string piece in workSymbols)
+        {
+            if (_tokenToId.TryGetValue(piece, out int id))
+            {
+                output.Add(id);
+            }
+            else
+            {
+                AddUtf8ByteFallback(piece, output);
+            }
+        }
+    }
+
+    private void AddUtf8ByteFallback(string piece, List<int> output)
+    {
+        Span<byte> buf = stackalloc byte[Encoding.UTF8.GetMaxByteCount(piece.Length)];
+        int count = Encoding.UTF8.GetBytes(piece.AsSpan(), buf);
+        for (int i = 0; i < count; i++)
+        {
+            byte b = buf[i];
+            if (_tokenToId.TryGetValue($"<0x{b:X2}>", out int id) ||
+                _tokenToId.TryGetValue($"<0x{b:x2}>", out id))
+            {
+                output.Add(id);
+            }
+        }
+    }
+
+    private static bool TryParseByteFallbackToken(string piece, out byte value)
+    {
+        if (piece.Length == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>')
+        {
+            return byte.TryParse(piece.AsSpan(3, 2), System.Globalization.NumberStyles.HexNumber, null, out value);
+        }
+        value = 0;
+        return false;
     }
 }

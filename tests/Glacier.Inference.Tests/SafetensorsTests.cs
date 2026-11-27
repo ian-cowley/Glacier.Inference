@@ -2,7 +2,10 @@ namespace Glacier.Inference.Tests;
 
 using System;
 using System.IO;
+using System.Text;
 using Glacier.Inference.Format;
+using Glacier.Inference.Memory;
+using Glacier.Inference.Tokenizer;
 using Xunit;
 
 public class SafetensorsTests
@@ -63,6 +66,77 @@ public class SafetensorsTests
                 if (rgb[i] > 0) anyNonZero = true;
             }
             Assert.True(anyNonZero, "VAE output must contain non-zero pixel data");
+        }
+    }
+
+    [Fact]
+    public void SafetensorsFile_Open_RejectsOversizedHeaderAndOutOfBoundsOffsets()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), $"glacier_st_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            string oversizedPath = Path.Combine(tempDir, "oversized.safetensors");
+            using (var fs = File.Create(oversizedPath))
+            using (var bw = new BinaryWriter(fs))
+            {
+                bw.Write(300UL * 1024UL * 1024UL);
+                bw.Write(new byte[16]);
+            }
+            Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(oversizedPath));
+
+            string oobPath = Path.Combine(tempDir, "oob.safetensors");
+            byte[] headerBytes = Encoding.UTF8.GetBytes("{\"w\":{\"dtype\":\"F32\",\"shape\":[4],\"data_offsets\":[0,9999]}}");
+            using (var fs = File.Create(oobPath))
+            using (var bw = new BinaryWriter(fs))
+            {
+                bw.Write((ulong)headerBytes.Length);
+                bw.Write(headerBytes);
+                bw.Write(new byte[16]);
+            }
+            Assert.Throws<InvalidDataException>(() => SafetensorsFile.Open(oobPath));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+                Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void BpeTokenizer_SentencePiece_RoundTripsSpaceAndByteFallback()
+    {
+        var vocab = new[]
+        {
+            "<unk>", "<s>", "</s>",
+            "\u2581hello", "\u2581", "world",
+            "<0xF0>", "<0x9F>", "<0x98>", "<0x80>"
+        };
+        var tok = new BpeTokenizer(vocab, merges: null, isSentencePiece: true, eosTokenId: 2, bosTokenId: 1, addSpacePrefix: true);
+
+        int[] ids = tok.Encode("hello\U0001F600");
+        Assert.Contains(3, ids);
+        Assert.Contains(6, ids);
+        Assert.Contains(9, ids);
+
+        string decoded = tok.Decode(ids);
+        Assert.Contains("hello", decoded);
+        Assert.Contains("\U0001F600", decoded);
+    }
+
+    [Fact]
+    public void GpuResidentSlotManager_WhenAllocateVramTrueWithoutCuda_DoesNotFabricateFakePointers()
+    {
+        using var slotMgr = new GpuResidentSlotManager(slotCount: 2, slotByteSize: 1024, allocateVram: true);
+        bool allocated = slotMgr.AllocateOrEvictSlot(0, 0, out _, out _, out _, out IntPtr devPtr);
+        Assert.True(allocated);
+        if (!slotMgr.HasRealVram)
+        {
+            Assert.Equal(IntPtr.Zero, devPtr);
+        }
+        else
+        {
+            Assert.NotEqual(IntPtr.Zero, devPtr);
         }
     }
 }
