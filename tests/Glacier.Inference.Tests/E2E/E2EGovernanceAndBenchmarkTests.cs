@@ -166,11 +166,11 @@ public class E2EGovernanceAndBenchmarkTests
     [Fact]
     public void BenchmarkHarness_MemoryTelemetry_CapturesAllocations()
     {
-        long initial = GC.GetTotalMemory(false);
+        long initial = GC.GetAllocatedBytesForCurrentThread();
         byte[] dummy = new byte[1024 * 1024]; // 1MB
-        long after = GC.GetTotalMemory(false);
+        long after = GC.GetAllocatedBytesForCurrentThread();
 
-        Assert.True(after >= initial);
+        Assert.True(after - initial >= 1024 * 1024);
         GC.KeepAlive(dummy);
     }
 
