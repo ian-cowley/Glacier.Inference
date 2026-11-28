@@ -7,23 +7,23 @@
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference/)
 
-`Glacier.Inference` is a pure C# .NET 10 runtime, Native AOT CLI (`glacier`), and OpenAI/Ollama-compatible HTTP server for running GGUF and Safetensors models without Python or C++ runtime wrappers. It binds directly to OS graphics and compute drivers (`nvcuda.dll`, `d3d12.dll`, Vulkan, HIP) and falls back to multi-threaded AVX-512, AVX2, or ARM64 NEON SIMD kernels when a GPU backend does not cover a model or weight format.
+`Glacier.Inference` is a local AI inference runtime, standalone CLI (`glacier`), and OpenAI/Ollama-compatible HTTP server written in pure C# for .NET 10.
 
-*(Backend scope note: on Linux and non-Windows hosts, the Vulkan runner currently accelerates hybrid Qwen 3.5/3.6 models using `Q4_K`/`Q5_K`/`Q6_K`/`Q8_0` weights; models with unsupported quantizations such as `IQ4_XS` log a notice and run on CPU SIMD.)*
+If you want to run open-weight LLMs, embeddings, image generation, video synthesis, or local text-to-speech on Windows, Linux, or Android—or embed model execution directly inside a C# app without installing Python, PyTorch, or the CUDA Toolkit—`Glacier.Inference` handles model loading and hardware acceleration in-process by calling your installed OS GPU drivers (`nvcuda.dll`, `d3d12.dll`, Vulkan, AMD HIP) or multi-core CPU SIMD.
 
 ## Install
 
 ```bash
-# Library
+# Embed inside a C# application
 dotnet add package Glacier.Inference
 
-# Standalone CLI tool
+# Install the CLI tool globally
 dotnet tool install --global Glacier.Inference.Cli
 ```
 
 ## Quick Start
 
-### C# Streaming Inference
+### Stream Tokens From C#
 
 ```csharp
 using Glacier.Inference.Engine;
@@ -44,34 +44,35 @@ await session.GenerateAsync("Explain quicksort in C#.", options, onToken: token 
 });
 ```
 
-### CLI & HTTP Server
+### Run or Serve From the Terminal
 
 ```bash
 glacier devices
-glacier inspect "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
 glacier run "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" "Explain quicksort in C#."
 glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 11434 --host 127.0.0.1
 ```
 
-## Supported Models & Backends
+## What You Can Do
 
-| Model Family | Core Components Implemented | Tested GGUF / Safetensors Weights |
-| :--- | :--- | :--- |
-| **Llama 3 / 3.1 / 3.2 / 3.3** | GQA, precomputed RoPE tables (128k context), SwiGLU | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` |
-| **DeepSeek-V2 / V3 / R1** | Multi-Head Latent Attention (MLA), decoupled RoPE + YaRN, MoE | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf`, `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` |
-| **Qwen 2.5 / 3 / 3.5 / 3.6 / 3.8** | Dense/MoE GQA, Gated DeltaNet SSM, partial MRoPE, NariQ `TRL1..TRL6` | `Qwen2.5-7B-Instruct-Q4_K_M.gguf`, `Qwen3-4B`, `Qwen3.6-35B-A3B`, `Qwen3.8-27B-NariQ` |
-| **Gemma 4 & EmbeddingGemma 2** | Dual MoE, interleaved sliding-window attention, 768D multimodal embeddings | `gemma-4-26B-A4B-it`, `google_gemma-4-E4B-it`, `embeddinggemma-2-Q8_0` |
-| **Phi-3 / Phi-4 & Mistral / Devstral** | Fused QKV / FFN projections, NeOX & `10^9`-base RoPE | `phi-4-Q4_K_M.gguf`, `Devstral-Small-2505` |
-| **FLUX.1 & Wan 2.1 Media** | 57-block DiT + tiled VAE (image); 30-block 3D DiT + 3D VAE (video) | `flux1-schnell-Q4_K_S.gguf` + `ae.safetensors`, `Wan2.1-T2V-1.3B-Q4_K_M.gguf` |
-| **Speech & Audio** | KittenTTS / Kokoro glottal formant TTS, Whisper STT client | Built-in formant voices (`af_heart`, `bm_george`) |
+| Workload | Supported Models & Formats (GGUF / Safetensors) |
+| :--- | :--- |
+| **Chat & Reasoning LLMs** | Llama 3 / 3.1 / 3.2 / 3.3, DeepSeek-V2 / V3 / R1, Qwen 2.5 / 3 / 3.5 / 3.6 / 3.8 (`TRL1..TRL6`), Gemma 4, Phi-3 / Phi-4, Mistral / Devstral |
+| **OpenAI & Ollama API Server** | Drop-in `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/api/chat`, `/api/generate`, `/api/tags` with optional `GLACIER_API_KEY` auth |
+| **Multimodal Embeddings** | EmbeddingGemma 2 (`EmbeddingGemma2Model`) across text, audio, image, and video inputs |
+| **Image & Video Generation** | FLUX.1 Schnell/Dev diffusion (`glacier image`) and Wan 2.1 video synthesis to APNG/GIF/AVI (`glacier video`) |
+| **Speech Synthesis & STT** | KittenTTS neural speech synthesis, Kokoro acoustic formant TTS, and OpenAI-compatible Whisper STT (`glacier voice`) |
 
-Hardware execution targets NVIDIA SASS (`nvcuda.dll` / `libcuda.so.1`), Direct3D 12 Wave32 (`d3d12.dll`), Vulkan 1.1/1.3 SPIR-V, AMD HIP (`amdhip64.dll`), multi-GPU layer splitting (`--split`), and AVX-512 / AVX2 / ARM64 NEON CPU kernels.
+## Platform & Compatibility
 
-## Measured Benchmarks
+- Targets Windows, Linux, and Android on `.NET 10`, with Native AOT support and zero external C++ runtime installers.
+- Automatically selects NVIDIA CUDA (`nvcuda.dll` / `libcuda.so.1`), Direct3D 12 (Windows), Vulkan 1.1/1.3, AMD HIP (`amdhip64.dll` / `/dev/kfd`), multi-GPU `--split`, or AVX-512 / AVX2 / ARM64 NEON CPU SIMD.
+- On Linux and other non-Windows systems, the Vulkan runner accelerates hybrid Qwen 3.5/3.6 models with `Q4_K`, `Q5_K`, `Q6_K`, or `Q8_0` weights; unsupported weight formats (such as `IQ4_XS`) log a diagnostic message and fall back to CPU execution.
 
-All values below were measured directly on physical machines without simulated steps or estimates:
+## Benchmarks
 
-| Workload | Hardware & Backend | Measured Throughput / Latency | Source |
+All numbers below come from executed runs on physical hardware (no simulated steps or approximations):
+
+| Workload | Hardware & Backend | Measured Result | Details |
 | :--- | :--- | ---: | :--- |
 | `Qwen2.5-7B-Instruct` (`Q4_K_M`) | RTX 4060 8 GB (CUDA SASS) | **106.71 tok/s** pp / **42.90–64.05 tok/s** tg | [benchmarks.md](docs/benchmarks.md) |
 | `Qwen3-4B-Instruct-2507` (`Q4_K_M`) | RTX 3060 12 GB (CUDA Graph ON) | **114.18 tok/s** pp / **71.03 tok/s** tg | [benchmarks.md](docs/benchmarks.md) |
@@ -81,7 +82,7 @@ All values below were measured directly on physical machines without simulated s
 | `VecDotF32` / `VecDotQ4_K` / `VecDotQ8_0` (`Dim=3584`) | Ryzen AI 9 HX 370 (`.NET 10.0.15`) | **137.6 ns** / **425.2 ns** / **353.6 ns** (`0 B` alloc) | `SimdDotBenchmarks` |
 | `MatVecMul_Q4_K` / `MatVecMul_Q8_0` (`3584x3584`) | Ryzen AI 9 HX 370 (`.NET 10.0.15`) | **284.3 us** / **245.5 us** | `GemvBenchmarks` |
 
-Reproduce CPU kernel microbenchmarks locally:
+Reproduce CPU microbenchmarks locally:
 
 ```bash
 dotnet run --project benchmarks/Glacier.Inference.Benchmarks/Glacier.Inference.Benchmarks.csproj -c Release -- --job short --filter *
@@ -89,8 +90,8 @@ dotnet run --project benchmarks/Glacier.Inference.Benchmarks/Glacier.Inference.B
 
 ## Documentation
 
-- [Usage Guide](docs/usage.md) — CLI commands (`devices`, `inspect`, `run`, `bench`, `serve`, `image`, `video`, `voice`), API auth, and troubleshooting
-- [Architecture](docs/architecture.md) — memory-mapped weights, ring-buffer KV cache, quantization blocks, HAL backends, and ADRs
+- [User Manual](docs/manual.md) — installation options, full C# & CLI reference, HTTP server auth, `--split` multi-GPU, VRAM sizing, image/video/voice, systemd setup, and troubleshooting
+- [Architecture](docs/architecture.md) — memory-mapped loading, ring-buffer KV cache, quantization blocks, HAL backends, and ADRs
 - [Benchmarks](docs/benchmarks.md) — cross-machine physical runs, multimodal VAE timings, and BenchmarkDotNet tables
 - [Vulkan Backend Notes](docs/VULKAN_BACKEND.md) — Linux RADV kernel pipeline, memory placement constraints, and re-quantization measurements
 - [MLA Decoupled RoPE](docs/explanation/mla_decoupled_rope.md) & [YaRN RoPE Scaling](docs/explanation/yarn_rope_scaling.md) — positional encoding specs
