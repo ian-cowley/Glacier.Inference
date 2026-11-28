@@ -546,7 +546,11 @@ public sealed unsafe class GgufFile : IDisposable
             {
                 if (shard.BasePtr != IntPtr.Zero)
                 {
-                    try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                    try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"[GgufFile] Shard ReleasePointer failed: {ex.Message}");
+                    }
                     shard.BasePtr = IntPtr.Zero;
                 }
                 shard.Acc.Dispose();
@@ -667,14 +671,24 @@ public sealed unsafe class GgufFile : IDisposable
                 {
                     _accessor?.SafeMemoryMappedViewHandle.ReleasePointer();
                 }
-                catch { }
+                catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[GgufFile] Base ReleasePointer failed: {ex.Message}");
+                }
                 _basePointer = null;
             }
             _accessor?.Dispose();
             _mmf?.Dispose();
             foreach (var shard in _extraShards)
             {
-                if (shard.BasePtr != IntPtr.Zero) { try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { } }
+                if (shard.BasePtr != IntPtr.Zero)
+                {
+                    try { shard.Acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                    catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"[GgufFile] Extra shard ReleasePointer failed: {ex.Message}");
+                    }
+                }
                 shard.Acc.Dispose();
                 shard.Mmf.Dispose();
             }
@@ -835,7 +849,11 @@ public sealed unsafe class GgufFile : IDisposable
                 {
                     if (basePtr != null && acc != null)
                     {
-                        try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                        try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                        {
+                            System.Diagnostics.Trace.TraceWarning($"[GgufFile] Shard open rollback ReleasePointer failed: {ex.Message}");
+                        }
                     }
                     acc?.Dispose();
                     mmf?.Dispose();

@@ -806,7 +806,11 @@ public sealed class GpuResidentSlotManager : IDisposable
         {
             if (slots[i].DevicePointer != IntPtr.Zero)
             {
-                try { CuDriver.MemFree(slots[i].DevicePointer); } catch { }
+                try { CuDriver.MemFree(slots[i].DevicePointer); }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[GpuResidentSlotManager] MemFree cleanup failed: {ex.Message}");
+                }
                 slots[i].DevicePointer = IntPtr.Zero;
             }
         }

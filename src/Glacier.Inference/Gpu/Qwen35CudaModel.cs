@@ -754,7 +754,10 @@ public sealed unsafe class Qwen35CudaModel : ID3D12Model
             if (_evJoin3 != IntPtr.Zero) CuDriver.EventDestroy(_evJoin3);
             if (_evAlphaBeta != IntPtr.Zero) CuDriver.EventDestroy(_evAlphaBeta);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[Qwen35CudaModel] CUDA event cleanup failed during Dispose: {ex.Message}");
+        }
         _trl.Dispose();
         _ctx.Dispose();
     }

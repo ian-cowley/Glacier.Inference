@@ -276,7 +276,11 @@ public static unsafe class GgufStageSlicer
         {
             if (File.Exists(tempPath))
             {
-                try { File.Delete(tempPath); } catch { }
+                try { File.Delete(tempPath); }
+                catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[GgufStageSlicer] Failed to delete temp file '{tempPath}': {ex.Message}");
+                }
             }
         }
     }

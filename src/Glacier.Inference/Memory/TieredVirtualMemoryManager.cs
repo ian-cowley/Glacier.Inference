@@ -462,7 +462,11 @@ public sealed unsafe class TieredVirtualMemoryManager : IDisposable
         _hostRamResidents.Remove(key);
         if (_osLockedPages.Remove(key))
         {
-            try { _weightBank.UnlockExpertPages(layer, expert); } catch { }
+            try { _weightBank.UnlockExpertPages(layer, expert); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[TieredVirtualMemoryManager] UnlockExpertPages failed for L{layer}E{expert}: {ex.Message}");
+            }
         }
     }
 
@@ -647,7 +651,11 @@ public sealed unsafe class TieredVirtualMemoryManager : IDisposable
             {
                 foreach (var key in _osLockedPages)
                 {
-                    try { _weightBank.UnlockExpertPages(key.Layer, key.Expert); } catch { }
+                    try { _weightBank.UnlockExpertPages(key.Layer, key.Expert); }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Trace.TraceWarning($"[TieredVirtualMemoryManager] UnlockExpertPages Dispose failed for L{key.Layer}E{key.Expert}: {ex.Message}");
+                    }
                 }
                 _osLockedPages.Clear();
                 _hostRamResidents.Clear();

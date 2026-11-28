@@ -230,7 +230,10 @@ public static partial class Program
                 Console.WriteLine(new string('-', 90));
                 Console.WriteLine();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[Inference.Cli] Voice listing section unavailable: {ex.Message}");
+            }
 
             Console.WriteLine($"{"Voice ID",-14} | {"Display Name",-22} | {"Accent",-10} | {"Gender",-8} | {"Base F0",-8} | {"Description",-32}");
             Console.WriteLine(new string('-', 105));
@@ -293,7 +296,10 @@ public static partial class Program
             {
                 kittenEngine = KittenTtsEngine.CreateDefault();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[Inference.Cli] KittenTtsEngine unavailable: {ex.Message}");
+            }
 
             string voiceStr = rawVoice.ToLowerInvariant();
             bool isKittenVoice = kittenEngine != null && (kittenEngine.AvailableVoices.Contains(voiceStr) || voiceStr is "bella" or "bruno" or "jasper" or "hugo" or "kiki" or "leo" or "luna" or "rosie" || engine == "kitten");

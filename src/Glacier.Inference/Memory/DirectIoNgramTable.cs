@@ -832,7 +832,11 @@ public sealed unsafe class DirectIoNgramTable : IDisposable
 
         if (_mmapBasePtr != null)
         {
-            try { _accessor?.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            try { _accessor?.SafeMemoryMappedViewHandle.ReleasePointer(); }
+            catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[DirectIoNgramTable] ReleasePointer failed: {ex.Message}");
+            }
             _mmapBasePtr = null;
         }
         _accessor?.Dispose();

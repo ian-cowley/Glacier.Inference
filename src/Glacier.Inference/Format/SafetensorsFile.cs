@@ -141,7 +141,11 @@ public sealed unsafe class SafetensorsFile : IDisposable
         {
             if (ptr != null && accessor != null)
             {
-                try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[SafetensorsFile] ReleasePointer during error cleanup failed: {ex.Message}");
+                }
             }
             accessor?.Dispose();
             mmf?.Dispose();
@@ -335,7 +339,11 @@ public sealed unsafe class SafetensorsFile : IDisposable
         {
             if (_basePointer != null)
             {
-                try { _accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                try { _accessor.SafeMemoryMappedViewHandle.ReleasePointer(); }
+                catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+                {
+                    System.Diagnostics.Trace.TraceWarning($"[SafetensorsFile] ReleasePointer during Dispose failed: {ex.Message}");
+                }
                 _basePointer = null;
             }
             _accessor.Dispose();

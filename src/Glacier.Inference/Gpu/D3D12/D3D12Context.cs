@@ -433,7 +433,10 @@ public sealed unsafe class D3D12Context : IDisposable
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[D3D12Context] Disk shader cache read failed for '{entryPoint}', recompiling: {ex.Message}");
+        }
 
         var bytecode = Compiler.Compile(hlsl, entryPoint, "source.hlsl", profile);
         if (bytecode.IsEmpty)
@@ -444,7 +447,10 @@ public sealed unsafe class D3D12Context : IDisposable
             Directory.CreateDirectory(_diskShaderCacheDir);
             File.WriteAllBytes(cacheFile, bytecode.ToArray());
         }
-        catch { }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[D3D12Context] Disk shader cache write failed for '{entryPoint}': {ex.Message}");
+        }
 
         _memoryShaderCache[key] = bytecode;
         return bytecode;
