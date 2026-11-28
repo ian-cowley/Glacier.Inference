@@ -18,12 +18,12 @@ public static partial class Program
             Console.WriteLine("Glacier Vision Feature Extraction Subsystem [Experimental] (ViT / SigLIP + 2D Spatial Merging)");
             Console.WriteLine();
             Console.WriteLine("Usage:");
-            Console.WriteLine("  glacier vision demo");
-            Console.WriteLine("  glacier vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
+            Console.WriteLine("  glacier-ai vision demo");
+            Console.WriteLine("  glacier-ai vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
             Console.WriteLine();
             Console.WriteLine("Examples:");
-            Console.WriteLine("  glacier vision demo");
-            Console.WriteLine("  glacier vision query diagram.png \"What objects and colors are in this scene?\" --synthetic-demo");
+            Console.WriteLine("  glacier-ai vision demo");
+            Console.WriteLine("  glacier-ai vision query diagram.png \"What objects and colors are in this scene?\" --synthetic-demo");
             return 0;
         }
 
@@ -136,14 +136,14 @@ public static partial class Program
 
             if (positional.Count < 2)
             {
-                Console.Error.WriteLine("Error: Missing image file or prompt. Usage: glacier vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
+                Console.Error.WriteLine("Error: Missing image file or prompt. Usage: glacier-ai vision query <image.png|bmp|raw> \"<prompt>\" --synthetic-demo");
                 return 1;
             }
 
             if (!syntheticDemo)
             {
                 Console.Error.WriteLine(
-                    "Error: 'glacier vision query' uses the [Experimental] synthetic VisionPipeline which does not load pretrained VLM weights. " +
+                    "Error: 'glacier-ai vision query' uses the [Experimental] synthetic VisionPipeline which does not load pretrained VLM weights. " +
                     "Pass '--synthetic-demo' to inspect synthetic visual token embeddings and scene statistics, or use EmbeddingGemma2Model with AttachMultimodalProjector (Gemma4VisionTower) for pretrained vision embeddings.");
                 return 1;
             }
@@ -187,7 +187,7 @@ public static partial class Program
             return 0;
         }
 
-        Console.Error.WriteLine($"Unknown vision command: '{subCmd}'. Use 'glacier vision --help' for usage.");
+        Console.Error.WriteLine($"Unknown vision command: '{subCmd}'. Use 'glacier-ai vision --help' for usage.");
         return 1;
     }
 
@@ -204,7 +204,7 @@ public static partial class Program
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing prompt for video generation. Usage: glacier video generate \"<prompt>\" [options]");
+                Console.Error.WriteLine("Error: Missing prompt for video generation. Usage: glacier-ai video generate \"<prompt>\" [options]");
                 return 1;
             }
 
@@ -424,7 +424,7 @@ public static partial class Program
         {
             if (args.Length < 3)
             {
-                Console.Error.WriteLine("Error: Missing frame directory or prompt. Usage: glacier video query <dir> \"<prompt>\"");
+                Console.Error.WriteLine("Error: Missing frame directory or prompt. Usage: glacier-ai video query <dir> \"<prompt>\"");
                 return 1;
             }
 
@@ -458,7 +458,7 @@ public static partial class Program
             return 0;
         }
 
-        Console.Error.WriteLine($"Unknown video command: '{subCmd}'. Use 'glacier video --help' for usage.");
+        Console.Error.WriteLine($"Unknown video command: '{subCmd}'. Use 'glacier-ai video --help' for usage.");
         return 1;
     }
 
@@ -531,7 +531,7 @@ public static partial class Program
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing model path. Usage: glacier image info <model.gguf>");
+                Console.Error.WriteLine("Error: Missing model path. Usage: glacier-ai image info <model.gguf>");
                 return 1;
             }
 
@@ -561,7 +561,7 @@ public static partial class Program
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier image generate \"<prompt>\" [-m <model.gguf>] [--out <file.png>]");
+                Console.Error.WriteLine("Error: Missing text prompt. Usage: glacier-ai image generate \"<prompt>\" [-m <model.gguf>] [--out <file.png>]");
                 return 1;
             }
 
@@ -635,7 +635,7 @@ public static partial class Program
             if (string.IsNullOrEmpty(modelPath) || !File.Exists(modelPath))
             {
                 throw new FileNotFoundException(
-                    "Flux.1 GGUF model weights (e.g., flux1-schnell-Q4_K_S.gguf) were not found. Provide --model <path.gguf> or run 'glacier image demo' for the experimental synthetic test pipeline.");
+                    "Flux.1 GGUF model weights (e.g., flux1-schnell-Q4_K_S.gguf) were not found. Provide --model <path.gguf> or run 'glacier-ai image demo' for the experimental synthetic test pipeline.");
             }
 
             Console.ForegroundColor = ConsoleColor.Cyan;
@@ -669,7 +669,7 @@ public static partial class Program
             return 0;
         }
 
-        Console.Error.WriteLine($"Unknown image command: '{subCmd}'. Use 'glacier image --help' for usage.");
+        Console.Error.WriteLine($"Unknown image command: '{subCmd}'. Use 'glacier-ai image --help' for usage.");
         return 1;
     }
 }

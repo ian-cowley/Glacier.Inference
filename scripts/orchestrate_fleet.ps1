@@ -93,10 +93,10 @@ if (-not $Credential -and ($activeNodes | Where-Object { $_.IP -ne "localhost" }
     $Credential = Get-Credential
 }
 
-# Local published glacier binary
-$localBin = "$PSScriptRoot\..\publish\glacier.exe"
+# Local published glacier-ai binary
+$localBin = "$PSScriptRoot\..\publish\glacier-ai.exe"
 if (-not (Test-Path $localBin)) {
-    Write-Host "   Building fresh standalone glacier binary..." -ForegroundColor Cyan
+    Write-Host "   Building fresh standalone glacier-ai binary..." -ForegroundColor Cyan
     dotnet publish "$PSScriptRoot\..\src\Glacier.Inference.Cli\Glacier.Inference.Cli.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "$PSScriptRoot\..\publish\" | Out-Null
 }
 
@@ -127,17 +127,17 @@ foreach ($node in $activeNodes) {
 
             try {
                 # Deploy binary if requested or if missing on remote
-                $remoteHasBin = Invoke-Command -Session $session -ScriptBlock { Test-Path "C:\Glacier\glacier.exe" }
+                $remoteHasBin = Invoke-Command -Session $session -ScriptBlock { Test-Path "C:\Glacier\glacier-ai.exe" }
                 if ($DeployBinary -or (-not $remoteHasBin)) {
-                    Write-Host "   Deploying standalone glacier.exe to $($node.IP):C:\Glacier\glacier.exe..." -ForegroundColor Cyan
-                    Copy-Item -Path $localBin -Destination "C:\Glacier\glacier.exe" -ToSession $session -Force
+                    Write-Host "   Deploying standalone glacier-ai.exe to $($node.IP):C:\Glacier\glacier-ai.exe..." -ForegroundColor Cyan
+                    Copy-Item -Path $localBin -Destination "C:\Glacier\glacier-ai.exe" -ToSession $session -Force
                     Write-Host "   Deployment complete!" -ForegroundColor Green
                 }
 
                 # Query remote GPU devices
                 Write-Host "   Enumerating devices on remote host..." -ForegroundColor Cyan
                 $devInfo = Invoke-Command -Session $session -ScriptBlock {
-                    & "C:\Glacier\glacier.exe" devices 2>&1 | Out-String
+                    & "C:\Glacier\glacier-ai.exe" devices 2>&1 | Out-String
                 }
                 Write-Host $devInfo
 
@@ -145,7 +145,7 @@ foreach ($node in $activeNodes) {
                 Write-Host "   Launching benchmark on $($node.GPU)..." -ForegroundColor Cyan
                 $remOut = Invoke-Command -Session $session -ScriptBlock {
                     param($m, $n, $p, $g, $e)
-                    & "C:\Glacier\glacier.exe" bench $m -n $n -p $p --device $g --engine $e 2>&1 | Out-String
+                    & "C:\Glacier\glacier-ai.exe" bench $m -n $n -p $p --device $g --engine $e 2>&1 | Out-String
                 } -ArgumentList $ModelPath, $Tokens, $Prompt, $node.GPU, $node.Engine
 
                 $results += [PSCustomObject]@{

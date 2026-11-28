@@ -21,12 +21,12 @@ model.AttachMultimodalProjector("models/mmproj-embeddinggemma-2-Q8_0.gguf");
 - Check GGUF compatibility with `EmbeddingGemma2Model.IsSupported(gguf)`.
 - Choose CPU/Vulkan target via `EmbeddingDevice` and preprocessing helpers `Gemma4AudioPreprocessor` (16 kHz audio) and `Gemma4ImagePreprocessor` (RGB frames) along with `ForwardHidden` and span-writing `Embed(text, Span<float>)` overloads.
 
-## 2. Image Generation (`glacier image`, FLUX.1 DiT + VAE)
+## 2. Image Generation (`glacier-ai image`, FLUX.1 DiT + VAE)
 
 ```bash
-glacier image demo --out "crystal_fortress.png"
-glacier image info "models/flux1-schnell-Q4_K_S.gguf"
-glacier image generate "A cybernetic dragon on a mountain peak" -w 1024 -h 1024 --steps 4 --seed 42 -o dragon.png
+glacier-ai image demo --out "crystal_fortress.png"
+glacier-ai image info "models/flux1-schnell-Q4_K_S.gguf"
+glacier-ai image generate "A cybernetic dragon on a mountain peak" -w 1024 -h 1024 --steps 4 --seed 42 -o dragon.png
 ```
 
 | Flag | Default | Description |
@@ -40,35 +40,35 @@ glacier image generate "A cybernetic dragon on a mountain peak" -w 1024 -h 1024 
 | `--seed` | Random | PRNG seed for reproducible noise latents |
 | `-o, --out` | `generated.png` | Output PNG or BMP path |
 
-## 3. Video Generation (`glacier video`, Wan 2.1 3D DiT)
+## 3. Video Generation (`glacier-ai video`, Wan 2.1 3D DiT)
 
 ```bash
-glacier video generate "Glacier fjords under aurora borealis" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --motion pan-right --format all --out glacier_pan.apng
-glacier video generate "Camera zoom into the mountain" --image "photo.png" --motion zoom-in --format all --out zoom.apng
-glacier video demo
-glacier video query frames_dir/ "Describe the motion across frames."
+glacier-ai video generate "Glacier fjords under aurora borealis" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --motion pan-right --format all --out glacier_pan.apng
+glacier-ai video generate "Camera zoom into the mountain" --image "photo.png" --motion zoom-in --format all --out zoom.apng
+glacier-ai video demo
+glacier-ai video query frames_dir/ "Describe the motion across frames."
 ```
 
 Key flags: `--image`, `--frames` (`17`), `--duration`, `--fps` (`16`), `--width` (`832`), `--height` (`480`), `--steps` (`25`), `--guidance` (`5.0`), `--motion` (`pan-left`, `pan-right`, `tilt-up`, `tilt-down`, `zoom-in`, `zoom-out`, `static`, `fluid`), `--format` (`apng`, `gif`, `avi`, `all`), `--seed`, `--out`.
 
-## 4. Vision (`glacier vision`)
+## 4. Vision (`glacier-ai vision`)
 
 Experimental synthetic `VisionPipeline` patchification and analysis utility:
 
 ```bash
-glacier vision demo
-glacier vision query scene.png "Describe the scene" --synthetic-demo
+glacier-ai vision demo
+glacier-ai vision query scene.png "Describe the scene" --synthetic-demo
 ```
 
-## 5. Voice & Speech (`glacier voice`)
+## 5. Voice & Speech (`glacier-ai voice`)
 
 Provides neural KittenTTS synthesis, procedural Kokoro glottal formant synthesis, and OpenAI-compatible Whisper speech-to-text:
 
 ```bash
-glacier voice voices
-glacier voice tts "All systems nominal." --out speech.wav --voice af_heart --speed 1.0 --play
-glacier voice stt speech.wav
-glacier voice demo --play
+glacier-ai voice voices
+glacier-ai voice tts "All systems nominal." --out speech.wav --voice af_heart --speed 1.0 --play
+glacier-ai voice stt speech.wav
+glacier-ai voice demo --play
 ```
 
 Built-in 16 voice IDs:

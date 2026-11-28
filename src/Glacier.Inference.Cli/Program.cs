@@ -108,7 +108,7 @@ public static partial class Program
         Console.WriteLine("╚═══════════════════════════════════════════════════════════════════════╝");
         Console.ResetColor();
         Console.WriteLine();
-        Console.WriteLine("Usage: glacier <command> [options]");
+        Console.WriteLine("Usage: glacier-ai <command> [options]");
         Console.WriteLine();
         Console.WriteLine("Hardware & Configuration Commands:");
         Console.WriteLine("  devices                              Enumerate detected GPUs, VRAM, and safe driver engines");
@@ -134,11 +134,11 @@ public static partial class Program
         Console.WriteLine("  --split <spec>                       Heterogeneous multi-GPU pipeline split (e.g. 'auto', 'nvidia-rtx-4060:14,amd-890m:14')");
         Console.WriteLine();
         Console.WriteLine("Subcommand Help:");
-        Console.WriteLine("  glacier <command> --help             Detailed help, options, and examples for any command");
-        Console.WriteLine("  glacier help <command>               Alternative syntax for subcommand help");
-        Console.WriteLine("  Example: glacier run --help");
-        Console.WriteLine("  Example: glacier bench --help");
-        Console.WriteLine("  Example: glacier serve --help");
+        Console.WriteLine("  glacier-ai <command> --help          Detailed help, options, and examples for any command");
+        Console.WriteLine("  glacier-ai help <command>            Alternative syntax for subcommand help");
+        Console.WriteLine("  Example: glacier-ai run --help");
+        Console.WriteLine("  Example: glacier-ai bench --help");
+        Console.WriteLine("  Example: glacier-ai serve --help");
     }
 
     private static void PrintCommandHelp(string command)
@@ -193,13 +193,13 @@ public static partial class Program
     private static void PrintImageHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier image - Pure C# .NET 10 Generative Image Production (Flux.1 / SDXL / DiT GGUF + VAE)");
+        Console.WriteLine("glacier-ai image - Pure C# .NET 10 Generative Image Production (Flux.1 / SDXL / DiT GGUF + VAE)");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier image demo [--out <file.png>]");
-        Console.WriteLine("  glacier image info <model.gguf>");
-        Console.WriteLine("  glacier image generate \"<prompt>\" [options]");
+        Console.WriteLine("  glacier-ai image demo [--out <file.png>]");
+        Console.WriteLine("  glacier-ai image info <model.gguf>");
+        Console.WriteLine("  glacier-ai image generate \"<prompt>\" [options]");
         Console.WriteLine();
         Console.WriteLine("Options (for 'generate'):");
         Console.WriteLine("  -m, --model <file.gguf>              Path to Flux/SD DiT GGUF (auto-detected if in models/)");
@@ -221,14 +221,14 @@ public static partial class Program
     private static void PrintVoiceHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier voice - Pure C# .NET 10 Voice Subsystem (KittenTTS Neural Speech Synthesis & Formant TTS + Audio DSP)");
+        Console.WriteLine("glacier-ai voice - Pure C# .NET 10 Voice Subsystem (KittenTTS Neural Speech Synthesis & Formant TTS + Audio DSP)");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier voice tts <text> [--out <file.wav>] [--voice <id>] [--speed <float>] [--play]");
-        Console.WriteLine("  glacier voice voices                                 # List all 16 USA & UK voices");
-        Console.WriteLine("  glacier voice stt <audio.wav>                        # Transcribe speech with Whisper");
-        Console.WriteLine("  glacier voice demo [--play]                          # Run full-duplex multi-accent demonstration");
+        Console.WriteLine("  glacier-ai voice tts <text> [--out <file.wav>] [--voice <id>] [--speed <float>] [--play]");
+        Console.WriteLine("  glacier-ai voice voices                              # List all 16 USA & UK voices");
+        Console.WriteLine("  glacier-ai voice stt <audio.wav>                     # Transcribe speech with Whisper");
+        Console.WriteLine("  glacier-ai voice demo [--play]                       # Run full-duplex multi-accent demonstration");
         Console.WriteLine();
         Console.WriteLine("Supported Voices (USA & British Accents):");
         Console.WriteLine("  USA Female:     af_heart, af_bella, af_sarah, af_sky");
@@ -240,25 +240,25 @@ public static partial class Program
     private static void PrintVisionHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier vision - [Experimental] Synthetic VisionPipeline patchification & analysis");
+        Console.WriteLine("glacier-ai vision - [Experimental] Synthetic VisionPipeline patchification & analysis");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier vision demo");
-        Console.WriteLine("  glacier vision query <image> \"<prompt>\" --synthetic-demo");
+        Console.WriteLine("  glacier-ai vision demo");
+        Console.WriteLine("  glacier-ai vision query <image> \"<prompt>\" --synthetic-demo");
     }
 
     private static void PrintVideoHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier video - Generative Video Production & Video-Language Multimodal Reasoning");
-        Console.WriteLine("                Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE + APNG/GIF/AVI");
+        Console.WriteLine("glacier-ai video - Generative Video Production & Video-Language Multimodal Reasoning");
+        Console.WriteLine("                   Pure C# .NET 10 | 3D-RoPE + Spatio-Temporal DiT + 3D VAE + APNG/GIF/AVI");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier video generate \"<prompt>\" [options]");
-        Console.WriteLine("  glacier video demo");
-        Console.WriteLine("  glacier video query <dir> \"<prompt>\"");
+        Console.WriteLine("  glacier-ai video generate \"<prompt>\" [options]");
+        Console.WriteLine("  glacier-ai video demo");
+        Console.WriteLine("  glacier-ai video query <dir> \"<prompt>\"");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  generate \"<prompt>\" [options]        Synthesize video from prompt (Spatio-Temporal DiT & 3D VAE)");
@@ -283,11 +283,11 @@ public static partial class Program
     private static void PrintDevicesHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier devices - Enumerate compute hardware and safe driver engines");
+        Console.WriteLine("glacier-ai devices - Enumerate compute hardware and safe driver engines");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier devices");
+        Console.WriteLine("  glacier-ai devices");
         Console.WriteLine();
         Console.WriteLine("Description:");
         Console.WriteLine("  Scans the system for all physical GPU accelerators and host CPUs using pure DXGI");
@@ -296,17 +296,17 @@ public static partial class Program
         Console.WriteLine("  are safe for each device (preventing Windows DWM display driver TDR timeouts).");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier devices");
+        Console.WriteLine("  glacier-ai devices");
     }
 
     private static void PrintConfigHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier config - View or set persistent hardware & engine preferences");
+        Console.WriteLine("glacier-ai config - View or set persistent hardware & engine preferences");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier config [options]");
+        Console.WriteLine("  glacier-ai config [options]");
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --device <id|name>                   Set default target device (e.g. nvidia-rtx-4060, amd-890m, cpu, auto)");
@@ -319,21 +319,21 @@ public static partial class Program
         Console.WriteLine("  When set, commands (run, bench, serve) automatically use these preferences unless overridden.");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier config                                     # View current persistent configuration");
-        Console.WriteLine("  glacier config --device nvidia-rtx-4060            # Default to NVIDIA discrete GPU");
-        Console.WriteLine("  glacier config --device amd-890m --engine directml  # Default to AMD iGPU with D3D12/DirectML");
-        Console.WriteLine("  glacier config --reset                             # Reset to factory auto-selection");
+        Console.WriteLine("  glacier-ai config                                  # View current persistent configuration");
+        Console.WriteLine("  glacier-ai config --device nvidia-rtx-4060         # Default to NVIDIA discrete GPU");
+        Console.WriteLine("  glacier-ai config --device amd-890m --engine directml # Default to AMD iGPU with D3D12/DirectML");
+        Console.WriteLine("  glacier-ai config --reset                          # Reset to factory auto-selection");
     }
 
     private static void PrintInspectHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier inspect - Inspect GGUF model architecture, metadata & tensors");
+        Console.WriteLine("glacier-ai inspect - Inspect GGUF model architecture, metadata & tensors");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier inspect <model.gguf> [options]");
-        Console.WriteLine("  glacier inspect -m <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai inspect <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai inspect -m <model.gguf> [options]");
         Console.WriteLine();
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
@@ -347,20 +347,20 @@ public static partial class Program
         Console.WriteLine("  and total parameter storage size in gigabytes.");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier inspect models/Qwen2.5-Coder-7B-Enterprise-Q8_0.gguf");
-        Console.WriteLine("  glacier inspect models/Qwen3-30B-A3B-Q4_K_M.gguf --filter exps");
-        Console.WriteLine("  glacier inspect -m models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf -a");
+        Console.WriteLine("  glacier-ai inspect models/Qwen2.5-Coder-7B-Enterprise-Q8_0.gguf");
+        Console.WriteLine("  glacier-ai inspect models/Qwen3-30B-A3B-Q4_K_M.gguf --filter exps");
+        Console.WriteLine("  glacier-ai inspect -m models/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf -a");
     }
 
     private static void PrintBenchHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier bench - Run speed & comparative performance benchmark");
+        Console.WriteLine("glacier-ai bench - Run speed & comparative performance benchmark");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier bench <model.gguf> [options]");
-        Console.WriteLine("  glacier bench -m <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai bench <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai bench -m <model.gguf> [options]");
         Console.WriteLine();
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
@@ -393,21 +393,21 @@ public static partial class Program
         Console.WriteLine("  identical prompt on the Ollama endpoint and generates a head-to-head performance table.");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier bench model.gguf -n 50");
-        Console.WriteLine("  glacier bench model.gguf -c 4096 --device nvidia-rtx-4060 --engine baremetal");
-        Console.WriteLine("  glacier bench model.gguf --split auto");
-        Console.WriteLine("  glacier bench model.gguf --compare-ollama http://127.0.0.1:11434 --compare-model qwen2.5:7b");
+        Console.WriteLine("  glacier-ai bench model.gguf -n 50");
+        Console.WriteLine("  glacier-ai bench model.gguf -c 4096 --device nvidia-rtx-4060 --engine baremetal");
+        Console.WriteLine("  glacier-ai bench model.gguf --split auto");
+        Console.WriteLine("  glacier-ai bench model.gguf --compare-ollama http://127.0.0.1:11434 --compare-model qwen2.5:7b");
     }
 
     private static void PrintRunHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier run - Interactive streaming chat REPL or single-shot prompt");
+        Console.WriteLine("glacier-ai run - Interactive streaming chat REPL or single-shot prompt");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier run <model.gguf> [prompt] [options]");
-        Console.WriteLine("  glacier run -m <model.gguf> [prompt] [options]");
+        Console.WriteLine("  glacier-ai run <model.gguf> [prompt] [options]");
+        Console.WriteLine("  glacier-ai run -m <model.gguf> [prompt] [options]");
         Console.WriteLine();
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
@@ -436,22 +436,22 @@ public static partial class Program
         Console.WriteLine("  exit, quit                           Terminate the interactive chat session");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier run model.gguf                                # Launch interactive chat REPL");
-        Console.WriteLine("  glacier run model.gguf \"Explain quicksort in C#\"       # Single-shot streaming answer");
-        Console.WriteLine("  glacier run model.gguf -c 4096 --temp 0.2              # Low-temperature coding mode");
-        Console.WriteLine("  glacier run model.gguf --split auto                   # Dual-GPU pipeline parallelism");
-        Console.WriteLine("  glacier run model.gguf --device amd-890m --engine directml");
+        Console.WriteLine("  glacier-ai run model.gguf                             # Launch interactive chat REPL");
+        Console.WriteLine("  glacier-ai run model.gguf \"Explain quicksort in C#\"    # Single-shot streaming answer");
+        Console.WriteLine("  glacier-ai run model.gguf -c 4096 --temp 0.2           # Low-temperature coding mode");
+        Console.WriteLine("  glacier-ai run model.gguf --split auto                # Dual-GPU pipeline parallelism");
+        Console.WriteLine("  glacier-ai run model.gguf --device amd-890m --engine directml");
     }
 
     private static void PrintServeHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier serve - Start Ollama & OpenAI compatible HTTP inference server");
+        Console.WriteLine("glacier-ai serve - Start Ollama & OpenAI compatible HTTP inference server");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier serve <model.gguf> [options]");
-        Console.WriteLine("  glacier serve -m <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai serve <model.gguf> [options]");
+        Console.WriteLine("  glacier-ai serve -m <model.gguf> [options]");
         Console.WriteLine();
         Console.WriteLine("Arguments & Options:");
         Console.WriteLine("  <model.gguf>, -m <model.gguf>        Path to GGUF model file (required)");
@@ -485,19 +485,19 @@ public static partial class Program
         Console.WriteLine("  GET  /v1/models                      OpenAI-compatible model & LoRA adapter list");
         Console.WriteLine();
         Console.WriteLine("Examples:");
-        Console.WriteLine("  glacier serve model.gguf                              # Listen on port 11434 (Ollama default)");
-        Console.WriteLine("  glacier serve model.gguf --port 8080 --host 127.0.0.1  # Bind to localhost:8080");
-        Console.WriteLine("  glacier serve model.gguf --device nvidia-rtx-4060 --engine baremetal");
+        Console.WriteLine("  glacier-ai serve model.gguf                           # Listen on port 11434 (Ollama default)");
+        Console.WriteLine("  glacier-ai serve model.gguf --port 8080 --host 127.0.0.1 # Bind to localhost:8080");
+        Console.WriteLine("  glacier-ai serve model.gguf --device nvidia-rtx-4060 --engine baremetal");
     }
 
     private static void PrintBounceHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier bounce - 3-Machine Peer Critic + OS-Sandboxed Compiler Bounce Proxy");
+        Console.WriteLine("glacier-ai bounce - 3-Machine Peer Critic + OS-Sandboxed Compiler Bounce Proxy");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier bounce [options]");
+        Console.WriteLine("  glacier-ai bounce [options]");
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  --primary <url>                      Primary Glacier/OpenAI server endpoint (default: http://192.168.1.108:18080)");

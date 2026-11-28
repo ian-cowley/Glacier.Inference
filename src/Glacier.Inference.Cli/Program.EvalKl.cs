@@ -15,11 +15,11 @@ public static partial class Program
     private static void PrintEvalKlHelp()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
-        Console.WriteLine("glacier eval-kl - Evaluate KL-divergence D_KL(P_ref || Q_cand) against a reference GGUF");
+        Console.WriteLine("glacier-ai eval-kl - Evaluate KL-divergence D_KL(P_ref || Q_cand) against a reference GGUF");
         Console.ResetColor();
         Console.WriteLine();
         Console.WriteLine("Usage:");
-        Console.WriteLine("  glacier eval-kl <candidate.gguf> --ref <reference.gguf> [options]");
+        Console.WriteLine("  glacier-ai eval-kl <candidate.gguf> --ref <reference.gguf> [options]");
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine("  <candidate.gguf>, -m, --model <path> Candidate quantized GGUF model (required)");

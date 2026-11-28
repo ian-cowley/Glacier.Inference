@@ -7,7 +7,7 @@
 [![Native AOT](https://img.shields.io/badge/Native%20AOT-Ready-brightgreen.svg)](https://learn.microsoft.com/dotnet/core/deploying/native-aot/)
 [![NuGet Version](https://img.shields.io/nuget/v/Glacier.Inference.svg)](https://www.nuget.org/packages/Glacier.Inference/)
 
-`Glacier.Inference` is a local AI inference runtime, standalone CLI (`glacier`), and OpenAI/Ollama-compatible HTTP server written in pure C# for .NET 10.
+`Glacier.Inference` is a local AI inference runtime, standalone CLI (`glacier-ai`), and OpenAI/Ollama-compatible HTTP server written in pure C# for .NET 10.
 
 If you want to run open-weight LLMs, embeddings, image generation, video synthesis, or local text-to-speech on Windows, Linux, or Android—or embed model execution directly inside a C# app without installing Python, PyTorch, or the CUDA Toolkit—`Glacier.Inference` handles model loading and hardware acceleration in-process by calling your installed OS GPU drivers (`nvcuda.dll`, `d3d12.dll`, Vulkan, AMD HIP) or multi-core CPU SIMD.
 
@@ -47,9 +47,9 @@ await session.GenerateAsync("Explain quicksort in C#.", options, onToken: token 
 ### Run or Serve From the Terminal
 
 ```bash
-glacier devices
-glacier run "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" "Explain quicksort in C#."
-glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 11434 --host 127.0.0.1
+glacier-ai devices
+glacier-ai run "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" "Explain quicksort in C#."
+glacier-ai serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 11434 --host 127.0.0.1
 ```
 
 ## What You Can Do
@@ -59,8 +59,8 @@ glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --port 11434 --hos
 | **Chat & Reasoning LLMs** | Llama 3 / 3.1 / 3.2 / 3.3, DeepSeek-V2 / V3 / R1, Qwen 2.5 / 3 / 3.5 / 3.6 / 3.8 (`TRL1..TRL6`), Gemma 4, Phi-3 / Phi-4, Mistral / Devstral |
 | **OpenAI & Ollama API Server** | Drop-in `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/api/chat`, `/api/generate`, `/api/tags` with optional `GLACIER_API_KEY` auth |
 | **Multimodal Embeddings** | EmbeddingGemma 2 (`EmbeddingGemma2Model`) across text, audio, image, and video inputs |
-| **Image & Video Generation** | FLUX.1 Schnell/Dev diffusion (`glacier image`) and Wan 2.1 video synthesis to APNG/GIF/AVI (`glacier video`) |
-| **Speech Synthesis & STT** | KittenTTS neural speech synthesis, Kokoro acoustic formant TTS, and OpenAI-compatible Whisper STT (`glacier voice`) |
+| **Image & Video Generation** | FLUX.1 Schnell/Dev diffusion (`glacier-ai image`) and Wan 2.1 video synthesis to APNG/GIF/AVI (`glacier-ai video`) |
+| **Speech Synthesis & STT** | KittenTTS neural speech synthesis, Kokoro acoustic formant TTS, and OpenAI-compatible Whisper STT (`glacier-ai voice`) |
 
 ## Platform & Compatibility
 

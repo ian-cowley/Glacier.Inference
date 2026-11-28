@@ -102,7 +102,7 @@ public sealed class InferenceCliDevicesParityTests
         Assert.Contains("NPU Sidecar (FLM / Lemonade)", text, StringComparison.Ordinal);
         Assert.Contains("[ACTIVE: Native Driver (SASS/HIP)]", text, StringComparison.Ordinal);
         Assert.Contains("* NPU Sidecar detected: run 'flm serve <model>' (FastFlowLM) or 'lemonade-server' and offload critic/RAG:", text, StringComparison.Ordinal);
-        Assert.Contains("glacier bounce --primary http://127.0.0.1:11434 --critic auto-npu", text, StringComparison.Ordinal);
+        Assert.Contains("glacier-ai bounce --primary http://127.0.0.1:11434 --critic auto-npu", text, StringComparison.Ordinal);
     }
 
     [Fact]

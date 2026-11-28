@@ -646,7 +646,7 @@ public static partial class Program
                 if (loraCount > 1)
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.Error.WriteLine("Error: 'glacier run' supports attaching a single --lora adapter at a time; use 'glacier serve' to host multiple named adapters.");
+                    Console.Error.WriteLine("Error: 'glacier-ai run' supports attaching a single --lora adapter at a time; use 'glacier-ai serve' to host multiple named adapters.");
                     Console.ResetColor();
                     return 1;
                 }

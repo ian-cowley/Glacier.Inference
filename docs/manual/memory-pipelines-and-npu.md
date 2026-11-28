@@ -4,7 +4,7 @@ This topic manual covers advanced memory management, programmatic multi-GPU pipe
 
 ## 1. Large-Model Memory & Tiered MoE (`TieredVirtualMemoryManager`)
 
-Control host RAM vs. VRAM placement directly on `InferenceSession` (or via `glacier run` flags `--ple-io`, `--host-arena-gib`, `--tiered-moe`):
+Control host RAM vs. VRAM placement directly on `InferenceSession` (or via `glacier-ai run` flags `--ple-io`, `--host-arena-gib`, `--tiered-moe`):
 
 - **`pleIoMode` (`PleIoMode.Auto` / `Direct` / `MemoryMapped`):** Controls how large per-layer embedding tables (`per_layer_token_embd.weight`) are mapped vs. counted against host RAM arena budgets.
 - **`hostArenaBudgetBytes` (`ulong?`):** Caps host RAM cached expert storage.

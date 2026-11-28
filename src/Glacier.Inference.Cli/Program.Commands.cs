@@ -79,16 +79,16 @@ public static partial class Program
         {
             if (useColors) Console.ForegroundColor = ConsoleColor.Cyan;
             output.WriteLine("* NPU Sidecar detected: run 'flm serve <model>' (FastFlowLM) or 'lemonade-server' and offload critic/RAG:");
-            output.WriteLine("  glacier bounce --primary http://127.0.0.1:11434 --critic auto-npu");
+            output.WriteLine("  glacier-ai bounce --primary http://127.0.0.1:11434 --critic auto-npu");
             if (useColors) Console.ResetColor();
         }
 
         if (useColors) Console.ForegroundColor = ConsoleColor.Yellow;
         output.WriteLine("* To switch your active hardware & driver engine:");
-        output.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
-        output.WriteLine("  Example: glacier config --device nvidia-rtx-4060 --engine baremetal");
-        output.WriteLine("  Example: glacier config --device amd-890m --engine vulkan");
-        output.WriteLine("  Example: glacier config --device cpu");
+        output.WriteLine("  glacier-ai config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
+        output.WriteLine("  Example: glacier-ai config --device nvidia-rtx-4060 --engine baremetal");
+        output.WriteLine("  Example: glacier-ai config --device amd-890m --engine vulkan");
+        output.WriteLine("  Example: glacier-ai config --device cpu");
         if (useColors) Console.ResetColor();
     }
 
@@ -124,8 +124,8 @@ public static partial class Program
             Console.WriteLine($"Default Top-P:     {settings.DefaultTopP}");
             Console.WriteLine();
             Console.WriteLine("Commands to configure:");
-            Console.WriteLine("  glacier config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
-            Console.WriteLine("  glacier config --reset");
+            Console.WriteLine("  glacier-ai config --device <id|name> [--engine <baremetal|vulkan|directml|cpu>]");
+            Console.WriteLine("  glacier-ai config --reset");
             return 0;
         }
 
@@ -171,7 +171,7 @@ public static partial class Program
             return 0;
         }
 
-        Console.WriteLine("Usage: glacier config [--device <id|name>] [--engine <baremetal|directml|cpu>] [--reset]");
+        Console.WriteLine("Usage: glacier-ai config [--device <id|name>] [--engine <baremetal|directml|cpu>] [--reset]");
         return 1;
     }
 
@@ -248,14 +248,14 @@ public static partial class Program
             }
             Console.WriteLine(new string('-', 105));
             Console.WriteLine();
-            Console.WriteLine("Usage: glacier voice tts \"<text>\" --voice <id> --out <speech.wav>");
+            Console.WriteLine("Usage: glacier-ai voice tts \"<text>\" --voice <id> --out <speech.wav>");
             return 0;
         }
         else if (subCmd == "tts")
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing text for TTS synthesis. Usage: glacier voice tts \"<text>\" [--out <file.wav>]");
+                Console.Error.WriteLine("Error: Missing text for TTS synthesis. Usage: glacier-ai voice tts \"<text>\" [--out <file.wav>]");
                 return 1;
             }
 
@@ -389,7 +389,7 @@ public static partial class Program
         {
             if (args.Length < 2)
             {
-                Console.Error.WriteLine("Error: Missing audio file for STT transcription. Usage: glacier voice stt <audio.wav>");
+                Console.Error.WriteLine("Error: Missing audio file for STT transcription. Usage: glacier-ai voice stt <audio.wav>");
                 return 1;
             }
 
@@ -504,7 +504,7 @@ public static partial class Program
             return 0;
         }
 
-        Console.Error.WriteLine($"Unknown voice command: '{subCmd}'. Use 'glacier voice --help' for usage.");
+        Console.Error.WriteLine($"Unknown voice command: '{subCmd}'. Use 'glacier-ai voice --help' for usage.");
         return 1;
     }
 }

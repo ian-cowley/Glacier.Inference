@@ -141,7 +141,7 @@ public static partial class DeviceManager
                 if (dev.Vendor == GpuVendor.Cpu) return dev;
         }
 
-        throw new ArgumentException($"No compute device matching '{query}' was found. Run 'glacier devices' to inspect available hardware.");
+        throw new ArgumentException($"No compute device matching '{query}' was found. Run 'glacier-ai devices' (or 'glacier devices') to inspect available hardware.");
     }
 
     private static List<DeviceInfo> EnumerateDevices()

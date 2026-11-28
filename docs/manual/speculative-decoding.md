@@ -1,8 +1,8 @@
 # Speculative Decoding (`lookup`, `mtp`, `dflash`, `adaptive`)
 
-`Glacier.Inference` supports speculative draft-and-verify decoding via the `glacier run` CLI and programmatically through `SpeculativeEngine`. Draft providers propose candidate tokens that the target model verifies in a batched forward pass.
+`Glacier.Inference` supports speculative draft-and-verify decoding via the `glacier-ai run` CLI and programmatically through `SpeculativeEngine`. Draft providers propose candidate tokens that the target model verifies in a batched forward pass.
 
-## 1. CLI Flags (`glacier run`)
+## 1. CLI Flags (`glacier-ai run`)
 
 | Flag | Values | Default | Purpose |
 | :--- | :--- | :--- | :--- |
@@ -16,7 +16,7 @@
 Example:
 
 ```bash
-glacier run "models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf" "Implement binary search in C#." --speculative adaptive --draft-tokens 4
+glacier-ai run "models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf" "Implement binary search in C#." --speculative adaptive --draft-tokens 4
 ```
 
 ## 2. Draft Providers & Cost-Gated Routing (`Glacier.Inference.Engine`)

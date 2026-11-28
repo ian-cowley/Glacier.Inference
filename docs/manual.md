@@ -5,7 +5,7 @@
 1. [Requirements & Installation](#1-requirements--installation)
 2. [C# Library API](#2-c-library-api)
 3. [CLI Command Reference](#3-cli-command-reference)
-4. [HTTP Microservice (`glacier serve`) & Authentication](#4-http-microservice-glacier-serve--authentication)
+4. [HTTP Microservice (`glacier-ai serve`) & Authentication](#4-http-microservice-glacier-ai-serve--authentication)
 5. [Quantization Formats & VRAM Sizing](#5-quantization-formats--vram-sizing)
 6. [Multi-GPU Splitting & Linux Vulkan Execution](#6-multi-gpu-splitting--linux-vulkan-execution)
 7. [Video, Image, Vision & Voice Commands](#7-video-image-vision--voice-commands)
@@ -32,11 +32,11 @@
 
 ### Three Ways to Install
 
-1. **Standalone Release Archive:** Download the prebuilt executable archive for your platform from GitHub Releases and add it to `PATH`, then verify with `glacier devices`.
+1. **Standalone Release Archive:** Download the prebuilt executable archive for your platform from GitHub Releases and add it to `PATH`, then verify with `glacier-ai devices`.
 2. **.NET Global CLI Tool:**
    ```bash
    dotnet tool install --global Glacier.Inference.Cli
-   glacier --help
+   glacier-ai --help
    ```
 3. **C# Library via NuGet:**
    ```bash
@@ -92,23 +92,23 @@ await session.GenerateAsync("Summarize quicksort.", options, formatChat: true, a
 ## 3. CLI Command Reference
 
 ```text
-Usage: glacier <command> [options]
+Usage: glacier-ai <command> [options]
 ```
 
 | Command | Function | Example |
 | :--- | :--- | :--- |
-| `devices` | Lists detected GPUs, NPUs, memory pools, and supported engines | `glacier devices` |
-| `config` | Displays or updates defaults in `~/.glacier/settings.json` | `glacier config --device nvidia-rtx-4060 --engine baremetal` |
-| `inspect` | Prints GGUF/Safetensors header metadata, context limit, and tensor inventory | `glacier inspect "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"` |
-| `run` | Runs interactive chat REPL or single prompt | `glacier run "models/model.gguf" "Write a C# dot product." --temp 0.2 --ctx 4096` |
-| `bench` | Measures prefill/decode tok/s (supports `--compare-ollama`) | `glacier bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64` |
-| `serve` | Launches HTTP service compatible with Ollama and OpenAI | `glacier serve "models/model.gguf" --port 11434 --host 127.0.0.1` |
-| `eval-kl` | Evaluates KL divergence and top-1 agreement across quantized models | `glacier eval-kl --help` |
-| `bounce` | Starts a multi-node peer-critic + compiler-verified proxy | `glacier bounce --primary http://127.0.0.1:18080` |
-| `video` | Generates APNG, GIF, or AVI video via Wan 2.1 | `glacier video generate "Prompt" --format all -o out.apng` |
-| `image` | Generates images via FLUX.1 DiT (`generate`, `info`, `demo`) | `glacier image generate "Prompt" -w 1024 -h 1024 --steps 4 -o out.png` |
-| `vision` | Experimental `VisionPipeline` image patch analysis | `glacier vision query scene.png "Describe scene" --synthetic-demo` |
-| `voice` | Synthesizes KittenTTS/Kokoro speech or runs Whisper STT | `glacier voice tts "Hello world" --voice af_heart` |
+| `devices` | Lists detected GPUs, NPUs, memory pools, and supported engines | `glacier-ai devices` |
+| `config` | Displays or updates defaults in `~/.glacier/settings.json` | `glacier-ai config --device nvidia-rtx-4060 --engine baremetal` |
+| `inspect` | Prints GGUF/Safetensors header metadata, context limit, and tensor inventory | `glacier-ai inspect "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"` |
+| `run` | Runs interactive chat REPL or single prompt | `glacier-ai run "models/model.gguf" "Write a C# dot product." --temp 0.2 --ctx 4096` |
+| `bench` | Measures prefill/decode tok/s (supports `--compare-ollama`) | `glacier-ai bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64` |
+| `serve` | Launches HTTP service compatible with Ollama and OpenAI | `glacier-ai serve "models/model.gguf" --port 11434 --host 127.0.0.1` |
+| `eval-kl` | Evaluates KL divergence and top-1 agreement across quantized models | `glacier-ai eval-kl --help` |
+| `bounce` | Starts a multi-node peer-critic + compiler-verified proxy | `glacier-ai bounce --primary http://127.0.0.1:18080` |
+| `video` | Generates APNG, GIF, or AVI video via Wan 2.1 | `glacier-ai video generate "Prompt" --format all -o out.apng` |
+| `image` | Generates images via FLUX.1 DiT (`generate`, `info`, `demo`) | `glacier-ai image generate "Prompt" -w 1024 -h 1024 --steps 4 -o out.png` |
+| `vision` | Experimental `VisionPipeline` image patch analysis | `glacier-ai vision query scene.png "Describe scene" --synthetic-demo` |
+| `voice` | Synthesizes KittenTTS/Kokoro speech or runs Whisper STT | `glacier-ai voice tts "Hello world" --voice af_heart` |
 
 ### Common Options (`run`, `bench`, `serve`)
 
@@ -136,14 +136,14 @@ Usage: glacier <command> [options]
 Compare against a local Ollama daemon side-by-side:
 
 ```bash
-glacier bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64 --compare-ollama "http://127.0.0.1:11434" --compare-model "qwen2.5:7b"
+glacier-ai bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64 --compare-ollama "http://127.0.0.1:11434" --compare-model "qwen2.5:7b"
 ```
 
 ---
 
-## 4. HTTP Microservice (`glacier serve`) & Authentication
+## 4. HTTP Microservice (`glacier-ai serve`) & Authentication
 
-`glacier serve` implements Ollama and OpenAI endpoints on the same listener (default `http://127.0.0.1:11434`):
+`glacier-ai serve` implements Ollama and OpenAI endpoints on the same listener (default `http://127.0.0.1:11434`):
 
 - **Ollama API:** `GET /api/tags`, `POST /api/generate` (`application/x-ndjson`), `POST /api/chat`
 - **OpenAI API:** `GET /v1/models`, `POST /v1/chat/completions` (`text/event-stream` SSE), `POST /v1/completions`
@@ -154,13 +154,13 @@ glacier bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64 --compare-oll
 ```powershell
 # Windows PowerShell
 $env:GLACIER_API_KEY = "<your_api_key>"
-glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --host 0.0.0.0 --port 8080 --kv-precision fp8
+glacier-ai serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --host 0.0.0.0 --port 8080 --kv-precision fp8
 ```
 
 ```bash
 # Linux / macOS
 export GLACIER_API_KEY="<your_api_key>"
-glacier serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --host 0.0.0.0 --port 8080 --kv-precision fp8
+glacier-ai serve "models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" --host 0.0.0.0 --port 8080 --kv-precision fp8
 ```
 
 ### Calling With `curl`, OpenAI Python SDK & LangChain
@@ -236,10 +236,10 @@ where $L$ is transformer layer count, $H_{\text{kv}}$ is KV head count, $D_{\tex
 Distribute layers across a discrete GPU and an integrated APU (for example a 28-layer 14B model split evenly):
 
 ```bash
-glacier run "models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf" --split "nvidia-rtx-4060:14,amd-890m:14"
+glacier-ai run "models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf" --split "nvidia-rtx-4060:14,amd-890m:14"
 
 # Or let Glacier allocate layers automatically across detected devices
-glacier serve "models/Large-30B-Model-Q4_K_M.gguf" --split auto
+glacier-ai serve "models/Large-30B-Model-Q4_K_M.gguf" --split auto
 ```
 
 ### Linux Vulkan (`--engine vulkan`)
@@ -247,7 +247,7 @@ glacier serve "models/Large-30B-Model-Q4_K_M.gguf" --split auto
 On Linux with Mesa RADV or proprietary Vulkan drivers (verify with `vulkaninfo --summary`):
 
 ```bash
-glacier run "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" "Hello" --device amd-890m --engine vulkan --ctx 2048
+glacier-ai run "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" "Hello" --device amd-890m --engine vulkan --ctx 2048
 ```
 
 If a model contains tensor formats the Vulkan runner does not implement (such as `IQ4_XS`), Glacier logs the reason and runs on CPU SIMD. See [Vulkan Backend Notes](VULKAN_BACKEND.md) for weight conversion and BIOS UMA carve-out details.
@@ -256,16 +256,16 @@ If a model contains tensor formats the Vulkan runner does not implement (such as
 
 ## 7. Video, Image, Vision & Voice Commands
 
-### Video Generation (`glacier video generate`)
+### Video Generation (`glacier-ai video generate`)
 
 Uses Wan 2.1 3D-RoPE flow matching + 16-channel 3D Causal VAE:
 
 ```bash
 # 15-second video (240 frames @ 16 FPS), exporting APNG, GIF, and AVI
-glacier video generate "Icy glacier fjords under shimmering aurora borealis" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --motion pan-right --format all --out glacier_pan.apng
+glacier-ai video generate "Icy glacier fjords under shimmering aurora borealis" --width 832 --height 480 --steps 25 --duration 15 --fps 16 --motion pan-right --format all --out glacier_pan.apng
 
 # Animate an input still image
-glacier video generate "Slow camera zoom into the scene" --image "input_photo.png" --motion zoom-in --format all --out animated.apng
+glacier-ai video generate "Slow camera zoom into the scene" --image "input_photo.png" --motion zoom-in --format all --out animated.apng
 ```
 
 | Parameter | Default | Description |
@@ -276,19 +276,19 @@ glacier video generate "Slow camera zoom into the scene" --image "input_photo.pn
 | `--motion` | `pan-right` | Camera motion (`pan-left`, `pan-right`, `tilt-up`, `tilt-down`, `zoom-in`, `zoom-out`, `static`, `fluid`) |
 | `--format` / `--out, -o` | `apng` / `glacier_video.apng` | Output format (`apng`, `gif`, `avi`, or `all`) |
 
-### Image Generation (`glacier image`)
+### Image Generation (`glacier-ai image`)
 
 ```bash
-glacier image generate "A dragon perched on a crystal peak at twilight" -w 1024 -h 1024 --steps 4 -o dragon.png
-glacier image info "models/flux1-schnell-Q4_K_S.gguf"
-glacier image demo --out "crystal_fortress.png"
+glacier-ai image generate "A dragon perched on a crystal peak at twilight" -w 1024 -h 1024 --steps 4 -o dragon.png
+glacier-ai image info "models/flux1-schnell-Q4_K_S.gguf"
+glacier-ai image demo --out "crystal_fortress.png"
 ```
 
 ---
 
 ## 8. Production Deployment (`systemd`) & Troubleshooting
 
-### Linux `systemd` Unit (`/etc/systemd/system/glacier-inference.service`)
+### Linux `systemd` Unit (`/etc/systemd/system/glacier-ai.service`)
 
 ```ini
 [Unit]
@@ -299,7 +299,7 @@ After=network.target
 Type=simple
 User=glacier
 WorkingDirectory=/opt/glacier
-ExecStart=/opt/glacier/glacier serve /opt/glacier/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --port 11434 --host 0.0.0.0
+ExecStart=/opt/glacier/glacier-ai serve /opt/glacier/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --port 11434 --host 0.0.0.0
 Environment=GLACIER_API_KEY=<your_api_key>
 Restart=always
 RestartSec=5
@@ -310,7 +310,7 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl daemon-reload && sudo systemctl enable --now glacier-inference
+sudo systemctl daemon-reload && sudo systemctl enable --now glacier-ai
 ```
 
 ### Troubleshooting

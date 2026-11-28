@@ -77,7 +77,7 @@ dotnet run --project benchmarks/Glacier.Inference.Benchmarks/Glacier.Inference.B
 
 | Machine & Backend | Model & Quant | Size | Prefill | Decode | Notes |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| **RTX 3060 (CUDA)** | `Qwen3-4B-Instruct-2507` (`Q4_K_M`) | 2.33 GB | 114.18 / 122.03 tok/s | **71.03** / 62.19 tok/s | CUDA Graph ON / OFF (`glacier bench`, 128 tok, +14.2%) |
+| **RTX 3060 (CUDA)** | `Qwen3-4B-Instruct-2507` (`Q4_K_M`) | 2.33 GB | 114.18 / 122.03 tok/s | **71.03** / 62.19 tok/s | CUDA Graph ON / OFF (`glacier-ai bench`, 128 tok, +14.2%) |
 | **RTX 3060 (CUDA)** | `Qwen2.5-7B-Instruct-1M` (`Q4_K_M`) | 4.36 GB | 57.41 / 62.55 tok/s | 39.45 / 44.77 tok/s | CUDA Graph ON / OFF (graph capture amortized after ~46 tok) |
 | **RTX 3060 (CUDA)** | `DeepSeek-R1-Distill-Qwen-7B` (`Q4_K_M`) | 4.68 GB | 65.53 tok/s | 45.19 tok/s | Turnaround: 1.33 s |
 | **RTX 3060 (CUDA)** | `Qwen3.8-27B-NariQ` (`TRL2/3 2.5bpw`) | 7.86 GB | — | **19.7 tok/s** FullGraph / **19.1–19.2** live | `nari-llama.cpp`: 24.0 tok/s; FullGraph step: 50.78 ms |
