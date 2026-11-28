@@ -12,7 +12,7 @@ using Glacier.Inference.Gpu;
 /// Runs on any Vulkan 1.1+ GPU: Qualcomm Adreno on Android, ARM Mali, NVIDIA, AMD, Intel.
 /// Q8_0 weights are dequantised on the fly in tiled compute shaders; all forward passes remain on the GPU.
 /// </summary>
-public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
+public sealed unsafe partial class Gemma2VulkanBackend : IGemma2Backend
 {
     internal sealed class VulkanBuffer : IDisposable
     {
@@ -582,17 +582,17 @@ public sealed unsafe class Gemma2VulkanBackend : IGemma2Backend
         public uint flags;
     }
 
-    [DllImport("vulkan-1.dll", EntryPoint = "vkCreateFence")]
-    private static extern int CreateFence(IntPtr device, ref VkFenceCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pFence);
+    [LibraryImport("vulkan-1.dll", EntryPoint = "vkCreateFence")]
+    private static partial int CreateFence(IntPtr device, ref VkFenceCreateInfo pCreateInfo, IntPtr pAllocator, out IntPtr pFence);
 
-    [DllImport("vulkan-1.dll", EntryPoint = "vkWaitForFences")]
-    private static extern int WaitForFences(IntPtr device, uint fenceCount, IntPtr* pFences, uint waitAll, ulong timeout);
+    [LibraryImport("vulkan-1.dll", EntryPoint = "vkWaitForFences")]
+    private static partial int WaitForFences(IntPtr device, uint fenceCount, IntPtr* pFences, uint waitAll, ulong timeout);
 
-    [DllImport("vulkan-1.dll", EntryPoint = "vkResetFences")]
-    private static extern int ResetFences(IntPtr device, uint fenceCount, IntPtr* pFences);
+    [LibraryImport("vulkan-1.dll", EntryPoint = "vkResetFences")]
+    private static partial int ResetFences(IntPtr device, uint fenceCount, IntPtr* pFences);
 
-    [DllImport("vulkan-1.dll", EntryPoint = "vkDestroyFence")]
-    private static extern void DestroyFence(IntPtr device, IntPtr fence, IntPtr pAllocator);
+    [LibraryImport("vulkan-1.dll", EntryPoint = "vkDestroyFence")]
+    private static partial void DestroyFence(IntPtr device, IntPtr fence, IntPtr pAllocator);
 
     private void SubmitAndWait()
     {

@@ -13,7 +13,7 @@ using Glacier.Inference.Gpu;
 /// using pure zero-dependency Windows DXGI and CUDA driver P/Invoke.
 /// Evaluates and enforces safe driver engine options per device.
 /// </summary>
-public static class DeviceManager
+public static partial class DeviceManager
 {
     private static readonly Lazy<List<DeviceInfo>> _devices = new(EnumerateDevices);
 
@@ -792,20 +792,20 @@ public static class DeviceManager
     // DXGI & Win32 Interop
     // =========================================================================
 
-    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    private static extern uint CM_Get_Device_ID_List_SizeW(out uint pulLen, string pszFilter, uint ulFlags);
+    [LibraryImport("cfgmgr32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial uint CM_Get_Device_ID_List_SizeW(out uint pulLen, string pszFilter, uint ulFlags);
 
-    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    private static extern uint CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] buffer, uint bufferLen, uint ulFlags);
+    [LibraryImport("cfgmgr32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    private static partial uint CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] buffer, uint bufferLen, uint ulFlags);
 
-    [DllImport("dxgi.dll", ExactSpelling = true)]
-    private static extern int CreateDXGIFactory1(ref Guid riid, out IntPtr ppFactory);
+    [LibraryImport("dxgi.dll")]
+    private static partial int CreateDXGIFactory1(ref Guid riid, out IntPtr ppFactory);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    private static partial bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    [StructLayout(LayoutKind.Sequential)]
     private struct MEMORYSTATUSEX
     {
         public uint dwLength;

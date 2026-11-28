@@ -89,6 +89,8 @@ public static class GgufTypes
             case GgufType.F16:
             case GgufType.BF16:
                 blockSize = 1; blockBytes = 2; return true;
+            case GgufType.F8_E4M3:
+                blockSize = 1; blockBytes = 1; return true;
             case GgufType.Q8_0:
                 blockSize = 32; blockBytes = 34; return true;
             case GgufType.Q4_0:
@@ -196,6 +198,7 @@ public sealed class GgufTensorInfo
         {
             GgufType.F32 => count * 4,
             GgufType.F16 or GgufType.BF16 => count * 2,
+            GgufType.F8_E4M3 => count,
             GgufType.Q8_0 => (count / 32) * 34,
             GgufType.Q4_0 => (count / 32) * 18,
             GgufType.Q5_0 => (count / 32) * 22,

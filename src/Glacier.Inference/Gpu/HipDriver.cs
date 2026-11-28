@@ -8,7 +8,7 @@ using System.Text;
 /// Direct, zero-dependency P/Invoke bindings to the native AMD ROCm / HIP driver (amdhip64.dll on Windows, libamdhip64.so on Linux).
 /// Bypasses high-level runtimes to achieve sub-microsecond bare-metal kernel dispatch directly to AMD RDNA/CDNA GPUs.
 /// </summary>
-public static class HipDriver
+public static partial class HipDriver
 {
     private const string HipLib = "amdhip64.dll";
 
@@ -56,131 +56,131 @@ public static class HipDriver
 
     public static bool IsAvailable() => _isAvailable.Value;
 
-    [DllImport(HipLib, EntryPoint = "hipInit")]
-    public static extern int Init(uint flags);
+    [LibraryImport(HipLib, EntryPoint = "hipInit")]
+    public static partial int Init(uint flags);
 
-    [DllImport(HipLib, EntryPoint = "hipDriverGetVersion")]
-    public static extern int DriverGetVersion(out int driverVersion);
+    [LibraryImport(HipLib, EntryPoint = "hipDriverGetVersion")]
+    public static partial int DriverGetVersion(out int driverVersion);
 
-    [DllImport(HipLib, EntryPoint = "hipGetDeviceCount")]
-    public static extern int DeviceGetCount(out int count);
+    [LibraryImport(HipLib, EntryPoint = "hipGetDeviceCount")]
+    public static partial int DeviceGetCount(out int count);
 
-    [DllImport(HipLib, EntryPoint = "hipDeviceGet")]
-    public static extern int DeviceGet(out int device, int ordinal);
+    [LibraryImport(HipLib, EntryPoint = "hipDeviceGet")]
+    public static partial int DeviceGet(out int device, int ordinal);
 
-    [DllImport(HipLib, EntryPoint = "hipDeviceGetName")]
-    public static extern int DeviceGetName(byte[] name, int len, int dev);
+    [LibraryImport(HipLib, EntryPoint = "hipDeviceGetName")]
+    public static partial int DeviceGetName([Out] byte[] name, int len, int dev);
 
-    [DllImport(HipLib, EntryPoint = "hipDeviceGetAttribute")]
-    public static extern int DeviceGetAttribute(out int pi, int attrib, int dev);
+    [LibraryImport(HipLib, EntryPoint = "hipDeviceGetAttribute")]
+    public static partial int DeviceGetAttribute(out int pi, int attrib, int dev);
 
-    [DllImport(HipLib, EntryPoint = "hipDeviceTotalMem")]
-    public static extern int DeviceTotalMem(out nuint bytes, int dev);
+    [LibraryImport(HipLib, EntryPoint = "hipDeviceTotalMem")]
+    public static partial int DeviceTotalMem(out nuint bytes, int dev);
 
-    [DllImport(HipLib, EntryPoint = "hipMemGetInfo")]
-    public static extern int MemGetInfo(out nuint free, out nuint total);
+    [LibraryImport(HipLib, EntryPoint = "hipMemGetInfo")]
+    public static partial int MemGetInfo(out nuint free, out nuint total);
 
-    [DllImport(HipLib, EntryPoint = "hipCtxCreate")]
-    public static extern int CtxCreate(out IntPtr pctx, uint flags, int dev);
-
-    [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipCtxSetCurrent")]
-    public static extern int CtxSetCurrent(IntPtr ctx);
+    [LibraryImport(HipLib, EntryPoint = "hipCtxCreate")]
+    public static partial int CtxCreate(out IntPtr pctx, uint flags, int dev);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipCtxGetCurrent")]
-    public static extern int CtxGetCurrent(out IntPtr pctx);
-
-    [DllImport(HipLib, EntryPoint = "hipCtxDestroy")]
-    public static extern int CtxDestroy(IntPtr ctx);
-
-    [DllImport(HipLib, EntryPoint = "hipCtxSynchronize")]
-    public static extern int CtxSynchronize();
-
-    [DllImport(HipLib, EntryPoint = "hipModuleLoadData")]
-    public static extern int ModuleLoadData(out IntPtr module, byte[] image);
-
-    [DllImport(HipLib, EntryPoint = "hipModuleUnload")]
-    public static extern int ModuleUnload(IntPtr hmod);
-
-    [DllImport(HipLib, EntryPoint = "hipModuleGetFunction")]
-    public static extern int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
-
-    [DllImport(HipLib, EntryPoint = "hipMalloc")]
-    public static extern int MemAlloc(out IntPtr dptr, nuint bytesize);
-
-    [DllImport(HipLib, EntryPoint = "hipFree")]
-    public static extern int MemFree(IntPtr dptr);
-
-    [DllImport(HipLib, EntryPoint = "hipHostMalloc")]
-    public static extern int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
-
-    [DllImport(HipLib, EntryPoint = "hipHostFree")]
-    public static extern int MemFreeHost(IntPtr p);
+    [LibraryImport(HipLib, EntryPoint = "hipCtxSetCurrent")]
+    public static partial int CtxSetCurrent(IntPtr ctx);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipHostGetDevicePointer")]
-    public static extern int MemHostGetDevicePointer(out IntPtr pdptr, IntPtr p, uint flags);
+    [LibraryImport(HipLib, EntryPoint = "hipCtxGetCurrent")]
+    public static partial int CtxGetCurrent(out IntPtr pctx);
 
-    [DllImport(HipLib, EntryPoint = "hipMemcpyHtoD")]
-    public static extern int MemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, nuint byteCount);
+    [LibraryImport(HipLib, EntryPoint = "hipCtxDestroy")]
+    public static partial int CtxDestroy(IntPtr ctx);
 
-    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoH")]
-    public static extern int MemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, nuint byteCount);
+    [LibraryImport(HipLib, EntryPoint = "hipCtxSynchronize")]
+    public static partial int CtxSynchronize();
 
-    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoD")]
-    public static extern int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
+    [LibraryImport(HipLib, EntryPoint = "hipModuleLoadData")]
+    public static partial int ModuleLoadData(out IntPtr module, byte[] image);
+
+    [LibraryImport(HipLib, EntryPoint = "hipModuleUnload")]
+    public static partial int ModuleUnload(IntPtr hmod);
+
+    [LibraryImport(HipLib, EntryPoint = "hipModuleGetFunction", StringMarshalling = StringMarshalling.Utf8)]
+    public static partial int ModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name);
+
+    [LibraryImport(HipLib, EntryPoint = "hipMalloc")]
+    public static partial int MemAlloc(out IntPtr dptr, nuint bytesize);
+
+    [LibraryImport(HipLib, EntryPoint = "hipFree")]
+    public static partial int MemFree(IntPtr dptr);
+
+    [LibraryImport(HipLib, EntryPoint = "hipHostMalloc")]
+    public static partial int MemHostAlloc(out IntPtr pp, nuint bytesize, uint flags);
+
+    [LibraryImport(HipLib, EntryPoint = "hipHostFree")]
+    public static partial int MemFreeHost(IntPtr p);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipMemcpyDtoDAsync")]
-    public static extern int MemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount, IntPtr hStream);
+    [LibraryImport(HipLib, EntryPoint = "hipHostGetDevicePointer")]
+    public static partial int MemHostGetDevicePointer(out IntPtr pdptr, IntPtr p, uint flags);
+
+    [LibraryImport(HipLib, EntryPoint = "hipMemcpyHtoD")]
+    public static partial int MemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, nuint byteCount);
+
+    [LibraryImport(HipLib, EntryPoint = "hipMemcpyDtoH")]
+    public static partial int MemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, nuint byteCount);
+
+    [LibraryImport(HipLib, EntryPoint = "hipMemcpyDtoD")]
+    public static partial int MemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipMemcpyHtoDAsync")]
-    public static extern int MemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, nuint byteCount, IntPtr hStream);
+    [LibraryImport(HipLib, EntryPoint = "hipMemcpyDtoDAsync")]
+    public static partial int MemcpyDtoDAsync(IntPtr dstDevice, IntPtr srcDevice, nuint byteCount, IntPtr hStream);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipMemsetD8")]
-    public static extern int MemsetD8(IntPtr dstDevice, byte uc, nuint count);
+    [LibraryImport(HipLib, EntryPoint = "hipMemcpyHtoDAsync")]
+    public static partial int MemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, nuint byteCount, IntPtr hStream);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipModuleLaunchKernel")]
-    public static extern int LaunchKernel(
+    [LibraryImport(HipLib, EntryPoint = "hipMemsetD8")]
+    public static partial int MemsetD8(IntPtr dstDevice, byte uc, nuint count);
+
+    [SuppressGCTransition]
+    [LibraryImport(HipLib, EntryPoint = "hipModuleLaunchKernel")]
+    public static partial int LaunchKernel(
         IntPtr f,
         uint gridDimX, uint gridDimY, uint gridDimZ,
         uint blockDimX, uint blockDimY, uint blockDimZ,
         uint sharedMemBytes, IntPtr hStream,
         IntPtr kernelParams, IntPtr extra);
 
-    [DllImport(HipLib, EntryPoint = "hipStreamCreate")]
-    public static extern int StreamCreate(out IntPtr phStream);
+    [LibraryImport(HipLib, EntryPoint = "hipStreamCreate")]
+    public static partial int StreamCreate(out IntPtr phStream);
 
-    [DllImport(HipLib, EntryPoint = "hipStreamSynchronize")]
-    public static extern int StreamSynchronize(IntPtr hStream);
+    [LibraryImport(HipLib, EntryPoint = "hipStreamSynchronize")]
+    public static partial int StreamSynchronize(IntPtr hStream);
 
-    [DllImport(HipLib, EntryPoint = "hipStreamDestroy")]
-    public static extern int StreamDestroy(IntPtr hStream);
+    [LibraryImport(HipLib, EntryPoint = "hipStreamDestroy")]
+    public static partial int StreamDestroy(IntPtr hStream);
 
-    [DllImport(HipLib, EntryPoint = "hipEventCreate")]
-    public static extern int EventCreate(out IntPtr phEvent);
-
-    [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipEventRecord")]
-    public static extern int EventRecord(IntPtr hEvent, IntPtr hStream);
-
-    [DllImport(HipLib, EntryPoint = "hipEventSynchronize")]
-    public static extern int EventSynchronize(IntPtr hEvent);
+    [LibraryImport(HipLib, EntryPoint = "hipEventCreate")]
+    public static partial int EventCreate(out IntPtr phEvent);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipEventElapsedTime")]
-    public static extern int EventElapsedTime(out float pMilliseconds, IntPtr hStart, IntPtr hEnd);
+    [LibraryImport(HipLib, EntryPoint = "hipEventRecord")]
+    public static partial int EventRecord(IntPtr hEvent, IntPtr hStream);
 
-    [DllImport(HipLib, EntryPoint = "hipEventDestroy")]
-    public static extern int EventDestroy(IntPtr hEvent);
+    [LibraryImport(HipLib, EntryPoint = "hipEventSynchronize")]
+    public static partial int EventSynchronize(IntPtr hEvent);
 
     [SuppressGCTransition]
-    [DllImport(HipLib, EntryPoint = "hipStreamWaitEvent")]
-    public static extern int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
+    [LibraryImport(HipLib, EntryPoint = "hipEventElapsedTime")]
+    public static partial int EventElapsedTime(out float pMilliseconds, IntPtr hStart, IntPtr hEnd);
+
+    [LibraryImport(HipLib, EntryPoint = "hipEventDestroy")]
+    public static partial int EventDestroy(IntPtr hEvent);
+
+    [SuppressGCTransition]
+    [LibraryImport(HipLib, EntryPoint = "hipStreamWaitEvent")]
+    public static partial int StreamWaitEvent(IntPtr hStream, IntPtr hEvent, uint flags);
 
     public static string GetDeviceName(int device)
     {

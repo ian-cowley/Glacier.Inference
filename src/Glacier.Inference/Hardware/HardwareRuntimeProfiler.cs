@@ -63,7 +63,7 @@ public sealed record HardwareExecutionPolicy
 /// Probes live CPU SIMD ISA support, host physical RAM availability, GPU VRAM headroom, and
 /// multi-threaded SIMD memory bandwidth so Glacier adapts cleanly to the active machine.
 /// </summary>
-public static unsafe class HardwareRuntimeProfiler
+public static unsafe partial class HardwareRuntimeProfiler
 {
     private const ulong GiB = 1024UL * 1024 * 1024;
     private const ulong MiB = 1024UL * 1024;
@@ -462,11 +462,11 @@ public static unsafe class HardwareRuntimeProfiler
     }
 
 #if !ANDROID
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+    private static partial bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    [StructLayout(LayoutKind.Sequential)]
     private struct MEMORYSTATUSEX
     {
         public uint dwLength;

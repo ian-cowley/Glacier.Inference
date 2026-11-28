@@ -280,6 +280,25 @@ public class GgufFileTests
     }
 
     [Fact]
+    public void F8E4M3_BlockInfo_RowBytes_And_TensorByteSize_MatchOneBytePerElement()
+    {
+        Assert.True(GgufTypes.TryGetBlockInfo(GgufType.F8_E4M3, out int blockSize, out int blockBytes));
+        Assert.Equal(1, blockSize);
+        Assert.Equal(1, blockBytes);
+        Assert.Equal(64L, GgufTypes.GetRowBytes(GgufType.F8_E4M3, 64));
+
+        var info = new GgufTensorInfo
+        {
+            Name = "fp8.weight",
+            DimensionsCount = 2,
+            Dimensions = [8UL, 8UL],
+            Type = GgufType.F8_E4M3,
+            Offset = 0UL
+        };
+        Assert.Equal(64UL, info.GetByteSize());
+    }
+
+    [Fact]
     public void Open_ThrowsInvalidDataException_WhenQuantizedTensorInnerDimNotBlockAligned()
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"gguf_unaligned_iq2xs_{Guid.NewGuid():N}.gguf");

@@ -14,8 +14,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Inference</PackageId>
-    <Version>1.10.1</Version>
-    <PackageReleaseNotes>v1.10.1: Safetensors bounds validation, strict unsupported architecture rejection, real-VRAM allocation reporting, and UTF-16 surrogate-safe SentencePiece tokenization.</PackageReleaseNotes>
+    <Version>1.10.2</Version>
+    <PackageReleaseNotes>v1.10.2: Migrated all remaining native driver P/Invokes to source-generated [LibraryImport] and added GgufType.F8_E4M3 1-byte block/tensor byte-size metadata.</PackageReleaseNotes>
 
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
