@@ -12,6 +12,13 @@
 8. [Production Deployment (`systemd`) & Troubleshooting](#8-production-deployment-systemd--troubleshooting)
 9. [Building & Testing](#9-building--testing)
 
+### Topic Manuals
+
+- [Speculative Decoding (`lookup`, `mtp`, `dflash`, `adaptive`)](manual/speculative-decoding.md) — draft providers, cost-gated routing, MoE tail skip, and CLI/C# usage
+- [Multimodal Embeddings, Image, Video, Vision & Voice](manual/embeddings-and-media.md) — `EmbeddingGemma2Model`, FLUX.1 image flags, Wan 2.1 video synthesis, Vision, KittenTTS/Kokoro TTS, and Whisper STT
+- [Memory Tiers, Pipelines, NPU Sidecar & Android](manual/memory-pipelines-and-npu.md) — `TieredVirtualMemoryManager`, `PipelineSession`, `NpuSidecarDiscovery`, diagnostics, settings, and Android support
+- [Continuum Memory, KL Evaluation, Bounce Proxy & Formats](manual/continuum-evaluation-and-formats.md) — HOPE/Titans sleep memory, `eval-kl`, `bounce` proxy, `GgufFile`, `SafetensorsFile`, tokenizers, and `Sampler`
+
 ---
 
 ## 1. Requirements & Installation
@@ -97,6 +104,7 @@ Usage: glacier <command> [options]
 | `bench` | Measures prefill/decode tok/s (supports `--compare-ollama`) | `glacier bench "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf" --tokens 64` |
 | `serve` | Launches HTTP service compatible with Ollama and OpenAI | `glacier serve "models/model.gguf" --port 11434 --host 127.0.0.1` |
 | `eval-kl` | Evaluates KL divergence and top-1 agreement across quantized models | `glacier eval-kl --help` |
+| `bounce` | Starts a multi-node peer-critic + compiler-verified proxy | `glacier bounce --primary http://127.0.0.1:18080` |
 | `video` | Generates APNG, GIF, or AVI video via Wan 2.1 | `glacier video generate "Prompt" --format all -o out.apng` |
 | `image` | Generates images via FLUX.1 DiT (`generate`, `info`, `demo`) | `glacier image generate "Prompt" -w 1024 -h 1024 --steps 4 -o out.png` |
 | `vision` | Experimental `VisionPipeline` image patch analysis | `glacier vision query scene.png "Describe scene" --synthetic-demo` |
@@ -108,10 +116,19 @@ Usage: glacier <command> [options]
 | :--- | :--- | :--- | :--- |
 | `--device, -d` | `nvidia-rtx-4060`, `amd-890m`, `cpu`, `0`, `auto` | `auto` | Target compute device |
 | `--engine` | `baremetal`, `directml`, `vulkan`, `cpu`, `auto` | `auto` | Compute backend selection |
-| `--kv-precision` | `auto`, `fp16`, `fp8`, `fp32` | `auto` | KV cache storage precision (`fp8` halves KV memory vs `fp16`) |
+| `--kv-precision` | `auto`, `fp16`, `fp8`, `q8_0`, `q4_0`, `fp32` | `auto` | KV cache storage precision (`fp8` halves KV memory vs `fp16`) |
 | `--ctx, -c` | Integer (`2048`, `4096`, `8192`, ...) | `2048` | Maximum sequence length |
+| `--tokens, -n` | Integer | `512` (`run`) | Maximum generated tokens per turn |
 | `--split` | `<dev1>:<layers>,<dev2>:<layers>` or `auto` | None | Splits layers across accelerators |
-| `--temp` | Float | `0.7` | Sampling temperature |
+| `--lora` | `<[name=]path>` (repeatable on `serve`) | None | Attaches a LoRA adapter binary or adapter directory |
+| `--ple-io` | `auto`, `direct`, `mmap` | `auto` | Per-layer embedding transport mode |
+| `--host-arena-gib` | Float (`0` disables) | `auto` | Host-RAM expert arena cap in GiB |
+| `--tiered-moe` | Flag | Off | Forces D3D12 GPU + CPU host-RAM expert slot pooling |
+| `--speculative` | `off`, `lookup`, `mtp`, `dflash`, `adaptive` | `off` | Speculative draft verification mode ([topic manual](manual/speculative-decoding.md)) |
+| `--blocks` / `--batch-size, -b` | Integers (`serve`) | `-` / `16` | PagedAttention KV block count and continuous batch limit |
+| `--max-think-tokens` | `auto`, `off`, `0`, `N` (`serve`) | `auto` | Caps `<think>` tokens and auto-closes reasoning tags |
+| `--sleep-memory` | Flag (`serve`) | Off | Enables HOPE + MemEx offline sleep consolidation ([topic manual](manual/continuum-evaluation-and-formats.md)) |
+| `--temp` | Float | `0.7` | Sampling temperature (`0` for greedy) |
 | `--top-p` | Float | `0.9` | Nucleus probability cutoff |
 | `--top-k` | Integer | `40` | Top-K candidate cutoff |
 | `--repeat-penalty` | Float | `1.1` | Penalty applied to recent tokens |
