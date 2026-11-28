@@ -36,7 +36,7 @@
     <None Include="Gpu\Vulkan\Shaders\*.comp;Gpu\Vulkan\Shaders\*.glsl;Gpu\Vulkan\Shaders\*.sh" />
   </ItemGroup>
 
-  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))' != 'android'">
+  <ItemGroup Condition="'$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))' != 'android'">
     <PackageReference Include="Vortice.D3DCompiler" />
     <PackageReference Include="Vortice.Direct3D12" />
   </ItemGroup>
