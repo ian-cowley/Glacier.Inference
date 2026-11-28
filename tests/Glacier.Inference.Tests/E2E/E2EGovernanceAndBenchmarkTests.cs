@@ -468,7 +468,7 @@ public class E2EGovernanceAndBenchmarkTests
             return;
         }
 
-        string archPath = Path.Combine(ResolveInferenceRepoRoot(), "ARCHITECTURE.md");
+        string archPath = Path.Combine(ResolveInferenceRepoRoot(), "docs", "architecture.md");
         Assert.True(File.Exists(archPath));
         Assert.True(new FileInfo(archPath).Length > 1024);
     }
@@ -486,7 +486,7 @@ public class E2EGovernanceAndBenchmarkTests
             return;
         }
 
-        string archText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "ARCHITECTURE.md"));
+        string archText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "docs", "architecture.md"));
         Assert.Contains("CUDA", archText, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("CPU", archText, StringComparison.OrdinalIgnoreCase);
     }
@@ -503,7 +503,7 @@ public class E2EGovernanceAndBenchmarkTests
             return;
         }
 
-        string benchText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "BENCHMARKS.md"));
+        string benchText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "docs", "benchmarks.md"));
         Assert.NotEmpty(benchText);
         Assert.Contains("tok/s", benchText, StringComparison.OrdinalIgnoreCase);
     }
@@ -520,9 +520,9 @@ public class E2EGovernanceAndBenchmarkTests
             return;
         }
 
-        string archText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "ARCHITECTURE.md"));
+        string archText = File.ReadAllText(Path.Combine(ResolveInferenceRepoRoot(), "docs", "architecture.md"));
         Assert.Contains("KV Cache", archText, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("Zero-Copy", archText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Memory-Mapped", archText, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
