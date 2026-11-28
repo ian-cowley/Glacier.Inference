@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -727,3 +728,4 @@ public static unsafe class D3D12TensorAlign
         return buffer;
     }
 }
+#endif

@@ -908,6 +908,11 @@ public abstract unsafe class CpuModelBase : ICpuModel, IHiddenStateSource
         KVCache? kvCache = null)
     {
         int totalTokens = !tokens.IsEmpty ? tokens.Length : (inputXBatch.Length / _dim);
+        if (kvCache != null && !kvCache.IsRingBuffer && (startPos < 0 || startPos + totalTokens > kvCache.MaxSeqLen))
+        {
+            throw new ArgumentOutOfRangeException(nameof(startPos), startPos,
+                $"Batch range [{startPos}, {startPos + totalTokens}) exceeds non-ring KV cache MaxSeqLen={kvCache.MaxSeqLen}.");
+        }
         int offset = 0;
         while (offset < totalTokens)
         {

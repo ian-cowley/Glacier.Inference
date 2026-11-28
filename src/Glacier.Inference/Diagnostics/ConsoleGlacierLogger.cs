@@ -40,7 +40,7 @@ public sealed class ConsoleGlacierLogger : IGlacierLogger
         {
             TextWriter writer = level >= LogLevel.Warning ? Console.Error : Console.Out;
 
-            if (_useColors)
+            if (_useColors && !OperatingSystem.IsAndroid())
             {
                 var prevColor = Console.ForegroundColor;
                 try

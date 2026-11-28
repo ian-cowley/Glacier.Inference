@@ -54,9 +54,14 @@ public static unsafe class VulkanDriver
     public const int VK_PIPELINE_BIND_POINT_COMPUTE = 1;
     public const uint VK_ACCESS_SHADER_READ_BIT = 0x00000020;
     public const uint VK_ACCESS_SHADER_WRITE_BIT = 0x00000040;
+    public const uint VK_ACCESS_TRANSFER_WRITE_BIT = 0x00001000;
     public const uint VK_ACCESS_HOST_READ_BIT = 0x00002000;
     public const uint VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = 0x00000800;
+    public const uint VK_PIPELINE_STAGE_TRANSFER_BIT = 0x00001000;
     public const uint VK_PIPELINE_STAGE_HOST_BIT = 0x00004000;
+    public const int VK_ERROR_OUT_OF_POOL_MEMORY = -1000069000;
+    public const int VK_ERROR_FRAGMENTED_POOL = -12;
+    public const ulong VK_WHOLE_SIZE = ~0UL;
 
     static VulkanDriver()
     {
@@ -695,6 +700,9 @@ public static unsafe class VulkanDriver
 
     [DllImport(VulkanLib, EntryPoint = "vkCmdCopyBuffer")]
     public static extern void CmdCopyBuffer(IntPtr commandBuffer, IntPtr srcBuffer, IntPtr dstBuffer, uint regionCount, VkBufferCopy* pRegions);
+
+    [DllImport(VulkanLib, EntryPoint = "vkCmdFillBuffer")]
+    public static extern void CmdFillBuffer(IntPtr commandBuffer, IntPtr dstBuffer, ulong dstOffset, ulong size, uint data);
 
     [DllImport(VulkanLib, EntryPoint = "vkCmdPipelineBarrier")]
     public static extern void CmdPipelineBarrier(IntPtr commandBuffer, uint srcStageMask, uint dstStageMask, uint dependencyFlags, uint memoryBarrierCount, VkMemoryBarrier* pMemoryBarriers, uint bufferMemoryBarrierCount, IntPtr pBufferMemoryBarriers, uint imageMemoryBarrierCount, IntPtr pImageMemoryBarriers);

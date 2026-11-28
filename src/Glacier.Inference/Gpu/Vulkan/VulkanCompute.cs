@@ -13,7 +13,8 @@ using System.Reflection;
 internal sealed unsafe class VulkanCompute : IDisposable
 {
     public readonly VulkanContext Ctx;
-    private readonly IntPtr _pool;
+    private readonly List<IntPtr> _pools = new();
+    private readonly List<Kernel> _kernels = new();
     private readonly List<(IntPtr Buf, IntPtr Mem)> _bufs = new();
     private IntPtr _stagingBuf;
     private IntPtr _stagingMem;
@@ -23,9 +24,12 @@ internal sealed unsafe class VulkanCompute : IDisposable
     private ulong[] _touchedBits = new ulong[16];
     private int _nextBufId;
     private bool _anyWrittenSinceBarrier;
+    private bool _recording;
     private IntPtr _boundPipeline;
     private bool _disposed;
 
+    internal int PoolCount => _pools.Count;
+    internal int KernelCount => _kernels.Count;
     internal int LastBarrierCount { get; private set; }
     internal int LastDispatchCount { get; private set; }
 
@@ -45,7 +49,7 @@ internal sealed unsafe class VulkanCompute : IDisposable
         public void UploadFrom(void* src, long bytes) => Owner.Ctx.CopyToBuffer(Mem, (IntPtr)src, (ulong)bytes);
         public void Upload(float[] d) { fixed (float* p = d) UploadFrom(p, d.Length * 4L); }
         public void DownloadTo(void* dst, long bytes) => Owner.Ctx.CopyFromBuffer((IntPtr)dst, Mem, (ulong)bytes);
-        public void Zero() { var z = new byte[Size]; fixed (byte* p = z) UploadFrom(p, (long)Size); }
+        public void Zero() => Owner.ZeroBuffer(this);
     }
 
     public sealed class Kernel
@@ -59,6 +63,11 @@ internal sealed unsafe class VulkanCompute : IDisposable
     public VulkanCompute(VulkanContext ctx)
     {
         Ctx = ctx;
+        CreateDescriptorPool();
+    }
+
+    private IntPtr CreateDescriptorPool()
+    {
         var poolSize = new VulkanDriver.VkDescriptorPoolSize { type = VulkanDriver.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount = 65536 };
         var poolInfo = new VulkanDriver.VkDescriptorPoolCreateInfo
         {
@@ -67,7 +76,9 @@ internal sealed unsafe class VulkanCompute : IDisposable
             poolSizeCount = 1,
             pPoolSizes = (IntPtr)(&poolSize)
         };
-        Check(VulkanDriver.CreateDescriptorPool(ctx.DeviceHandle, ref poolInfo, IntPtr.Zero, out _pool), "vkCreateDescriptorPool");
+        Check(VulkanDriver.CreateDescriptorPool(Ctx.DeviceHandle, ref poolInfo, IntPtr.Zero, out IntPtr pool), "vkCreateDescriptorPool");
+        _pools.Add(pool);
+        return pool;
     }
 
     public static void Check(int res, string what)
@@ -80,9 +91,10 @@ internal sealed unsafe class VulkanCompute : IDisposable
     {
         const uint hostCoherent = VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VulkanDriver.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         const uint deviceLocalHostCoherent = VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | hostCoherent;
+        ulong allocBytes = ((ulong)Math.Max(bytes, 16) + 3UL) & ~3UL;
         Ctx.CreateBufferPreferred(
-            (ulong)Math.Max(bytes, 16),
-            VulkanDriver.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            allocBytes,
+            VulkanDriver.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VulkanDriver.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             out var b,
             out var m,
             (deviceLocalHostCoherent, VulkanDriver.VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD),
@@ -99,7 +111,7 @@ internal sealed unsafe class VulkanCompute : IDisposable
         }
 
         _bufs.Add((b, m));
-        return new GBuf { Buf = b, Mem = m, Size = (ulong)Math.Max(bytes, 16), Id = id, Owner = this };
+        return new GBuf { Buf = b, Mem = m, Size = allocBytes, Id = id, Owner = this };
     }
 
     /// <summary>Allocates a buffer and fills it from host memory.</summary>
@@ -122,7 +134,7 @@ internal sealed unsafe class VulkanCompute : IDisposable
         }
 
         const uint hostCoherent = VulkanDriver.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VulkanDriver.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        ulong allocBytes = (ulong)Math.Max(bytes, 16);
+        ulong allocBytes = ((ulong)Math.Max(bytes, 16) + 3UL) & ~3UL;
         Ctx.CreateBufferPreferred(
             allocBytes,
             VulkanDriver.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VulkanDriver.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -224,6 +236,7 @@ internal sealed unsafe class VulkanCompute : IDisposable
         s.ReadExactly(spirv);
         var k = new Kernel { NBuf = nBuf, PushBytes = pushBytes, WriteBindingMask = writeBindingMask };
         VulkanComputePipeline.CreatePipeline(Ctx.DeviceHandle, spirv, (uint)nBuf, pushBytes, out k.Pipe, out k.Layout, out k.Dsl);
+        _kernels.Add(k);
         return k;
     }
 
@@ -234,12 +247,18 @@ internal sealed unsafe class VulkanCompute : IDisposable
         var alloc = new VulkanDriver.VkDescriptorSetAllocateInfo
         {
             sType = VulkanDriver.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptorPool = _pool,
+            descriptorPool = _pools[^1],
             descriptorSetCount = 1,
             pSetLayouts = (IntPtr)(&dsl)
         };
         IntPtr set = IntPtr.Zero;
-        Check(VulkanDriver.AllocateDescriptorSets(Ctx.DeviceHandle, ref alloc, &set), "vkAllocateDescriptorSets");
+        int allocRes = VulkanDriver.AllocateDescriptorSets(Ctx.DeviceHandle, ref alloc, &set);
+        if (allocRes == VulkanDriver.VK_ERROR_OUT_OF_POOL_MEMORY || allocRes == VulkanDriver.VK_ERROR_FRAGMENTED_POOL)
+        {
+            alloc.descriptorPool = CreateDescriptorPool();
+            allocRes = VulkanDriver.AllocateDescriptorSets(Ctx.DeviceHandle, ref alloc, &set);
+        }
+        Check(allocRes, "vkAllocateDescriptorSets");
         var infos = stackalloc VulkanDriver.VkDescriptorBufferInfo[bufs.Length];
         var writes = stackalloc VulkanDriver.VkWriteDescriptorSet[bufs.Length];
         for (int i = 0; i < bufs.Length; i++)
@@ -306,11 +325,103 @@ internal sealed unsafe class VulkanCompute : IDisposable
         LastBarrierCount++;
     }
 
+    private void ZeroBuffer(GBuf buf)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (buf.Buf == IntPtr.Zero || buf.Size == 0) return;
+
+        ulong fillSize = (buf.Size & 3UL) == 0UL ? VulkanDriver.VK_WHOLE_SIZE : (buf.Size & ~3UL);
+        IntPtr cb = Cmd;
+
+        if (_recording)
+        {
+            if (TestBit(_writtenBits, buf.Id) || TestBit(_touchedBits, buf.Id))
+            {
+                var preBarrier = new VulkanDriver.VkMemoryBarrier
+                {
+                    sType = 46, // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+                    srcAccessMask = VulkanDriver.VK_ACCESS_SHADER_READ_BIT | VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT | VulkanDriver.VK_ACCESS_TRANSFER_WRITE_BIT,
+                    dstAccessMask = VulkanDriver.VK_ACCESS_TRANSFER_WRITE_BIT
+                };
+                VulkanDriver.CmdPipelineBarrier(
+                    cb,
+                    VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VulkanDriver.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VulkanDriver.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    1,
+                    &preBarrier,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero);
+                LastBarrierCount++;
+            }
+
+            VulkanDriver.CmdFillBuffer(cb, buf.Buf, 0, fillSize, 0u);
+
+            var postBarrier = new VulkanDriver.VkMemoryBarrier
+            {
+                sType = 46, // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+                srcAccessMask = VulkanDriver.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask = VulkanDriver.VK_ACCESS_SHADER_READ_BIT | VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT | VulkanDriver.VK_ACCESS_HOST_READ_BIT
+            };
+            VulkanDriver.CmdPipelineBarrier(
+                cb,
+                VulkanDriver.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VulkanDriver.VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                1,
+                &postBarrier,
+                0,
+                IntPtr.Zero,
+                0,
+                IntPtr.Zero);
+            SetBit(_writtenBits, buf.Id);
+            SetBit(_touchedBits, buf.Id);
+            LastBarrierCount++;
+            return;
+        }
+
+        VulkanDriver.ResetCommandBuffer(cb, 0);
+        var begin = new VulkanDriver.VkCommandBufferBeginInfo { sType = VulkanDriver.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        Check(VulkanDriver.BeginCommandBuffer(cb, ref begin), "vkBeginCommandBuffer(zero)");
+        VulkanDriver.CmdFillBuffer(cb, buf.Buf, 0, fillSize, 0u);
+        var hostBarrier = new VulkanDriver.VkMemoryBarrier
+        {
+            sType = 46, // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+            srcAccessMask = VulkanDriver.VK_ACCESS_TRANSFER_WRITE_BIT,
+            dstAccessMask = VulkanDriver.VK_ACCESS_SHADER_READ_BIT | VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT | VulkanDriver.VK_ACCESS_HOST_READ_BIT
+        };
+        VulkanDriver.CmdPipelineBarrier(
+            cb,
+            VulkanDriver.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VulkanDriver.VK_PIPELINE_STAGE_HOST_BIT,
+            0,
+            1,
+            &hostBarrier,
+            0,
+            IntPtr.Zero,
+            0,
+            IntPtr.Zero);
+        Check(VulkanDriver.EndCommandBuffer(cb), "vkEndCommandBuffer(zero)");
+
+        var submit = new VulkanDriver.VkSubmitInfo
+        {
+            sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount = 1,
+            pCommandBuffers = (IntPtr)(&cb)
+        };
+        Check(VulkanDriver.QueueSubmit(Ctx.ComputeQueueHandle, 1, ref submit, IntPtr.Zero), "vkQueueSubmit(zero)");
+        Ctx.Synchronize();
+    }
+
     public void Begin()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         VulkanDriver.ResetCommandBuffer(Cmd, 0);
         var begin = new VulkanDriver.VkCommandBufferBeginInfo { sType = VulkanDriver.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         Check(VulkanDriver.BeginCommandBuffer(Cmd, ref begin), "vkBeginCommandBuffer");
+        _recording = true;
         ClearHazardTracking();
         _boundPipeline = IntPtr.Zero;
         LastBarrierCount = 0;
@@ -395,42 +506,53 @@ internal sealed unsafe class VulkanCompute : IDisposable
     /// <summary>Ends the command buffer, submits it and waits for completion.</summary>
     public double SubmitAndWait()
     {
-        if (_anyWrittenSinceBarrier)
-        {
-            var hostBarrier = new VulkanDriver.VkMemoryBarrier
-            {
-                sType = 46, // VK_STRUCTURE_TYPE_MEMORY_BARRIER
-                srcAccessMask = VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT,
-                dstAccessMask = VulkanDriver.VK_ACCESS_SHADER_READ_BIT | VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT | VulkanDriver.VK_ACCESS_HOST_READ_BIT
-            };
-            VulkanDriver.CmdPipelineBarrier(
-                Cmd,
-                VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VulkanDriver.VK_PIPELINE_STAGE_HOST_BIT,
-                0,
-                1,
-                &hostBarrier,
-                0,
-                IntPtr.Zero,
-                0,
-                IntPtr.Zero);
-            ClearHazardTracking();
-            LastBarrierCount++;
-        }
-        _boundPipeline = IntPtr.Zero;
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_recording)
+            throw new InvalidOperationException("SubmitAndWait called without an active Begin().");
 
-        IntPtr cb = Cmd;
-        Check(VulkanDriver.EndCommandBuffer(cb), "vkEndCommandBuffer");
-        var submit = new VulkanDriver.VkSubmitInfo
+        try
         {
-            sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            commandBufferCount = 1,
-            pCommandBuffers = (IntPtr)(&cb)
-        };
-        long t0 = Stopwatch.GetTimestamp();
-        Check(VulkanDriver.QueueSubmit(Ctx.ComputeQueueHandle, 1, ref submit, IntPtr.Zero), "vkQueueSubmit");
-        Ctx.Synchronize();
-        return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+            if (_anyWrittenSinceBarrier)
+            {
+                var hostBarrier = new VulkanDriver.VkMemoryBarrier
+                {
+                    sType = 46, // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+                    srcAccessMask = VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT,
+                    dstAccessMask = VulkanDriver.VK_ACCESS_SHADER_READ_BIT | VulkanDriver.VK_ACCESS_SHADER_WRITE_BIT | VulkanDriver.VK_ACCESS_HOST_READ_BIT
+                };
+                VulkanDriver.CmdPipelineBarrier(
+                    Cmd,
+                    VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VulkanDriver.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VulkanDriver.VK_PIPELINE_STAGE_HOST_BIT,
+                    0,
+                    1,
+                    &hostBarrier,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero);
+                ClearHazardTracking();
+                LastBarrierCount++;
+            }
+            _boundPipeline = IntPtr.Zero;
+
+            IntPtr cb = Cmd;
+            Check(VulkanDriver.EndCommandBuffer(cb), "vkEndCommandBuffer");
+            var submit = new VulkanDriver.VkSubmitInfo
+            {
+                sType = VulkanDriver.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                commandBufferCount = 1,
+                pCommandBuffers = (IntPtr)(&cb)
+            };
+            long t0 = Stopwatch.GetTimestamp();
+            Check(VulkanDriver.QueueSubmit(Ctx.ComputeQueueHandle, 1, ref submit, IntPtr.Zero), "vkQueueSubmit");
+            Ctx.Synchronize();
+            return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+        }
+        finally
+        {
+            _recording = false;
+        }
     }
 
     public static uint F(float v) => BitConverter.SingleToUInt32Bits(v);
@@ -449,5 +571,23 @@ internal sealed unsafe class VulkanCompute : IDisposable
         }
         foreach (var (b, m) in _bufs) Ctx.DestroyBuffer(b, m);
         _bufs.Clear();
+
+        IntPtr device = Ctx.DeviceHandle;
+        if (device != IntPtr.Zero)
+        {
+            foreach (var k in _kernels)
+            {
+                if (k.Pipe != IntPtr.Zero) { VulkanDriver.DestroyPipeline(device, k.Pipe, IntPtr.Zero); k.Pipe = IntPtr.Zero; }
+                if (k.Layout != IntPtr.Zero) { VulkanDriver.DestroyPipelineLayout(device, k.Layout, IntPtr.Zero); k.Layout = IntPtr.Zero; }
+                if (k.Dsl != IntPtr.Zero) { VulkanDriver.DestroyDescriptorSetLayout(device, k.Dsl, IntPtr.Zero); k.Dsl = IntPtr.Zero; }
+            }
+            foreach (var pool in _pools)
+            {
+                if (pool != IntPtr.Zero) VulkanDriver.DestroyDescriptorPool(device, pool, IntPtr.Zero);
+            }
+        }
+        _kernels.Clear();
+        _pools.Clear();
+        _setAccess.Clear();
     }
 }

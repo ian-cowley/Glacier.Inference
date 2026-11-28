@@ -88,7 +88,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
     public string ActiveBackend =>
         Engine == InferenceEngineType.Vulkan ? "Vulkan" :
         _gpuModel != null ? "Cuda" :
-        _d3d12Model != null ? "Direct3D12" :
+        (_d3d12Model != null
+#if !ANDROID
+         || _cpuModel is Gpu.D3D12.Inkling2D3D12Model
+#endif
+         || Engine == InferenceEngineType.DirectML) ? "Direct3D12" :
         (_pipelineSession != null && _pipelineSession.Stages.Count > 0
             ? (_pipelineSession.Stages[0].Engine == InferenceEngineType.BareMetal ? "Cuda"
                : _pipelineSession.Stages[0].Engine == InferenceEngineType.DirectML ? "Direct3D12"
@@ -96,9 +100,28 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                : "Cpu")
             : "Cpu");
     public Exception? FallbackException { get; private set; }
-    public bool IsGpuAccelerated => _gpuModel != null || _d3d12Model != null || _pipelineSession != null;
+    public bool IsGpuAccelerated =>
+        _gpuModel != null
+        || _d3d12Model != null
+        || _pipelineSession != null
+#if !ANDROID
+        || _cpuModel is Gpu.D3D12.Inkling2D3D12Model
+#endif
+        || Engine == InferenceEngineType.DirectML;
     public bool IsPipelineAccelerated => _pipelineSession != null;
     public PipelineSession? PipelineSession => _pipelineSession;
+
+    internal static string FormatVulkanModeDescription(UniversalArchitecture architecture, bool isHybridSsm, bool isMoe) =>
+        architecture == UniversalArchitecture.Mamba2
+            ? $"Mamba-2 Hybrid SSM{(isMoe ? " + MoE" : "")}"
+            : isHybridSsm
+                ? $"Qwen 3.5/3.6 Gated DeltaNet{(isMoe ? " + MoE" : "")}"
+                : architecture == UniversalArchitecture.Gemma4
+                    ? $"Gemma 4 ISWA{(isMoe ? " + Dual MoE" : "")}"
+                    : $"Standard Dense{(isMoe ? " + MoE" : "")}";
+
+    internal static string FormatVulkanActiveDevice(string deviceName, UniversalArchitecture architecture, bool isHybridSsm, bool isMoe) =>
+        $"{deviceName} [Engine: Vulkan Compute ({FormatVulkanModeDescription(architecture, isHybridSsm, isMoe)}) | KV: FP32 | Arch: {architecture}]";
     public KvCachePrecision KvPrecision =>
         _gpuModel?.KvPrecision
         ?? _d3d12Model?.KvPrecision
@@ -419,6 +442,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Direct3D 12 | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
+#endif
             else if (_weights.HasTrellisWeights && _weights.IsHybridSsm && !_weights.IsMoe &&
                      targetDevice.Vendor == GpuVendor.Nvidia && targetEngine != InferenceEngineType.Cpu &&
                      targetEngine != InferenceEngineType.Vulkan && GpuContext.IsSupported &&
@@ -449,15 +473,9 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     _d3d12Model = vkModel;
                     _kvCache = null; // GPU maintains all KV / recurrent states in device-visible memory
                     Engine = InferenceEngineType.Vulkan;
-                    string modeDesc = _weights.ArchitectureFamily == UniversalArchitecture.Mamba2
-                        ? $"Mamba-2 Hybrid SSM{(_weights.IsMoe ? " + MoE" : "")}"
-                        : _weights.IsHybridSsm
-                            ? $"Qwen 3.5/3.6 Gated DeltaNet{(_weights.IsMoe ? " + MoE" : "")}"
-                            : _weights.ArchitectureFamily == UniversalArchitecture.Gemma4
-                                ? $"Gemma 4 ISWA{(_weights.IsMoe ? " + Dual MoE" : "")}"
-                                : $"Standard Dense{(_weights.IsMoe ? " + MoE" : "")}";
+                    string modeDesc = FormatVulkanModeDescription(_weights.ArchitectureFamily, _weights.IsHybridSsm, _weights.IsMoe);
                     string vkName = vkModel is VulkanRunnerBase vrb ? vrb.DeviceName : vkModel is Qwen35VulkanModel m35 ? m35.DeviceName : targetDevice.Name;
-                    ActiveDevice = $"{vkName} [Engine: Vulkan Compute ({modeDesc}) | KV: FP32 | Arch: {_weights.ArchitectureFamily}]";
+                    ActiveDevice = FormatVulkanActiveDevice(vkName, _weights.ArchitectureFamily, _weights.IsHybridSsm, _weights.IsMoe);
                 }
                 catch (Exception ex)
                 {
@@ -477,7 +495,6 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
                     ActiveDevice = $"{Device.Name} [Fallback from Vulkan | Arch: {_weights.ArchitectureFamily}]";
                 }
             }
-#endif
             else
             {
                 var settings = GlacierSettings.Load();
@@ -703,7 +720,7 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
             recentTokens.Add(nextToken);
 
             // Check for stop tokens
-            if (_tokenizer.IsStopToken(nextToken) || nextToken == _tokenizer.EosTokenId || nextToken == 151645 || nextToken == 151643)
+            if (_tokenizer.IsStopToken(nextToken) || (_tokenizer.EosTokenId >= 0 && nextToken == _tokenizer.EosTokenId))
             {
                 finishReason = $"stop({nextToken})";
                 break;
@@ -905,11 +922,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             qhD3dVerify.VerifyBatch(tokens, startPos, predictedTokens, perStepSnapshots);
         }
+#endif
         else if (_d3d12Model is Qwen35VulkanModel vk35Verify)
         {
             vk35Verify.VerifyBatch(tokens, startPos, predictedTokens, perStepSnapshots);
         }
-#endif
         else if (_cpuModel is { SupportsBatchVerification: true })
         {
             _cpuModel.VerifyBatch(tokens, startPos, predictedTokens, _kvCache, perStepSnapshots);
@@ -958,11 +975,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             qhD3dLogits.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, perStepSnapshots);
         }
+#endif
         else if (_d3d12Model is Qwen35VulkanModel vk35Logits)
         {
             vk35Logits.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, perStepSnapshots);
         }
-#endif
         else if (_cpuModel is { SupportsBatchVerification: true })
         {
             _cpuModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut, _weights.VocabSize, _kvCache, perStepSnapshots);
@@ -988,11 +1005,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             qhD3d.SaveRecurrentState(destination);
         }
+#endif
         else if (_d3d12Model is Qwen35VulkanModel vk35)
         {
             vk35.SaveRecurrentState(destination);
         }
-#endif
     }
 
     public void RestoreRecurrentState(ReadOnlySpan<byte> snapshot)
@@ -1006,11 +1023,11 @@ public sealed class InferenceSession : IDisposable, ISpeculativeTarget
         {
             qhD3d.RestoreRecurrentState(snapshot);
         }
+#endif
         else if (_d3d12Model is Qwen35VulkanModel vk35)
         {
             vk35.RestoreRecurrentState(snapshot);
         }
-#endif
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

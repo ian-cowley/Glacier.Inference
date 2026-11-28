@@ -9,6 +9,8 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Model;
+using Glacier.Inference.Quant;
+using Glacier.Inference.Tests.E2E;
 using Glacier.Inference.Tests.VulkanE2E.Fixtures;
 using Xunit;
 
@@ -66,15 +68,21 @@ public unsafe class VulkanE2ETier3CrossFeatureCombinationTests
     public void T3_P04_Biases_And_WorkgroupDispatch_Interaction()
     {
         // P4: Attention Biases (F1) + Workgroup Dispatch boundary (F11)
-        int m = 32769; // Output rows crossing 32768
+        const int m = 32769; // Output rows crossing 32768
         var (gx, gy) = VulkanE2ETestFixtures.ReferenceQuantOracle.CalculateAddQmvWorkgroups(m);
         Assert.Equal(32768u, gx);
         Assert.Equal(2u, gy);
 
-        // Elementwise bias addition across 32769 elements
-        int biasWorkgroups = (m + 255) / 256;
-        Assert.Equal(129, biasWorkgroups);
-        Assert.True(biasWorkgroups * 256 >= m);
+        float[] dst = new float[m];
+        float[] bias = new float[m];
+        Array.Fill(dst, 1.5f);
+        Array.Fill(bias, 0.25f);
+        fixed (float* pDst = dst, pBias = bias)
+        {
+            QuantKernels.VecAdd(pBias, pDst, m);
+        }
+        Assert.Equal(1.75f, dst[0], 0.0001f);
+        Assert.Equal(1.75f, dst[32768], 0.0001f);
     }
 
     [Fact]
@@ -227,27 +235,18 @@ public unsafe class VulkanE2ETier3CrossFeatureCombinationTests
     [Fact]
     public void T3_P16_PreCommit_E2E_Test_And_SecurityScanner_Interaction()
     {
-        // P16: Mandatory Security (F16) + Full Test Suite Execution in Sequence
-        string repoRoot = Path.GetFullPath(AppContext.BaseDirectory);
-        while (!string.IsNullOrEmpty(repoRoot) && !File.Exists(Path.Combine(repoRoot, "scripts", "security_check.py")))
-        {
-            var parent = Path.GetDirectoryName(repoRoot);
-            if (parent == repoRoot) break;
-            repoRoot = parent;
-        }
+        // P16: Mandatory Security (F16) + Full Test Suite Tree Audit in Sequence
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        var (srcExit, srcScanned, srcFindings, srcReport) =
+            E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(Path.Combine(inferenceRoot, "src"));
+        Assert.True(srcExit == 0, $"Source audit failed:\n{srcReport}");
+        Assert.Empty(srcFindings);
+        Assert.True(srcScanned > 10);
 
-        if (string.IsNullOrEmpty(repoRoot) || !File.Exists(Path.Combine(repoRoot, "scripts", "security_check.py"))) return;
-
-        var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
-        {
-            WorkingDirectory = repoRoot,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
-        };
-        using var proc = Process.Start(psi);
-        Assert.NotNull(proc);
-        proc.WaitForExit();
-        Assert.Equal(0, proc.ExitCode);
+        var (testExit, testScanned, testFindings, testReport) =
+            E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(Path.Combine(inferenceRoot, "tests"));
+        Assert.True(testExit == 0, $"Test audit failed:\n{testReport}");
+        Assert.Empty(testFindings);
+        Assert.True(testScanned > 10);
     }
 }

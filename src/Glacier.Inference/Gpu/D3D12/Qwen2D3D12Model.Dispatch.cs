@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -442,3 +443,4 @@ public sealed unsafe partial class Qwen2D3D12Model
         cmdList.Dispatch((uint)_nHeads, (uint)batchSize, 1);
     }
 }
+#endif

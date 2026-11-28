@@ -522,7 +522,7 @@ public sealed unsafe partial class Inkling2D3D12Model : ICpuModel
         // 4. Determine safe VRAM / UMA budget
         var headroom = _ctx.QueryVramHeadroom(explicitVramReserveBytes);
         ulong safeBudget;
-        bool isUma = _ctx.IsUnifiedMemoryArchitecture || _ctx.DeviceName.Contains("Radeon", StringComparison.OrdinalIgnoreCase);
+        bool isUma = _ctx.IsUnifiedMemoryArchitecture;
         if (isUma)
         {
             // On AMD Radeon 890M (32GB UMA), TotalAccessibleMemory is ~16.5GB; allow up to 15.5GB so ALL 24 physical layers fit!

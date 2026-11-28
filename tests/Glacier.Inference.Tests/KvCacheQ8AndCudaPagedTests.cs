@@ -13,6 +13,7 @@ using Xunit;
 
 namespace Glacier.Inference.Tests;
 
+[Collection("SequentialGpu")]
 public unsafe class KvCacheQ8AndCudaPagedTests
 {
     [Fact]
@@ -199,8 +200,8 @@ public unsafe class KvCacheQ8AndCudaPagedTests
         }
 
         cache.Reset();
-        cache.ReadKey(1, 1, 3, kRead);
-        for (int d = 0; d < headDim; d++) Assert.Equal(0f, kRead[d]);
+        Assert.False(cache.IsPositionValid(1, 3));
+        Assert.Throws<InvalidOperationException>(() => cache.ReadKey(1, 1, 3, kRead));
 
         // Gemma4KvCache Q8_0 verification
         using var gemmaCache = new Gemma4KvCache(
@@ -261,6 +262,7 @@ public unsafe class KvCacheQ8AndCudaPagedTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void Qwen2GpuModel_CudaPagedFp16Q8AndQ4_SingleAndBatchedMatchCpuFp32()
     {
         if (!CuDriver.IsAvailable() || !GpuContext.IsSupported)

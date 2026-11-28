@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0;net10.0-android</TargetFrameworks>
+    <SupportedOSPlatformVersion Condition="'$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))' == 'android'">28</SupportedOSPlatformVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -35,14 +36,13 @@
     <None Include="Gpu\Vulkan\Shaders\*.comp;Gpu\Vulkan\Shaders\*.glsl;Gpu\Vulkan\Shaders\*.sh" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
-    <PackageReference Include="Vortice.Direct3D12" Version="3.8.3" />
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))' != 'android'">
+    <PackageReference Include="Vortice.D3DCompiler" />
+    <PackageReference Include="Vortice.Direct3D12" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="Glacier.Inference.Tests" />
-    <InternalsVisibleTo Include="Glacier.Inference.Distributed" />
     <InternalsVisibleTo Include="Glacier.Cluster" />
     <InternalsVisibleTo Include="Glacier.Cluster.Tests" />
   </ItemGroup>

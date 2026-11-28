@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using Glacier.Inference.Config;
@@ -8,6 +9,8 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Model;
+using Glacier.Inference.Quant;
+using Glacier.Inference.Tests.E2E;
 using Glacier.Inference.Tests.VulkanE2E.Fixtures;
 using Xunit;
 
@@ -37,51 +40,99 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_02_AttentionBiases_AllZeroMagnitudes()
     {
-        float[] bias = [0.0f, 0.0f, 0.0f, 0.0f];
-        float[] activation = [1.25f, -3.5f, 42.0f, 0.001f];
-        float[] result = new float[4];
-        for (int i = 0; i < 4; i++) result[i] = activation[i] + bias[i];
+        const int dim = 64;
+        float[] bias = new float[dim];
+        float[] activation = new float[dim];
+        for (int i = 0; i < dim; i++) activation[i] = (i % 5) * 1.25f - 2.0f;
+        float[] original = (float[])activation.Clone();
 
-        for (int i = 0; i < 4; i++)
+        fixed (float* pBias = bias, pAct = activation)
         {
-            Assert.Equal(activation[i], result[i]);
+            QuantKernels.VecAdd(pBias, pAct, dim);
+        }
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.Equal(original[i], activation[i]);
         }
     }
 
     [Fact]
     public void T2_BVA_03_AttentionBiases_ExtremeMagnitudes_NoNaNOrOverflow()
     {
-        float[] bias = [1000.0f, -1000.0f, 1e5f, -1e5f];
-        float[] activation = [5.0f, -10.0f, 20.0f, -50.0f];
-        float[] result = new float[4];
-        for (int i = 0; i < 4; i++)
+        const int dim = 32;
+        float[] bias = new float[dim];
+        float[] activation = new float[dim];
+        float[] pattern = [1000.0f, -1000.0f, 1e5f, -1e5f];
+        float[] actPattern = [5.0f, -10.0f, 20.0f, -50.0f];
+        for (int i = 0; i < dim; i++)
         {
-            result[i] = activation[i] + bias[i];
-            Assert.False(float.IsNaN(result[i]));
-            Assert.False(float.IsInfinity(result[i]));
+            bias[i] = pattern[i & 3];
+            activation[i] = actPattern[i & 3];
+        }
+
+        fixed (float* pBias = bias, pAct = activation)
+        {
+            QuantKernels.VecAdd(pBias, pAct, dim);
+        }
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.False(float.IsNaN(activation[i]));
+            Assert.False(float.IsInfinity(activation[i]));
+            Assert.Equal(actPattern[i & 3] + pattern[i & 3], activation[i], 0.01f);
         }
     }
 
     [Fact]
     public void T2_BVA_04_AttentionBiases_SubnormalFloats_HandledGracefully()
     {
+        const int dim = 20;
         float subnormal = 1e-38f;
-        float[] bias = [subnormal, -subnormal];
-        float[] activation = [1.0f, -1.0f];
-        float[] result = [activation[0] + bias[0], activation[1] + bias[1]];
+        float[] bias = new float[dim];
+        float[] activation = new float[dim];
+        for (int i = 0; i < dim; i++)
+        {
+            bias[i] = (i & 1) == 0 ? subnormal : -subnormal;
+            activation[i] = (i & 1) == 0 ? 1.0f : -1.0f;
+        }
 
-        Assert.False(float.IsNaN(result[0]));
-        Assert.False(float.IsNaN(result[1]));
+        fixed (float* pBias = bias, pAct = activation)
+        {
+            QuantKernels.VecAdd(pBias, pAct, dim);
+        }
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.True(float.IsFinite(activation[i]));
+            Assert.Equal((i & 1) == 0 ? 1.0f : -1.0f, activation[i], 1e-6f);
+        }
     }
 
     [Fact]
     public void T2_BVA_05_AttentionBiases_UnalignedDimension_Padding()
     {
-        // Unaligned head count / dimension: 896 elements
-        int dim = 896;
-        int workgroups = (dim + 255) / 256;
-        Assert.Equal(4, workgroups);
-        Assert.True(workgroups * 256 >= dim);
+        // Unaligned non-SIMD-multiple dimension (not divisible by 16 or 8)
+        const int dim = 899;
+        float[] bias = new float[dim];
+        float[] activation = new float[dim];
+        float[] normWeight = new float[dim];
+        float[] normOut = new float[dim];
+        for (int i = 0; i < dim; i++)
+        {
+            bias[i] = 0.25f;
+            activation[i] = i * 0.1f;
+            normWeight[i] = 1.0f;
+        }
+
+        fixed (float* pBias = bias, pAct = activation, pW = normWeight, pNorm = normOut)
+        {
+            QuantKernels.VecAdd(pBias, pAct, dim);
+            QuantKernels.RMSNorm(pAct, pW, pNorm, dim, 1e-5f);
+        }
+
+        Assert.Equal(898 * 0.1f + 0.25f, activation[dim - 1], 0.001f);
+        Assert.True(float.IsFinite(normOut[dim - 1]));
     }
 
     #endregion
@@ -144,37 +195,57 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_11_EmbedGather_TokenZero_ValidOffset()
     {
-        int token = 0;
-        int dim = 2048;
-        int blockSize = 32;
-        int nb = dim / blockSize;
-        long byteOffset = (long)token * nb * 18;
+        const int dim = 256;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: 256, vocabSize: 16, embdType: GgufType.Q4_0);
+        Assert.Equal(8L * 18L, GgufTypes.GetRowBytes(GgufType.Q4_0, dim));
 
-        Assert.Equal(0L, byteOffset);
+        float[] embd = new float[dim];
+        float[] expected = new float[dim];
+        fixed (float* pOut = embd)
+        {
+            QuantKernels.ExtractEmbedding(handle.Weights.EmbdType, handle.Weights.EmbdWeight, tokenId: 0, pOut, dim);
+        }
+        VulkanE2ETestFixtures.ReferenceQuantOracle.DequantizeQ4_0(
+            new ReadOnlySpan<byte>(handle.Weights.EmbdWeight, (int)GgufTypes.GetRowBytes(GgufType.Q4_0, dim)),
+            expected);
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.Equal(expected[i], embd[i], 0.0001f);
+        }
     }
 
     [Fact]
     public void T2_BVA_12_EmbedGather_MaxVocabToken_ValidOffset()
     {
-        int vocabSize = 151936;
+        const int vocabSize = 32, dim = 256;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: 256, vocabSize: vocabSize, embdType: GgufType.Q4_0);
+        long rowBytes = GgufTypes.GetRowBytes(GgufType.Q4_0, dim);
         int token = vocabSize - 1;
-        int dim = 2048;
-        int blockSize = 32;
-        int nb = dim / blockSize;
-        long byteOffset = (long)token * nb * 18;
 
-        Assert.True(byteOffset > 0);
-        Assert.Equal((151936L - 1L) * 64 * 18, byteOffset);
+        float[] embd = new float[dim];
+        float[] expected = new float[dim];
+        fixed (float* pOut = embd)
+        {
+            QuantKernels.ExtractEmbedding(handle.Weights.EmbdType, handle.Weights.EmbdWeight, token, pOut, dim);
+        }
+        VulkanE2ETestFixtures.ReferenceQuantOracle.DequantizeQ4_0(
+            new ReadOnlySpan<byte>(handle.Weights.EmbdWeight + (long)token * rowBytes, (int)rowBytes),
+            expected);
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.Equal(expected[i], embd[i], 0.0001f);
+        }
     }
 
     [Fact]
     public void T2_BVA_13_EmbedGather_UnalignedEmbeddingDim_CalculatesBlocks()
     {
-        int dim = 1536; // Phi-1.5 dimension
-        int blockSize = 256;
-        int nb = dim / blockSize;
-        Assert.Equal(6, nb);
-        Assert.Equal(dim, nb * blockSize);
+        Assert.Equal(6L * 144L, GgufTypes.GetRowBytes(GgufType.Q4_K, 1536));
+        Assert.Throws<ArgumentException>(() => GgufTypes.GetRowBytes(GgufType.Q4_K, 100));
     }
 
     [Fact]
@@ -207,42 +278,46 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_16_FusedQkv_MQA_SingleKvHead()
     {
-        int nQ = 32;
-        int nKv = 1;
-        int hd = 64;
-        int qDim = nQ * hd;
-        int kvDim = nKv * hd;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: 128, ffnDim: 256, headCount: 4, headCountKv: 1, vocabSize: 16, fusedQkv: true);
+        Assert.Equal(1, handle.Weights.HeadCountKv);
+        Assert.True(handle.Weights.Layers[0].HasFusedQkv);
 
-        Assert.Equal(2048, qDim);
-        Assert.Equal(64, kvDim);
-        Assert.Equal(2176, qDim + 2 * kvDim);
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.ForwardToken(token: 2, pos: 0, computeLogits: true);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
     public void T2_BVA_17_FusedQkv_MHA_EqualHeadCounts()
     {
-        int nQ = 16;
-        int nKv = 16;
-        int hd = 64;
-        int qDim = nQ * hd;
-        int kvDim = nKv * hd;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: 128, ffnDim: 256, headCount: 4, headCountKv: 4, vocabSize: 16, fusedQkv: true);
+        Assert.Equal(handle.Weights.HeadCount, handle.Weights.HeadCountKv);
+        Assert.True(handle.Weights.Layers[0].HasFusedQkv);
 
-        Assert.Equal(qDim, kvDim);
-        Assert.Equal(3 * qDim, qDim + 2 * kvDim);
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.ForwardToken(token: 2, pos: 0, computeLogits: true);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
     public void T2_BVA_18_FusedQkv_AsymmetricGQA_Ratio7to1()
     {
-        int nQ = 28;
-        int nKv = 4;
-        int hd = 128;
-        int qDim = nQ * hd;
-        int kvDim = nKv * hd;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: 224, ffnDim: 256, headCount: 7, headCountKv: 1, vocabSize: 16, fusedQkv: true);
+        Assert.Equal(7, handle.Weights.HeadCount / handle.Weights.HeadCountKv);
+        Assert.True(handle.Weights.Layers[0].HasFusedQkv);
 
-        Assert.Equal(7, nQ / nKv);
-        Assert.Equal(3584, qDim);
-        Assert.Equal(512, kvDim);
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.ForwardToken(token: 2, pos: 0, computeLogits: true);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
@@ -317,19 +392,27 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_26_SequencePosition_Zero_IdentityOffset()
     {
-        uint pos = 0u;
-        uint[] push = [0u];
-        push[0] = pos;
-        Assert.Equal(0u, push[0]);
+        var runner = TestableVulkanRunner.CreateForTest(maxSeqLen: 16, vocab: 32);
+        runner.AddPosOp(99u);
+        runner.ExecuteRun(token: 0, pos: 0);
+        Assert.Equal(0u, runner.GetPush(0)[0]);
     }
 
     [Fact]
     public void T2_BVA_27_SequencePosition_MaxSeqLenMinusOne()
     {
-        int maxSeqLen = 4096;
-        int pos = maxSeqLen - 1;
-        Assert.Equal(4095, pos);
-        Assert.True((uint)pos < (uint)maxSeqLen);
+        const int maxSeqLen = 16;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: 64, ffnDim: 128, headCount: 2, headCountKv: 2, vocabSize: 16);
+        using var session = new InferenceSession(handle.Path, maxSeqLen: maxSeqLen, device: "cpu");
+
+        int[] tokens = Enumerable.Repeat(1, maxSeqLen).ToArray();
+        session.Prefill(tokens);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => float.IsFinite(x));
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => session.ForwardToken(token: 1, pos: maxSeqLen, computeLogits: true));
     }
 
     [Fact]
@@ -389,46 +472,76 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_32_RoPE_ExtremeBaseFrequency_1e9()
     {
-        float baseFreq = 1e9f; // Mistral / Devstral extended frequency base
-        int ropeDim = 64;
-        for (int i = 0; i < ropeDim / 2; i++)
+        const int headDim = 64;
+        float[] q = new float[headDim];
+        float[] k = new float[headDim];
+        for (int i = 0; i < headDim; i++) { q[i] = (i + 1) * 0.1f; k[i] = (headDim - i) * 0.1f; }
+        float qNormBefore = MathF.Sqrt(q.Sum(v => v * v));
+
+        fixed (float* pQ = q, pK = k)
         {
-            float theta = 1.0f / MathF.Pow(baseFreq, (2f * i) / ropeDim);
-            Assert.False(float.IsNaN(theta));
-            Assert.False(float.IsInfinity(theta));
-            Assert.True(theta > 0f);
+            QuantKernels.RoPE(pQ, pK, nHeadsQ: 1, nHeadsKv: 1, headDim: headDim, pos: 512, freqBase: 1e9f);
         }
+
+        Assert.All(q, v => Assert.True(float.IsFinite(v)));
+        Assert.All(k, v => Assert.True(float.IsFinite(v)));
+        Assert.Equal(qNormBefore, MathF.Sqrt(q.Sum(v => v * v)), 0.001f);
     }
 
     [Fact]
     public void T2_BVA_33_RoPE_HighContextPosition_32768_NumericalStability()
     {
-        int pos = 32768;
-        float freq = 10000.0f;
-        float theta = pos / freq;
-        float cos = MathF.Cos(theta);
-        float sin = MathF.Sin(theta);
+        const int headDim = 64;
+        float[] q = new float[headDim];
+        float[] k = new float[headDim];
+        for (int i = 0; i < headDim; i++) { q[i] = MathF.Sin(i + 1); k[i] = MathF.Cos(i + 1); }
+        float qNormBefore = MathF.Sqrt(q.Sum(v => v * v));
+        float kNormBefore = MathF.Sqrt(k.Sum(v => v * v));
 
-        Assert.True(cos >= -1.0f && cos <= 1.0f);
-        Assert.True(sin >= -1.0f && sin <= 1.0f);
-        Assert.Equal(1.0f, cos * cos + sin * sin, 0.0001f);
+        fixed (float* pQ = q, pK = k)
+        {
+            QuantKernels.RoPE(pQ, pK, nHeadsQ: 1, nHeadsKv: 1, headDim: headDim, pos: 32768, freqBase: 10000.0f);
+        }
+
+        Assert.All(q, v => Assert.True(float.IsFinite(v)));
+        Assert.All(k, v => Assert.True(float.IsFinite(v)));
+        Assert.Equal(qNormBefore, MathF.Sqrt(q.Sum(v => v * v)), 0.001f);
+        Assert.Equal(kNormBefore, MathF.Sqrt(k.Sum(v => v * v)), 0.001f);
     }
 
     [Fact]
     public void T2_BVA_34_RoPE_PartialDimension_RotationBounds()
     {
-        int headDim = 128;
-        int ropeDim = 64; // only first 64 dimensions rotated
-        Assert.True(ropeDim <= headDim);
-        Assert.Equal(64, headDim - ropeDim);
+        const int headDim = 128, ropeDim = 64;
+        float[] q = new float[headDim];
+        float[] k = new float[headDim];
+        for (int i = 0; i < headDim; i++) { q[i] = i + 1.0f; k[i] = -(i + 1.0f); }
+        float[] qTailBefore = q[ropeDim..];
+        float[] kTailBefore = k[ropeDim..];
+
+        fixed (float* pQ = q, pK = k)
+        {
+            QuantKernels.RoPE(pQ, pK, nHeadsQ: 1, nHeadsKv: 1, headDim: headDim, pos: 7, freqBase: 10000.0f, ropeDim: ropeDim);
+        }
+
+        // Unrotated tail [64..128) must remain bit-identical while [0..64) rotates
+        Assert.NotEqual(1.0f, q[0]);
+        for (int i = ropeDim; i < headDim; i++)
+        {
+            Assert.Equal(qTailBefore[i - ropeDim], q[i]);
+            Assert.Equal(kTailBefore[i - ropeDim], k[i]);
+        }
     }
 
     [Fact]
     public void T2_BVA_35_RoPE_Llama32_HighTheta_500000()
     {
-        float baseFreq = 500_000.0f; // Llama 3.2 1B/3B theta
-        float theta = 1.0f / baseFreq;
-        Assert.True(theta > 0f && theta < 1f);
+        const int dim = 64;
+        float[] invFreq = new float[dim / 2];
+        QuantKernels.PrecomputeYarnFrequencies(invFreq, dim, freqBase: 500_000.0f, scalingFactor: 8.0f, originalCtx: 8192);
+
+        Assert.All(invFreq, f => Assert.True(float.IsFinite(f) && f > 0f && f <= 1f));
+        Assert.True(invFreq[1] < 1f && invFreq[0] > invFreq[^1], "YaRN inverse frequencies must decrease with dimension index");
     }
 
     #endregion
@@ -438,41 +551,96 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_36_SecurityScanner_RegexPattern_GoogleAiKeyMatch()
     {
-        var regex = new Regex(@"AIzaSy[0-9A-Za-z\-_]{33}");
-        string syntheticKey = "AIzaSy" + new string('A', 33);
-        Assert.Matches(regex, syntheticKey);
+        string dir = Path.Combine(Path.GetTempPath(), $"bva_sec36_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "cfg.json"), "API_KEY=\"" + "AIzaSy" + new string('A', 33) + "\"");
+            var (exitCode, _, findings, _) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(dir);
+            Assert.Equal(1, exitCode);
+            Assert.Single(findings);
+            Assert.Contains("Google AI", findings[0]);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     [Fact]
     public void T2_BVA_37_SecurityScanner_RegexPattern_PrivateKeyMatch()
     {
-        var regex = new Regex(@"-----\b" + @"BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY" + @"-----");
-        string syntheticHeader = "-----" + "BEGIN RSA " + "PRIVATE KEY" + "-----";
-        Assert.Matches(regex, syntheticHeader);
+        string dir = Path.Combine(Path.GetTempPath(), $"bva_sec37_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "key.pem"), "-----" + "BEGIN RSA " + "PRIVATE KEY" + "-----");
+            var (exitCode, _, findings, _) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(dir);
+            Assert.Equal(1, exitCode);
+            Assert.Single(findings);
+            Assert.Contains("Private Key Header", findings[0]);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     [Fact]
     public void T2_BVA_38_SecurityScanner_RegexPattern_OpenAiKeyMatch()
     {
-        var regex = new Regex(@"sk-[a-zA-Z0-9]{32,}");
-        string syntheticKey = "sk-" + new string('b', 35);
-        Assert.Matches(regex, syntheticKey);
+        string dir = Path.Combine(Path.GetTempPath(), $"bva_sec38_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "cfg.env"), "OPENAI_KEY=" + "sk-" + new string('b', 35));
+            var (exitCode, _, findings, _) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(dir);
+            Assert.Equal(1, exitCode);
+            Assert.Single(findings);
+            Assert.Contains("OpenAI", findings[0]);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     [Fact]
     public void T2_BVA_39_SecurityScanner_Allowlist_EnvironmentVariable()
     {
-        var allowlist = new Regex(@"(?i)environment\.getenvironmentvariable");
-        string safeLine = "string key = Environment.GetEnvironmentVariable(\"API_KEY\");";
-        Assert.Matches(allowlist, safeLine);
+        string dir = Path.Combine(Path.GetTempPath(), $"bva_sec39_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "Program.cs"), "string key = Environment.GetEnvironmentVariable(\"API_KEY\") ?? \"\";");
+            var (exitCode, scanned, findings, _) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(dir);
+            Assert.Equal(0, exitCode);
+            Assert.Equal(1, scanned);
+            Assert.Empty(findings);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     [Fact]
     public void T2_BVA_40_SecurityScanner_Allowlist_PlaceholderPattern()
     {
-        var allowlist = new Regex(@"(?i)your[-_]?api[-_]?key|dummy");
-        string placeholderLine = "apiKey = \"your-api-key\";";
-        Assert.Matches(allowlist, placeholderLine);
+        string dir = Path.Combine(Path.GetTempPath(), $"bva_sec40_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "template.json"), "apiKey = \"your-api-key\"; // DUMMY");
+            var (exitCode, scanned, findings, _) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(dir);
+            Assert.Equal(0, exitCode);
+            Assert.Equal(1, scanned);
+            Assert.Empty(findings);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     #endregion
@@ -511,18 +679,18 @@ public unsafe class VulkanE2ETier2BoundaryAndCornerTests
     [Fact]
     public void T2_BVA_44_ActiveBackend_CaseInsensitiveEngineQuery()
     {
-        Assert.Equal("Vulkan", InferenceEngineType.Vulkan.ToString());
-        Assert.Equal("Cpu", InferenceEngineType.Cpu.ToString());
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2();
+        using var session = new InferenceSession(handle.Path, device: "CPU");
+        Assert.Equal(InferenceEngineType.Cpu, session.Engine);
+        Assert.Equal("Cpu", session.ActiveBackend);
+        Assert.False(session.IsGpuAccelerated);
     }
 
     [Fact]
     public void T2_BVA_45_ModeDesc_MoE_DualMoE_FormatConsistency()
     {
-        var gemmaArch = UniversalArchitecture.Gemma4;
-        var qwenArch = UniversalArchitecture.Qwen;
-
-        string gemmaMoeDesc = gemmaArch == UniversalArchitecture.Gemma4 ? "Gemma 4 ISWA + Dual MoE" : "Standard Dense";
-        string standardMoeDesc = qwenArch == UniversalArchitecture.Gemma4 ? "Gemma 4 ISWA + Dual MoE" : "Standard Dense + MoE";
+        string gemmaMoeDesc = InferenceSession.FormatVulkanModeDescription(UniversalArchitecture.Gemma4, isHybridSsm: false, isMoe: true);
+        string standardMoeDesc = InferenceSession.FormatVulkanModeDescription(UniversalArchitecture.Qwen, isHybridSsm: false, isMoe: true);
 
         Assert.Contains("Dual MoE", gemmaMoeDesc);
         Assert.DoesNotContain("Dual MoE", standardMoeDesc);

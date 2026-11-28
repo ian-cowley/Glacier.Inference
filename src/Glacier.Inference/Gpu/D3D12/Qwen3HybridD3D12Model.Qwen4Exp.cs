@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -8,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Glacier.Inference.Diagnostics;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
@@ -1010,10 +1012,10 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
         // Upgrade expert workspaces so topK overflow experts can execute in parallel via Parallel.For
         if (_expertWorkspaces == null || _expertWorkspaces.Length < topK)
         {
-            _expertWorkspaces = new Qwen2D3D12Model.ExpertCpuWorkspace[topK];
+            _expertWorkspaces = new ExpertCpuWorkspace[topK];
             for (int i = 0; i < topK; i++)
             {
-                _expertWorkspaces[i] = new Qwen2D3D12Model.ExpertCpuWorkspace(expertFfnDim, _dim);
+                _expertWorkspaces[i] = new ExpertCpuWorkspace(expertFfnDim, _dim);
             }
         }
 
@@ -2182,3 +2184,4 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
         _sigSparseAttn?.Dispose();
     }
 }
+#endif

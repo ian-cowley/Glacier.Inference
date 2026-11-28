@@ -1,0 +1,21 @@
+<Project>
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Packages.props', '$(MSBuildThisFileDirectory)../'))"
+          Condition="Exists($([MSBuild]::GetPathOfFileAbove('Directory.Packages.props', '$(MSBuildThisFileDirectory)../')))" />
+
+  <PropertyGroup Condition="'$(_RootPackagesPropsLoaded)' != 'true'">
+    <_GlacierRelProjDir>\$([MSBuild]::MakeRelative('$(MSBuildThisFileDirectory)', '$(MSBuildProjectDirectory)'))\</_GlacierRelProjDir>
+    <ManagePackageVersionsCentrally Condition="'$(ManagePackageVersionsCentrally)' == '' and !$(_GlacierRelProjDir.Contains('\scratch\'))">true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_RootPackagesPropsLoaded)' != 'true'">
+    <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
+    <PackageVersion Include="Glacier.Media" Version="1.1.2" />
+    <PackageVersion Include="Glacier.MemEx" Version="1.2.3" />
+    <PackageVersion Include="Glacier.Serve" Version="1.9.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="Vortice.D3DCompiler" Version="3.8.3" />
+    <PackageVersion Include="Vortice.Direct3D12" Version="3.8.3" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+</Project>

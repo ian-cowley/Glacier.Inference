@@ -8,6 +8,8 @@ using Glacier.Inference.Quant;
 using Xunit;
 using Xunit.Abstractions;
 
+[Collection("SequentialGpu")]
+[Trait("Hardware", "Gpu")]
 public sealed unsafe class NariQGpuParityTests
 {
     private readonly ITestOutputHelper _output;

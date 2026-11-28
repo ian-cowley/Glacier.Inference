@@ -53,6 +53,7 @@ public class VramReserveOverrideTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12Context_And_Models_HonorExplicitZeroVramReserve()
     {
         if (!D3D12Context.IsSupported)
@@ -125,6 +126,7 @@ public class VramReserveOverrideTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void InferenceSession_Propagates_KvPrecision_And_VramReserveMb()
     {
         string tempGguf = KvCacheQ4Tests.CreateSyntheticQwen2Gguf(dim: 64, ffnDim: 128, nHeads: 2, nHeadsKv: 1, layers: 2, vocab: 64);

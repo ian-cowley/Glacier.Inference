@@ -14,7 +14,9 @@ using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
 using Glacier.Inference.Scheduling;
+#if !ANDROID
 using Vortice.DXGI;
+#endif
 
 /// <summary>
 /// Live snapshot of physical hardware capabilities, free memory headroom, and measured SIMD bandwidth
@@ -342,6 +344,7 @@ public static unsafe class HardwareRuntimeProfiler
 
     private static (ulong TotalBytes, ulong AvailableBytes) QueryHostPhysicalMemory()
     {
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             var mem = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>() };
@@ -350,7 +353,9 @@ public static unsafe class HardwareRuntimeProfiler
                 return (mem.ullTotalPhys, mem.ullAvailPhys);
             }
         }
-        else if (OperatingSystem.IsLinux() && File.Exists("/proc/meminfo"))
+        else
+#endif
+        if (OperatingSystem.IsLinux() && File.Exists("/proc/meminfo"))
         {
             try
             {
@@ -402,6 +407,7 @@ public static unsafe class HardwareRuntimeProfiler
         ulong budget = dev.DedicatedVramBytes;
         ulong free = dev.DedicatedVramBytes;
 
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             try
@@ -450,10 +456,12 @@ public static unsafe class HardwareRuntimeProfiler
                 // Keep static DXGI totals if live VideoMemoryInfo query is unavailable
             }
         }
+#endif
 
         return (budget, free);
     }
 
+#if !ANDROID
     [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
@@ -471,4 +479,5 @@ public static unsafe class HardwareRuntimeProfiler
         public ulong ullAvailVirtual;
         public ulong ullAvailExtendedVirtual;
     }
+#endif
 }

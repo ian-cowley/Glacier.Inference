@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -167,3 +168,4 @@ public sealed class D3D12LayerWeights : IDisposable
         HcFfnInjectWeight?.Dispose();
     }
 }
+#endif

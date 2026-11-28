@@ -170,6 +170,7 @@ public class DeviceManagerTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TestGpuDiagnostics()
     {
         if (!GpuContext.IsSupported) return;
@@ -207,6 +208,7 @@ public class DeviceManagerTests
 
 #pragma warning disable GLACIER_EXP001
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void HipContext_InitializationAndAllocation_SucceedsIfSupported()
     {
         if (!HipContext.IsSupported) return;
@@ -240,6 +242,7 @@ public class DeviceManagerTests
 #pragma warning restore GLACIER_EXP001
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void VulkanContext_InitializationAndBufferMapping_SucceedsIfSupported()
     {
         if (!VulkanContext.IsSupported) return;

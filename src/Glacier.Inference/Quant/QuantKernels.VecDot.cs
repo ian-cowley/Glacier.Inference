@@ -56,32 +56,21 @@ public static unsafe partial class QuantKernels
 
                 if (Vector512.IsHardwareAccelerated)
                 {
-                    var vSubSum1 = Vector512<float>.Zero;
-                    for (int l = 0; l < 32; l += 16)
-                    {
-                        var vx = Vector512.Load(x + l);
-                        var vq = Vector512.Create(
-                            (float)(q[l + 0] & 0x0F), (float)(q[l + 1] & 0x0F), (float)(q[l + 2] & 0x0F), (float)(q[l + 3] & 0x0F),
-                            (float)(q[l + 4] & 0x0F), (float)(q[l + 5] & 0x0F), (float)(q[l + 6] & 0x0F), (float)(q[l + 7] & 0x0F),
-                            (float)(q[l + 8] & 0x0F), (float)(q[l + 9] & 0x0F), (float)(q[l + 10] & 0x0F), (float)(q[l + 11] & 0x0F),
-                            (float)(q[l + 12] & 0x0F), (float)(q[l + 13] & 0x0F), (float)(q[l + 14] & 0x0F), (float)(q[l + 15] & 0x0F));
-                        vSubSum1 = Vector512.FusedMultiplyAdd(vx, vq, vSubSum1);
-                    }
+                    var raw32 = Vector256.Load(q);
+                    var mask15 = Vector256.Create((byte)0x0F);
+                    var lo32 = raw32 & mask15;
+                    var hi32 = Vector256.ShiftRightLogical(raw32.AsUInt16(), 4).AsByte() & mask15;
+
+                    var vqLo0 = WidenUInt8ToFloat512(lo32.GetLower());
+                    var vqLo1 = WidenUInt8ToFloat512(lo32.GetUpper());
+                    var vSubSum1 = Vector512.FusedMultiplyAdd(Vector512.Load(x), vqLo0, Vector512.Load(x + 16) * vqLo1);
                     float subMin1 = xSums != null ? xSums[sumIdx++] : ComputeChunk32Sum(x);
                     sum += (d1 * Vector512.Sum(vSubSum1)) - (m1 * subMin1);
                     x += 32;
 
-                    var vSubSum2 = Vector512<float>.Zero;
-                    for (int l = 0; l < 32; l += 16)
-                    {
-                        var vx = Vector512.Load(x + l);
-                        var vq = Vector512.Create(
-                            (float)(q[l + 0] >> 4), (float)(q[l + 1] >> 4), (float)(q[l + 2] >> 4), (float)(q[l + 3] >> 4),
-                            (float)(q[l + 4] >> 4), (float)(q[l + 5] >> 4), (float)(q[l + 6] >> 4), (float)(q[l + 7] >> 4),
-                            (float)(q[l + 8] >> 4), (float)(q[l + 9] >> 4), (float)(q[l + 10] >> 4), (float)(q[l + 11] >> 4),
-                            (float)(q[l + 12] >> 4), (float)(q[l + 13] >> 4), (float)(q[l + 14] >> 4), (float)(q[l + 15] >> 4));
-                        vSubSum2 = Vector512.FusedMultiplyAdd(vx, vq, vSubSum2);
-                    }
+                    var vqHi0 = WidenUInt8ToFloat512(hi32.GetLower());
+                    var vqHi1 = WidenUInt8ToFloat512(hi32.GetUpper());
+                    var vSubSum2 = Vector512.FusedMultiplyAdd(Vector512.Load(x), vqHi0, Vector512.Load(x + 16) * vqHi1);
                     float subMin2 = xSums != null ? xSums[sumIdx++] : ComputeChunk32Sum(x);
                     sum += (d2 * Vector512.Sum(vSubSum2)) - (m2 * subMin2);
                     x += 32;
@@ -189,6 +178,38 @@ public static unsafe partial class QuantKernels
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<float> WidenUInt8ToFloat512(Vector128<byte> b)
+    {
+        if (Avx512F.IsSupported)
+        {
+            return Vector512.ConvertToSingle(Avx512F.ConvertToVector512Int32(b));
+        }
+
+        var (u16Lo, u16Hi) = Vector128.Widen(b);
+        var (u32_0, u32_1) = Vector128.Widen(u16Lo);
+        var (u32_2, u32_3) = Vector128.Widen(u16Hi);
+        return Vector512.ConvertToSingle(Vector512.Create(
+            Vector256.Create(u32_0, u32_1),
+            Vector256.Create(u32_2, u32_3)).AsInt32());
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<float> WidenSByteToFloat512(Vector128<sbyte> b)
+    {
+        if (Avx512F.IsSupported)
+        {
+            return Vector512.ConvertToSingle(Avx512F.ConvertToVector512Int32(b));
+        }
+
+        var (i16Lo, i16Hi) = Vector128.Widen(b);
+        var (i32_0, i32_1) = Vector128.Widen(i16Lo);
+        var (i32_2, i32_3) = Vector128.Widen(i16Hi);
+        return Vector512.ConvertToSingle(Vector512.Create(
+            Vector256.Create(i32_0, i32_1),
+            Vector256.Create(i32_2, i32_3)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float ComputeChunk32Sum(float* x)
     {
         if (Vector512.IsHardwareAccelerated)
@@ -259,169 +280,47 @@ public static unsafe partial class QuantKernels
 
                 if (Vector512.IsHardwareAccelerated)
                 {
-                    var vx0 = Vector512.Load(x + 0);
-                    var vx2 = Vector512.Load(x + 32);
-                    var vx4 = Vector512.Load(x + 64);
-                    var vx6 = Vector512.Load(x + 96);
+                    var ql0 = Vector256.Load(ql);
+                    var ql1 = Vector256.Load(ql + 32);
+                    var qh0 = Vector256.Load(qh);
+                    var mask0F = Vector256.Create((byte)0x0F);
+                    var mask03 = Vector256.Create((byte)0x03);
+                    var v32 = Vector512.Create(32.0f);
 
-                    var vq1 = Vector512.Create(
-                        (float)(((ql[0] & 0x0F) | (((qh[0] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[1] & 0x0F) | (((qh[1] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[2] & 0x0F) | (((qh[2] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[3] & 0x0F) | (((qh[3] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[4] & 0x0F) | (((qh[4] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[5] & 0x0F) | (((qh[5] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[6] & 0x0F) | (((qh[6] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[7] & 0x0F) | (((qh[7] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[8] & 0x0F) | (((qh[8] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[9] & 0x0F) | (((qh[9] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[10] & 0x0F) | (((qh[10] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[11] & 0x0F) | (((qh[11] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[12] & 0x0F) | (((qh[12] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[13] & 0x0F) | (((qh[13] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[14] & 0x0F) | (((qh[14] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[15] & 0x0F) | (((qh[15] >> 0) & 3) << 4)) - 32));
+                    var ql0Lo = ql0 & mask0F;
+                    var ql1Lo = ql1 & mask0F;
+                    var ql0Hi = Vector256.ShiftRightLogical(ql0.AsUInt16(), 4).AsByte() & mask0F;
+                    var ql1Hi = Vector256.ShiftRightLogical(ql1.AsUInt16(), 4).AsByte() & mask0F;
 
-                    var vq2 = Vector512.Create(
-                        (float)(((ql[32] & 0x0F) | (((qh[0] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[33] & 0x0F) | (((qh[1] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[34] & 0x0F) | (((qh[2] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[35] & 0x0F) | (((qh[3] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[36] & 0x0F) | (((qh[4] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[37] & 0x0F) | (((qh[5] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[38] & 0x0F) | (((qh[6] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[39] & 0x0F) | (((qh[7] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[40] & 0x0F) | (((qh[8] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[41] & 0x0F) | (((qh[9] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[42] & 0x0F) | (((qh[10] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[43] & 0x0F) | (((qh[11] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[44] & 0x0F) | (((qh[12] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[45] & 0x0F) | (((qh[13] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[46] & 0x0F) | (((qh[14] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[47] & 0x0F) | (((qh[15] >> 2) & 3) << 4)) - 32));
+                    var qhSh0 = (qh0 & mask03) << 4;
+                    var qhSh2 = (Vector256.ShiftRightLogical(qh0.AsUInt16(), 2).AsByte() & mask03) << 4;
+                    var qhSh4 = (Vector256.ShiftRightLogical(qh0.AsUInt16(), 4).AsByte() & mask03) << 4;
+                    var qhSh6 = (Vector256.ShiftRightLogical(qh0.AsUInt16(), 6).AsByte() & mask03) << 4;
 
-                    var vq3 = Vector512.Create(
-                        (float)(((ql[0] >> 4) | (((qh[0] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[1] >> 4) | (((qh[1] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[2] >> 4) | (((qh[2] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[3] >> 4) | (((qh[3] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[4] >> 4) | (((qh[4] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[5] >> 4) | (((qh[5] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[6] >> 4) | (((qh[6] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[7] >> 4) | (((qh[7] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[8] >> 4) | (((qh[8] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[9] >> 4) | (((qh[9] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[10] >> 4) | (((qh[10] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[11] >> 4) | (((qh[11] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[12] >> 4) | (((qh[12] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[13] >> 4) | (((qh[13] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[14] >> 4) | (((qh[14] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[15] >> 4) | (((qh[15] >> 4) & 3) << 4)) - 32));
+                    var q1Bytes = ql0Lo | qhSh0;
+                    var q2Bytes = ql1Lo | qhSh2;
+                    var q3Bytes = ql0Hi | qhSh4;
+                    var q4Bytes = ql1Hi | qhSh6;
 
-                    var vq4 = Vector512.Create(
-                        (float)(((ql[32] >> 4) | (((qh[0] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[33] >> 4) | (((qh[1] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[34] >> 4) | (((qh[2] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[35] >> 4) | (((qh[3] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[36] >> 4) | (((qh[4] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[37] >> 4) | (((qh[5] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[38] >> 4) | (((qh[6] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[39] >> 4) | (((qh[7] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[40] >> 4) | (((qh[8] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[41] >> 4) | (((qh[9] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[42] >> 4) | (((qh[10] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[43] >> 4) | (((qh[11] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[44] >> 4) | (((qh[12] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[45] >> 4) | (((qh[13] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[46] >> 4) | (((qh[14] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[47] >> 4) | (((qh[15] >> 6) & 3) << 4)) - 32));
+                    var vq1 = WidenUInt8ToFloat512(q1Bytes.GetLower()) - v32;
+                    var vq2 = WidenUInt8ToFloat512(q2Bytes.GetLower()) - v32;
+                    var vq3 = WidenUInt8ToFloat512(q3Bytes.GetLower()) - v32;
+                    var vq4 = WidenUInt8ToFloat512(q4Bytes.GetLower()) - v32;
 
-                    sub0 = Vector512.Sum(vx0 * vq1);
-                    sub2 = Vector512.Sum(vx2 * vq2);
-                    sub4 = Vector512.Sum(vx4 * vq3);
-                    sub6 = Vector512.Sum(vx6 * vq4);
+                    sub0 = Vector512.Sum(Vector512.Load(x + 0) * vq1);
+                    sub2 = Vector512.Sum(Vector512.Load(x + 32) * vq2);
+                    sub4 = Vector512.Sum(Vector512.Load(x + 64) * vq3);
+                    sub6 = Vector512.Sum(Vector512.Load(x + 96) * vq4);
 
-                    var vx1_512 = Vector512.Load(x + 16);
-                    var vx3_512 = Vector512.Load(x + 48);
-                    var vx5_512 = Vector512.Load(x + 80);
-                    var vx7_512 = Vector512.Load(x + 112);
+                    var vq1_b = WidenUInt8ToFloat512(q1Bytes.GetUpper()) - v32;
+                    var vq2_b = WidenUInt8ToFloat512(q2Bytes.GetUpper()) - v32;
+                    var vq3_b = WidenUInt8ToFloat512(q3Bytes.GetUpper()) - v32;
+                    var vq4_b = WidenUInt8ToFloat512(q4Bytes.GetUpper()) - v32;
 
-                    var vq1_b = Vector512.Create(
-                        (float)(((ql[16] & 0x0F) | (((qh[16] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[17] & 0x0F) | (((qh[17] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[18] & 0x0F) | (((qh[18] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[19] & 0x0F) | (((qh[19] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[20] & 0x0F) | (((qh[20] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[21] & 0x0F) | (((qh[21] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[22] & 0x0F) | (((qh[22] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[23] & 0x0F) | (((qh[23] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[24] & 0x0F) | (((qh[24] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[25] & 0x0F) | (((qh[25] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[26] & 0x0F) | (((qh[26] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[27] & 0x0F) | (((qh[27] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[28] & 0x0F) | (((qh[28] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[29] & 0x0F) | (((qh[29] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[30] & 0x0F) | (((qh[30] >> 0) & 3) << 4)) - 32),
-                        (float)(((ql[31] & 0x0F) | (((qh[31] >> 0) & 3) << 4)) - 32));
-
-                    var vq2_b = Vector512.Create(
-                        (float)(((ql[48] & 0x0F) | (((qh[16] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[49] & 0x0F) | (((qh[17] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[50] & 0x0F) | (((qh[18] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[51] & 0x0F) | (((qh[19] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[52] & 0x0F) | (((qh[20] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[53] & 0x0F) | (((qh[21] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[54] & 0x0F) | (((qh[22] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[55] & 0x0F) | (((qh[23] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[56] & 0x0F) | (((qh[24] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[57] & 0x0F) | (((qh[25] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[58] & 0x0F) | (((qh[26] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[59] & 0x0F) | (((qh[27] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[60] & 0x0F) | (((qh[28] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[61] & 0x0F) | (((qh[29] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[62] & 0x0F) | (((qh[30] >> 2) & 3) << 4)) - 32),
-                        (float)(((ql[63] & 0x0F) | (((qh[31] >> 2) & 3) << 4)) - 32));
-
-                    var vq3_b = Vector512.Create(
-                        (float)(((ql[16] >> 4) | (((qh[16] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[17] >> 4) | (((qh[17] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[18] >> 4) | (((qh[18] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[19] >> 4) | (((qh[19] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[20] >> 4) | (((qh[20] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[21] >> 4) | (((qh[21] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[22] >> 4) | (((qh[22] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[23] >> 4) | (((qh[23] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[24] >> 4) | (((qh[24] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[25] >> 4) | (((qh[25] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[26] >> 4) | (((qh[26] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[27] >> 4) | (((qh[27] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[28] >> 4) | (((qh[28] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[29] >> 4) | (((qh[29] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[30] >> 4) | (((qh[30] >> 4) & 3) << 4)) - 32),
-                        (float)(((ql[31] >> 4) | (((qh[31] >> 4) & 3) << 4)) - 32));
-
-                    var vq4_b = Vector512.Create(
-                        (float)(((ql[48] >> 4) | (((qh[16] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[49] >> 4) | (((qh[17] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[50] >> 4) | (((qh[18] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[51] >> 4) | (((qh[19] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[52] >> 4) | (((qh[20] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[53] >> 4) | (((qh[21] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[54] >> 4) | (((qh[22] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[55] >> 4) | (((qh[23] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[56] >> 4) | (((qh[24] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[57] >> 4) | (((qh[25] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[58] >> 4) | (((qh[26] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[59] >> 4) | (((qh[27] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[60] >> 4) | (((qh[28] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[61] >> 4) | (((qh[29] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[62] >> 4) | (((qh[30] >> 6) & 3) << 4)) - 32),
-                        (float)(((ql[63] >> 4) | (((qh[31] >> 6) & 3) << 4)) - 32));
-
-                    sub1 = Vector512.Sum(vx1_512 * vq1_b);
-                    sub3 = Vector512.Sum(vx3_512 * vq2_b);
-                    sub5 = Vector512.Sum(vx5_512 * vq3_b);
-                    sub7 = Vector512.Sum(vx7_512 * vq4_b);
+                    sub1 = Vector512.Sum(Vector512.Load(x + 16) * vq1_b);
+                    sub3 = Vector512.Sum(Vector512.Load(x + 48) * vq2_b);
+                    sub5 = Vector512.Sum(Vector512.Load(x + 80) * vq3_b);
+                    sub7 = Vector512.Sum(Vector512.Load(x + 112) * vq4_b);
                 }
                 else if (AdvSimd.IsSupported)
                 {

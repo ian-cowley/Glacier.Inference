@@ -63,15 +63,15 @@ public unsafe class ChallengerFinalTests
 
         Assert.Equal(15, cache.GetPhysicalSlot(wrapPos1));
 
-        // Retrieve both via wrapPos1 (47) and logical slot (15)
+        // Valid position wrapPos1 (47) must succeed; evicted/never-written slot alias (15) must reject stale read
+        Assert.True(cache.IsPositionValid(1, wrapPos1));
+        Assert.False(cache.IsPositionValid(1, 15));
         float* kOutWrap = cache.GetKeyPtr(layer: 1, headKv: 0, pos: wrapPos1);
-        float* kOutDirect = cache.GetKeyPtr(layer: 1, headKv: 0, pos: 15);
-        Assert.True(kOutWrap == kOutDirect, "Pointer for wrapped pos 47 must equal pointer for slot 15");
+        Assert.Throws<InvalidOperationException>(() => _ = cache.GetKeyPtr(layer: 1, headKv: 0, pos: 15));
 
         for (int i = 0; i < 8; i++)
         {
             Assert.Equal(kWrap1[i], kOutWrap[i]);
-            Assert.Equal(kWrap1[i], kOutDirect[i]);
         }
 
         float* vOutWrap = cache.GetValuePtr(layer: 1, headKv: 1, pos: wrapPos1);
@@ -90,9 +90,10 @@ public unsafe class ChallengerFinalTests
             cache.Store(layer: 0, pos: hugePos, pK, pV);
         }
 
+        Assert.True(cache.IsPositionValid(0, hugePos));
+        Assert.False(cache.IsPositionValid(0, 3));
         float* kOutHuge = cache.GetKeyPtr(layer: 0, headKv: 0, pos: hugePos);
-        float* kOutSlot3 = cache.GetKeyPtr(layer: 0, headKv: 0, pos: 3);
-        Assert.True(kOutHuge == kOutSlot3);
+        Assert.Throws<InvalidOperationException>(() => _ = cache.GetKeyPtr(layer: 0, headKv: 0, pos: 3));
         for (int i = 0; i < 8; i++)
         {
             Assert.Equal(kHuge[i], kOutHuge[i]);

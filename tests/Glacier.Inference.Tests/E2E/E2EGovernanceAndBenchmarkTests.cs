@@ -269,24 +269,27 @@ public class E2EGovernanceAndBenchmarkTests
     // FEATURE 24: ZERO SECRETS SECURITY AUDIT (PURE C# — ZERO PYTHON)
     // =========================================================================
 
-    private static readonly (string Name, Regex Pattern)[] SecretPatterns =
+    internal static readonly (string Name, Regex Pattern)[] SecretPatterns =
     [
         ("Google AI / Gemini / Maps API Key", new Regex(@"AIza[0-9A-Za-z\-_]{35}", RegexOptions.Compiled)),
         ("GitHub Personal Access Token", new Regex(@"gh[pousr]_[A-Za-z0-9_]{36,255}", RegexOptions.Compiled)),
         ("OpenAI / Standard Secret Key", new Regex(@"sk-[A-Za-z0-9]{32,}", RegexOptions.Compiled)),
         ("NuGet API Key", new Regex(@"oy2[a-z0-9]{43}", RegexOptions.Compiled)),
+        ("Private Key Header", new Regex(@"-----\b" + @"BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", RegexOptions.Compiled)),
     ];
 
-    private static readonly string[] AllowlistTokens =
+    internal static readonly string[] AllowlistTokens =
     [
         "your-api-key",
+        "your_api_key",
         "<placeholder>",
         "\"\"",
         "EXAMPLE",
         "DUMMY",
+        "Environment.GetEnvironmentVariable",
     ];
 
-    private static (int ExitCode, int ScannedFiles, List<string> Findings, string FormattedReport) RunPureCSharpSecretAudit(string targetDirectory)
+    internal static (int ExitCode, int ScannedFiles, List<string> Findings, string FormattedReport) RunPureCSharpSecretAudit(string targetDirectory)
     {
         var findings = new List<string>();
         int scanned = 0;
@@ -295,8 +298,10 @@ public class E2EGovernanceAndBenchmarkTests
         {
             string rel = Path.GetRelativePath(targetDirectory, file);
             if (rel.StartsWith(".git", StringComparison.OrdinalIgnoreCase) ||
+                rel.StartsWith(".vs", StringComparison.OrdinalIgnoreCase) ||
                 rel.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) ||
-                rel.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
+                rel.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) ||
+                rel.Contains($"{Path.DirectorySeparatorChar}TestResults{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -541,33 +546,47 @@ public class E2EGovernanceAndBenchmarkTests
     // HELPER METHODS: DYNAMIC PATH RESOLUTION
     // =========================================================================
 
-    private static string ResolveInferenceRepoRoot()
+    private static string GetThisSourceFilePath([System.Runtime.CompilerServices.CallerFilePath] string path = "") => path;
+
+    internal static string ResolveInferenceRepoRoot()
     {
-        string? dir = AppContext.BaseDirectory;
-        while (!string.IsNullOrEmpty(dir))
+        foreach (string? startDir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory(), Path.GetDirectoryName(GetThisSourceFilePath()) })
         {
-            if (File.Exists(Path.Combine(dir, "Glacier.Inference.slnx")) ||
-                Directory.Exists(Path.Combine(dir, "src", "Glacier.Inference")))
+            string? dir = startDir;
+            while (!string.IsNullOrEmpty(dir))
             {
-                return dir;
+                if (File.Exists(Path.Combine(dir, "Glacier.Inference.slnx")) ||
+                    Directory.Exists(Path.Combine(dir, "src", "Glacier.Inference")))
+                {
+                    return dir;
+                }
+                string sub = Path.Combine(dir, "Glacier.Inference");
+                if (File.Exists(Path.Combine(sub, "Glacier.Inference.slnx")) ||
+                    Directory.Exists(Path.Combine(sub, "src", "Glacier.Inference")))
+                {
+                    return sub;
+                }
+                dir = Directory.GetParent(dir)?.FullName;
             }
-            dir = Directory.GetParent(dir)?.FullName;
         }
-        throw new DirectoryNotFoundException($"Glacier.Inference repository root not found starting from {AppContext.BaseDirectory}");
+        throw new DirectoryNotFoundException($"Glacier.Inference repository root not found starting from {AppContext.BaseDirectory} or {Directory.GetCurrentDirectory()}");
     }
 
     private static bool TryResolveSynthesisReportPath([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? reportPath)
     {
-        string? dir = AppContext.BaseDirectory;
-        while (!string.IsNullOrEmpty(dir))
+        foreach (string? startDir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory(), Path.GetDirectoryName(GetThisSourceFilePath()) })
         {
-            string candidate = Path.Combine(dir, "DEC_HETEROGENEOUS_INFERENCE_REPORT.md");
-            if (File.Exists(candidate))
+            string? dir = startDir;
+            while (!string.IsNullOrEmpty(dir))
             {
-                reportPath = candidate;
-                return true;
+                string candidate = Path.Combine(dir, "DEC_HETEROGENEOUS_INFERENCE_REPORT.md");
+                if (File.Exists(candidate))
+                {
+                    reportPath = candidate;
+                    return true;
+                }
+                dir = Directory.GetParent(dir)?.FullName;
             }
-            dir = Directory.GetParent(dir)?.FullName;
         }
         reportPath = null;
         return false;

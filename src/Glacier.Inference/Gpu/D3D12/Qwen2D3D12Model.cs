@@ -1,9 +1,11 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Glacier.Inference.Diagnostics;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
@@ -203,24 +205,6 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
 
     internal void DispatchVecAddWeightedExternal(ID3D12GraphicsCommandList cmd, ID3D12Resource b, ID3D12Resource a, float weight, int size, uint accumulate = 1)
         => DispatchVecAddWeighted(cmd, b, a, weight, size, accumulate);
-
-    internal sealed class ExpertCpuWorkspace
-    {
-        public readonly float[] Gate;
-        public readonly float[] Up;
-        public readonly float[] Act;
-        public readonly float[] ActSums;
-        public readonly float[] DownOut;
-
-        public ExpertCpuWorkspace(int expertFfnDim, int dim)
-        {
-            Gate = new float[expertFfnDim];
-            Up = new float[expertFfnDim];
-            Act = new float[expertFfnDim];
-            ActSums = new float[(expertFfnDim + 31) / 32];
-            DownOut = new float[dim];
-        }
-    }
 
     // Batched GPU Scratch Buffers
     private ID3D12Resource _dXBatch = null!;
@@ -1059,3 +1043,4 @@ public sealed unsafe partial class Qwen2D3D12Model : ID3D12Model
         }
     }
 }
+#endif

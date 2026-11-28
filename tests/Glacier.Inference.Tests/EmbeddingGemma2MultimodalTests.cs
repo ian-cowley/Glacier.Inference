@@ -134,6 +134,7 @@ public class EmbeddingGemma2MultimodalTests
     }
 
     [Theory]
+    [Trait("Hardware", "Gpu")]
     [InlineData(0)]
     [InlineData(1)]
     public void Audio_Embedding_MatchesReference_OnEachGpu(int adapter)
@@ -190,6 +191,7 @@ public class EmbeddingGemma2MultimodalTests
     }
 
     [Theory]
+    [Trait("Hardware", "Gpu")]
     [InlineData(0)]
     [InlineData(1)]
     public void Video_Embedding_MatchesReference_OnEachGpu(int adapter)

@@ -8,6 +8,7 @@ using System.Text;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu.D3D12;
+using Glacier.Inference.Hardware;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
 using Glacier.Inference.Quant;
@@ -114,19 +115,47 @@ public sealed unsafe class HostRamExpertArenaTests : IDisposable
         string path = Path.Combine(_tempDir, "session_auto.gguf");
         HostedTestGgufBuilder.BuildRealLayoutQwen4ExpGguf(path);
 
+        var disabledSnapBefore = HardwareRuntimeProfiler.CaptureSnapshot();
         using (var disabled = new InferenceSession(path, maxSeqLen: 64, device: "cpu", pleIoMode: PleIoMode.Auto, hostArenaBudgetBytes: 0))
         {
+            var disabledSnapAfter = HardwareRuntimeProfiler.CaptureSnapshot();
             Assert.Null(disabled.ExpertArena);
             Assert.NotNull(disabled.PleTable);
-            Assert.Equal(PleIoMode.MemoryMapped, disabled.PleTable!.IoMode);
+            PleIoMode actualMode = disabled.PleTable!.IoMode;
+            Assert.True(actualMode is PleIoMode.MemoryMapped or PleIoMode.DirectIo);
+
+            PleIoMode expectedBefore = HardwareRuntimeProfiler.RecommendPolicy(disabledSnapBefore, disabled.Weights).RecommendedPleIoMode;
+            PleIoMode expectedAfter = HardwareRuntimeProfiler.RecommendPolicy(disabledSnapAfter, disabled.Weights).RecommendedPleIoMode;
+            Assert.True(actualMode == expectedBefore || actualMode == expectedAfter,
+                $"PleIoMode.Auto resolved to {actualMode}, expected {expectedBefore} (before) or {expectedAfter} (after).");
         }
 
+        var autoSnapBefore = HardwareRuntimeProfiler.CaptureSnapshot();
         using (var autoSession = new InferenceSession(path, maxSeqLen: 64, device: "cpu", pleIoMode: PleIoMode.Auto))
         {
+            var autoSnapAfter = HardwareRuntimeProfiler.CaptureSnapshot();
             Assert.NotNull(autoSession.ExpertArena);
             Assert.Equal(autoSession.ExpertArena!.TotalMoeLayers, autoSession.ExpertArena.ResidentMoeLayers);
             Assert.NotNull(autoSession.PleTable);
-            Assert.Equal(PleIoMode.MemoryMapped, autoSession.PleTable!.IoMode);
+            PleIoMode actualMode = autoSession.PleTable!.IoMode;
+            Assert.True(actualMode is PleIoMode.MemoryMapped or PleIoMode.DirectIo);
+
+            PleIoMode expectedBefore = HardwareRuntimeProfiler.RecommendPolicy(autoSnapBefore, autoSession.Weights).RecommendedPleIoMode;
+            PleIoMode expectedAfter = HardwareRuntimeProfiler.RecommendPolicy(autoSnapAfter, autoSession.Weights).RecommendedPleIoMode;
+            Assert.True(actualMode == expectedBefore || actualMode == expectedAfter,
+                $"PleIoMode.Auto resolved to {actualMode}, expected {expectedBefore} (before) or {expectedAfter} (after).");
+        }
+
+        using (var mmapSession = new InferenceSession(path, maxSeqLen: 64, device: "cpu", pleIoMode: PleIoMode.MemoryMapped))
+        {
+            Assert.NotNull(mmapSession.PleTable);
+            Assert.Equal(PleIoMode.MemoryMapped, mmapSession.PleTable!.IoMode);
+        }
+
+        using (var directSession = new InferenceSession(path, maxSeqLen: 64, device: "cpu", pleIoMode: PleIoMode.DirectIo))
+        {
+            Assert.NotNull(directSession.PleTable);
+            Assert.Equal(PleIoMode.DirectIo, directSession.PleTable!.IoMode);
         }
     }
 
@@ -194,6 +223,7 @@ public sealed unsafe class HostRamExpertArenaTests : IDisposable
     }
 }
 
+[Trait("Hardware", "Gpu")]
 [Collection("SequentialGpu")]
 public sealed unsafe class D3D12HostedMoeAndNewQuantsTests : IDisposable
 {

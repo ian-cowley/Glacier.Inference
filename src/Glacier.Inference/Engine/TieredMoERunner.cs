@@ -19,8 +19,10 @@ using Glacier.Inference.Quant;
 using Glacier.Inference.Sampling;
 using Glacier.Inference.Scheduling;
 using Glacier.Inference.Tokenizer;
+#if !ANDROID
 using Vortice.Direct3D12;
 using Vortice.DXGI;
+#endif
 
 /// <summary>
 /// Operational tiering policy controlling weight locality across VRAM, Host RAM, and Cluster nodes.
@@ -139,8 +141,10 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     private readonly GgufFile? _gguf;
     private readonly ModelWeights? _weights;
     private readonly BpeTokenizer? _tokenizer;
+#if !ANDROID
     private readonly D3D12Context? _d3dCtx;
     private readonly Qwen2D3D12Model? _d3dModel;
+#endif
     private readonly Qwen2Model? _cpuModel;
     private readonly KVCache? _kvCache;
     private readonly TieredRunnerOptions _options;
@@ -157,6 +161,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     private readonly IReadOnlyList<TieredStepTelemetry> _telemetryHistoryReadOnly;
     private TieredStepTelemetry? _lastStepTelemetry;
 
+#if !ANDROID
     // D3D12 tiered MoE VRAM slot pool & PCIe Upload staging
     private readonly List<ID3D12Resource> _dVramSlotSegments = new();
     private int _slotsPerSegment;
@@ -172,7 +177,8 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     private ID3D12Resource? _uploadExpertPcieStaging;
     private unsafe byte* _pUploadExpertPcieStaging;
     private int _pcieStagingCapacity;
-    private Qwen2D3D12Model.ExpertCpuWorkspace[]? _cpuWorkspaces;
+#endif
+    private ExpertCpuWorkspace[]? _cpuWorkspaces;
     private float[]? _cpuNormXSums;
 
     // Synthetic/in-memory MoE execution state (used by internal test constructor)
@@ -199,16 +205,32 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     private bool _disposed;
 
     /// <summary>Active hardware device descriptor.</summary>
-    public string DeviceDescription => _d3dCtx?.DeviceName ?? "CPU-TieredMoE";
+    public string DeviceDescription =>
+#if !ANDROID
+        _d3dCtx?.DeviceName ??
+#endif
+        "CPU-TieredMoE";
 
     /// <summary>Dedicated GPU video memory in megabytes.</summary>
-    public ulong DedicatedVramMb => _d3dCtx != null ? _d3dCtx.DedicatedVideoMemory / (1024 * 1024) : 0UL;
+    public ulong DedicatedVramMb =>
+#if !ANDROID
+        _d3dCtx != null ? _d3dCtx.DedicatedVideoMemory / (1024 * 1024) :
+#endif
+        0UL;
 
     /// <summary>Shared system memory in megabytes.</summary>
-    public ulong SharedSystemMemoryMb => _d3dCtx != null ? _d3dCtx.SharedSystemMemory / (1024 * 1024) : 0UL;
+    public ulong SharedSystemMemoryMb =>
+#if !ANDROID
+        _d3dCtx != null ? _d3dCtx.SharedSystemMemory / (1024 * 1024) :
+#endif
+        0UL;
 
     /// <summary>Whether the model is operating in heterogeneous tiered mode.</summary>
-    public bool IsTieredActive => _d3dModel?.TieredMoe ?? true;
+    public bool IsTieredActive =>
+#if !ANDROID
+        _d3dModel?.TieredMoe ??
+#endif
+        true;
 
     /// <summary>Model vocabulary size.</summary>
     public int VocabularySize => _tokenizer?.VocabSize ?? _syntheticVocabSize;
@@ -221,14 +243,18 @@ public sealed class TieredMoERunner : ISpeculativeTarget
 
     /// <summary>Resolved KV-cache precision in VRAM.</summary>
     public KvCachePrecision KvPrecision =>
-        _d3dModel?.KvPrecision
-        ?? _kvCache?.Precision
+#if !ANDROID
+        _d3dModel?.KvPrecision ??
+#endif
+        _kvCache?.Precision
         ?? KvCachePrecision.Fp32;
 
     /// <summary>Effective VRAM safety reserve in bytes honored by the underlying D3D12 model.</summary>
     public ulong EffectiveVramReserveBytes =>
-        _d3dModel?.EffectiveVramReserveBytes
-        ?? (WddmVramGuard.ResolveExplicitReserveBytes(_options.VramReserveMb) ?? 0UL);
+#if !ANDROID
+        _d3dModel?.EffectiveVramReserveBytes ??
+#endif
+        (WddmVramGuard.ResolveExplicitReserveBytes(_options.VramReserveMb) ?? 0UL);
 
     /// <summary>Empirical routing frequency profile shared across MoE layers.</summary>
     public ExpertRoutingProfile RoutingProfile => _routingProfile;
@@ -265,10 +291,12 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     public VramHeadroomSnapshot QueryVramHeadroom()
     {
         ulong? explicitReserve = WddmVramGuard.ResolveExplicitReserveBytes(_options.VramReserveMb);
+#if !ANDROID
         if (_d3dCtx != null)
         {
             return _d3dCtx.QueryVramHeadroom(explicitReserve);
         }
+#endif
 
         return WddmVramGuard.EvaluateHeadroom(
             0UL,
@@ -328,6 +356,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
             }
         }
 
+#if !ANDROID
         bool useD3D12 = D3D12Context.IsSupported && _options.GpuAdapterIndex >= -1;
         if (useD3D12)
         {
@@ -362,6 +391,9 @@ public sealed class TieredMoERunner : ISpeculativeTarget
             }
         }
         else
+#else
+        _ = explicitReserveBytes;
+#endif
         {
             _cpuModel = new Qwen2Model(_weights, _options.MaxSequenceLength);
             _kvCache = new KVCache(
@@ -387,10 +419,10 @@ public sealed class TieredMoERunner : ISpeculativeTarget
                 int topK = Math.Max(1, _weights.ExpertUsedCount);
                 int expertFfnDim = _weights.ExpertFeedForwardLength;
                 int dim = _weights.EmbeddingLength;
-                _cpuWorkspaces = new Qwen2D3D12Model.ExpertCpuWorkspace[topK];
+                _cpuWorkspaces = new ExpertCpuWorkspace[topK];
                 for (int i = 0; i < topK; i++)
                 {
-                    _cpuWorkspaces[i] = new Qwen2D3D12Model.ExpertCpuWorkspace(expertFfnDim, dim);
+                    _cpuWorkspaces[i] = new ExpertCpuWorkspace(expertFfnDim, dim);
                 }
                 _cpuNormXSums = new float[(dim + 31) / 32];
 
@@ -463,10 +495,10 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         _hostArena = hostArena;
         _logitsBuffer = new float[Math.Max(1, vocabSize)];
 
-        _cpuWorkspaces = new Qwen2D3D12Model.ExpertCpuWorkspace[Math.Max(1, topK)];
+        _cpuWorkspaces = new ExpertCpuWorkspace[Math.Max(1, topK)];
         for (int i = 0; i < _cpuWorkspaces.Length; i++)
         {
-            _cpuWorkspaces[i] = new Qwen2D3D12Model.ExpertCpuWorkspace(expertFfnDim, dim);
+            _cpuWorkspaces[i] = new ExpertCpuWorkspace(expertFfnDim, dim);
         }
         _cpuNormXSums = new float[(dim + 31) / 32];
         _syntheticNormScratch = new float[dim];
@@ -757,6 +789,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         return split;
     }
 
+#if !ANDROID
     private unsafe void InitializeD3D12TieredExpertResources()
     {
         if (_d3dCtx == null || _weights == null || !_weights.IsMoe)
@@ -810,10 +843,10 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         }
 
         _maxAlignedSlotBytes = maxSlotBytes;
-        _cpuWorkspaces = new Qwen2D3D12Model.ExpertCpuWorkspace[topK];
+        _cpuWorkspaces = new ExpertCpuWorkspace[topK];
         for (int i = 0; i < topK; i++)
         {
-            _cpuWorkspaces[i] = new Qwen2D3D12Model.ExpertCpuWorkspace(expertFfnDim, dim);
+            _cpuWorkspaces[i] = new ExpertCpuWorkspace(expertFfnDim, dim);
         }
         _cpuNormXSums = new float[(dim + 31) / 32];
 
@@ -1228,6 +1261,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         _stepRoutedExpertMs += Stopwatch.GetElapsedTime(layerStart).TotalMilliseconds;
         return gpuInitializedOut;
     }
+#endif
 
     private unsafe void HandleCpuTieredMoeLayerBatch(
         int modelLayer,
@@ -1376,7 +1410,9 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     public void ResetKvCache()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+#if !ANDROID
         _d3dModel?.ResetKvCache();
+#endif
         _kvCache?.Reset();
     }
 
@@ -1388,11 +1424,14 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         ResetStepTelemetryAccumulators();
         long startTs = Stopwatch.GetTimestamp();
 
+#if !ANDROID
         if (_d3dModel != null)
         {
             _d3dModel.ForwardBatch(promptTokens, 0, _logitsBuffer.AsSpan(), computeLogits: true);
         }
-        else if (_cpuModel != null)
+        else
+#endif
+        if (_cpuModel != null)
         {
             _cpuModel.ForwardBatch(promptTokens, 0, _logitsBuffer.AsSpan(), _kvCache!, computeLogits: true);
         }
@@ -1409,11 +1448,14 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         ResetStepTelemetryAccumulators();
         long startTs = Stopwatch.GetTimestamp();
 
+#if !ANDROID
         if (_d3dModel != null)
         {
             _d3dModel.Forward(token, pos, _logitsBuffer.AsSpan(), computeLogits);
         }
-        else if (_cpuModel != null)
+        else
+#endif
+        if (_cpuModel != null)
         {
             _cpuModel.Forward(token, pos, _kvCache!, _logitsBuffer.AsSpan(), computeLogits);
         }
@@ -1478,11 +1520,14 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         ResetStepTelemetryAccumulators();
         long startTs = Stopwatch.GetTimestamp();
 
+#if !ANDROID
         if (_d3dModel != null)
         {
             _d3dModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut, vocabSize, allowTailSkip: true);
         }
-        else if (_cpuModel != null)
+        else
+#endif
+        if (_cpuModel != null)
         {
             _cpuModel.VerifyBatchLogits(tokens, startPos, batchLogitsOut, vocabSize, _kvCache);
         }
@@ -1539,7 +1584,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
 
             int nextToken = SampleToken(_logitsBuffer.AsSpan(), samplingOpts);
 
-            if (_tokenizer.IsStopToken(nextToken) || nextToken == _tokenizer.EosTokenId || nextToken == 151645 || nextToken == 151643)
+            if (_tokenizer.IsStopToken(nextToken) || (_tokenizer.EosTokenId >= 0 && nextToken == _tokenizer.EosTokenId))
                 break;
 
             string piece = _tokenizer.DecodeToken(nextToken);
@@ -1602,6 +1647,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         _routingProfile.Save(target);
     }
 
+#if !ANDROID
     private static ulong ResolveExpertGpuVa(
         TieredMoEMissSplitter missSplitter,
         List<ID3D12Resource> slotSegments,
@@ -1633,6 +1679,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         }
         return 0UL;
     }
+#endif
 
     private int SampleToken(Span<float> logits, SamplingOptions samplingOptions)
     {
@@ -1675,6 +1722,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
     private static ulong AlignUp256(ulong bytes) =>
         (bytes + SlotSubAlignmentBytes - 1UL) & ~(SlotSubAlignmentBytes - 1UL);
 
+#if !ANDROID
     private static int SelectOptimalAdapter()
     {
         using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory4>();
@@ -1694,6 +1742,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         }
         return bestIdx;
     }
+#endif
 
     public void Dispose()
     {
@@ -1701,6 +1750,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
         {
             _disposed = true;
 
+#if !ANDROID
             _d3dCtx?.Synchronize();
 
             for (int i = 0; i < _dVramSlotSegments.Count; i++)
@@ -1722,6 +1772,7 @@ public sealed class TieredMoERunner : ISpeculativeTarget
 
             _d3dModel?.Dispose();
             _d3dCtx?.Dispose();
+#endif
             _cpuModel?.Dispose();
             _kvCache?.Dispose();
             _slotManager?.Dispose();

@@ -23,7 +23,10 @@ public sealed record SafetensorsTensorInfo(
         {
             if (Shape.Length == 0) return 0;
             long count = 1;
-            foreach (var d in Shape) count *= d;
+            checked
+            {
+                foreach (var d in Shape) count *= d;
+            }
             return count;
         }
     }
@@ -35,6 +38,8 @@ public sealed record SafetensorsTensorInfo(
 /// </summary>
 public sealed unsafe class SafetensorsFile : IDisposable
 {
+    private const int MaxTensorRank = 16;
+
     private readonly MemoryMappedFile _mmf;
     private readonly MemoryMappedViewAccessor _accessor;
     private byte* _basePointer;
@@ -59,93 +64,252 @@ public sealed unsafe class SafetensorsFile : IDisposable
         _fileLength = fileLength;
     }
 
+    private static long ResolveFileLength(string filePath)
+    {
+        var fileInfo = new FileInfo(filePath);
+        long length = fileInfo.Length;
+        if (length == 0 || fileInfo.LinkTarget != null)
+        {
+            try
+            {
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                length = fs.Length;
+            }
+            catch
+            {
+                if (fileInfo.LinkTarget != null && File.Exists(fileInfo.LinkTarget))
+                {
+                    length = new FileInfo(fileInfo.LinkTarget).Length;
+                }
+            }
+        }
+        return length;
+    }
+
     public static SafetensorsFile Open(string filePath)
     {
         if (!File.Exists(filePath))
             throw new FileNotFoundException($"Safetensors file not found: {filePath}", filePath);
 
-        var fileInfo = new FileInfo(filePath);
-        if (fileInfo.Length < 8)
-            throw new InvalidDataException($"Safetensors file is truncated (length {fileInfo.Length} < 8 bytes).");
+        long fileLength = ResolveFileLength(filePath);
+        if (fileLength < 8)
+            throw new InvalidDataException($"Safetensors file is truncated (length {fileLength} < 8 bytes).");
 
-        var mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        var accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
-
+        MemoryMappedFile? mmf = null;
+        MemoryMappedViewAccessor? accessor = null;
         byte* ptr = null;
-        accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
 
-        const ulong MaxHeaderSize = 256UL * 1024 * 1024;
-        ulong headerSize = *(ulong*)ptr;
-        if (headerSize > MaxHeaderSize || headerSize > (ulong)(fileInfo.Length - 8))
-        {
-            accessor.SafeMemoryMappedViewHandle.ReleasePointer();
-            accessor.Dispose();
-            mmf.Dispose();
-            throw new InvalidDataException($"Invalid Safetensors header size: {headerSize} bytes (file length {fileInfo.Length}).");
-        }
-
-        var file = new SafetensorsFile(filePath, mmf, accessor, ptr, headerSize, fileInfo.Length);
+        var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         try
         {
-            file.ParseHeader();
-            return file;
+            mmf = MemoryMappedFile.CreateFromFile(stream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
         }
         catch
         {
-            file.Dispose();
+            stream.Dispose();
+            throw;
+        }
+
+        try
+        {
+            accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+
+            const ulong MaxHeaderSize = 256UL * 1024 * 1024;
+            ulong headerSize = *(ulong*)ptr;
+            if (headerSize > MaxHeaderSize || headerSize > (ulong)(fileLength - 8))
+            {
+                throw new InvalidDataException($"Invalid Safetensors header size: {headerSize} bytes (file length {fileLength}).");
+            }
+
+            var file = new SafetensorsFile(filePath, mmf, accessor, ptr, headerSize, fileLength);
+            mmf = null;
+            accessor = null;
+            ptr = null;
+            try
+            {
+                file.ParseHeader();
+                return file;
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            if (ptr != null && accessor != null)
+            {
+                try { accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            }
+            accessor?.Dispose();
+            mmf?.Dispose();
             throw;
         }
     }
 
     private void ParseHeader()
     {
-        // Read header JSON string
-        byte[] headerBytes = new byte[HeaderSize];
-        System.Runtime.InteropServices.Marshal.Copy((IntPtr)(_basePointer + 8), headerBytes, 0, (int)HeaderSize);
+        var headerSpan = new ReadOnlySpan<byte>(_basePointer + 8, checked((int)HeaderSize));
+        var reader = new Utf8JsonReader(headerSpan);
 
-        using var doc = JsonDocument.Parse(headerBytes);
-        var root = doc.RootElement;
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+            throw new InvalidDataException("Invalid Safetensors header JSON: expected root object.");
+
         ulong dataStart = DataOffset;
         ulong totalFileBytes = (ulong)_fileLength;
 
-        foreach (var prop in root.EnumerateObject())
+        while (reader.Read())
         {
-            if (prop.Name == "__metadata__")
+            if (reader.TokenType == JsonTokenType.EndObject)
+                break;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                throw new InvalidDataException("Invalid Safetensors header JSON: expected property name.");
+
+            string propName = reader.GetString() ?? "";
+            if (!reader.Read())
+                throw new InvalidDataException($"Unexpected end of Safetensors header JSON at '{propName}'.");
+
+            if (propName == "__metadata__")
             {
-                foreach (var meta in prop.Value.EnumerateObject())
+                if (reader.TokenType != JsonTokenType.StartObject)
                 {
-                    Metadata[meta.Name] = meta.Value.GetString() ?? "";
+                    reader.Skip();
+                    continue;
+                }
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                {
+                    if (reader.TokenType != JsonTokenType.PropertyName)
+                        throw new InvalidDataException("Invalid Safetensors __metadata__ entry.");
+                    string metaKey = reader.GetString() ?? "";
+                    if (!reader.Read())
+                        throw new InvalidDataException($"Unexpected end of Safetensors __metadata__ at '{metaKey}'.");
+                    Metadata[metaKey] = reader.TokenType == JsonTokenType.String ? (reader.GetString() ?? "") : "";
+                    if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+                        reader.Skip();
                 }
                 continue;
             }
 
-            var elem = prop.Value;
-            string dtype = elem.GetProperty("dtype").GetString() ?? "F32";
+            if (reader.TokenType != JsonTokenType.StartObject)
+                throw new InvalidDataException($"Invalid Safetensors tensor entry '{propName}': expected object.");
 
-            var shapeArr = elem.GetProperty("shape");
-            long[] shape = new long[shapeArr.GetArrayLength()];
-            int sIdx = 0;
-            foreach (var s in shapeArr.EnumerateArray())
+            string? dtype = null;
+            var shapeList = new List<long>(4);
+            bool hasShape = false;
+            ulong start = 0;
+            ulong end = 0;
+            int offsetCount = 0;
+            bool hasOffsets = false;
+
+            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
             {
-                long dim = s.GetInt64();
-                if (dim < 0)
-                    throw new InvalidDataException($"Invalid negative dimension {dim} in Safetensors tensor '{prop.Name}'.");
-                shape[sIdx++] = dim;
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    throw new InvalidDataException($"Invalid Safetensors tensor entry '{propName}'.");
+
+                string field = reader.GetString() ?? "";
+                if (!reader.Read())
+                    throw new InvalidDataException($"Unexpected end of Safetensors tensor '{propName}' at '{field}'.");
+
+                switch (field)
+                {
+                    case "dtype":
+                        dtype = reader.GetString() ?? "F32";
+                        break;
+                    case "shape":
+                        if (reader.TokenType != JsonTokenType.StartArray)
+                            throw new InvalidDataException($"Invalid shape array in Safetensors tensor '{propName}'.");
+                        hasShape = true;
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            if (shapeList.Count >= MaxTensorRank)
+                                throw new InvalidDataException($"Safetensors tensor '{propName}' exceeds maximum rank ({MaxTensorRank}).");
+                            long dim = reader.GetInt64();
+                            if (dim < 0)
+                                throw new InvalidDataException($"Invalid negative dimension {dim} in Safetensors tensor '{propName}'.");
+                            shapeList.Add(dim);
+                        }
+                        break;
+                    case "data_offsets":
+                        if (reader.TokenType != JsonTokenType.StartArray)
+                            throw new InvalidDataException($"Invalid data_offsets array in Safetensors tensor '{propName}'.");
+                        hasOffsets = true;
+                        while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                        {
+                            ulong val = reader.GetUInt64();
+                            if (offsetCount == 0) start = val;
+                            else if (offsetCount == 1) end = val;
+                            offsetCount++;
+                        }
+                        break;
+                    default:
+                        reader.Skip();
+                        break;
+                }
             }
 
-            var offsetsArr = elem.GetProperty("data_offsets");
-            if (offsetsArr.GetArrayLength() != 2)
-                throw new InvalidDataException($"Invalid data_offsets array length in Safetensors tensor '{prop.Name}'.");
+            if (dtype == null || !hasShape || !hasOffsets || offsetCount != 2)
+                throw new InvalidDataException($"Safetensors tensor '{propName}' is missing required metadata or has invalid data_offsets.");
 
-            ulong start = offsetsArr[0].GetUInt64();
-            ulong end = offsetsArr[1].GetUInt64();
             if (end < start || end > totalFileBytes - dataStart)
             {
-                throw new InvalidDataException($"Safetensors tensor '{prop.Name}' data_offsets [{start}, {end}] extend beyond file bounds.");
+                throw new InvalidDataException($"Safetensors tensor '{propName}' data_offsets [{start}, {end}] extend beyond file bounds.");
             }
 
-            Tensors[prop.Name] = new SafetensorsTensorInfo(prop.Name, dtype, shape, start, end);
+            long[] shape = shapeList.ToArray();
+            ulong elemCount = 1UL;
+            try
+            {
+                checked
+                {
+                    for (int i = 0; i < shape.Length; i++)
+                    {
+                        elemCount *= (ulong)shape[i];
+                    }
+                }
+            }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException($"Safetensors tensor '{propName}' shape dimensions overflow element count.", ex);
+            }
+
+            if (TryGetDtypeByteSize(dtype, out ulong dtypeBytes))
+            {
+                ulong expectedBytes;
+                try
+                {
+                    expectedBytes = checked(elemCount * dtypeBytes);
+                }
+                catch (OverflowException ex)
+                {
+                    throw new InvalidDataException($"Safetensors tensor '{propName}' byte size overflows.", ex);
+                }
+
+                ulong spanBytes = end - start;
+                if (spanBytes != expectedBytes)
+                {
+                    throw new InvalidDataException(
+                        $"Safetensors tensor '{propName}' byte size mismatch: data_offsets span {spanBytes} bytes, expected {expectedBytes} bytes for {dtype}.");
+                }
+            }
+
+            Tensors[propName] = new SafetensorsTensorInfo(propName, dtype, shape, start, end);
         }
+    }
+
+    private static bool TryGetDtypeByteSize(string dtype, out ulong bytes)
+    {
+        bytes = dtype switch
+        {
+            "F64" or "I64" or "U64" => 8UL,
+            "F32" or "I32" or "U32" => 4UL,
+            "F16" or "BF16" or "I16" or "U16" => 2UL,
+            "F8_E4M3" or "F8_E5M2" or "I8" or "U8" or "BOOL" => 1UL,
+            _ => 0UL
+        };
+        return bytes > 0UL;
     }
 
     /// <summary>
@@ -153,6 +317,7 @@ public sealed unsafe class SafetensorsFile : IDisposable
     /// </summary>
     public byte* GetTensorPointer(string tensorName)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (!Tensors.TryGetValue(tensorName, out var info))
             throw new KeyNotFoundException($"Tensor '{tensorName}' not found in Safetensors file.");
 
@@ -170,12 +335,13 @@ public sealed unsafe class SafetensorsFile : IDisposable
         {
             if (_basePointer != null)
             {
-                _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+                try { _accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
                 _basePointer = null;
             }
             _accessor.Dispose();
             _mmf.Dispose();
             _disposed = true;
         }
+        GC.SuppressFinalize(this);
     }
 }

@@ -170,9 +170,12 @@ public unsafe class KvCacheQ4Tests
             cache.Store(0, pos, k, v);
         }
 
-        // Position 5 overwrote slot 1 (5 % 4 == 1)
+        // Position 5 overwrote slot 1 (5 % 4 == 1): evicted logical pos 1 must reject reads while active pos 5 succeeds
         var readBack = new float[headDim];
-        cache.ReadKey(0, 0, 1, readBack);
+        Assert.False(cache.IsPositionValid(0, 1));
+        Assert.Throws<InvalidOperationException>(() => cache.ReadKey(0, 0, 1, readBack));
+        Assert.True(cache.IsPositionValid(0, 5));
+        cache.ReadKey(0, 0, 5, readBack);
         Assert.All(readBack, x => Assert.InRange(x, 5.5f, 6.5f));
     }
 
@@ -213,6 +216,7 @@ public unsafe class KvCacheQ4Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void CudaKernels_Q4_0_StoreAndAttention_MatchReference_WhenCudaAvailable()
     {
         if (!OperatingSystem.IsWindows())
@@ -399,6 +403,7 @@ public unsafe class KvCacheQ4Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void CudaQwen2GpuModel_Q4_0_MemoryReduction_And_ForwardAccuracy()
     {
         if (!GpuContext.IsSupported)
@@ -440,6 +445,7 @@ public unsafe class KvCacheQ4Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12Shaders_CompileAndExecute_Q4_0_Attention_WhenD3D12Supported()
     {
         if (!D3D12Context.IsSupported)
@@ -632,6 +638,7 @@ public unsafe class KvCacheQ4Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12Qwen2Model_Q4_0_MemoryReduction_And_ForwardAccuracy()
     {
         if (!D3D12Context.IsSupported)
@@ -691,6 +698,7 @@ public unsafe class KvCacheQ4Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12Shaders_Execute_Qwen3_Sparse_And_Gemma4Swa_Q4_0_WhenD3D12Supported()
     {
         if (!D3D12Context.IsSupported)

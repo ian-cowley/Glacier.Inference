@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -1217,3 +1218,4 @@ public sealed unsafe partial class Qwen2D3D12Model
         QuantKernels.VecAdd(bias, target, length);
     }
 }
+#endif

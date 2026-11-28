@@ -119,19 +119,22 @@ public sealed unsafe class Tier2CpuKvAndVramBoundaryE2ETests
         var (k, v, q) = Fx1Vectors.GenerateOrthogonalVectors(2, 2, 64, seed: 2104);
 
         cache.Store(0, 2, k, v);
+        Assert.True(cache.IsPositionValid(0, 2));
         cache.Reset();
+        Assert.False(cache.IsPositionValid(0, 2));
 
         float[] read = new float[64];
-        cache.ReadKey(0, 0, 2, read);
-        Assert.All(read, x => Assert.Equal(0.0f, x));
+        Assert.Throws<InvalidOperationException>(() => cache.ReadKey(0, 0, 2, read));
 
         fixed (float* pQ = q)
         {
-            Assert.Equal(0.0f, cache.DotKey(0, 0, 2, pQ));
+            nint qAddr = (nint)pQ;
+            Assert.Throws<InvalidOperationException>(() => cache.DotKey(0, 0, 2, (float*)qAddr));
         }
 
         // Re-store after Reset
         cache.Store(0, 2, k, v);
+        Assert.True(cache.IsPositionValid(0, 2));
         cache.ReadKey(0, 0, 2, read);
         Assert.True(Fx1Vectors.CosineSimilarity(k.AsSpan(0, 64), read) > 0.96f);
 

@@ -254,10 +254,10 @@ public sealed unsafe class Inkling2D3D12Offload : IDisposable
         _downExpBytes = new ulong[nPhys];
         _layerPinned = new bool[nPhys];
 
-        // 5. Determine safe VRAM budget (NVIDIA discrete + AMD 890M UMA)
+        // 5. Determine safe VRAM budget (discrete GPU vs UMA)
         var headroom = _ctx.QueryVramHeadroom(explicitVramReserveBytes);
         ulong safeBudget;
-        bool isUma = _ctx.IsUnifiedMemoryArchitecture || _ctx.DeviceName.Contains("Radeon", StringComparison.OrdinalIgnoreCase);
+        bool isUma = _ctx.IsUnifiedMemoryArchitecture;
         if (isUma)
         {
             ulong umaBudget = Math.Min((ulong)(_ctx.TotalAccessibleMemory * 0.55), 15UL * 1024 * 1024 * 1024);

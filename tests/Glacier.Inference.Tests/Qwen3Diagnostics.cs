@@ -10,6 +10,7 @@ using Vortice.Direct3D12;
 using Xunit;
 using Xunit.Abstractions;
 
+[Collection("SequentialGpu")]
 public class Qwen3Diagnostics
 {
     private readonly ITestOutputHelper _output;
@@ -21,6 +22,7 @@ public class Qwen3Diagnostics
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void TestGpuStepByStep()
     {
         if (!File.Exists(ModelPath) || !OperatingSystem.IsWindows()) return;
@@ -53,6 +55,7 @@ public class Qwen3Diagnostics
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void CompareCpuAndGpuFirstTokenLogits()
     {
         if (!File.Exists(ModelPath) || !OperatingSystem.IsWindows()) return;
@@ -106,6 +109,7 @@ public class Qwen3Diagnostics
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void CompareLayer0()
     {
         if (!File.Exists(ModelPath) || !OperatingSystem.IsWindows()) return;
@@ -198,6 +202,7 @@ public class Qwen3Diagnostics
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void DiagnoseLayer3()
     {
         if (!File.Exists(ModelPath) || !OperatingSystem.IsWindows()) return;

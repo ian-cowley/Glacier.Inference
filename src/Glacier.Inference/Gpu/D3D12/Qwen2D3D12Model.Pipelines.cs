@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -245,3 +246,4 @@ public sealed unsafe partial class Qwen2D3D12Model
         _psoAttentionBatch = _ctx.CreatePipelineState(_sigAttentionBatch, _ctx.CompileShader(attnShaderBatch));
     }
 }
+#endif

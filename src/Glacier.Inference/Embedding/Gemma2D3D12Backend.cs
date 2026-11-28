@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Embedding;
 
 using System;
@@ -365,6 +366,7 @@ internal sealed unsafe class Gemma2D3D12Backend : IGemma2Backend
         _ctx.Dispose();
     }
 }
+#endif
 
 internal static class Gemma2Shaders
 {

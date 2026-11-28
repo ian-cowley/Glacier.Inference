@@ -82,6 +82,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_EndToEndSyntheticGguf_MatchesCpuReferenceAndPreservesM1ReserveZero()
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"glacier_m2_e2e_{Guid.NewGuid():N}.gguf");
@@ -171,6 +172,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_EndToEndSyntheticGguf_PoliciesAndSpeculativeTailSkip()
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"glacier_m2_pol_{Guid.NewGuid():N}.gguf");
@@ -570,6 +572,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_D3D12_SharedExpertGate_PrefillForwardAndVerifyBatchLogits_NoEFail()
     {
         if (!D3D12Context.IsSupported)
@@ -663,6 +666,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_FusedGateUp_DefaultAutoOptions_AndHybridDenseFirstLayer_MatchesCpuReference()
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"glacier_m2_fused_{Guid.NewGuid():N}.gguf");
@@ -731,6 +735,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_BF16Experts_D3D12AutoAndGpuSharedMemory_MatchesCpuReference()
     {
         if (!D3D12Context.IsSupported)
@@ -814,6 +819,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void TieredMoERunner_VerifyBatchLogits_OneTokenAndNineTokens_HonorsRouteTailSkipMinRank()
     {
         string tempPath = Path.Combine(Path.GetTempPath(), $"glacier_m2_1and9_{Guid.NewGuid():N}.gguf");
@@ -984,6 +990,7 @@ public sealed unsafe class TieredMoERunnerM2Tests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public async Task TieredMoERunner_EdgeCases_TailSkipGeTopK_NormTopKFalse_BiasedLayer_And_DisposeIdempotency()
     {
         // 1. RouteTailSkipMinRank >= topK disables tail skipping (0% skipped) & NormTopK = false preserves unnormalized weights

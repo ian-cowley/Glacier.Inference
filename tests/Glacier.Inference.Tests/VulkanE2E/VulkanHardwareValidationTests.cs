@@ -11,6 +11,7 @@ namespace Glacier.Inference.Tests.VulkanE2E;
 /// Uses [VulkanFact] attribute: executes on hosts with physical Vulkan hardware (such as AMD Radeon 890M GFX1150),
 /// and cleanly skips with explicit reason when run on headless CI or environments without Vulkan GPUs.
 /// </summary>
+[Trait("Hardware", "Gpu")]
 [Collection("SequentialGpu")]
 public unsafe class VulkanHardwareValidationTests
 {

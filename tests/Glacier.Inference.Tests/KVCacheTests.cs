@@ -52,10 +52,21 @@ public unsafe class KVCacheTests
             cache.Store(0, 0, p, p);
         }
 
+        Assert.True(cache.IsPositionValid(0, 0));
         Assert.Equal(1f, *cache.GetKeyPtr(0, 0, 0));
 
         cache.Reset();
 
+        Assert.False(cache.IsPositionValid(0, 0));
+        Assert.Throws<InvalidOperationException>(() => _ = cache.GetKeyPtr(0, 0, 0));
+        Assert.Throws<InvalidOperationException>(() => _ = cache.GetValuePtr(0, 0, 0));
+
+        float[] zeros = new float[8];
+        fixed (float* pz = zeros)
+        {
+            cache.Store(0, 0, pz, pz);
+        }
+        Assert.True(cache.IsPositionValid(0, 0));
         Assert.Equal(0f, *cache.GetKeyPtr(0, 0, 0));
         Assert.Equal(0f, *cache.GetValuePtr(0, 0, 0));
     }

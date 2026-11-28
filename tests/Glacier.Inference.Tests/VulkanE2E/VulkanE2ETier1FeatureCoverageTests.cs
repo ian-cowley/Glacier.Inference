@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Glacier.Inference.Config;
 using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
@@ -11,6 +12,8 @@ using Glacier.Inference.Gpu;
 using Glacier.Inference.Gpu.D3D12;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Model;
+using Glacier.Inference.Quant;
+using Glacier.Inference.Tests.E2E;
 using Glacier.Inference.Tests.VulkanE2E.Fixtures;
 using Xunit;
 
@@ -115,17 +118,46 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     [Fact]
     public void T1_F1_05_AttentionBiases_ElementwiseAdd_NumericalParity()
     {
-        float[] activation = [1.0f, -2.0f, 3.5f, 0.0f];
-        float[] bias = [0.1f, -0.5f, 0.25f, -1.0f];
-        float[] expected = [1.1f, -2.5f, 3.75f, -1.0f];
+        const int dim = 64;
+        using var biased = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: 128, headCount: 2, headCountKv: 2, vocabSize: 16, addBiases: true);
+        var layer = biased.Weights.Layers[0];
+        Assert.True(layer.QBias != null);
 
-        float[] result = new float[4];
-        for (int i = 0; i < 4; i++) result[i] = activation[i] + bias[i];
+        float[] activation = new float[dim];
+        for (int i = 0; i < dim; i++) activation[i] = (i % 7) * 0.25f - 0.5f;
+        float[] expected = new float[dim];
+        for (int i = 0; i < dim; i++) expected[i] = activation[i] + layer.QBias[i];
 
-        for (int i = 0; i < 4; i++)
+        fixed (float* pDst = activation)
         {
-            Assert.Equal(expected[i], result[i], 0.0001f);
+            QuantKernels.VecAdd(layer.QBias, pDst, dim);
         }
+
+        for (int i = 0; i < dim; i++)
+        {
+            Assert.Equal(expected[i], activation[i], 0.0001f);
+        }
+
+        using var unbiased = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: 128, headCount: 2, headCountKv: 2, vocabSize: 16, addBiases: false);
+        using var sessionBiased = new InferenceSession(biased.Path, maxSeqLen: 16, device: "cpu");
+        using var sessionUnbiased = new InferenceSession(unbiased.Path, maxSeqLen: 16, device: "cpu");
+
+        sessionBiased.ForwardToken(token: 3, pos: 0, computeLogits: true);
+        sessionUnbiased.ForwardToken(token: 3, pos: 0, computeLogits: true);
+        float[] logitsBiased = new float[sessionBiased.VocabSize];
+        float[] logitsUnbiased = new float[sessionUnbiased.VocabSize];
+        sessionBiased.CopyCurrentLogits(logitsBiased);
+        sessionUnbiased.CopyCurrentLogits(logitsUnbiased);
+
+        Assert.Contains(logitsBiased, x => x != 0f && float.IsFinite(x));
+        bool anyDiff = false;
+        for (int i = 0; i < logitsBiased.Length; i++)
+        {
+            if (MathF.Abs(logitsBiased[i] - logitsUnbiased[i]) > 1e-6f) { anyDiff = true; break; }
+        }
+        Assert.True(anyDiff, "Adding attention biases must alter InferenceSession output logits.");
     }
 
     #endregion
@@ -245,32 +277,151 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
         Assert.Equal(128, kvDim);
     }
 
-    [Fact]
-    public void T1_F4_04_FusedQkv_TotalChannelCountInvariant()
+    private static void WriteDeterministicQwen2Gguf(
+        string path,
+        int dim,
+        int ffnDim,
+        int headCount,
+        int headCountKv,
+        int vocabSize,
+        bool fusedQkv,
+        bool fusedGateUp)
     {
-        int dim = 256;
-        int headCount = 4;
-        int headCountKv = 2;
+        var rng = new Random(1234);
         int headDim = dim / headCount;
         int qDim = headCount * headDim;
         int kvDim = headCountKv * headDim;
-        int totalExpected = qDim + 2 * kvDim;
 
-        Assert.Equal(512, totalExpected);
+        byte[] FloatsToBytes(float[] f) => MemoryMarshal.AsBytes(f.AsSpan()).ToArray();
+        float[] RandFloats(int n) => VulkanE2ETestFixtures.SyntheticGgufBuilder.RandomFloats(rng, n);
+        float[] ConstFloats(int n, float v) => VulkanE2ETestFixtures.SyntheticGgufBuilder.ConstantFloats(n, v);
+
+        byte[] embdBytes = FloatsToBytes(RandFloats(dim * vocabSize));
+        byte[] outNormBytes = FloatsToBytes(ConstFloats(dim, 1.0f));
+        byte[] outBytes = FloatsToBytes(RandFloats(dim * vocabSize));
+        byte[] attnNormBytes = FloatsToBytes(ConstFloats(dim, 1.0f));
+        byte[] qBytes = FloatsToBytes(RandFloats(dim * qDim));
+        byte[] kBytes = FloatsToBytes(RandFloats(dim * kvDim));
+        byte[] vBytes = FloatsToBytes(RandFloats(dim * kvDim));
+        byte[] attnOutBytes = FloatsToBytes(RandFloats(qDim * dim));
+        byte[] ffnNormBytes = FloatsToBytes(ConstFloats(dim, 1.0f));
+        byte[] gateBytes = FloatsToBytes(RandFloats(dim * ffnDim));
+        byte[] upBytes = FloatsToBytes(RandFloats(dim * ffnDim));
+        byte[] downBytes = FloatsToBytes(RandFloats(ffnDim * dim));
+
+        var metadata = new System.Collections.Generic.List<(string, GgufValueType, object)>
+        {
+            ("general.architecture", GgufValueType.String, "qwen2"),
+            ("qwen2.block_count", GgufValueType.Uint32, 1u),
+            ("qwen2.context_length", GgufValueType.Uint32, 32u),
+            ("qwen2.embedding_length", GgufValueType.Uint32, (uint)dim),
+            ("qwen2.feed_forward_length", GgufValueType.Uint32, (uint)ffnDim),
+            ("qwen2.attention.head_count", GgufValueType.Uint32, (uint)headCount),
+            ("qwen2.attention.head_count_kv", GgufValueType.Uint32, (uint)headCountKv),
+            ("tokenizer.ggml.eos_token_id", GgufValueType.Uint32, (uint)(vocabSize - 1)),
+            ("tokenizer.ggml.bos_token_id", GgufValueType.Uint32, (uint)(vocabSize - 2)),
+            ("tokenizer.ggml.tokens", GgufValueType.Array, VulkanE2ETestFixtures.SyntheticGgufBuilder.BuildTokens(vocabSize))
+        };
+
+        var tensors = new System.Collections.Generic.List<(string, ulong[], GgufType, byte[])>
+        {
+            ("token_embd.weight", [(ulong)dim, (ulong)vocabSize], GgufType.F32, embdBytes),
+            ("output_norm.weight", [(ulong)dim], GgufType.F32, outNormBytes),
+            ("output.weight", [(ulong)dim, (ulong)vocabSize], GgufType.F32, outBytes),
+            ("blk.0.attn_norm.weight", [(ulong)dim], GgufType.F32, attnNormBytes),
+            ("blk.0.attn_output.weight", [(ulong)qDim, (ulong)dim], GgufType.F32, attnOutBytes),
+            ("blk.0.ffn_norm.weight", [(ulong)dim], GgufType.F32, ffnNormBytes),
+            ("blk.0.ffn_down.weight", [(ulong)ffnDim, (ulong)dim], GgufType.F32, downBytes)
+        };
+
+        if (fusedQkv)
+        {
+            byte[] qkvBytes = new byte[qBytes.Length + kBytes.Length + vBytes.Length];
+            qBytes.CopyTo(qkvBytes, 0);
+            kBytes.CopyTo(qkvBytes, qBytes.Length);
+            vBytes.CopyTo(qkvBytes, qBytes.Length + kBytes.Length);
+            tensors.Add(("blk.0.attn_qkv.weight", [(ulong)dim, (ulong)(qDim + 2 * kvDim)], GgufType.F32, qkvBytes));
+        }
+        else
+        {
+            tensors.Add(("blk.0.attn_q.weight", [(ulong)dim, (ulong)qDim], GgufType.F32, qBytes));
+            tensors.Add(("blk.0.attn_k.weight", [(ulong)dim, (ulong)kvDim], GgufType.F32, kBytes));
+            tensors.Add(("blk.0.attn_v.weight", [(ulong)dim, (ulong)kvDim], GgufType.F32, vBytes));
+        }
+
+        if (fusedGateUp)
+        {
+            byte[] gateUpBytes = new byte[gateBytes.Length + upBytes.Length];
+            gateBytes.CopyTo(gateUpBytes, 0);
+            upBytes.CopyTo(gateUpBytes, gateBytes.Length);
+            tensors.Add(("blk.0.ffn_up.weight", [(ulong)dim, (ulong)(2 * ffnDim)], GgufType.F32, gateUpBytes));
+        }
+        else
+        {
+            tensors.Add(("blk.0.ffn_gate.weight", [(ulong)dim, (ulong)ffnDim], GgufType.F32, gateBytes));
+            tensors.Add(("blk.0.ffn_up.weight", [(ulong)dim, (ulong)ffnDim], GgufType.F32, upBytes));
+        }
+
+        VulkanE2ETestFixtures.SyntheticGgufBuilder.WriteGguf(path, metadata, tensors);
+    }
+
+    [Fact]
+    public void T1_F4_04_FusedQkv_TotalChannelCountInvariant()
+    {
+        const int dim = 256, headCount = 4, headCountKv = 2;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, headCount: headCount, headCountKv: headCountKv, fusedQkv: true);
+
+        Assert.True(handle.GgufFile.TryGetTensor("blk.0.attn_qkv.weight", out var qkvTensor) && qkvTensor != null);
+        Assert.Equal([256UL, 512UL], qkvTensor.Dimensions);
+
+        var layer = handle.Weights.Layers[0];
+        Assert.True(layer.HasFusedQkv);
+        Assert.True(layer.QkvWeight != null);
+        Assert.True(layer.QWeight == null);
+        Assert.True(layer.KWeight == null);
+        Assert.True(layer.VWeight == null);
+
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.ForwardToken(token: 3, pos: 0, computeLogits: true);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
     public void T1_F4_05_FusedQkv_SlicingOffsetArithmetic()
     {
-        int qDim = 256;
-        int kvDim = 128;
-        int qOffset = 0;
-        int kOffset = qDim;
-        int vOffset = qDim + kvDim;
+        string unfusedPath = Path.Combine(Path.GetTempPath(), $"qkv_unfused_{Guid.NewGuid():N}.gguf");
+        string fusedPath = Path.Combine(Path.GetTempPath(), $"qkv_fused_{Guid.NewGuid():N}.gguf");
+        try
+        {
+            WriteDeterministicQwen2Gguf(unfusedPath, dim: 128, ffnDim: 256, headCount: 4, headCountKv: 2, vocabSize: 16, fusedQkv: false, fusedGateUp: false);
+            WriteDeterministicQwen2Gguf(fusedPath, dim: 128, ffnDim: 256, headCount: 4, headCountKv: 2, vocabSize: 16, fusedQkv: true, fusedGateUp: false);
 
-        Assert.Equal(0, qOffset);
-        Assert.Equal(256, kOffset);
-        Assert.Equal(384, vOffset);
+            using var sUnfused = new InferenceSession(unfusedPath, maxSeqLen: 16, device: "cpu");
+            using var sFused = new InferenceSession(fusedPath, maxSeqLen: 16, device: "cpu");
+            Assert.False(sUnfused.Weights.Layers[0].HasFusedQkv);
+            Assert.True(sFused.Weights.Layers[0].HasFusedQkv);
+
+            sUnfused.Prefill([3, 5, 7]);
+            sFused.Prefill([3, 5, 7]);
+            float[] logitsUnfused = new float[sUnfused.VocabSize];
+            float[] logitsFused = new float[sFused.VocabSize];
+            sUnfused.CopyCurrentLogits(logitsUnfused);
+            sFused.CopyCurrentLogits(logitsFused);
+
+            Assert.Contains(logitsFused, x => x != 0f && float.IsFinite(x));
+            for (int i = 0; i < logitsFused.Length; i++)
+            {
+                Assert.Equal(logitsUnfused[i], logitsFused[i], 0.0001f);
+            }
+        }
+        finally
+        {
+            if (File.Exists(unfusedPath)) File.Delete(unfusedPath);
+            if (File.Exists(fusedPath)) File.Delete(fusedPath);
+        }
     }
 
     #endregion
@@ -287,31 +438,84 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     [Fact]
     public void T1_F5_02_FusedGateUp_CalculatesGateSliceDimensions()
     {
-        int ffnDim = 512;
-        int gateStart = 0;
-        int gateEnd = ffnDim;
+        const int dim = 256, ffnDim = 512;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: ffnDim, fusedGateUp: true);
 
-        Assert.Equal(0, gateStart);
-        Assert.Equal(512, gateEnd);
+        Assert.True(handle.GgufFile.TryGetTensor("blk.0.ffn_up.weight", out var ffnUpTensor) && ffnUpTensor != null);
+        Assert.Equal([(ulong)dim, (ulong)(2 * ffnDim)], ffnUpTensor.Dimensions);
+
+        var layer = handle.Weights.Layers[0];
+        Assert.True(layer.HasFusedGateUp);
+        Assert.True(layer.FfnGateWeight == null);
+        Assert.True(layer.FfnUpWeight != null);
+
+        long halfBytes = (long)ffnDim * GgufTypes.GetRowBytes(layer.FfnUpType, dim);
+        Assert.Equal((ulong)(2 * halfBytes), ffnUpTensor.GetByteSize());
     }
 
     [Fact]
     public void T1_F5_03_FusedGateUp_CalculatesUpSliceDimensions()
     {
-        int ffnDim = 512;
-        int upStart = ffnDim;
-        int upEnd = 2 * ffnDim;
+        string unfusedPath = Path.Combine(Path.GetTempPath(), $"gateup_unfused_{Guid.NewGuid():N}.gguf");
+        string fusedPath = Path.Combine(Path.GetTempPath(), $"gateup_fused_{Guid.NewGuid():N}.gguf");
+        try
+        {
+            WriteDeterministicQwen2Gguf(unfusedPath, dim: 128, ffnDim: 256, headCount: 4, headCountKv: 2, vocabSize: 16, fusedQkv: false, fusedGateUp: false);
+            WriteDeterministicQwen2Gguf(fusedPath, dim: 128, ffnDim: 256, headCount: 4, headCountKv: 2, vocabSize: 16, fusedQkv: false, fusedGateUp: true);
 
-        Assert.Equal(512, upStart);
-        Assert.Equal(1024, upEnd);
+            using var sUnfused = new InferenceSession(unfusedPath, maxSeqLen: 16, device: "cpu");
+            using var sFused = new InferenceSession(fusedPath, maxSeqLen: 16, device: "cpu");
+            Assert.False(sUnfused.Weights.Layers[0].HasFusedGateUp);
+            Assert.True(sFused.Weights.Layers[0].HasFusedGateUp);
+
+            sUnfused.Prefill([2, 4, 6]);
+            sFused.Prefill([2, 4, 6]);
+            float[] logitsUnfused = new float[sUnfused.VocabSize];
+            float[] logitsFused = new float[sFused.VocabSize];
+            sUnfused.CopyCurrentLogits(logitsUnfused);
+            sFused.CopyCurrentLogits(logitsFused);
+
+            Assert.Contains(logitsFused, x => x != 0f && float.IsFinite(x));
+            for (int i = 0; i < logitsFused.Length; i++)
+            {
+                Assert.Equal(logitsUnfused[i], logitsFused[i], 0.0001f);
+            }
+        }
+        finally
+        {
+            if (File.Exists(unfusedPath)) File.Delete(unfusedPath);
+            if (File.Exists(fusedPath)) File.Delete(fusedPath);
+        }
     }
 
     [Fact]
     public void T1_F5_04_FusedGateUp_TotalIntermediateCountInvariant()
     {
-        int ffnDim = 512;
-        int totalRows = 2 * ffnDim;
-        Assert.Equal(1024, totalRows);
+        const int dim = 256, ffnDim = 512;
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: dim, ffnDim: ffnDim, fusedGateUp: true);
+        var layer = handle.Weights.Layers[0];
+        Assert.True(layer.HasFusedGateUp);
+
+        float[] normX = new float[dim];
+        for (int i = 0; i < dim; i++) normX[i] = ((i % 13) - 6) * 0.05f;
+        float[] gateUpOut = new float[2 * ffnDim];
+        float[] actOut = new float[ffnDim];
+
+        fixed (float* pX = normX, pGU = gateUpOut, pAct = actOut)
+        {
+            QuantKernels.MatVecMul(layer.FfnUpType, layer.FfnUpWeight, pX, pGU, dim, 2 * ffnDim);
+            QuantKernels.SwiGLU(pGU, pGU + ffnDim, pAct, ffnDim);
+        }
+
+        float[] oracle = VulkanE2ETestFixtures.ReferenceQuantOracle.ComputeSwiGlu(
+            gateUpOut.AsSpan(0, ffnDim).ToArray(),
+            gateUpOut.AsSpan(ffnDim, ffnDim).ToArray());
+        for (int i = 0; i < ffnDim; i++)
+        {
+            Assert.Equal(oracle[i], actOut[i], 0.0001f);
+        }
     }
 
     [Fact]
@@ -319,15 +523,25 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     {
         float[] gate = [0.0f, 1.0f, -1.0f, 2.0f];
         float[] up = [2.0f, 3.0f, 4.0f, 0.5f];
+        float[] actual = new float[4];
+
+        fixed (float* pG = gate, pU = up, pDst = actual)
+        {
+            QuantKernels.SwiGLU(pG, pU, pDst, 4);
+        }
 
         float[] swiglu = VulkanE2ETestFixtures.ReferenceQuantOracle.ComputeSwiGlu(gate, up);
 
         // silu(0) = 0 * 0.5 = 0; 0 * 2 = 0
-        Assert.Equal(0.0f, swiglu[0], 0.0001f);
+        Assert.Equal(0.0f, actual[0], 0.0001f);
         // silu(1) = 1 / (1 + exp(-1)) = 0.7310586; * 3 = 2.193176
-        Assert.Equal(2.193176f, swiglu[1], 0.001f);
+        Assert.Equal(2.193176f, actual[1], 0.001f);
         // silu(-1) = -1 / (1 + exp(1)) = -0.2689414; * 4 = -1.075765
-        Assert.Equal(-1.075765f, swiglu[2], 0.001f);
+        Assert.Equal(-1.075765f, actual[2], 0.001f);
+        for (int i = 0; i < 4; i++)
+        {
+            Assert.Equal(swiglu[i], actual[i], 0.0001f);
+        }
     }
 
     #endregion
@@ -469,7 +683,7 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     [Fact]
     public void T1_F8_04_Gemma4Model_IdentifiesArchitectureGemma4()
     {
-        Assert.Equal("Gemma4", UniversalArchitecture.Gemma4.ToString());
+        Assert.Equal(UniversalArchitecture.Gemma4, ModelArchitectureDetector.Detect("gemma4", null));
     }
 
     [Fact]
@@ -547,6 +761,14 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
         Assert.Equal("Cpu", session.ActiveBackend);
     }
 
+    private sealed class StubGpuModel : ID3D12Model
+    {
+        public void Forward(int token, int pos, Span<float> logits, bool computeLogits = true) { }
+        public void ForwardBatch(ReadOnlySpan<int> tokens, int startPos, Span<float> logits, bool computeLogits = true) { }
+        public void ResetKvCache() { }
+        public void Dispose() { }
+    }
+
     [Fact]
     public void T1_F9_05_ActiveBackend_VulkanPrecedence_PreventsDirect3D12Misreporting()
     {
@@ -555,13 +777,14 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
         using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2();
         using var session = new InferenceSession(handle.Path, device: "cpu");
 
-        var uninitD3dModel = (ID3D12Model)RuntimeHelpers.GetUninitializedObject(typeof(Qwen2VulkanModel));
+        using var stubModel = new StubGpuModel();
         typeof(InferenceSession).GetField("_d3d12Model", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .SetValue(session, uninitD3dModel);
+            .SetValue(session, stubModel);
         typeof(InferenceSession).GetProperty(nameof(InferenceSession.Engine), BindingFlags.Public | BindingFlags.Instance)!
             .SetValue(session, InferenceEngineType.Vulkan);
 
         Assert.Equal("Vulkan", session.ActiveBackend);
+        Assert.True(session.IsGpuAccelerated);
 
         typeof(InferenceSession).GetField("_d3d12Model", BindingFlags.NonPublic | BindingFlags.Instance)!
             .SetValue(session, null);
@@ -607,38 +830,28 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
         using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateMamba2();
         using var session = new InferenceSession(handle.Path, device: "cpu");
 
-        string vkName = "AMD Radeon 890M";
-        string modeDesc = session.Architecture == UniversalArchitecture.Mamba2 ? "Mamba-2 Hybrid SSM" : "Standard Dense";
-        string formatted = $"{vkName} [Engine: Vulkan Compute ({modeDesc}) | KV: FP32 | Arch: {session.Architecture}]";
+        string formatted = InferenceSession.FormatVulkanActiveDevice(
+            "AMD Radeon 890M",
+            session.Architecture,
+            session.Weights.IsHybridSsm,
+            session.Weights.IsMoe);
 
-        typeof(InferenceSession).GetProperty(nameof(InferenceSession.ActiveDevice), BindingFlags.Public | BindingFlags.Instance)!
-            .SetValue(session, formatted);
-
-        Assert.Contains("Engine: Vulkan Compute", session.ActiveDevice);
-        Assert.Contains("Mamba-2 Hybrid SSM", session.ActiveDevice);
-        Assert.Contains($"Arch: {UniversalArchitecture.Mamba2}", session.ActiveDevice);
+        Assert.Contains("Engine: Vulkan Compute", formatted);
+        Assert.Contains("Mamba-2 Hybrid SSM", formatted);
+        Assert.Contains($"Arch: {UniversalArchitecture.Mamba2}", formatted);
     }
 
     [Fact]
     public void T1_F10_05_modeDesc_MoE_DualMoE_ArchitectureDistinction()
     {
-        var archGemma = UniversalArchitecture.Gemma4;
-        var archMamba = UniversalArchitecture.Mamba2;
-
-        string gemmaMode = archGemma switch
-        {
-            UniversalArchitecture.Gemma4 => "Gemma 4 ISWA + Dual MoE",
-            _ => "Standard Dense"
-        };
-        string mambaMode = archMamba switch
-        {
-            UniversalArchitecture.Mamba2 => "Mamba-2 Hybrid SSM + MoE",
-            _ => "Standard Dense"
-        };
+        string gemmaMode = InferenceSession.FormatVulkanModeDescription(UniversalArchitecture.Gemma4, isHybridSsm: false, isMoe: true);
+        string mambaMode = InferenceSession.FormatVulkanModeDescription(UniversalArchitecture.Mamba2, isHybridSsm: false, isMoe: true);
+        string qwenMode = InferenceSession.FormatVulkanModeDescription(UniversalArchitecture.Qwen, isHybridSsm: true, isMoe: true);
 
         Assert.Contains("Dual MoE", gemmaMode);
         Assert.DoesNotContain("Dual MoE", mambaMode);
         Assert.Contains("+ MoE", mambaMode);
+        Assert.Contains("Gated DeltaNet + MoE", qwenMode);
     }
 
     #endregion
@@ -792,18 +1005,34 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     [Fact]
     public void T1_F13_05_RoPE_FrequencyInterpolation_MathematicalParity()
     {
-        float baseFreq = 10000.0f;
-        float factor = 2.0f;
-        float effectiveFreq = baseFreq / factor;
-        int pos = 10;
-        float theta = pos * (1.0f / effectiveFreq);
+        using var handle = VulkanE2ETestFixtures.SyntheticGgufHandle.CreateQwen2(
+            dim: 64, ffnDim: 128, headCount: 2, headCountKv: 2, hasRopeFreqs: true);
+        Assert.True(handle.Weights.HasRopeFreqs);
 
-        float cos = MathF.Cos(theta);
-        float sin = MathF.Sin(theta);
+        const int headDim = 32;
+        const int halfDim = headDim / 2;
+        float[] q = new float[headDim];
+        float[] k = new float[headDim];
+        float[] ropeFreqs = new float[halfDim];
+        for (int i = 0; i < headDim; i++) { q[i] = 1.0f + i * 0.1f; k[i] = -0.5f + i * 0.05f; }
+        Array.Fill(ropeFreqs, 2.0f);
 
-        Assert.True(cos >= -1.0f && cos <= 1.0f);
-        Assert.True(sin >= -1.0f && sin <= 1.0f);
-        Assert.Equal(1.0f, cos * cos + sin * sin, 0.0001f);
+        float qNormBefore = MathF.Sqrt(q.Sum(v => v * v));
+        const int pos = 10;
+        const float baseFreq = 10000.0f;
+        float q0 = q[0], qHalf = q[halfDim];
+
+        fixed (float* pQ = q, pK = k, pRf = ropeFreqs)
+        {
+            QuantKernels.RoPE(pQ, pK, nHeadsQ: 1, nHeadsKv: 1, headDim: headDim, pos: pos, freqBase: baseFreq, ropeFreqs: pRf);
+        }
+
+        float qNormAfter = MathF.Sqrt(q.Sum(v => v * v));
+        Assert.Equal(qNormBefore, qNormAfter, 0.001f);
+
+        float theta0 = pos * (1.0f / (1.0f * ropeFreqs[0]));
+        Assert.Equal(q0 * MathF.Cos(theta0) - qHalf * MathF.Sin(theta0), q[0], 0.0001f);
+        Assert.Equal(q0 * MathF.Sin(theta0) + qHalf * MathF.Cos(theta0), q[halfDim], 0.0001f);
     }
 
     #endregion
@@ -902,18 +1131,6 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
         // It must never throw an unhandled exception during instantiation.
     }
 
-    private static string FindRepoRoot()
-    {
-        var dir = AppContext.BaseDirectory;
-        while (!string.IsNullOrEmpty(dir) && !File.Exists(Path.Combine(dir, "scripts", "security_check.py")))
-        {
-            var parent = Path.GetDirectoryName(dir);
-            if (parent == dir) break;
-            dir = parent;
-        }
-        return dir ?? AppContext.BaseDirectory;
-    }
-
     [Fact]
     public void T1_F15_02_FindVulkanDevice_ExcludesSoftwareRasteriser()
     {
@@ -957,6 +1174,7 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void T1_F15_04_GlacierSettings_ResolveTarget_RespectsVulkanEngine()
     {
         var (device, engine) = GlacierSettings.ResolveTarget(null, "Vulkan");
@@ -976,76 +1194,60 @@ public unsafe class VulkanE2ETier1FeatureCoverageTests
     #region Feature 16: Mandatory Security Compliance
 
     [Fact]
-    public void T1_F16_01_SecurityScript_ExistsOnDisk()
+    public void T1_F16_01_SecurityAudit_TargetSourceTree_ExistsOnDisk()
     {
-        string repoRoot = FindRepoRoot();
-        string scriptPath = Path.Combine(repoRoot, "scripts", "security_check.py");
-        if (!File.Exists(scriptPath)) return; // Monorepo security script is absent in standalone CI checkout
-        Assert.True(File.Exists(scriptPath), $"Security scanner script must exist at: {scriptPath}");
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        Assert.True(Directory.Exists(Path.Combine(inferenceRoot, "src", "Glacier.Inference")),
+            $"Glacier.Inference source directory must exist under: {inferenceRoot}");
+        Assert.True(Directory.Exists(Path.Combine(inferenceRoot, "tests", "Glacier.Inference.Tests")),
+            $"Glacier.Inference test directory must exist under: {inferenceRoot}");
     }
 
     [Fact]
     public void T1_F16_02_SecurityScanner_ExecutesAndExitsZero()
     {
-        string repoRoot = FindRepoRoot();
-        string scriptPath = Path.Combine(repoRoot, "scripts", "security_check.py");
-        if (!File.Exists(scriptPath)) return;
-        var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
-        {
-            WorkingDirectory = repoRoot,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
-        };
-        using var proc = Process.Start(psi);
-        Assert.NotNull(proc);
-        proc.WaitForExit();
-        Assert.Equal(0, proc.ExitCode);
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        var (exitCode, scanned, findings, report) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(
+            Path.Combine(inferenceRoot, "src"));
+        Assert.Equal(0, exitCode);
+        Assert.Empty(findings);
+        Assert.True(scanned > 10, $"Expected > 10 source files scanned, got {scanned}");
+        Assert.Contains("[PASSED]", report);
     }
 
     [Fact]
     public void T1_F16_03_SecurityScanner_ReportsZeroSecretsDetected()
     {
-        string repoRoot = FindRepoRoot();
-        string scriptPath = Path.Combine(repoRoot, "scripts", "security_check.py");
-        if (!File.Exists(scriptPath)) return;
-        var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
-        {
-            WorkingDirectory = repoRoot,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
-        };
-        using var proc = Process.Start(psi);
-        Assert.NotNull(proc);
-        string output = proc.StandardOutput.ReadToEnd();
-        proc.WaitForExit();
-
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        var (exitCode, _, findings, output) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(inferenceRoot);
+        Assert.True(exitCode == 0, $"Secret audit reported findings:\n{output}");
+        Assert.Empty(findings);
         Assert.Contains("[PASSED] Zero secrets or credentials detected.", output);
     }
 
     [Fact]
     public void T1_F16_04_SourceCode_AuditNoHardcodedApiKeys()
     {
-        // Sanity check: Ensure our test file contains no private keys or api tokens
-        string testFile = Path.GetFullPath("Glacier.Inference/tests/Glacier.Inference.Tests/VulkanE2E/VulkanE2ETier1FeatureCoverageTests.cs");
-        if (File.Exists(testFile))
-        {
-            string content = File.ReadAllText(testFile);
-            Assert.DoesNotContain("AIzaSy", content);
-            Assert.DoesNotContain("BEGIN PRIVATE KEY", content);
-        }
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        string testFile = Path.Combine(inferenceRoot, "tests", "Glacier.Inference.Tests", "VulkanE2E", "VulkanE2ETier1FeatureCoverageTests.cs");
+        Assert.True(File.Exists(testFile));
+        string content = File.ReadAllText(testFile);
+        Assert.DoesNotContain("AIza" + "Sy", content);
+        Assert.DoesNotContain("BEGIN PRIVATE " + "KEY", content);
     }
 
     [Fact]
     public void T1_F16_05_GitIgnore_ContainsCredentialExclusions()
     {
-        string gitIgnorePath = Path.GetFullPath(".gitignore");
-        if (File.Exists(gitIgnorePath))
-        {
-            string gitIgnore = File.ReadAllText(gitIgnorePath);
-            Assert.Contains(".env", gitIgnore);
-        }
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        string? repoRoot = Directory.GetParent(inferenceRoot)?.FullName;
+        string gitIgnorePath = Path.Combine(inferenceRoot, ".gitignore");
+        if (!File.Exists(gitIgnorePath) && repoRoot != null)
+            gitIgnorePath = Path.Combine(repoRoot, ".gitignore");
+
+        Assert.True(File.Exists(gitIgnorePath), $"Expected .gitignore at {gitIgnorePath}");
+        string gitIgnore = File.ReadAllText(gitIgnorePath);
+        Assert.Contains(".env", gitIgnore);
     }
 
     #endregion

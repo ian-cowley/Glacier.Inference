@@ -148,18 +148,24 @@ public sealed class SpeculativeEngine : IDisposable
         int vocabSize = useLeviathanRejection ? _targetSession.VocabSize : 0;
 
         int maxDraftCfg = Math.Max(0, options.MaxDraftTokens);
-        int[] draftBuf = new int[Math.Max(1, maxDraftCfg)];
-        int[] verifyBatch = new int[maxDraftCfg + 1];
-        int[] predictions = new int[maxDraftCfg + 1];
+        int draftBufLen = Math.Max(1, maxDraftCfg);
+        int verifyLen = maxDraftCfg + 1;
+        int draftProbsLen = maxDraftCfg * vocabSize;
+        int targetLogitsLen = verifyLen * vocabSize;
 
-        float[]? draftProbs = useLeviathanRejection && maxDraftCfg > 0 ? new float[maxDraftCfg * vocabSize] : null;
-        float[]? targetBatchLogits = useLeviathanRejection ? new float[(maxDraftCfg + 1) * vocabSize] : null;
-        float[]? targetProbs = useLeviathanRejection ? new float[vocabSize] : null;
-        float[]? residualProbs = useLeviathanRejection ? new float[vocabSize] : null;
+        int[] draftBuf = System.Buffers.ArrayPool<int>.Shared.Rent(draftBufLen);
+        int[] verifyBatch = System.Buffers.ArrayPool<int>.Shared.Rent(verifyLen);
+        int[] predictions = System.Buffers.ArrayPool<int>.Shared.Rent(verifyLen);
+
+        float[]? draftProbs = useLeviathanRejection && maxDraftCfg > 0 ? System.Buffers.ArrayPool<float>.Shared.Rent(draftProbsLen) : null;
+        float[]? targetBatchLogits = useLeviathanRejection ? System.Buffers.ArrayPool<float>.Shared.Rent(targetLogitsLen) : null;
+        float[]? targetProbs = useLeviathanRejection ? System.Buffers.ArrayPool<float>.Shared.Rent(vocabSize) : null;
+        float[]? residualProbs = useLeviathanRejection ? System.Buffers.ArrayPool<float>.Shared.Rent(vocabSize) : null;
 
         long ssmStateBytes = _targetSession.StateSnapshotBytes;
         bool usePerStepSnapshots = ssmStateBytes > 0 && _targetSession.SupportsPerStepVerificationSnapshots;
-        byte[]? ssmSnapshot = ssmStateBytes > 0 && !usePerStepSnapshots ? new byte[ssmStateBytes] : null;
+        int ssmLen = ssmStateBytes > 0 ? checked((int)ssmStateBytes) : 0;
+        byte[]? ssmSnapshot = ssmStateBytes > 0 && !usePerStepSnapshots ? System.Buffers.ArrayPool<byte>.Shared.Rent(ssmLen) : null;
         byte[][]? stepSnapshots = null;
         if (usePerStepSnapshots && maxDraftCfg > 0)
         {
@@ -170,6 +176,8 @@ public sealed class SpeculativeEngine : IDisposable
             }
         }
 
+        try
+        {
         // 4. Main Speculative Decoding Loop
         while (generatedTokens.Count < options.MaxTokens && (_targetSession.IsRingBufferEnabled || currentPos < maxSeq))
         {
@@ -191,15 +199,15 @@ public sealed class SpeculativeEngine : IDisposable
                         sampling,
                         _sampler,
                         vocabSize,
-                        draftBuf,
-                        draftProbs.AsSpan());
+                        draftBuf.AsSpan(0, maxDraftThisStep),
+                        draftProbs.AsSpan(0, draftProbsLen));
                 }
                 else
                 {
                     draftedCount = _draftProvider.Draft(
                         CollectionsMarshal.AsSpan(allTokens),
                         maxDraftThisStep,
-                        draftBuf);
+                        draftBuf.AsSpan(0, maxDraftThisStep));
                 }
             }
 
@@ -237,7 +245,7 @@ public sealed class SpeculativeEngine : IDisposable
 
                 if (ssmSnapshot != null)
                 {
-                    _targetSession.SaveRecurrentState(ssmSnapshot);
+                    _targetSession.SaveRecurrentState(ssmSnapshot.AsSpan(0, ssmLen));
                 }
 
                 int batchLen = draftedCount + 1;
@@ -260,7 +268,7 @@ public sealed class SpeculativeEngine : IDisposable
                             rawTargetLogits,
                             sampling,
                             CollectionsMarshal.AsSpan(generatedTokens),
-                            targetProbs.AsSpan());
+                            targetProbs.AsSpan(0, vocabSize));
 
                         ReadOnlySpan<float> qRow = draftProbs.AsSpan(i * vocabSize, vocabSize);
                         float pCandidate = (uint)candidate < (uint)vocabSize ? targetProbs![candidate] : 0f;
@@ -303,7 +311,7 @@ public sealed class SpeculativeEngine : IDisposable
                         }
                         else
                         {
-                            int correctionToken = SampleResidualDistribution(targetProbs!, qRow, residualProbs!, _sampler.Rng);
+                            int correctionToken = SampleResidualDistribution(targetProbs.AsSpan(0, vocabSize), qRow, residualProbs.AsSpan(0, vocabSize), _sampler.Rng);
                             allTokens.Add(correctionToken);
                             generatedTokens.Add(correctionToken);
 
@@ -313,7 +321,7 @@ public sealed class SpeculativeEngine : IDisposable
                             }
                             else if (ssmSnapshot != null)
                             {
-                                RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
+                                RollbackAndReplayRecurrentState(ssmSnapshot.AsSpan(0, ssmLen), verifyBatch, currentPos, acceptedInStep);
                             }
 
                             pendingToken = correctionToken;
@@ -342,8 +350,8 @@ public sealed class SpeculativeEngine : IDisposable
                             bonusLogits,
                             sampling,
                             CollectionsMarshal.AsSpan(generatedTokens),
-                            targetProbs.AsSpan());
-                        int bonusToken = Sampler.SampleFromDistribution(targetProbs!, _sampler.Rng);
+                            targetProbs.AsSpan(0, vocabSize));
+                        int bonusToken = Sampler.SampleFromDistribution(targetProbs.AsSpan(0, vocabSize), _sampler.Rng);
 
                         allTokens.Add(bonusToken);
                         generatedTokens.Add(bonusToken);
@@ -405,7 +413,7 @@ public sealed class SpeculativeEngine : IDisposable
                             }
                             else if (ssmSnapshot != null)
                             {
-                                RollbackAndReplayRecurrentState(ssmSnapshot, verifyBatch, currentPos, acceptedInStep);
+                                RollbackAndReplayRecurrentState(ssmSnapshot.AsSpan(0, ssmLen), verifyBatch, currentPos, acceptedInStep);
                             }
 
                             pendingToken = targetPrediction;
@@ -460,6 +468,18 @@ public sealed class SpeculativeEngine : IDisposable
                 await Task.Yield();
             }
         }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<int>.Shared.Return(draftBuf);
+            System.Buffers.ArrayPool<int>.Shared.Return(verifyBatch);
+            System.Buffers.ArrayPool<int>.Shared.Return(predictions);
+            if (draftProbs != null) System.Buffers.ArrayPool<float>.Shared.Return(draftProbs);
+            if (targetBatchLogits != null) System.Buffers.ArrayPool<float>.Shared.Return(targetBatchLogits);
+            if (targetProbs != null) System.Buffers.ArrayPool<float>.Shared.Return(targetProbs);
+            if (residualProbs != null) System.Buffers.ArrayPool<float>.Shared.Return(residualProbs);
+            if (ssmSnapshot != null) System.Buffers.ArrayPool<byte>.Shared.Return(ssmSnapshot);
+        }
 
         int flushChars = utf8Decoder.GetChars(Array.Empty<byte>(), 0, 0, charBuf, 0, flush: true);
         if (flushChars > 0)
@@ -495,7 +515,7 @@ public sealed class SpeculativeEngine : IDisposable
         };
     }
 
-    private void RollbackAndReplayRecurrentState(byte[] ssmSnapshot, int[] verifyBatch, int basePos, int acceptedDrafts)
+    private void RollbackAndReplayRecurrentState(ReadOnlySpan<byte> ssmSnapshot, int[] verifyBatch, int basePos, int acceptedDrafts)
     {
         _targetSession.RestoreRecurrentState(ssmSnapshot);
         for (int r = 0; r <= acceptedDrafts; r++)
@@ -574,7 +594,7 @@ public sealed class SpeculativeEngine : IDisposable
 
     private bool IsEos(int token)
     {
-        return _targetSession.Tokenizer.IsStopToken(token) || token == _targetSession.Tokenizer.EosTokenId || token == 151645 || token == 151643;
+        return _targetSession.Tokenizer.IsStopToken(token) || (_targetSession.Tokenizer.EosTokenId >= 0 && token == _targetSession.Tokenizer.EosTokenId);
     }
 
     public void Dispose()

@@ -210,6 +210,7 @@ public class KlDivergenceVerifierM3Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void VerifyModels_And_VerifyPrompts_RealInferenceSessions_PassForQ8_0_And_FailForCorrupted()
     {
         string refF32Path = CreateTempPath("ref_f32");

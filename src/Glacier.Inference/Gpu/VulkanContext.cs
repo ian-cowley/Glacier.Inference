@@ -139,9 +139,14 @@ public sealed unsafe class VulkanContext : IDisposable
                 var devices = new IntPtr[devCount];
                 VulkanDriver.EnumeratePhysicalDevices(instance, ref devCount, devices);
 
+                int hwOrdinal = 0;
                 for (uint i = 0; i < devCount; i++)
                 {
                     VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var props);
+                    if (IsSoftwareDevice(in props))
+                    {
+                        continue;
+                    }
                     VulkanDriver.GetPhysicalDeviceMemoryProperties(devices[i], out var memProps);
                     ulong totalMem = 0;
                     var heaps = (VulkanDriver.VkMemoryHeap*)memProps.memoryHeaps;
@@ -149,7 +154,7 @@ public sealed unsafe class VulkanContext : IDisposable
                     {
                         totalMem += heaps[h].size;
                     }
-                    list.Add(((int)i, props.deviceName, totalMem));
+                    list.Add((hwOrdinal++, props.deviceName, totalMem));
                 }
             }
             finally
@@ -200,36 +205,38 @@ public sealed unsafe class VulkanContext : IDisposable
         if (res != 0 || _instance == IntPtr.Zero)
             throw new InvalidOperationException($"Failed to create Vulkan instance: code {res}");
 
-        // 2. Enumerate Physical Devices
-        uint devCount = 0;
-        VulkanDriver.EnumeratePhysicalDevices(_instance, ref devCount, null);
-        if (devCount == 0)
-            throw new InvalidOperationException("No Vulkan physical devices found on this system.");
-
-        var devices = new IntPtr[devCount];
-        VulkanDriver.EnumeratePhysicalDevices(_instance, ref devCount, devices);
-
-        var hwDevices = new List<IntPtr>();
-        for (int i = 0; i < devCount; i++)
+        try
         {
-            VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var candidateProps);
-            if (!IsSoftwareDevice(in candidateProps))
+            // 2. Enumerate Physical Devices
+            uint devCount = 0;
+            VulkanDriver.EnumeratePhysicalDevices(_instance, ref devCount, null);
+            if (devCount == 0)
+                throw new InvalidOperationException("No Vulkan physical devices found on this system.");
+
+            var devices = new IntPtr[devCount];
+            VulkanDriver.EnumeratePhysicalDevices(_instance, ref devCount, devices);
+
+            var hwDevices = new List<IntPtr>();
+            for (int i = 0; i < devCount; i++)
             {
-                hwDevices.Add(devices[i]);
+                VulkanDriver.GetPhysicalDeviceProperties(devices[i], out var candidateProps);
+                if (!IsSoftwareDevice(in candidateProps))
+                {
+                    hwDevices.Add(devices[i]);
+                }
             }
-        }
 
-        if (hwDevices.Count > 0)
-        {
-            DeviceOrdinal = Math.Clamp(deviceOrdinal, 0, hwDevices.Count - 1);
+            if (hwDevices.Count == 0)
+            {
+                throw new PlatformNotSupportedException("No hardware Vulkan GPU physical devices found (software rasterizers skipped).");
+            }
+            if ((uint)deviceOrdinal >= (uint)hwDevices.Count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(deviceOrdinal), deviceOrdinal,
+                    $"Vulkan hardware device ordinal must be between 0 and {hwDevices.Count - 1}.");
+            }
+            DeviceOrdinal = deviceOrdinal;
             _physicalDevice = hwDevices[DeviceOrdinal];
-        }
-        else
-        {
-            VulkanDriver.DestroyInstance(_instance, IntPtr.Zero);
-            _instance = IntPtr.Zero;
-            throw new PlatformNotSupportedException("No hardware Vulkan GPU physical devices found (software rasterizers skipped).");
-        }
 
         VulkanDriver.GetPhysicalDeviceProperties(_physicalDevice, out var props);
         DeviceName = props.deviceName;
@@ -408,7 +415,26 @@ public sealed unsafe class VulkanContext : IDisposable
         if (cmdRes != 0)
             throw new InvalidOperationException($"Failed to allocate Vulkan command buffer: code {cmdRes}");
 
-        _commandBuffer = cmdBufs[0];
+            _commandBuffer = cmdBufs[0];
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    internal static int ResolveHardwareDeviceOrdinal(ReadOnlySpan<(bool IsSoftware, string Name)> devices, int requestedOrdinal)
+    {
+        if (requestedOrdinal < 0) return -1;
+        int hwIndex = 0;
+        for (int i = 0; i < devices.Length; i++)
+        {
+            if (devices[i].IsSoftware) continue;
+            if (hwIndex == requestedOrdinal) return i;
+            hwIndex++;
+        }
+        return -1;
     }
 
     public bool TryFindMemoryType(uint typeFilter, uint properties, uint avoidProperties, out uint memTypeIndex)

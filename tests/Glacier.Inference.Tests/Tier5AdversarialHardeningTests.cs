@@ -58,6 +58,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [CudaFact]
+    [Trait("Hardware", "Gpu")]
     public void T5_B1_Cuda_KvCacheStoreQ4_0_OutlierAboveHalfMaxTimes7_DoesNotPoisonToNaN()
     {
         const int headDim = 32;
@@ -128,6 +129,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void T5_B1_D3D12_KvCacheStoreQ4_0_PositiveInfinity_DoesNotPoisonToNaN()
     {
         if (!D3D12Context.IsSupported)
@@ -213,6 +215,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void T5_B2_D3D12_KvCacheStoreF16_OddHeadDim33_PreservesFinalElementWithoutTruncation()
     {
         if (!D3D12Context.IsSupported)
@@ -313,6 +316,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [Theory]
+    [Trait("Hardware", "Gpu")]
     [InlineData("Gemma4SwaAttentionF16")]
     [InlineData("Qwen3AttentionF16")]
     [InlineData("Qwen3SparseAttentionF16")]
@@ -467,6 +471,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void T5_B3_Qwen3HybridD3D12Model_MissingSsmConv1dOnSplitStage_ReportsGlobalModelLayerIndex()
     {
         if (!D3D12Context.IsSupported)
@@ -510,6 +515,7 @@ public sealed unsafe class Tier5AdversarialHardeningTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public async Task T5_B5_TieredMoERunner_GenerateStreamAsync_ClampsAtMaxSequenceLengthWithoutThrowing()
     {
         string path = Path.Combine(Path.GetTempPath(), $"t5_moe_seq_{Guid.NewGuid():N}.gguf");

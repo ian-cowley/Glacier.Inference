@@ -270,6 +270,7 @@ public class PhaseARemediationTests
     }
 
     [CudaFact(false)]
+    [Trait("Hardware", "Gpu")]
     public void CudaAttentionGqa_HeadDim64And256_MatchesCpuOracle()
     {
         using var gpu = new GpuContext(0);
@@ -293,6 +294,7 @@ public class PhaseARemediationTests
     }
 
     [CudaFact(false)]
+    [Trait("Hardware", "Gpu")]
     public void CudaPagedAttention_SingleAndBatch_NonContiguousBlocks_MatchesCpuOracle()
     {
         using var gpu = new GpuContext(0);
@@ -316,6 +318,7 @@ public class PhaseARemediationTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12AttentionShaders_HeadDim64And256_MatchesCpuOracle()
     {
         if (!OperatingSystem.IsWindows())
@@ -646,6 +649,7 @@ public class PhaseARemediationTests
     // =========================================================================
 
     [CudaFact(false)]
+    [Trait("Hardware", "Gpu")]
     public void CudaPagedAttention_NegativePhysBlock_SkipsUnmappedBlocksSafely()
     {
         using var gpu = new GpuContext(0);
@@ -666,6 +670,7 @@ public class PhaseARemediationTests
     }
 
     [CudaFact(false)]
+    [Trait("Hardware", "Gpu")]
     public async Task CudaGpuContext_MakeCurrent_SurvivesAsyncThreadHop()
     {
         using var gpu = new GpuContext(0);
@@ -705,6 +710,7 @@ public class PhaseARemediationTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12_RmsNormHeads_HeadDim256_MatchesCpuOracle()
     {
         if (!OperatingSystem.IsWindows())
@@ -766,6 +772,7 @@ public class PhaseARemediationTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12_MoeRouterSoftmaxTopK_NumExperts300_MatchesCpuOracle()
     {
         if (!OperatingSystem.IsWindows())
@@ -849,6 +856,7 @@ public class PhaseARemediationTests
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12_RepetitionPenalty_DeduplicatesAndIgnoresOutOfBoundsTokens()
     {
         if (!OperatingSystem.IsWindows())

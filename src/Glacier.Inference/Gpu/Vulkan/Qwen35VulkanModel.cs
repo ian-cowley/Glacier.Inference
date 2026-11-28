@@ -2,6 +2,7 @@ namespace Glacier.Inference.Gpu;
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using Glacier.Inference.Diagnostics;
 using Glacier.Inference.Gguf;
@@ -420,13 +421,20 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
         list.Add(Mv(m, x, y));
     }
 
+    private static VulkanCompute.GBuf RequireBuf([NotNull] Mat? mat, string name)
+    {
+        if (mat == null)
+            throw new InvalidOperationException($"Missing required layer matrix '{name}'.");
+        return mat.Buf ?? throw new NotSupportedException($"Vulkan matrix '{name}' ({mat.Type}) does not have a linear GPU buffer.");
+    }
+
     private Op Mv(Mat m, VulkanCompute.GBuf x, VulkanCompute.GBuf y)
     {
         var k = _kMv[QIdx(m.Type)];
         int groups = (m.N + 3) / 4;
         return new Op
         {
-            Name = $"mv_{m.Type} K{m.K} N{m.N}", K = k, Set = _vk.MakeSet(k, m.Buf!, x, y),
+            Name = $"mv_{m.Type} K{m.K} N{m.N}", K = k, Set = _vk.MakeSet(k, RequireBuf(m, nameof(m)), x, y),
             Push = new uint[] { (uint)m.K, (uint)m.N },
             Gx = (uint)Math.Min(groups, 32768), Gy = (uint)((groups + 32767) / 32768)
         };
@@ -440,9 +448,10 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
     private Op MvMoe(Mat expsAsOne, int k, int n, long sliceBytes, int xStride, VulkanCompute.GBuf x, VulkanCompute.GBuf y, VulkanCompute.GBuf idx, int topK)
     {
         var kern = _kMoe[QIdx(expsAsOne.Type)];
+        var buf = RequireBuf(expsAsOne, nameof(expsAsOne));
         return new Op
         {
-            Name = $"moe_mv_{expsAsOne.Type} K{k} N{n}", K = kern, Set = _vk.MakeSet(kern, expsAsOne.Buf, x, y, idx),
+            Name = $"moe_mv_{expsAsOne.Type} K{k} N{n}", K = kern, Set = _vk.MakeSet(kern, buf, x, y, idx),
             Push = new uint[] { (uint)k, (uint)n, (uint)sliceBytes, (uint)xStride },
             Gx = (uint)((n + 3) / 4), Gy = (uint)topK
         };
@@ -911,12 +920,15 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
 
             if (m.IsGdn)
             {
-                var kQkv = _kMm[QIdx(m.Qkv!.Type)];
-                var kGate = _kMm[QIdx(m.Gate!.Type)];
-                var kOut = _kMm[QIdx(m.OutW!.Type)];
-                m.BQkvSet = _vk.MakeSet(kQkv, m.Qkv.Buf, _bNorm, _bQkv);
+                var qkvBuf = RequireBuf(m.Qkv, nameof(m.Qkv));
+                var gateBuf = RequireBuf(m.Gate, nameof(m.Gate));
+                var outBuf = RequireBuf(m.OutW, nameof(m.OutW));
+                var kQkv = _kMm[QIdx(m.Qkv.Type)];
+                var kGate = _kMm[QIdx(m.Gate.Type)];
+                var kOut = _kMm[QIdx(m.OutW.Type)];
+                m.BQkvSet = _vk.MakeSet(kQkv, qkvBuf, _bNorm, _bQkv);
                 if (m.QkvBias != null) m.BQkvBiasSet = _vk.MakeSet(_kBiasBatch, _bQkv, m.QkvBias);
-                m.BGateSet = _vk.MakeSet(kGate, m.Gate.Buf, _bNorm, _bZ);
+                m.BGateSet = _vk.MakeSet(kGate, gateBuf, _bNorm, _bZ);
                 m.BAlphaSet = _vk.MakeSet(_kF32Mm, m.AlphaW!, _bNorm, _bAlpha);
                 m.BBetaSet = _vk.MakeSet(_kF32Mm, m.BetaW!, _bNorm, _bBeta);
                 m.BConvSet = _vk.MakeSet(_kConvB, _bQkv, m.ConvW!, m.ConvState!, _bConvOut);
@@ -924,30 +936,37 @@ public sealed unsafe class Qwen35VulkanModel : ID3D12Model, IHiddenStateSource
                 m.BRecSet = _vk.MakeSet(_kRecB, _bConvOut, _bAlpha, _bBeta, m.DtBias!, m.AW!, m.RecState!, _bY);
                 m.BSsmNormSet = _vk.MakeSet(_kRms, _bY, m.SsmNorm!, _bY);
                 m.BSwiGdnSet = _vk.MakeSet(_kSwi, _bZ, _bY, _bGated);
-                m.BOutSet = _vk.MakeSet(kOut, m.OutW.Buf, _bGated, _bProj);
+                m.BOutSet = _vk.MakeSet(kOut, outBuf, _bGated, _bProj);
             }
             else
             {
-                m.BQSet = _vk.MakeSet(_kMm[QIdx(m.QW!.Type)], m.QW.Buf, _bNorm, _bQFull);
-                m.BKSet = _vk.MakeSet(_kMm[QIdx(m.KW!.Type)], m.KW.Buf, _bNorm, _bK);
-                m.BVSet = _vk.MakeSet(_kMm[QIdx(m.VW!.Type)], m.VW.Buf, _bNorm, _bV);
+                var qBuf = RequireBuf(m.QW, nameof(m.QW));
+                var kBuf = RequireBuf(m.KW, nameof(m.KW));
+                var vBuf = RequireBuf(m.VW, nameof(m.VW));
+                var oBuf = RequireBuf(m.OW, nameof(m.OW));
+                m.BQSet = _vk.MakeSet(_kMm[QIdx(m.QW.Type)], qBuf, _bNorm, _bQFull);
+                m.BKSet = _vk.MakeSet(_kMm[QIdx(m.KW.Type)], kBuf, _bNorm, _bK);
+                m.BVSet = _vk.MakeSet(_kMm[QIdx(m.VW.Type)], vBuf, _bNorm, _bV);
                 if (m.QBias != null) m.BQBiasSet = _vk.MakeSet(_kBiasBatch, _bQFull, m.QBias);
                 if (m.KBias != null) m.BKBiasSet = _vk.MakeSet(_kBiasBatch, _bK, m.KBias);
                 if (m.VBias != null) m.BVBiasSet = _vk.MakeSet(_kBiasBatch, _bV, m.VBias);
                 m.BPrepSet = _vk.MakeSet(_kPrep, _bQFull, _bK, _bV, m.QNorm!, m.KNorm!, _bQ, _bGate, m.KCache!, m.VCache!);
                 m.BDecSet = _vk.MakeSet(_kDec, _bQ, _bGate, m.KCache!, m.VCache!, _bScores, _bAttnOut);
-                m.BOSet = _vk.MakeSet(_kMm[QIdx(m.OW!.Type)], m.OW.Buf, _bAttnOut, _bProj);
+                m.BOSet = _vk.MakeSet(_kMm[QIdx(m.OW.Type)], oBuf, _bAttnOut, _bProj);
                 if (m.OBias != null) m.BOBiasSet = _vk.MakeSet(_kBiasBatch, _bProj, m.OBias);
             }
 
             if (!m.IsMoe)
             {
-                m.BGSet = _vk.MakeSet(_kMm[QIdx(m.GW!.Type)], m.GW.Buf, _bNorm, _bGateOut);
-                m.BUSet = _vk.MakeSet(_kMm[QIdx(m.UW!.Type)], m.UW.Buf, _bNorm, _bUpOut);
+                var gBuf = RequireBuf(m.GW, nameof(m.GW));
+                var uBuf = RequireBuf(m.UW, nameof(m.UW));
+                var dBuf = RequireBuf(m.DW, nameof(m.DW));
+                m.BGSet = _vk.MakeSet(_kMm[QIdx(m.GW.Type)], gBuf, _bNorm, _bGateOut);
+                m.BUSet = _vk.MakeSet(_kMm[QIdx(m.UW.Type)], uBuf, _bNorm, _bUpOut);
                 if (m.GBias != null) m.BGBiasSet = _vk.MakeSet(_kBiasBatch, _bGateOut, m.GBias);
                 if (m.UBias != null) m.BUBiasSet = _vk.MakeSet(_kBiasBatch, _bUpOut, m.UBias);
                 m.BSwiFfnSet = _vk.MakeSet(_kSwi, _bGateOut, _bUpOut, _bAct);
-                m.BDSet = _vk.MakeSet(_kMm[QIdx(m.DW!.Type)], m.DW.Buf, _bAct, _bProj);
+                m.BDSet = _vk.MakeSet(_kMm[QIdx(m.DW.Type)], dBuf, _bAct, _bProj);
             }
         }
     }

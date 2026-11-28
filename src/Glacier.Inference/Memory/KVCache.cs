@@ -32,6 +32,7 @@ public sealed unsafe class KVCache : IDisposable
     private readonly long _totalBytesK;
     private readonly long _totalBytesV;
 
+    private readonly int[] _slotLogicalPos;
     private int _slidingWindow;
     private bool _isRingBuffer;
     private byte* _kBuffer;
@@ -53,7 +54,14 @@ public sealed unsafe class KVCache : IDisposable
     public bool IsRingBuffer
     {
         get => _isRingBuffer;
-        set => _isRingBuffer = value;
+        set
+        {
+            if (_isRingBuffer != value)
+            {
+                _isRingBuffer = value;
+                Array.Fill(_slotLogicalPos, -1);
+            }
+        }
     }
 
     public int SlidingWindow
@@ -63,7 +71,11 @@ public sealed unsafe class KVCache : IDisposable
         {
             if (value < 0 || value > _maxSeqLen)
                 throw new ArgumentOutOfRangeException(nameof(value), value, $"Sliding window must be between 0 and {_maxSeqLen}.");
-            _slidingWindow = value;
+            if (_slidingWindow != value)
+            {
+                _slidingWindow = value;
+                Array.Fill(_slotLogicalPos, -1);
+            }
         }
     }
 
@@ -128,8 +140,47 @@ public sealed unsafe class KVCache : IDisposable
 
             _kBuffer = (byte*)NativeMemory.AllocZeroed((nuint)_totalBytesK);
             _vBuffer = (byte*)NativeMemory.AllocZeroed((nuint)_totalBytesV);
+            _slotLogicalPos = new int[checked(_layers * _maxSeqLen)];
+            Array.Fill(_slotLogicalPos, -1);
         }
     }
+
+    /// <summary>
+    /// Returns true if the physical slot corresponding to <paramref name="pos"/> in <paramref name="layer"/>
+    /// currently holds valid KV data written for that exact logical <paramref name="pos"/> (not unwritten, reset, or evicted by wraparound).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool IsPositionValid(int layer, int pos)
+    {
+        if (_disposed)
+            ThrowDisposed();
+        if ((uint)layer >= (uint)_layers || pos < 0)
+            return false;
+        if (!_isRingBuffer && _slidingWindow == 0 && (uint)pos >= (uint)_maxSeqLen)
+            return false;
+
+        int slot = (_isRingBuffer || _slidingWindow > 0) ? (pos % EffectiveWindowSize) : pos;
+        return _slotLogicalPos[layer * _maxSeqLen + slot] == pos;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int GetValidatedPhysicalSlot(int layer, int pos)
+    {
+        int slot = GetPhysicalSlot(pos);
+        int storedPos = _slotLogicalPos[layer * _maxSeqLen + slot];
+        if (storedPos != pos)
+        {
+            ThrowInvalidSlotPosition(layer, pos, storedPos);
+        }
+        return slot;
+    }
+
+    [DoesNotReturn]
+    private static void ThrowInvalidSlotPosition(int layer, int pos, int storedPos)
+        => throw new InvalidOperationException(
+            storedPos < 0
+                ? $"KV cache slot for layer {layer}, logical position {pos} has not been populated or was reset."
+                : $"KV cache slot for layer {layer}, logical position {pos} was evicted/overwritten by logical position {storedPos}.");
 
     /// <summary>
     /// Translates a logical token sequence position to its physical buffer slot.
@@ -162,7 +213,7 @@ public sealed unsafe class KVCache : IDisposable
         if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        int slot = GetPhysicalSlot(pos);
+        int slot = GetValidatedPhysicalSlot(layer, pos);
         long offset = (long)layer * _layerByteStrideK + (long)headKv * _headByteStrideK + (long)slot * _slotBytesK;
         return (float*)(_kBuffer + offset);
     }
@@ -177,7 +228,7 @@ public sealed unsafe class KVCache : IDisposable
         if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        int slot = GetPhysicalSlot(pos);
+        int slot = GetValidatedPhysicalSlot(layer, pos);
         long offset = (long)layer * _layerByteStrideV + (long)headKv * _headByteStrideV + (long)slot * _slotBytesV;
         return (float*)(_vBuffer + offset);
     }
@@ -207,7 +258,7 @@ public sealed unsafe class KVCache : IDisposable
         if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        int slot = GetPhysicalSlot(pos);
+        int slot = GetValidatedPhysicalSlot(layer, pos);
         long offset = (long)layer * _layerByteStrideK + (long)headKv * _headByteStrideK + (long)slot * _slotBytesK;
         return _kBuffer + offset;
     }
@@ -220,7 +271,7 @@ public sealed unsafe class KVCache : IDisposable
         if ((uint)layer >= (uint)_layers || (uint)headKv >= (uint)_nHeadsKv)
             ThrowOutOfRange(layer, headKv, pos);
 
-        int slot = GetPhysicalSlot(pos);
+        int slot = GetValidatedPhysicalSlot(layer, pos);
         long offset = (long)layer * _layerByteStrideV + (long)headKv * _headByteStrideV + (long)slot * _slotBytesV;
         return _vBuffer + offset;
     }
@@ -272,6 +323,8 @@ public sealed unsafe class KVCache : IDisposable
                     throw new NotSupportedException($"Unsupported KV cache precision: {_precision}.");
             }
         }
+
+        _slotLogicalPos[layer * _maxSeqLen + slot] = pos;
     }
 
     public void Store(int layer, int pos, ReadOnlySpan<float> kSrc, ReadOnlySpan<float> vSrc)
@@ -453,6 +506,7 @@ public sealed unsafe class KVCache : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         NativeMemory.Clear(_kBuffer, (nuint)_totalBytesK);
         NativeMemory.Clear(_vBuffer, (nuint)_totalBytesV);
+        Array.Fill(_slotLogicalPos, -1);
     }
 
     public void Dispose()

@@ -70,8 +70,8 @@ public sealed unsafe class GgufFile : IDisposable
     }
     public float RopeFreqBase => GetMetadataSingle($"{Architecture}.rope.freq_base", 10000000.0f);
     public float RmsNormEps => GetMetadataSingle($"{Architecture}.attention.layer_norm_rms_epsilon", 1e-5f);
-    public int EosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.eos_token_id", 151645);
-    public int BosTokenId => (int)GetMetadataUInt32("tokenizer.ggml.bos_token_id", 151643);
+    public int EosTokenId => TryGetFirstMetadataInt32("tokenizer.ggml.eos_token_id", out int eos) ? eos : -1;
+    public int BosTokenId => TryGetFirstMetadataInt32("tokenizer.ggml.bos_token_id", out int bos) ? bos : -1;
     public bool AddBosToken => GetMetadataBool("tokenizer.ggml.add_bos_token", false);
     public bool AddEosToken => GetMetadataBool("tokenizer.ggml.add_eos_token", false);
 
@@ -188,31 +188,21 @@ public sealed unsafe class GgufFile : IDisposable
         if (!File.Exists(filePath))
             throw new FileNotFoundException($"Model file not found: {filePath}", filePath);
 
-        var fileInfo = new FileInfo(filePath);
-        _fileLength = fileInfo.Length;
-        // On Linux/macOS FileInfo.Length of a symlink (e.g. HuggingFace snapshots -> blobs) is the link size, not the target size.
-        // FileStream.Length follows the link, so always prefer it.
-        if (_fileLength == 0 || fileInfo.LinkTarget != null)
-        {
-            try
-            {
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                _fileLength = fs.Length;
-            }
-            catch
-            {
-                if (fileInfo.LinkTarget != null && File.Exists(fileInfo.LinkTarget))
-                {
-                    _fileLength = new FileInfo(fileInfo.LinkTarget).Length;
-                }
-            }
-        }
+        _fileLength = ResolveFileLength(filePath);
         const long MinGgufHeaderSize = 4 + 4 + 8 + 8; // magic + version + tensor_count + metadata_kv_count
         if (_fileLength < MinGgufHeaderSize)
             throw new InvalidDataException($"File is too short to be a valid GGUF file ({_fileLength} bytes).");
 
         var primaryStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        _mmf = MemoryMappedFile.CreateFromFile(primaryStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
+        try
+        {
+            _mmf = MemoryMappedFile.CreateFromFile(primaryStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
+        }
+        catch
+        {
+            primaryStream.Dispose();
+            throw;
+        }
         try
         {
             _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
@@ -261,7 +251,7 @@ public sealed unsafe class GgufFile : IDisposable
                     }
                     else if (parsedAlign > 0)
                     {
-                        Alignment = parsedAlign;
+                        throw new InvalidDataException($"Invalid GGUF general.alignment ({parsedAlign}): must be a positive power of 2.");
                     }
                 }
             }
@@ -382,6 +372,77 @@ public sealed unsafe class GgufFile : IDisposable
 
     public string GetMetadataString(string key, string fallback = "") =>
         Metadata.TryGetValue(key, out var val) && val is string s ? s : fallback;
+
+    public bool TryGetFirstMetadataInt32(string key, out int value)
+    {
+        value = -1;
+        if (!Metadata.TryGetValue(key, out var val) || val == null)
+            return false;
+
+        if (TryConvertToInt32(val, out value))
+            return true;
+
+        if (val is List<object> list)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (TryConvertToInt32(list[i], out value))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    public IReadOnlyList<int> GetEosTokenIds()
+    {
+        var ids = new List<int>();
+        CollectMetadataInt32s("tokenizer.ggml.eos_token_id", ids);
+        CollectMetadataInt32s("tokenizer.ggml.eot_token_id", ids);
+        return ids;
+    }
+
+    private void CollectMetadataInt32s(string key, List<int> destination)
+    {
+        if (!Metadata.TryGetValue(key, out var val) || val == null)
+            return;
+
+        if (TryConvertToInt32(val, out int scalar) && scalar >= 0 && !destination.Contains(scalar))
+        {
+            destination.Add(scalar);
+        }
+        else if (val is List<object> list)
+        {
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (TryConvertToInt32(list[i], out int item) && item >= 0 && !destination.Contains(item))
+                {
+                    destination.Add(item);
+                }
+            }
+        }
+    }
+
+    private static bool TryConvertToInt32(object? val, out int result)
+    {
+        switch (val)
+        {
+            case uint u32 when u32 <= int.MaxValue:
+                result = (int)u32;
+                return true;
+            case int i32 when i32 >= 0:
+                result = i32;
+                return true;
+            case ulong u64 when u64 <= int.MaxValue:
+                result = (int)u64;
+                return true;
+            case long i64 when i64 >= 0 && i64 <= int.MaxValue:
+                result = (int)i64;
+                return true;
+            default:
+                result = -1;
+                return false;
+        }
+    }
 
     public uint GetMetadataUInt32(string key, uint fallback = 0)
     {
@@ -622,6 +683,30 @@ public sealed unsafe class GgufFile : IDisposable
         }
     }
 
+    private static long ResolveFileLength(string path)
+    {
+        var fileInfo = new FileInfo(path);
+        long length = fileInfo.Length;
+        // On Linux/macOS FileInfo.Length of a symlink (e.g. HuggingFace snapshots -> blobs) is the link size, not the target size.
+        // FileStream.Length follows the link, so always prefer it.
+        if (length == 0 || fileInfo.LinkTarget != null)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                length = fs.Length;
+            }
+            catch
+            {
+                if (fileInfo.LinkTarget != null && File.Exists(fileInfo.LinkTarget))
+                {
+                    length = new FileInfo(fileInfo.LinkTarget).Length;
+                }
+            }
+        }
+        return length;
+    }
+
     private void LoadExtraShards(string firstShardPath)
     {
         var m = System.Text.RegularExpressions.Regex.Match(firstShardPath, @"^(.*-)(\d{5})(-of-)(\d{5})(\.gguf)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -630,6 +715,7 @@ public sealed unsafe class GgufFile : IDisposable
         int splitCount = Metadata.TryGetValue("split.count", out var sc) ? Convert.ToInt32(sc) : int.Parse(m.Groups[4].Value);
         if (splitCount <= 1) return;
 
+        const long MinGgufHeaderSize = 4 + 4 + 8 + 8;
         string prefix = m.Groups[1].Value, mid = m.Groups[3].Value, totalStr = m.Groups[4].Value, ext = m.Groups[5].Value;
         for (int s = 2; s <= splitCount; s++)
         {
@@ -637,71 +723,124 @@ public sealed unsafe class GgufFile : IDisposable
             if (!File.Exists(shardPath))
                 throw new FileNotFoundException($"Missing split-GGUF shard {s}/{splitCount}: {shardPath}", shardPath);
 
-            long shardLen = new FileInfo(shardPath).Length;
-            var shardStream = new FileStream(shardPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            var mmf = MemoryMappedFile.CreateFromFile(shardStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
-            var acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+            long shardLen = ResolveFileLength(shardPath);
+            if (shardLen < MinGgufHeaderSize)
+                throw new InvalidDataException($"Split-GGUF shard '{shardPath}' is too short ({shardLen} bytes).");
+
+            MemoryMappedFile? mmf = null;
+            MemoryMappedViewAccessor? acc = null;
             byte* basePtr = null;
-            acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            bool ownershipTransferred = false;
 
-            byte* ptr = basePtr;
-            byte* endPtr = basePtr + shardLen;
-            uint magic = ReadUInt32(ref ptr, endPtr);
-            if (magic != 0x46554747) throw new InvalidDataException($"Invalid GGUF magic in shard {shardPath}.");
-            uint ver = ReadUInt32(ref ptr, endPtr);
-            if (ver < 2 || ver > 3) throw new NotSupportedException($"Unsupported GGUF version {ver} in shard {shardPath}.");
-
-            ulong tCount = ReadUInt64(ref ptr, endPtr);
-            ulong kvCount = ReadUInt64(ref ptr, endPtr);
-            uint shardAlign = Alignment;
-            for (ulong i = 0; i < kvCount; i++)
+            var shardStream = new FileStream(shardPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            try
             {
-                string key = ReadString(ref ptr, endPtr);
-                uint vType = ReadUInt32(ref ptr, endPtr);
-                object val = ReadValue(ref ptr, endPtr, (GgufValueType)vType, 0);
-                if (key == "general.alignment" && val is uint u32 && u32 > 0) shardAlign = u32;
+                mmf = MemoryMappedFile.CreateFromFile(shardStream, null, 0, MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: false);
+            }
+            catch
+            {
+                shardStream.Dispose();
+                throw;
             }
 
-            var shardTensors = new List<GgufTensorInfo>((int)tCount);
-            for (ulong i = 0; i < tCount; i++)
+            try
             {
-                string name = ReadString(ref ptr, endPtr);
-                uint nDims = ReadUInt32(ref ptr, endPtr);
-                ulong[] dims = new ulong[nDims];
-                for (uint d = 0; d < nDims; d++) dims[d] = ReadUInt64(ref ptr, endPtr);
-                var tType = (GgufType)ReadUInt32(ref ptr, endPtr);
-                ulong offset = ReadUInt64(ref ptr, endPtr);
-                var info = new GgufTensorInfo { Name = name, DimensionsCount = nDims, Dimensions = dims, Type = tType, Offset = offset };
-                shardTensors.Add(info);
-                Tensors[name] = info;
-                TensorList.Add(info);
-            }
+                acc = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+                acc.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
 
-            ulong headerBytes = (ulong)(ptr - basePtr);
-            ulong rem = headerBytes % shardAlign;
-            ulong dataOff = rem == 0 ? headerBytes : headerBytes + (shardAlign - rem);
+                byte* ptr = basePtr;
+                byte* endPtr = basePtr + shardLen;
+                uint magic = ReadUInt32(ref ptr, endPtr);
+                if (magic != 0x46554747) throw new InvalidDataException($"Invalid GGUF magic in shard {shardPath}.");
+                uint ver = ReadUInt32(ref ptr, endPtr);
+                if (ver < 2 || ver > 3) throw new NotSupportedException($"Unsupported GGUF version {ver} in shard {shardPath}.");
 
-            _extraShards.Add(new ExtraShardMapping
-            {
-                Path = shardPath,
-                TensorDataOffset = dataOff,
-                TensorCount = shardTensors.Count,
-                SingleTensorName = shardTensors.Count == 1 ? shardTensors[0].Name : null,
-                Mmf = mmf,
-                Acc = acc,
-                BasePtr = (IntPtr)basePtr
-            });
+                ulong tCount = ReadUInt64(ref ptr, endPtr);
+                ulong kvCount = ReadUInt64(ref ptr, endPtr);
+                ulong remainingBytes = (ulong)(endPtr - ptr);
+                if (kvCount > remainingBytes / 8 || tCount > remainingBytes / 16)
+                    throw new InvalidDataException($"Shard '{shardPath}' header metadata counts exceed available bytes (KV={kvCount}, Tensors={tCount}).");
 
-            foreach (var t in shardTensors)
-            {
-                ValidateTensorBoundsAndAlignment(t, dataOff, (ulong)shardLen, $"shard '{Path.GetFileName(shardPath)}'");
-                _shardTensorPtrs[t.Name] = (IntPtr)(basePtr + dataOff + t.Offset);
-                _shardTensorLocations[t.Name] = (shardPath, checked((long)(dataOff + t.Offset)));
-                if (t.Name == "per_layer_token_embd.weight")
+                uint shardAlign = Alignment;
+                for (ulong i = 0; i < kvCount; i++)
                 {
-                    PleTableFilePath = shardPath;
-                    PleTableByteOffset = (long)(dataOff + t.Offset);
+                    string key = ReadString(ref ptr, endPtr);
+                    uint vType = ReadUInt32(ref ptr, endPtr);
+                    object val = ReadValue(ref ptr, endPtr, (GgufValueType)vType, 0);
+                    if (key == "general.alignment")
+                    {
+                        uint parsedAlign = 0;
+                        if (val is uint u32) parsedAlign = u32;
+                        else if (val is int i32 && i32 > 0) parsedAlign = (uint)i32;
+                        else if (val is ulong u64 && u64 <= uint.MaxValue) parsedAlign = (uint)u64;
+
+                        if (parsedAlign > 0 && (parsedAlign & (parsedAlign - 1)) == 0)
+                            shardAlign = parsedAlign;
+                        else if (parsedAlign > 0)
+                            throw new InvalidDataException($"Invalid GGUF general.alignment ({parsedAlign}) in shard '{shardPath}': must be a positive power of 2.");
+                    }
                 }
+
+                int tCountInt = checked((int)tCount);
+                var shardTensors = new List<GgufTensorInfo>(tCountInt);
+                for (ulong i = 0; i < tCount; i++)
+                {
+                    string name = ReadString(ref ptr, endPtr);
+                    uint nDims = ReadUInt32(ref ptr, endPtr);
+                    if (nDims > MaxDimensionsCount)
+                        throw new InvalidDataException($"Tensor '{name}' in shard '{shardPath}' exceeds maximum supported dimensions ({nDims} > {MaxDimensionsCount}).");
+
+                    ulong[] dims = new ulong[nDims];
+                    for (uint d = 0; d < nDims; d++) dims[d] = ReadUInt64(ref ptr, endPtr);
+                    var tType = (GgufType)ReadUInt32(ref ptr, endPtr);
+                    ulong offset = ReadUInt64(ref ptr, endPtr);
+                    var info = new GgufTensorInfo { Name = name, DimensionsCount = nDims, Dimensions = dims, Type = tType, Offset = offset };
+                    shardTensors.Add(info);
+                    Tensors[name] = info;
+                    TensorList.Add(info);
+                }
+
+                ulong headerBytes = (ulong)(ptr - basePtr);
+                if (shardAlign == 0) shardAlign = 32;
+                ulong rem = headerBytes % shardAlign;
+                ulong dataOff = rem == 0 ? headerBytes : headerBytes + (shardAlign - rem);
+
+                _extraShards.Add(new ExtraShardMapping
+                {
+                    Path = shardPath,
+                    TensorDataOffset = dataOff,
+                    TensorCount = shardTensors.Count,
+                    SingleTensorName = shardTensors.Count == 1 ? shardTensors[0].Name : null,
+                    Mmf = mmf,
+                    Acc = acc,
+                    BasePtr = (IntPtr)basePtr
+                });
+                ownershipTransferred = true;
+
+                foreach (var t in shardTensors)
+                {
+                    ValidateTensorBoundsAndAlignment(t, dataOff, (ulong)shardLen, $"shard '{Path.GetFileName(shardPath)}'");
+                    _shardTensorPtrs[t.Name] = (IntPtr)(basePtr + dataOff + t.Offset);
+                    _shardTensorLocations[t.Name] = (shardPath, checked((long)(dataOff + t.Offset)));
+                    if (t.Name == "per_layer_token_embd.weight")
+                    {
+                        PleTableFilePath = shardPath;
+                        PleTableByteOffset = (long)(dataOff + t.Offset);
+                    }
+                }
+            }
+            catch
+            {
+                if (!ownershipTransferred)
+                {
+                    if (basePtr != null && acc != null)
+                    {
+                        try { acc.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                    }
+                    acc?.Dispose();
+                    mmf?.Dispose();
+                }
+                throw;
             }
         }
     }

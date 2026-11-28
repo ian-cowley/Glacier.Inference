@@ -100,6 +100,7 @@ public unsafe class VulkanKernelTests
 
     // ---------- quantised mat-vec ----------
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void QuantizedMatVec_MatchesCpuReference_ForAllSupportedTypes()
     {
         const int K = 1024, N = 300;     // N deliberately not a multiple of the workgroup size
@@ -134,6 +135,7 @@ public unsafe class VulkanKernelTests
 
     // ---------- Mixture-of-Experts FFN ----------
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void MoeFfn_RouterExpertsAndSharedExpert_MatchCpuReference()
     {
         const int DIM = 512, E = 16, TOPK = 4, F = 256;
@@ -225,6 +227,7 @@ public unsafe class VulkanKernelTests
     private const int GdnD = 128, GdnConvKernel = 4;
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void GatedDeltaNet_TokenStep_MatchesReference_AndUsesTiledHeadMapping()
     {
         // nV / nK = 2 so grouped (h / 2) and tiled (h % nK) V-head -> Q/K-head mappings differ; llama.cpp tiles.
@@ -328,6 +331,7 @@ public unsafe class VulkanKernelTests
     private const int AttD = 256, AttRope = 64;
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void FullAttention_QkNormRopeKvCacheAndGate_MatchReference()
     {
         const int NQ = 4, NKV = 2, MAXSEQ = 16, TOKENS = 6;
@@ -429,6 +433,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void Iq4Xs_And_Mxfp4_MatVec_MatchCpuReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -508,6 +513,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void StandardGqa_And_GeGlu_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -567,6 +573,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void Mamba2_Conv_And_Recurrence_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -627,6 +634,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void Mla_And_DsaTopk_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -670,6 +678,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void Mamba2_PackedOffsets_And_MultiStep_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -753,6 +762,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void DsaTopk_MultiStep_CacheAppend_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -816,6 +826,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void QMatVec_Q3K_And_IQ4NL_MatchReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -882,6 +893,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public unsafe void BatchedPrefillKernels_MatchReference_AndHazardCoalescingSkipsIndependentBarriers()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);
@@ -951,6 +963,7 @@ public unsafe class VulkanKernelTests
     }
 
     [VulkanFact]
+    [Trait("Hardware", "Gpu")]
     public void BatchedPrefill_GdnAndFullAttention_MatchSequentialReference()
     {
         using var ctx = new VulkanContext(VulkanFactAttribute.DeviceOrdinal);

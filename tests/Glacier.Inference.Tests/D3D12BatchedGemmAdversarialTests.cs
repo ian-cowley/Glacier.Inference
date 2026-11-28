@@ -9,6 +9,7 @@ using Glacier.Inference.Quant;
 using Vortice.Direct3D12;
 using Xunit;
 
+[Trait("Hardware", "Gpu")]
 [Collection("SequentialGpu")]
 public unsafe class D3D12BatchedGemmAdversarialTests
 {

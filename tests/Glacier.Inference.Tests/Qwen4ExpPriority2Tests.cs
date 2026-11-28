@@ -863,7 +863,34 @@ public sealed unsafe class Qwen4ExpPriority2Tests : IDisposable
 
         Assert.Equal(2, moePolicy.RecommendedMtpDraftTokens);
         Assert.Equal(4, densePolicy.RecommendedMtpDraftTokens);
-        Assert.Equal(PleIoMode.MemoryMapped, moePolicy.RecommendedPleIoMode);
+
+        ulong liveMargin = Math.Max(4UL * 1024 * 1024 * 1024, snap.TotalPhysicalRamBytes / 8UL);
+        if (snap.TotalPhysicalRamBytes < 16UL * 1024 * 1024 * 1024)
+        {
+            liveMargin = Math.Min(liveMargin, Math.Max(1UL * 1024 * 1024 * 1024, snap.AvailablePhysicalRamBytes / 2UL));
+        }
+        long liveMapBytes = (long)Math.Min((ulong)long.MaxValue, HardwareRuntimeProfiler.EstimateTotalModelAndPleBytes(weights));
+        var expectedLiveMode = DirectIoNgramTable.ResolveIoMode(
+            PleIoMode.Auto,
+            liveMapBytes,
+            snap.AvailablePhysicalRamBytes,
+            liveMargin);
+        Assert.Equal(expectedLiveMode, moePolicy.RecommendedPleIoMode);
+
+        // Deterministic PLE I/O mode policy checks using explicit synthetic memory snapshots
+        var abundantRamSnap = snap with
+        {
+            TotalPhysicalRamBytes = 64UL * 1024 * 1024 * 1024,
+            AvailablePhysicalRamBytes = 32UL * 1024 * 1024 * 1024
+        };
+        var constrainedRamSnap = snap with
+        {
+            TotalPhysicalRamBytes = 64UL * 1024 * 1024 * 1024,
+            AvailablePhysicalRamBytes = 2UL * 1024 * 1024 * 1024
+        };
+        Assert.Equal(PleIoMode.MemoryMapped, HardwareRuntimeProfiler.RecommendPolicy(abundantRamSnap, weights).RecommendedPleIoMode);
+        Assert.Equal(PleIoMode.DirectIo, HardwareRuntimeProfiler.RecommendPolicy(constrainedRamSnap, weights).RecommendedPleIoMode);
+
         Assert.Equal(PleIoMode.DirectIo, DirectIoNgramTable.ResolveIoMode(PleIoMode.Auto, 40L * 1024 * 1024 * 1024, 32UL * 1024 * 1024 * 1024));
         Assert.Equal(PleIoMode.MemoryMapped, DirectIoNgramTable.ResolveIoMode(PleIoMode.Auto, 4L * 1024 * 1024 * 1024, 32UL * 1024 * 1024 * 1024));
         Assert.NotNull(HardwareRuntimeProfiler.CreateCalibratedCoScheduler(snap));
@@ -989,6 +1016,7 @@ public sealed unsafe class Qwen4ExpPriority2Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12_GemvGgmlQ2_0_ExpertAndBatchGemm_MatchCpuExact()
     {
         if (!OperatingSystem.IsWindows()) return;

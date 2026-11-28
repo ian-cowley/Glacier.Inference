@@ -127,6 +127,7 @@ public class EmbeddingGemma2VisionTests
     public void ImageEmbedding_MatchesReference_OnCpu() => CheckImageEmbedding(EmbeddingDevice.Cpu, -1);
 
     [Theory]
+    [Trait("Hardware", "Gpu")]
     [InlineData(0)]
     [InlineData(1)]
     public void ImageEmbedding_MatchesReference_OnEachGpu(int adapter)

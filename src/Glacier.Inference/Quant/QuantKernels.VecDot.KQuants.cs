@@ -29,17 +29,10 @@ public static unsafe partial class QuantKernels
 
             if (Vector512.IsHardwareAccelerated)
             {
-                var acc512 = Vector512<float>.Zero;
-                for (int l = 0; l < 32; l += 16)
-                {
-                    var vx = Vector512.Load(x + l);
-                    var vq = Vector512.Create(
-                        (float)q[l + 0], (float)q[l + 1], (float)q[l + 2], (float)q[l + 3],
-                        (float)q[l + 4], (float)q[l + 5], (float)q[l + 6], (float)q[l + 7],
-                        (float)q[l + 8], (float)q[l + 9], (float)q[l + 10], (float)q[l + 11],
-                        (float)q[l + 12], (float)q[l + 13], (float)q[l + 14], (float)q[l + 15]);
-                    acc512 = Vector512.FusedMultiplyAdd(vx, vq, acc512);
-                }
+                var q32 = Vector256.Load(q);
+                var vq0 = WidenSByteToFloat512(q32.GetLower());
+                var vq1 = WidenSByteToFloat512(q32.GetUpper());
+                var acc512 = Vector512.FusedMultiplyAdd(Vector512.Load(x), vq0, Vector512.Load(x + 16) * vq1);
                 blockSum = Vector512.Sum(acc512);
             }
             else if (AdvSimd.IsSupported)
@@ -101,16 +94,13 @@ public static unsafe partial class QuantKernels
 
             if (Vector512.IsHardwareAccelerated)
             {
-                var vqLow = Vector512.Create(
-                    (float)((q[0] & 0x0F) - 8), (float)((q[1] & 0x0F) - 8), (float)((q[2] & 0x0F) - 8), (float)((q[3] & 0x0F) - 8),
-                    (float)((q[4] & 0x0F) - 8), (float)((q[5] & 0x0F) - 8), (float)((q[6] & 0x0F) - 8), (float)((q[7] & 0x0F) - 8),
-                    (float)((q[8] & 0x0F) - 8), (float)((q[9] & 0x0F) - 8), (float)((q[10] & 0x0F) - 8), (float)((q[11] & 0x0F) - 8),
-                    (float)((q[12] & 0x0F) - 8), (float)((q[13] & 0x0F) - 8), (float)((q[14] & 0x0F) - 8), (float)((q[15] & 0x0F) - 8));
-                var vqHigh = Vector512.Create(
-                    (float)((q[0] >> 4) - 8), (float)((q[1] >> 4) - 8), (float)((q[2] >> 4) - 8), (float)((q[3] >> 4) - 8),
-                    (float)((q[4] >> 4) - 8), (float)((q[5] >> 4) - 8), (float)((q[6] >> 4) - 8), (float)((q[7] >> 4) - 8),
-                    (float)((q[8] >> 4) - 8), (float)((q[9] >> 4) - 8), (float)((q[10] >> 4) - 8), (float)((q[11] >> 4) - 8),
-                    (float)((q[12] >> 4) - 8), (float)((q[13] >> 4) - 8), (float)((q[14] >> 4) - 8), (float)((q[15] >> 4) - 8));
+                var raw = Vector128.Load(q);
+                var mask0F = Vector128.Create((byte)0x0F);
+                var lo = raw & mask0F;
+                var hi = Vector128.ShiftRightLogical(raw.AsUInt16(), 4).AsByte() & mask0F;
+                var v8 = Vector512.Create(8.0f);
+                var vqLow = WidenUInt8ToFloat512(lo) - v8;
+                var vqHigh = WidenUInt8ToFloat512(hi) - v8;
                 var vxLow = Vector512.Load(x);
                 var vxHigh = Vector512.Load(x + 16);
                 var vAcc = Vector512.FusedMultiplyAdd(vxLow, vqLow, vxHigh * vqHigh);

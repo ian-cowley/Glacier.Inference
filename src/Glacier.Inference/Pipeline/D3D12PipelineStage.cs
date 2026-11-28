@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Pipeline;
 
 using System;
@@ -98,3 +99,4 @@ public sealed class D3D12PipelineStage : IPipelineStage
         GC.SuppressFinalize(this);
     }
 }
+#endif

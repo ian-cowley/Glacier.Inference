@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -1180,3 +1181,4 @@ public sealed unsafe partial class Gemma4D3D12Model : ID3D12Model
         }
     }
 }
+#endif

@@ -1,3 +1,4 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
@@ -31,6 +32,9 @@ public sealed unsafe class D3D12Context : IDisposable
 
     private ID3D12Resource _dummyBuffer = null!;
     private ID3D12Resource _stagingUploadBuffer = null!;
+    private ID3D12Resource? _readbackBuffer;
+    private ulong _readbackCapacity;
+    private readonly Lock _readbackLock = new();
     private const ulong StagingUploadBufferSize = 32 * 1024 * 1024; // 32 MB reusable staging buffer
     private string _deviceName = string.Empty;
     private bool _disposed;
@@ -42,10 +46,11 @@ public sealed unsafe class D3D12Context : IDisposable
     public ID3D12Resource DummyBuffer => _dummyBuffer;
     private ulong _dedicatedVideoMemory;
     private ulong _sharedSystemMemory;
+    private bool _isUma;
     public ulong DedicatedVideoMemory => _dedicatedVideoMemory;
     public ulong SharedSystemMemory => _sharedSystemMemory;
-    public bool IsUnifiedMemoryArchitecture => _dedicatedVideoMemory < 4_000_000_000UL;
-    public ulong TotalAccessibleMemory => (_dedicatedVideoMemory < 4_000_000_000UL || _deviceName.Contains("Radeon", StringComparison.OrdinalIgnoreCase) || _deviceName.Contains("Intel", StringComparison.OrdinalIgnoreCase))
+    public bool IsUnifiedMemoryArchitecture => _isUma;
+    public ulong TotalAccessibleMemory => _isUma
         ? (_dedicatedVideoMemory + _sharedSystemMemory)
         : _dedicatedVideoMemory;
     public IDXGIAdapter1? Adapter => _adapter;
@@ -187,6 +192,9 @@ public sealed unsafe class D3D12Context : IDisposable
         if (!hr.Success || _device == null)
             throw new InvalidOperationException($"Failed to create Direct3D 12 device on {_deviceName}: {hr}");
 
+        var arch = new FeatureDataArchitecture1 { NodeIndex = 0 };
+        _isUma = _device.CheckFeatureSupport(Vortice.Direct3D12.Feature.Architecture1, ref arch) && (bool)arch.Uma;
+
         var queueDesc = new CommandQueueDescription(CommandListType.Compute);
         _queue = _device.CreateCommandQueue(queueDesc);
 
@@ -286,7 +294,12 @@ public sealed unsafe class D3D12Context : IDisposable
 
         ulong clearBytes = Math.Min(sizeInBytes, StagingUploadBufferSize);
         void* pUpload = null;
-        _stagingUploadBuffer.Map(0, null, &pUpload);
+        var mapHr = _stagingUploadBuffer.Map(0, null, &pUpload);
+        if (!mapHr.Success || pUpload == null)
+        {
+            var reason = _device.DeviceRemovedReason;
+            throw new InvalidOperationException($"stagingUploadBuffer.Map failed in ZeroDeviceBuffer: {mapHr}, DeviceRemovedReason: {reason}, sizeInBytes: {sizeInBytes}");
+        }
         NativeMemory.Clear(pUpload, (nuint)clearBytes);
         _stagingUploadBuffer.Unmap(0);
 
@@ -329,28 +342,44 @@ public sealed unsafe class D3D12Context : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (sizeInBytes == 0) return;
 
-        using var readbackBuffer = CreateReadbackBuffer(sizeInBytes);
-
-        _cmdAlloc.Reset();
-        _cmdList.Reset(_cmdAlloc, null);
-
-        _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.Common, ResourceStates.CopySource);
-        _cmdList.CopyBufferRegion(readbackBuffer, 0, deviceBuffer, 0, sizeInBytes);
-        _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.CopySource, ResourceStates.Common);
-
-        _cmdList.Close();
-        _queue.ExecuteCommandList(_cmdList);
-        Synchronize();
-
-        void* pRead = null;
-        var mapRes = readbackBuffer.Map(0, null, &pRead);
-        if (pRead == null || !mapRes.Success)
+        lock (_readbackLock)
         {
-            var reason = _device.DeviceRemovedReason;
-            throw new InvalidOperationException($"readbackBuffer.Map failed: {mapRes}, DeviceRemovedReason: {reason}");
+            ulong alignedSize = (sizeInBytes + 255UL) & ~255UL;
+            if (_readbackBuffer == null || _readbackCapacity < alignedSize)
+            {
+                _readbackBuffer?.Dispose();
+                ulong newCapacity = Math.Max(alignedSize, _readbackCapacity * 2UL);
+                _readbackBuffer = CreateReadbackBuffer(newCapacity);
+                _readbackCapacity = newCapacity;
+            }
+
+            _cmdAlloc.Reset();
+            _cmdList.Reset(_cmdAlloc, null);
+
+            _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.Common, ResourceStates.CopySource);
+            _cmdList.CopyBufferRegion(_readbackBuffer, 0, deviceBuffer, 0, sizeInBytes);
+            _cmdList.ResourceBarrierTransition(deviceBuffer, ResourceStates.CopySource, ResourceStates.Common);
+
+            _cmdList.Close();
+            _queue.ExecuteCommandList(_cmdList);
+            Synchronize();
+
+            void* pRead = null;
+            var mapRes = _readbackBuffer.Map(0, null, &pRead);
+            if (pRead == null || !mapRes.Success)
+            {
+                var reason = _device.DeviceRemovedReason;
+                throw new InvalidOperationException($"readbackBuffer.Map failed: {mapRes}, DeviceRemovedReason: {reason}");
+            }
+            try
+            {
+                Buffer.MemoryCopy(pRead, (void*)pHostData, sizeInBytes, sizeInBytes);
+            }
+            finally
+            {
+                _readbackBuffer.Unmap(0);
+            }
         }
-        Buffer.MemoryCopy(pRead, (void*)pHostData, sizeInBytes, sizeInBytes);
-        readbackBuffer.Unmap(0);
     }
 
     public void Synchronize(int timeoutMs = 300000)
@@ -654,7 +683,12 @@ public sealed unsafe class D3D12Context : IDisposable
         if (count == 0) return;
 
         void* pUpload = null;
-        _recentTokensUploadBuffer.Map(0, null, &pUpload);
+        var mapHr = _recentTokensUploadBuffer.Map(0, null, &pUpload);
+        if (!mapHr.Success || pUpload == null)
+        {
+            var reason = _device.DeviceRemovedReason;
+            throw new InvalidOperationException($"recentTokensUploadBuffer.Map failed in DispatchRepetitionPenalty: {mapHr}, DeviceRemovedReason: {reason}, count: {count}");
+        }
         Buffer.MemoryCopy(uniqueBuf, pUpload, (ulong)(maxPenaltyTokens * sizeof(int)), (ulong)(count * sizeof(int)));
         _recentTokensUploadBuffer.Unmap(0);
 
@@ -904,6 +938,12 @@ public sealed unsafe class D3D12Context : IDisposable
             _psoVecAddWeightedFromBuffer?.Dispose();
             _sigVecAddWeightedFromBuffer?.Dispose();
 
+            lock (_readbackLock)
+            {
+                _readbackBuffer?.Dispose();
+                _readbackBuffer = null;
+                _readbackCapacity = 0;
+            }
             _stagingUploadBuffer?.Dispose();
             _dummyBuffer?.Dispose();
             _fenceEvent?.Dispose();
@@ -917,3 +957,4 @@ public sealed unsafe class D3D12Context : IDisposable
         }
     }
 }
+#endif

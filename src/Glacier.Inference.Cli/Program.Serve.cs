@@ -355,10 +355,15 @@ public static partial class Program
                 Console.WriteLine($"Loaded LoRA:  {string.Join(", ", loadedAdapters)}");
             }
 
-            using var serveApp = GlacierServeApp.CreateBuilder()
+            var serveBuilder = GlacierServeApp.CreateBuilder()
                 .UseHost(host)
-                .UsePort(port)
-                .Build();
+                .UsePort(port);
+            if (!string.IsNullOrEmpty(apiKey))
+            {
+                Console.WriteLine("API Auth:     Enabled (Bearer)");
+                serveBuilder.UseBearerAuth(apiKey);
+            }
+            using var serveApp = serveBuilder.Build();
             serveApp.MapInference(batchEngine, modelName, batchSleepMemory);
 
             using var cts = new CancellationTokenSource();
@@ -428,14 +433,22 @@ public static partial class Program
         return 0;
     }
 
-    private static bool CanUseContinuousBatchEngine(
+    internal static bool FixedTimeTokenEquals(string provided, string expected)
+    {
+        byte[] a = SHA256.HashData(Encoding.UTF8.GetBytes(provided));
+        byte[] b = SHA256.HashData(Encoding.UTF8.GetBytes(expected));
+        return CryptographicOperations.FixedTimeEquals(a, b);
+    }
+
+    internal static bool CanUseContinuousBatchEngine(
         string modelPath,
         string? apiKey,
         string? split,
         string? device,
         InferenceEngineType engine)
     {
-        if (!string.IsNullOrEmpty(apiKey) || !string.IsNullOrEmpty(split))
+        _ = apiKey;
+        if (!string.IsNullOrEmpty(split))
             return false;
 
         if (engine is not (InferenceEngineType.Auto or InferenceEngineType.BareMetal or InferenceEngineType.Cpu))
@@ -547,15 +560,11 @@ public static partial class Program
                 if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
                 {
                     string token = authHeader.Substring(7).Trim();
-                    authorized = CryptographicOperations.FixedTimeEquals(
-                        Encoding.UTF8.GetBytes(token),
-                        Encoding.UTF8.GetBytes(apiKey));
+                    authorized = FixedTimeTokenEquals(token, apiKey);
                 }
                 else if (!string.IsNullOrEmpty(xApiKey))
                 {
-                    authorized = CryptographicOperations.FixedTimeEquals(
-                        Encoding.UTF8.GetBytes(xApiKey),
-                        Encoding.UTF8.GetBytes(apiKey));
+                    authorized = FixedTimeTokenEquals(xApiKey, apiKey);
                 }
 
                 if (!authorized)

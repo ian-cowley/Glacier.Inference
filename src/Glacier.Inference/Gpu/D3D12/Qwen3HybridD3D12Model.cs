@@ -1,9 +1,11 @@
+#if !ANDROID
 namespace Glacier.Inference.Gpu.D3D12;
 
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using Glacier.Inference.Engine;
 using Glacier.Inference.Gguf;
 using Glacier.Inference.Memory;
 using Glacier.Inference.Model;
@@ -180,7 +182,7 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
     private ID3D12Resource? _uploadExpertOut;
     private float* _pUploadExpertOut;
     private float[]? _normXSums;
-    private Qwen2D3D12Model.ExpertCpuWorkspace[]? _expertWorkspaces;
+    private ExpertCpuWorkspace[]? _expertWorkspaces;
 
     // In-VRAM MoE Router and Shared Expert Buffers
     private ID3D12Resource? _dTopKIndices;
@@ -692,7 +694,7 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
                 _pUploadExpertOut = (float*)pUpExpOut;
 
                 _normXSums = new float[(_dim + 31) / 32];
-                _expertWorkspaces = [new Qwen2D3D12Model.ExpertCpuWorkspace(expertFfnDim, _dim)];
+                _expertWorkspaces = [new ExpertCpuWorkspace(expertFfnDim, _dim)];
             }
         }
 
@@ -3186,3 +3188,4 @@ public sealed unsafe partial class Qwen3HybridD3D12Model : ID3D12Model, IHiddenS
         }
     }
 }
+#endif

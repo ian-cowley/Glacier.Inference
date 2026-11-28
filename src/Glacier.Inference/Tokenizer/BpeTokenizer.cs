@@ -15,6 +15,7 @@ public sealed partial class BpeTokenizer
     private readonly Dictionary<string, int> _tokenToId = new(160000, StringComparer.Ordinal);
     private readonly string[] _idToToken;
     private readonly Dictionary<string, int> _bpeRanks = new(160000, StringComparer.Ordinal);
+    private readonly Dictionary<(string Left, string Right), int> _bpePairRanks = new(160000);
     private readonly Dictionary<string, int> _specialTokens = new(StringComparer.Ordinal);
     private readonly HashSet<int> _stopTokens = new();
     private readonly string _architecture = "";
@@ -82,9 +83,8 @@ public sealed partial class BpeTokenizer
 
     public BpeTokenizer(GgufFile gguf)
     {
-        EosTokenId = gguf.EosTokenId;
         BosTokenId = gguf.BosTokenId;
-        PadTokenId = (int)gguf.GetMetadataUInt32("tokenizer.ggml.padding_token_id", (uint)BosTokenId);
+        PadTokenId = (int)gguf.GetMetadataUInt32("tokenizer.ggml.padding_token_id", BosTokenId >= 0 ? (uint)BosTokenId : 0u);
         AddBosToken = gguf.AddBosToken;
         AddEosToken = gguf.AddEosToken;
         _architecture = gguf.Architecture;
@@ -110,99 +110,68 @@ public sealed partial class BpeTokenizer
             for (int i = 0; i < mergeList.Count; i++)
             {
                 string merge = mergeList[i]?.ToString() ?? "";
-                _bpeRanks[merge] = i;
+                AddMergeRule(merge, i);
             }
         }
 
-        // Register special tokens across architectures (Qwen, LLaMA 3, DeepSeek, Mistral)
-        RegisterSpecialToken("<|im_start|>");
-        RegisterSpecialToken("<|im_end|>");
-        RegisterSpecialToken("<|endoftext|>");
-        RegisterSpecialToken("<|begin_of_text|>");
-        RegisterSpecialToken("<|end_of_text|>");
-        RegisterSpecialToken("<|start_header_id|>");
-        RegisterSpecialToken("<|end_header_id|>");
-        RegisterSpecialToken("<|eot_id|>");
-        RegisterSpecialToken("<s>");
-        RegisterSpecialToken("</s>");
-        RegisterSpecialToken("<unk>");
-        RegisterSpecialToken("<think>");
-        RegisterSpecialToken("</think>");
-        RegisterSpecialToken("<｜begin of sentence｜>");
-        RegisterSpecialToken("<｜begin▁of▁sentence｜>");
-        RegisterSpecialToken("<｜end of sentence｜>");
-        RegisterSpecialToken("<｜end▁of▁sentence｜>");
-        RegisterSpecialToken("<｜System｜>");
-        RegisterSpecialToken("<｜User｜>");
-        RegisterSpecialToken("<｜Assistant｜>");
-        RegisterSpecialToken("<｜latest_reminder｜>");
-        RegisterSpecialToken("｜DSML｜");
-        RegisterSpecialToken("<｜ref｜>");
-        RegisterSpecialToken("<｜/ref｜>");
-        RegisterSpecialToken("<｜box｜>");
-        RegisterSpecialToken("<｜/box｜>");
-        RegisterSpecialToken("<｜point｜>");
-        RegisterSpecialToken("<｜/point｜>");
-        RegisterSpecialToken("<｜polygon｜>");
-        RegisterSpecialToken("<｜/polygon｜>");
+        RegisterKnownSpecialTokens();
 
-        // Gemma 4 special tokens
-        RegisterSpecialToken("<|turn>");
-        RegisterSpecialToken("<turn|>");
-        RegisterSpecialToken("<|channel>");
-        RegisterSpecialToken("<channel|>");
-        RegisterSpecialToken("<|tool>");
-        RegisterSpecialToken("<tool|>");
-        RegisterSpecialToken("<|tool_call>");
-        RegisterSpecialToken("<tool_call|>");
-        RegisterSpecialToken("<|tool_response>");
-        RegisterSpecialToken("<tool_response|>");
-        RegisterSpecialToken("<|think|>");
-        RegisterSpecialToken("<eos>");
-
-        // Thinking Machines Inkling-2 special control tokens (IDs 200000..200057)
-        RegisterSpecialToken("<|message_user|>");
-        RegisterSpecialToken("<|message_model|>");
-        RegisterSpecialToken("<|message_system|>");
-        RegisterSpecialToken("<|message_tool|>");
-        RegisterSpecialToken("<|content_text|>");
-        RegisterSpecialToken("<|content_thinking|>");
-        RegisterSpecialToken("<|content_image|>");
-        RegisterSpecialToken("<|content_xml|>");
-        RegisterSpecialToken("<|content_invoke_tool_json|>");
-        RegisterSpecialToken("<|content_invoke_tool_text|>");
-        RegisterSpecialToken("<|content_tool_error|>");
-        RegisterSpecialToken("<|end_message|>");
-        RegisterSpecialToken("<|content_model_end_sampling|>");
-        RegisterSpecialToken("<|unused_200054|>");
-
-        // Dynamically register model's configured BOS/EOS
+        // Dynamically register model's configured BOS/EOS/EOT tokens (supports scalar and array GGUF metadata)
         if (BosTokenId >= 0 && BosTokenId < _idToToken.Length)
         {
             RegisterSpecialToken(_idToToken[BosTokenId]);
         }
+
+        var eosIds = gguf.GetEosTokenIds();
+        for (int i = 0; i < eosIds.Count; i++)
+        {
+            int id = eosIds[i];
+            if (id >= 0)
+            {
+                if (id < _idToToken.Length)
+                    RegisterSpecialToken(_idToToken[id]);
+                _stopTokens.Add(id);
+            }
+        }
+
+        int resolvedEos = gguf.EosTokenId;
+        if (resolvedEos < 0 && eosIds.Count > 0)
+            resolvedEos = eosIds[0];
+
+        if (resolvedEos < 0)
+        {
+            ReadOnlySpan<string> fallbackEosNames =
+            [
+                "<|im_end|>",
+                "<|endoftext|>",
+                "</s>",
+                "<eos>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+                "<｜end▁of▁sentence｜>",
+                "<｜end of sentence｜>",
+                "<|content_model_end_sampling|>",
+                "<turn|>"
+            ];
+            for (int i = 0; i < fallbackEosNames.Length; i++)
+            {
+                if (_tokenToId.TryGetValue(fallbackEosNames[i], out int candidateId))
+                {
+                    resolvedEos = candidateId;
+                    break;
+                }
+            }
+        }
+        EosTokenId = resolvedEos;
+
         if (EosTokenId >= 0 && EosTokenId < _idToToken.Length)
         {
             RegisterSpecialToken(_idToToken[EosTokenId]);
-            RegisterStopToken(_idToToken[EosTokenId]);
         }
 
         // Initialize stop tokens (NEVER register <|end_message|>: it delimits internal blocks within one turn)
         if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
-        RegisterStopToken("<|content_model_end_sampling|>");
-        RegisterStopToken("<|im_end|>");
-        RegisterStopToken("<|endoftext|>");
-        RegisterStopToken("<|end_of_text|>");
-        RegisterStopToken("<|eot_id|>");
-        RegisterStopToken("</s>");
-        RegisterStopToken("<｜end of sentence｜>");
-        RegisterStopToken("<｜end▁of▁sentence｜>");
-        RegisterStopToken("<｜User｜>");
-        RegisterStopToken("<｜System｜>");
-        RegisterStopToken("<turn|>");
-        RegisterStopToken("<eos>");
-        RegisterStopToken("<|tool_call>");
-        RegisterStopToken("<|tool_response>");
+        RegisterKnownStopTokens();
 
         string tokModel = gguf.GetMetadataString("tokenizer.ggml.model", "");
         _addSpacePrefix = gguf.GetMetadataBool("tokenizer.ggml.add_space_prefix", fallback: true);
@@ -236,10 +205,6 @@ public sealed partial class BpeTokenizer
         for (int i = 0; i < tokenList.Count; i++)
         {
             _tokenToId[tokenList[i]] = i;
-            if (!isSentencePiece || merges == null)
-            {
-                _specialTokens[tokenList[i]] = i;
-            }
         }
 
         if (merges != null)
@@ -247,27 +212,125 @@ public sealed partial class BpeTokenizer
             int rank = 0;
             foreach (string merge in merges)
             {
-                _bpeRanks[merge] = rank++;
+                AddMergeRule(merge, rank++);
             }
         }
 
-        if (isSentencePiece)
-        {
-            _specialTokens.Clear();
-            RegisterSpecialToken("<s>");
-            RegisterSpecialToken("</s>");
-            RegisterSpecialToken("<unk>");
-            if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[BosTokenId]);
-            if (EosTokenId >= 0 && EosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[EosTokenId]);
-        }
+        RegisterKnownSpecialTokens();
+        if (BosTokenId >= 0 && BosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[BosTokenId]);
+        if (EosTokenId >= 0 && EosTokenId < _idToToken.Length) RegisterSpecialToken(_idToToken[EosTokenId]);
 
         if (EosTokenId >= 0) _stopTokens.Add(EosTokenId);
+        RegisterKnownStopTokens();
+    }
+
+    private void AddMergeRule(string merge, int rank)
+    {
+        _bpeRanks[merge] = rank;
+        int sp = merge.IndexOf(' ', 1);
+        if (sp <= 0) sp = merge.IndexOf(' ');
+        if (sp > 0 && sp + 1 < merge.Length)
+        {
+            string left = merge.Substring(0, sp);
+            string right = merge.Substring(sp + 1);
+            _bpePairRanks[(left, right)] = rank;
+        }
+    }
+
+    private void RegisterKnownSpecialTokens()
+    {
+        // Qwen, LLaMA 3, DeepSeek, Phi, Mistral
+        RegisterSpecialToken("<|im_start|>");
+        RegisterSpecialToken("<|im_end|>");
+        RegisterSpecialToken("<|im_sep|>");
+        RegisterSpecialToken("<|endoftext|>");
+        RegisterSpecialToken("<|begin_of_text|>");
+        RegisterSpecialToken("<|end_of_text|>");
+        RegisterSpecialToken("<|start_header_id|>");
+        RegisterSpecialToken("<|end_header_id|>");
+        RegisterSpecialToken("<|eot_id|>");
+        RegisterSpecialToken("<s>");
+        RegisterSpecialToken("</s>");
+        RegisterSpecialToken("<unk>");
+        RegisterSpecialToken("[INST]");
+        RegisterSpecialToken("[/INST]");
+        RegisterSpecialToken("[TOOL_CALLS]");
+        RegisterSpecialToken("[TOOL_RESULTS]");
+        RegisterSpecialToken("[/TOOL_RESULTS]");
+        RegisterSpecialToken("<think>");
+        RegisterSpecialToken("</think>");
+        RegisterSpecialToken("<｜begin of sentence｜>");
+        RegisterSpecialToken("<｜begin▁of▁sentence｜>");
+        RegisterSpecialToken("<｜end of sentence｜>");
+        RegisterSpecialToken("<｜end▁of▁sentence｜>");
+        RegisterSpecialToken("<｜System｜>");
+        RegisterSpecialToken("<｜User｜>");
+        RegisterSpecialToken("<｜Assistant｜>");
+        RegisterSpecialToken("<｜latest_reminder｜>");
+        RegisterSpecialToken("｜DSML｜");
+        RegisterSpecialToken("<｜ref｜>");
+        RegisterSpecialToken("<｜/ref｜>");
+        RegisterSpecialToken("<｜det｜>");
+        RegisterSpecialToken("<｜/det｜>");
+        RegisterSpecialToken("<｜box｜>");
+        RegisterSpecialToken("<｜/box｜>");
+        RegisterSpecialToken("<｜point｜>");
+        RegisterSpecialToken("<｜/point｜>");
+        RegisterSpecialToken("<｜polygon｜>");
+        RegisterSpecialToken("<｜/polygon｜>");
+        RegisterSpecialToken("<｜grounding｜>");
+        RegisterSpecialToken("<｜/grounding｜>");
+
+        // Gemma 2 / 4 special tokens
+        RegisterSpecialToken("<bos>");
+        RegisterSpecialToken("<eos>");
+        RegisterSpecialToken("<start_of_turn>");
+        RegisterSpecialToken("<end_of_turn>");
+        RegisterSpecialToken("<|turn>");
+        RegisterSpecialToken("<turn|>");
+        RegisterSpecialToken("<|channel>");
+        RegisterSpecialToken("<channel|>");
+        RegisterSpecialToken("<|tool>");
+        RegisterSpecialToken("<tool|>");
+        RegisterSpecialToken("<|tool_call>");
+        RegisterSpecialToken("<tool_call|>");
+        RegisterSpecialToken("<|tool_response>");
+        RegisterSpecialToken("<tool_response|>");
+        RegisterSpecialToken("<|think|>");
+
+        // Thinking Machines Inkling-2 special control tokens (IDs 200000..200057)
+        RegisterSpecialToken("<|message_user|>");
+        RegisterSpecialToken("<|message_model|>");
+        RegisterSpecialToken("<|message_system|>");
+        RegisterSpecialToken("<|message_tool|>");
+        RegisterSpecialToken("<|content_text|>");
+        RegisterSpecialToken("<|content_thinking|>");
+        RegisterSpecialToken("<|content_image|>");
+        RegisterSpecialToken("<|content_xml|>");
+        RegisterSpecialToken("<|content_invoke_tool_json|>");
+        RegisterSpecialToken("<|content_invoke_tool_text|>");
+        RegisterSpecialToken("<|content_tool_error|>");
+        RegisterSpecialToken("<|end_message|>");
+        RegisterSpecialToken("<|content_model_end_sampling|>");
+        RegisterSpecialToken("<|unused_200054|>");
+    }
+
+    private void RegisterKnownStopTokens()
+    {
+        RegisterStopToken("<|content_model_end_sampling|>");
         RegisterStopToken("<|im_end|>");
         RegisterStopToken("<|endoftext|>");
         RegisterStopToken("<|end_of_text|>");
         RegisterStopToken("<|eot_id|>");
         RegisterStopToken("</s>");
+        RegisterStopToken("<｜end of sentence｜>");
+        RegisterStopToken("<｜end▁of▁sentence｜>");
+        RegisterStopToken("<｜User｜>");
+        RegisterStopToken("<｜System｜>");
+        RegisterStopToken("<turn|>");
         RegisterStopToken("<eos>");
+        RegisterStopToken("<|tool_call>");
+        RegisterStopToken("<|tool_response>");
     }
 
     private void RegisterSpecialToken(string token)
@@ -307,8 +370,23 @@ public sealed partial class BpeTokenizer
             .Replace("<｜Assistant｜>", "< ｜Assistant｜ >")
             .Replace("<｜latest_reminder｜>", "< ｜latest_reminder｜ >")
             .Replace("｜DSML｜", "｜ DSML ｜")
+            .Replace("<｜ref｜>", "< ｜ref｜ >")
+            .Replace("<｜/ref｜>", "< ｜/ref｜ >")
+            .Replace("<｜det｜>", "< ｜det｜ >")
+            .Replace("<｜/det｜>", "< ｜/det｜ >")
+            .Replace("<｜box｜>", "< ｜box｜ >")
+            .Replace("<｜/box｜>", "< ｜/box｜ >")
+            .Replace("<｜point｜>", "< ｜point｜ >")
+            .Replace("<｜/point｜>", "< ｜/point｜ >")
+            .Replace("<｜polygon｜>", "< ｜polygon｜ >")
+            .Replace("<｜/polygon｜>", "< ｜/polygon｜ >")
+            .Replace("<｜grounding｜>", "< ｜grounding｜ >")
+            .Replace("<｜/grounding｜>", "< ｜/grounding｜ >")
             .Replace("<think>", "< think >")
             .Replace("</think>", "< /think >")
+            .Replace("<|think|>", "< |think| >")
+            .Replace("<|thought|>", "< |thought| >")
+            .Replace("<|/thought|>", "< |/thought| >")
             .Replace("<|im_start|>", "< |im_start| >")
             .Replace("<|im_end|>", "< |im_end| >")
             .Replace("<|im_sep|>", "< |im_sep| >")
@@ -321,7 +399,39 @@ public sealed partial class BpeTokenizer
             .Replace("<start_of_turn>", "< start_of_turn >")
             .Replace("<end_of_turn>", "< end_of_turn >")
             .Replace("<|turn>", "< |turn >")
-            .Replace("<turn|>", "< turn| >");
+            .Replace("<turn|>", "< turn| >")
+            .Replace("<|channel>", "< |channel >")
+            .Replace("<channel|>", "< channel| >")
+            .Replace("<|tool>", "< |tool >")
+            .Replace("<tool|>", "< tool| >")
+            .Replace("<|tool_call>", "< |tool_call >")
+            .Replace("<tool_call|>", "< tool_call| >")
+            .Replace("<|tool_response>", "< |tool_response >")
+            .Replace("<tool_response|>", "< tool_response| >")
+            .Replace("<eos>", "< eos >")
+            .Replace("<bos>", "< bos >")
+            .Replace("<|message_user|>", "< |message_user| >")
+            .Replace("<|message_model|>", "< |message_model| >")
+            .Replace("<|message_system|>", "< |message_system| >")
+            .Replace("<|message_tool|>", "< |message_tool| >")
+            .Replace("<|content_text|>", "< |content_text| >")
+            .Replace("<|content_thinking|>", "< |content_thinking| >")
+            .Replace("<|content_image|>", "< |content_image| >")
+            .Replace("<|content_xml|>", "< |content_xml| >")
+            .Replace("<|content_invoke_tool_json|>", "< |content_invoke_tool_json| >")
+            .Replace("<|content_invoke_tool_text|>", "< |content_invoke_tool_text| >")
+            .Replace("<|content_tool_error|>", "< |content_tool_error| >")
+            .Replace("<|end_message|>", "< |end_message| >")
+            .Replace("<|content_model_end_sampling|>", "< |content_model_end_sampling| >")
+            .Replace("<|unused_200054|>", "< |unused_200054| >")
+            .Replace("[INST]", "[ INST ]")
+            .Replace("[/INST]", "[ /INST ]")
+            .Replace("<s>", "< s >")
+            .Replace("</s>", "< /s >")
+            .Replace("<unk>", "< unk >")
+            .Replace("[TOOL_CALLS]", "[ TOOL_CALLS ]")
+            .Replace("[TOOL_RESULTS]", "[ TOOL_RESULTS ]")
+            .Replace("[/TOOL_RESULTS]", "[ /TOOL_RESULTS ]");
     }
 
     /// <summary>
@@ -623,6 +733,11 @@ public sealed partial class BpeTokenizer
             foreach (var match in GetTokenSplitterRegex().EnumerateMatches(segment))
             {
                 ReadOnlySpan<char> matchSpan = segment.Slice(match.Index, match.Length);
+                if (_bpeRanks.Count == 0 && _tokenToId.TryGetValue(matchSpan.ToString(), out int directId))
+                {
+                    result.Add(directId);
+                    continue;
+                }
                 int maxBytes = Encoding.UTF8.GetMaxByteCount(matchSpan.Length);
                 byte[]? rentedBytes = null;
                 Span<byte> byteSpan = maxBytes <= 256 ? utf8StackBuffer : (rentedBytes = System.Buffers.ArrayPool<byte>.Shared.Rent(maxBytes));
@@ -636,28 +751,8 @@ public sealed partial class BpeTokenizer
                         word.Add(CharToStringLut[byteSpan[i]]);
                     }
 
-                    // Apply BPE merges
-                    while (word.Count > 1)
-                    {
-                        int bestRank = int.MaxValue;
-                        int bestIndex = -1;
-
-                        for (int i = 0; i < word.Count - 1; i++)
-                        {
-                            string pair = $"{word[i]} {word[i + 1]}";
-                            if (_bpeRanks.TryGetValue(pair, out int rank) && rank < bestRank)
-                            {
-                                bestRank = rank;
-                                bestIndex = i;
-                            }
-                        }
-
-                        if (bestIndex == -1) break; // No more merges possible
-
-                        string merged = word[bestIndex] + word[bestIndex + 1];
-                        word[bestIndex] = merged;
-                        word.RemoveAt(bestIndex + 1);
-                    }
+                    // Apply BPE merges via O(n log n) min-heap priority queue
+                    ApplyBpeMerges(word);
 
                     // Map merged tokens to IDs
                     foreach (string piece in word)
@@ -854,24 +949,7 @@ public sealed partial class BpeTokenizer
             i += charStep;
         }
 
-        while (workSymbols.Count > 1)
-        {
-            int bestRank = int.MaxValue;
-            int bestIndex = -1;
-            for (int i = 0; i < workSymbols.Count - 1; i++)
-            {
-                string pair = $"{workSymbols[i]} {workSymbols[i + 1]}";
-                if (_bpeRanks.TryGetValue(pair, out int rank) && rank < bestRank)
-                {
-                    bestRank = rank;
-                    bestIndex = i;
-                }
-            }
-            if (bestIndex == -1) break;
-
-            workSymbols[bestIndex] = workSymbols[bestIndex] + workSymbols[bestIndex + 1];
-            workSymbols.RemoveAt(bestIndex + 1);
-        }
+        ApplyBpeMerges(workSymbols);
 
         foreach (string piece in workSymbols)
         {
@@ -883,6 +961,71 @@ public sealed partial class BpeTokenizer
             {
                 AddUtf8ByteFallback(piece, output);
             }
+        }
+    }
+
+    private void ApplyBpeMerges(List<string> symbols)
+    {
+        int n = symbols.Count;
+        if (n <= 1 || _bpePairRanks.Count == 0)
+            return;
+
+        var sym = new string[n];
+        var prev = new int[n];
+        var next = new int[n];
+        var alive = new bool[n];
+        var gen = new int[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            sym[i] = symbols[i];
+            prev[i] = i - 1;
+            next[i] = i + 1 < n ? i + 1 : -1;
+            alive[i] = true;
+        }
+
+        var pq = new PriorityQueue<(int Left, int Right, int LeftGen, int RightGen), (int Rank, int Pos)>(n);
+
+        void TryPush(int l)
+        {
+            if (l < 0 || !alive[l]) return;
+            int r = next[l];
+            if (r < 0 || !alive[r]) return;
+            if (_bpePairRanks.TryGetValue((sym[l], sym[r]), out int rank))
+            {
+                pq.Enqueue((l, r, gen[l], gen[r]), (rank, l));
+            }
+        }
+
+        for (int i = 0; i < n - 1; i++)
+        {
+            TryPush(i);
+        }
+
+        while (pq.TryDequeue(out var item, out _))
+        {
+            int l = item.Left;
+            int r = item.Right;
+            if (!alive[l] || !alive[r] || next[l] != r || gen[l] != item.LeftGen || gen[r] != item.RightGen)
+                continue;
+
+            sym[l] = string.Concat(sym[l], sym[r]);
+            gen[l]++;
+            alive[r] = false;
+            int rr = next[r];
+            next[l] = rr;
+            if (rr >= 0)
+                prev[rr] = l;
+
+            TryPush(prev[l]);
+            TryPush(l);
+        }
+
+        symbols.Clear();
+        for (int cur = 0; cur >= 0; cur = next[cur])
+        {
+            if (alive[cur])
+                symbols.Add(sym[cur]);
         }
     }
 

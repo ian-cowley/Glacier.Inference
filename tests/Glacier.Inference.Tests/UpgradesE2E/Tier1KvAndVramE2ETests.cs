@@ -272,21 +272,6 @@ public sealed unsafe class Tier1CpuKvAndVramE2ETests
         int defaultSlots = WddmVramGuard.ComputeRecommendedSlotCount(defaultSnap, slotBytes, 0, maxSlotCapacity: 32, minSlotFloor: 0);
         int zeroSlots = WddmVramGuard.ComputeRecommendedSlotCount(zeroSnap, slotBytes, 0, maxSlotCapacity: 32, minSlotFloor: 0);
         Assert.True(zeroSlots > defaultSlots, $"Expected zeroSlots ({zeroSlots}) > defaultSlots ({defaultSlots}).");
-
-        if (OperatingSystem.IsWindows() && D3D12Context.IsSupported)
-        {
-            using var tmp = new TempDirScope();
-            string moePath = UpgradeScenarioFixtures.BuildTinyQwen2MoeModel(
-                tmp.GetFilePath("t1_f4_03_moe.gguf"),
-                dim: 64, ffnDim: 64, expertFfnDim: 64, nLayers: 1, nHeads: 4, nHeadsKv: 2, numExperts: 4, topK: 2, vocabSize: 32, maxSeqLen: 16);
-
-            using var d3dDefault = new TieredMoERunner(moePath, new TieredRunnerOptions { VramReserveMb = null, MaxSequenceLength = 16 });
-            using var d3dZero = new TieredMoERunner(moePath, new TieredRunnerOptions { VramReserveMb = 0, MaxSequenceLength = 16 });
-
-            Assert.True(d3dDefault.EffectiveVramReserveBytes >= 350_000_000UL);
-            Assert.Equal(0UL, d3dZero.EffectiveVramReserveBytes);
-            Assert.True(d3dZero.QueryVramHeadroom().SafeAvailableBytes > d3dDefault.QueryVramHeadroom().SafeAvailableBytes);
-        }
     }
 }
 
@@ -997,5 +982,25 @@ public sealed unsafe class Tier1D3D12KvAndVramE2ETests
             vramReserveMb: 0);
         Assert.NotNull(session.D3D12Model);
         Assert.Equal(0UL, ((Qwen2D3D12Model)session.D3D12Model!).EffectiveVramReserveBytes);
+    }
+
+    [Fact]
+    [Trait("Hardware", "Gpu")]
+    public void T1_F4_06_D3D12TieredMoERunner_VramReserveMbZero_WiresEffectiveReserveZero()
+    {
+        if (!OperatingSystem.IsWindows() || !D3D12Context.IsSupported)
+            return;
+
+        using var tmp = new TempDirScope();
+        string moePath = UpgradeScenarioFixtures.BuildTinyQwen2MoeModel(
+            tmp.GetFilePath("t1_f4_03_moe.gguf"),
+            dim: 64, ffnDim: 64, expertFfnDim: 64, nLayers: 1, nHeads: 4, nHeadsKv: 2, numExperts: 4, topK: 2, vocabSize: 32, maxSeqLen: 16);
+
+        using var d3dDefault = new TieredMoERunner(moePath, new TieredRunnerOptions { VramReserveMb = null, MaxSequenceLength = 16 });
+        using var d3dZero = new TieredMoERunner(moePath, new TieredRunnerOptions { VramReserveMb = 0, MaxSequenceLength = 16 });
+
+        Assert.True(d3dDefault.EffectiveVramReserveBytes >= 350_000_000UL);
+        Assert.Equal(0UL, d3dZero.EffectiveVramReserveBytes);
+        Assert.True(d3dZero.QueryVramHeadroom().SafeAvailableBytes > d3dDefault.QueryVramHeadroom().SafeAvailableBytes);
     }
 }

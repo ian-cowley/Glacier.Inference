@@ -101,8 +101,9 @@ public abstract unsafe class VulkanRunnerBase : ID3D12Model
     private protected VulkanCompute.GBuf UploadFloats(float* ptr, int count) => _vk.AllocDeviceFrom(ptr, (long)count * 4);
     private protected VulkanCompute.GBuf AllocDeviceZero(long bytes)
     {
-        byte[] z = new byte[Math.Max(bytes, 16)];
-        fixed (byte* p = z) return _vk.AllocDeviceFrom(p, z.Length);
+        var b = _vk.AllocDeviceOnly(bytes);
+        b.Zero();
+        return b;
     }
     private protected VulkanCompute.GBuf AllocStateZero(long bytes) { var b = _vk.Alloc(bytes); b.Zero(); _recurrentStates.Add(b); return b; }
 

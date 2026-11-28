@@ -148,6 +148,7 @@ public static class DeviceManager
     {
         var results = new List<DeviceInfo>();
 
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             try
@@ -159,6 +160,7 @@ public static class DeviceManager
                 // Fallback if DXGI fails
             }
         }
+#endif
 
         // If DXGI found no discrete GPUs or if on Linux, run native direct driver enumeration
         if (results.Count == 0)
@@ -371,6 +373,7 @@ public static class DeviceManager
         }
     }
 
+#if !ANDROID
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static void EnumerateDxgiAdapters(List<DeviceInfo> results)
     {
@@ -506,10 +509,12 @@ public static class DeviceManager
             Marshal.Release(factoryPtr);
         }
     }
+#endif
 
     private static DeviceInfo GetHostCpuDevice(int index)
     {
         string cpuName = "Host CPU";
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             try
@@ -524,6 +529,7 @@ public static class DeviceManager
                 // Fallback if registry read fails
             }
         }
+#endif
         if (cpuName == "Host CPU")
         {
             cpuName = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "Host CPU";
@@ -608,6 +614,7 @@ public static class DeviceManager
 
     private static ulong GetPhysicalMemoryBytes()
     {
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             var memStatus = new MEMORYSTATUSEX();
@@ -617,6 +624,7 @@ public static class DeviceManager
                 return memStatus.ullTotalPhys;
             }
         }
+#endif
         return (ulong)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
     }
 
@@ -624,15 +632,18 @@ public static class DeviceManager
     // Zero-Dependency NPU Discovery (Windows cfgmgr32 / Linux /sys/class/accel)
     // =========================================================================
 
+#if !ANDROID
     private const uint CR_SUCCESS = 0;
     private const uint CM_GETIDLIST_FILTER_CLASS = 0x00000200;
     private const uint CM_GETIDLIST_FILTER_PRESENT = 0x00000100;
     private const string GUID_DEVCLASS_COMPUTEACCELERATOR = "{F01A9D53-3FF6-48D2-9F97-C8A7004BE10C}";
+#endif
 
     private static void EnumerateNpuAccelerators(List<DeviceInfo> results)
     {
         ulong totalRam = GetPhysicalMemoryBytes();
 
+#if !ANDROID
         if (OperatingSystem.IsWindows())
         {
             uint flags = CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT;
@@ -659,7 +670,9 @@ public static class DeviceManager
                 }
             }
         }
-        else if (OperatingSystem.IsLinux())
+        else
+#endif
+        if (OperatingSystem.IsLinux())
         {
             const string accelRoot = "/sys/class/accel";
             if (!Directory.Exists(accelRoot))
@@ -774,6 +787,7 @@ public static class DeviceManager
         return null;
     }
 
+#if !ANDROID
     // =========================================================================
     // DXGI & Win32 Interop
     // =========================================================================
@@ -862,4 +876,5 @@ public static class DeviceManager
         public long AdapterLuid;
         public uint Flags;
     }
+#endif
 }

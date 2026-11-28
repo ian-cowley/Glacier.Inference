@@ -35,9 +35,13 @@ public class EmbeddingGemma2BackendTests
         }
     }
 
-    public static TheoryData<EmbeddingDevice, int> Backends => new()
+    public static TheoryData<EmbeddingDevice, int> CpuBackends => new()
     {
         { EmbeddingDevice.Cpu, -1 },
+    };
+
+    public static TheoryData<EmbeddingDevice, int> GpuBackends => new()
+    {
         { EmbeddingDevice.D3D12, 0 },
         { EmbeddingDevice.D3D12, 1 },
         { EmbeddingDevice.D3D12, 2 },
@@ -58,8 +62,17 @@ public class EmbeddingGemma2BackendTests
         Enumerable.Range(0, 150).Select(i => $"Sentence number {i}: the quick brown fox jumps over the lazy dog near river bank {i % 7}."));
 
     [Theory]
-    [MemberData(nameof(Backends))]
-    public void Backend_MatchesGolden_AndReportsSpeed(EmbeddingDevice dev, int adapter)
+    [MemberData(nameof(CpuBackends))]
+    public void CpuBackend_MatchesGolden_AndReportsSpeed(EmbeddingDevice dev, int adapter) =>
+        RunMatchesGoldenAndReportsSpeed(dev, adapter);
+
+    [Theory]
+    [Trait("Hardware", "Gpu")]
+    [MemberData(nameof(GpuBackends))]
+    public void Backend_MatchesGolden_AndReportsSpeed(EmbeddingDevice dev, int adapter) =>
+        RunMatchesGoldenAndReportsSpeed(dev, adapter);
+
+    private void RunMatchesGoldenAndReportsSpeed(EmbeddingDevice dev, int adapter)
     {
         if (EmbeddingGemma2ModelLocator.Path is null) return;
         using var model = TryLoad(dev, adapter);
@@ -78,7 +91,8 @@ public class EmbeddingGemma2BackendTests
     }
 
     [Theory]
-    [MemberData(nameof(Backends))]
+    [Trait("Hardware", "Gpu")]
+    [MemberData(nameof(GpuBackends))]
     public void Backend_HiddenStatesMatchCpu(EmbeddingDevice dev, int adapter)
     {
         if (EmbeddingGemma2ModelLocator.Path is null || dev == EmbeddingDevice.Cpu) return;

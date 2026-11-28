@@ -187,7 +187,7 @@ public static class ModelArchitectureDetector
             return UniversalArchitecture.LoopedTransformer;
         }
 
-        if (gguf.Metadata.TryGetValue("general.architecture", out var archObj))
+        if (gguf?.Metadata != null && gguf.Metadata.TryGetValue("general.architecture", out var archObj))
         {
             string archStr = archObj?.ToString() ?? "";
             if (archStr.Contains("nemotron_h", StringComparison.OrdinalIgnoreCase) ||

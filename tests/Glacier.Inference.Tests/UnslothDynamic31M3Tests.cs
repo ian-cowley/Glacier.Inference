@@ -179,6 +179,7 @@ public unsafe class UnslothDynamic31M3Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void SyntheticUdIq2Xs_MixedTensorGguf_RunsOnCpuD3D12AndCuda_WithVulkanGuard()
     {
         // UD-IQ2_XS mixed profile combining IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
@@ -219,6 +220,7 @@ public unsafe class UnslothDynamic31M3Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void SyntheticUdIq3_And_UdIq4Xs_MixedTensorGgufs_RunOnCpuD3D12AndCuda()
     {
         string udIq3Path = CreateTempPath("ud_iq3");
@@ -261,6 +263,7 @@ public unsafe class UnslothDynamic31M3Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void D3D12Context_EnsureExpertGemvPipelines_CompilesAllUd31ShadersAtRuntime()
     {
         if (!D3D12Context.IsSupported)
@@ -358,6 +361,7 @@ public unsafe class UnslothDynamic31M3Tests : IDisposable
     }
 
     [Fact]
+    [Trait("Hardware", "Gpu")]
     public void Gemma4D3D12Model_AlignedMoeExpertSliceOffsets_MatchUploadAlignedTensor_AndExecuteOnD3D12()
     {
         const int dim = 256;

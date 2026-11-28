@@ -8,6 +8,8 @@ using Glacier.Inference.Gguf;
 using Glacier.Inference.Gpu;
 using Glacier.Inference.Hardware;
 using Glacier.Inference.Model;
+using Glacier.Inference.Quant;
+using Glacier.Inference.Tests.E2E;
 using Glacier.Inference.Tests.VulkanE2E.Fixtures;
 using Xunit;
 
@@ -19,18 +21,6 @@ namespace Glacier.Inference.Tests.VulkanE2E;
 /// </summary>
 public unsafe class VulkanE2ETier4RealWorldScenarioTests
 {
-    private static string FindRepoRoot()
-    {
-        var dir = AppContext.BaseDirectory;
-        while (!string.IsNullOrEmpty(dir) && !File.Exists(Path.Combine(dir, "scripts", "security_check.py")))
-        {
-            var parent = Path.GetDirectoryName(dir);
-            if (parent == dir) break;
-            dir = parent;
-        }
-        return dir ?? AppContext.BaseDirectory;
-    }
-
     [Fact]
     public void Scenario1_Qwen25_AttentionBiases_And_FusedWeights_Execution()
     {
@@ -56,27 +46,37 @@ public unsafe class VulkanE2ETier4RealWorldScenarioTests
         // 2. Verify fused Gate/Up is recognized
         Assert.True(layer.HasFusedGateUp);
 
-        // 3. Simulate forward pass math: apply attention biases to projection
-        float[] qRaw = new float[256];
+        // 3. Apply attention biases via real QuantKernels.VecAdd
         float[] qBiased = new float[256];
-        for (int i = 0; i < 256; i++)
+        Array.Fill(qBiased, 0.5f);
+        fixed (float* pQ = qBiased)
         {
-            qRaw[i] = 0.5f;
-            qBiased[i] = qRaw[i] + layer.QBias[i];
+            QuantKernels.VecAdd(layer.QBias, pQ, 256);
         }
 
         // Bias was initialized to 0.05f in fixture
         Assert.Equal(0.55f, qBiased[0], 0.0001f);
+        Assert.Equal(0.55f, qBiased[255], 0.0001f);
 
-        // 4. Simulate intermediate SwiGLU activation
+        // 4. Execute SwiGLU activation via real QuantKernels.SwiGLU
         float[] gate = new float[512];
         float[] up = new float[512];
+        float[] swiglu = new float[512];
         Array.Fill(gate, 1.0f);
         Array.Fill(up, 2.0f);
-        float[] swiglu = VulkanE2ETestFixtures.ReferenceQuantOracle.ComputeSwiGlu(gate, up);
+        fixed (float* pGate = gate, pUp = up, pSwi = swiglu)
+        {
+            QuantKernels.SwiGLU(pGate, pUp, pSwi, 512);
+        }
 
-        Assert.Equal(512, swiglu.Length);
         Assert.True(swiglu[0] > 0.0f);
+
+        // 5. Execute real InferenceSession forward pass end-to-end
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.Prefill([1, 2, 3]);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
@@ -97,25 +97,33 @@ public unsafe class VulkanE2ETier4RealWorldScenarioTests
         Assert.True(weights.HasRopeFreqs);
         Assert.True(weights.RopeFreqsWeight != null);
 
-        // 2. Evaluate frequency factors across context positions
+        // 2. Evaluate real QuantKernels.RoPE across context positions
         int[] contextPositions = [0, 128, 512, 1024, 4096];
-        float baseFreq = (float)weights.RopeFreqBase;
-        if (baseFreq <= 0f) baseFreq = 10000.0f;
-
-        float ropeFreq = weights.RopeFreqsWeight[0];
-        Assert.True(ropeFreq > 0f);
-
+        float baseFreq = weights.RopeFreqBase > 0f ? weights.RopeFreqBase : 10000.0f;
+        int headDim = weights.HeadDim;
         foreach (int pos in contextPositions)
         {
-            float theta = pos * (1.0f / (baseFreq * ropeFreq));
-            float cos = MathF.Cos(theta);
-            float sin = MathF.Sin(theta);
+            float[] q = new float[weights.HeadCount * headDim];
+            float[] k = new float[weights.HeadCountKv * headDim];
+            for (int i = 0; i < q.Length; i++) q[i] = ((i % 11) - 5) * 0.2f;
+            for (int i = 0; i < k.Length; i++) k[i] = ((i % 7) - 3) * 0.3f;
+            float qNorm = MathF.Sqrt(q.Sum(v => v * v));
 
-            Assert.False(float.IsNaN(cos));
-            Assert.False(float.IsNaN(sin));
-            Assert.True(cos >= -1.0f && cos <= 1.0f);
-            Assert.True(sin >= -1.0f && sin <= 1.0f);
+            fixed (float* pQ = q, pK = k)
+            {
+                QuantKernels.RoPE(pQ, pK, weights.HeadCount, weights.HeadCountKv, headDim, pos, baseFreq, ropeFreqs: weights.RopeFreqsWeight);
+            }
+
+            Assert.All(q, v => Assert.True(float.IsFinite(v)));
+            Assert.Equal(qNorm, MathF.Sqrt(q.Sum(v => v * v)), 0.01f);
         }
+
+        // 3. Execute real InferenceSession forward pass on Q4_0 + custom RoPE model
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        session.ForwardToken(token: 4, pos: 0, computeLogits: true);
+        float[] logits = new float[session.VocabSize];
+        session.CopyCurrentLogits(logits);
+        Assert.Contains(logits, x => x != 0f && float.IsFinite(x));
     }
 
     [Fact]
@@ -138,10 +146,16 @@ public unsafe class VulkanE2ETier4RealWorldScenarioTests
         bool supported = Mamba2VulkanModel.IsSupported(weights, out string reason);
         Assert.True(supported, $"Mamba2 model should be accepted: {reason}");
 
-        // 3. Telemetry and active device string verification
-        string deviceName = "AMD Radeon 890M";
-        string modeDesc = $"Mamba-2 Hybrid SSM{(weights.IsMoe ? " + MoE" : "")}";
-        string activeDevice = $"{deviceName} [Engine: Vulkan Compute ({modeDesc}) | KV: FP32 | Arch: {weights.ArchitectureFamily}]";
+        // 3. Real InferenceSession negotiation + production Vulkan device string formatting
+        using var session = new InferenceSession(handle.Path, maxSeqLen: 16, device: "cpu");
+        Assert.Equal(UniversalArchitecture.Mamba2, session.Architecture);
+        Assert.Contains("Mamba-2 Hybrid SSM", session.ActiveDevice);
+
+        string activeDevice = InferenceSession.FormatVulkanActiveDevice(
+            "AMD Radeon 890M",
+            session.Architecture,
+            weights.IsHybridSsm,
+            weights.IsMoe);
 
         Assert.Contains("Engine: Vulkan Compute", activeDevice);
         Assert.Contains("Mamba-2 Hybrid SSM", activeDevice);
@@ -225,22 +239,13 @@ public unsafe class VulkanE2ETier4RealWorldScenarioTests
     [Fact]
     public void Scenario6_Automated_PrePublish_Security_Audit_And_Hygiene()
     {
-        // Workload: Automated pre-publish security scanner execution on Glacier.Inference
-        string repoRoot = FindRepoRoot();
-        if (!File.Exists(Path.Combine(repoRoot, "scripts", "security_check.py"))) return;
-        var psi = new ProcessStartInfo("python", "scripts/security_check.py Glacier.Inference")
-        {
-            WorkingDirectory = repoRoot,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
-        };
-        using var proc = Process.Start(psi);
-        Assert.NotNull(proc);
-        string output = proc.StandardOutput.ReadToEnd();
-        proc.WaitForExit();
+        // Workload: Automated standalone pre-publish security scanner execution on Glacier.Inference
+        string inferenceRoot = E2EGovernanceAndBenchmarkTests.ResolveInferenceRepoRoot();
+        var (exitCode, scanned, findings, output) = E2EGovernanceAndBenchmarkTests.RunPureCSharpSecretAudit(inferenceRoot);
 
-        Assert.Equal(0, proc.ExitCode);
+        Assert.True(exitCode == 0, $"Security audit failed:\n{output}");
+        Assert.Empty(findings);
+        Assert.True(scanned > 20);
         Assert.Contains("[PASSED] Zero secrets or credentials detected.", output);
     }
 }
